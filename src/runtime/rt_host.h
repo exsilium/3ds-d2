@@ -55,11 +55,21 @@ struct RunOptions {
     // (FPU CMOV MMX FXSR SSE SSE2). The 3DS reports kCpuidNoSimd: the game
     // then takes its x87/integer paths instead of SSE code the ARM11 emulates.
     uint32_t cpuid_edx = 0;
-    uint32_t max_ms = 0;
+    uint32_t max_ms = 0;                           // stop the guest after this much guest time (0: no limit)
     std::function<void(const Frame &)> present;   // each frame the game shows
     std::function<void()> poll_input;              // sample the controls (from the message pump, every >= 16 ms)
-    uint32_t trap_report = 0;
-    uint32_t heartbeat_ms = 0;                     // log progress counters every N ms of guest time                      // at exit, print the N most-called imports (stdout)                           // stop the guest after this much guest time (0: no limit)
+    uint32_t trap_report = 0;                      // at exit, print the N most-called imports (stdout)
+    uint32_t heartbeat_ms = 0;                     // log progress counters every N ms of guest time
+    // Registry DWORDs seeded under the game's settings key when absent (the
+    // game's own Options menu still changes and saves them): the 3DS app picks
+    // cheaper video settings than a PC's defaults.
+    std::vector<std::pair<std::string, uint32_t>> registry_dwords;
+    // Sound: WinVita's DirectSound emulation (ds_emul) mixing at `audio_rate`
+    // Hz into the sink its settings pick (WX86_SON: "vita" = the platform's
+    // realtime sink, "wav" with WX86_SONDUMP, "null"). Off: DirectSoundCreate
+    // reports "no driver" and the game runs silent.
+    bool audio = false;
+    int audio_rate = 22050;
 };
 
 constexpr uint32_t kCpuidNoSimd = 0x00008001;   // FPU | CMOV

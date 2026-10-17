@@ -12,6 +12,9 @@ void Autoplay::load(const std::string &script)
 {
     events_.clear();
     next_ = 0;
+    shift_ms_ = 0;
+    wait_at_ = 0;
+    waiting_for_.clear();
     pad_ = Pad();
     std::string item;
     for (size_t i = 0; i <= script.size(); i++) {
@@ -27,13 +30,34 @@ void Autoplay::load(const std::string &script)
     }
 }
 
-const Pad &Autoplay::step(uint64_t now_ms, Controls &controls, bool &shot)
+const Pad &Autoplay::step(uint64_t now_ms, Controls &controls, bool &shot, const GameState &state)
 {
     static const struct { const char *name; uint32_t bit; } kNames[] = {
         {"A", kA}, {"B", kB}, {"X", kX}, {"Y", kY}, {"L", kL}, {"R", kR}, {"ZL", kZL}, {"ZR", kZR},
         {"START", kStart}, {"SELECT", kSelect}, {"UP", kUp}, {"DOWN", kDown}, {"LEFT", kLeft}, {"RIGHT", kRight},
     };
     shot = false;
+    if (!waiting_for_.empty()) {
+        const bool met = (waiting_for_ == "textfield" && state.edit_focus) ||
+                         (waiting_for_ == "ingame" && state.in_game) || (waiting_for_ == "menus" && !state.in_game);
+        if (!met) {
+            if (retry_tap_ && now_ms >= next_retry_ms_ && !pad_.touching) {
+                controls.warp_cursor(retry_x_, retry_y_);
+                pad_.touching = true;
+                pad_.touch_x = 160;
+                pad_.touch_y = 120;
+                touch_until_ = now_ms + 100;
+                next_retry_ms_ = now_ms + 5000;
+            }
+            if (pad_.touching && now_ms >= touch_until_)
+                pad_.touching = false;
+            return pad_;
+        }
+        retry_tap_ = false;
+        rt::logf("autoplay: %s reached", waiting_for_.c_str());
+        waiting_for_.clear();
+        shift_ms_ = (int64_t)now_ms - (int64_t)wait_at_;   // later events count from here
+    }
     while (next_ < events_.size()) {
         const char *ev = events_[next_].c_str();
         unsigned long long at = 0;
@@ -43,6 +67,8 @@ const Pad &Autoplay::step(uint64_t now_ms, Controls &controls, bool &shot)
             next_++;
             continue;
         }
+        const unsigned long long script_at = at;
+        at = (unsigned long long)((int64_t)at + shift_ms_);
         if (at > now_ms)
             break;
         next_++;
@@ -67,6 +93,18 @@ const Pad &Autoplay::step(uint64_t now_ms, Controls &controls, bool &shot)
                 rt::input_char((unsigned char)*t);
         } else if (v == "shot") {
             shot = true;
+        } else if (v == "tapuntil" && std::sscanf(ev, "%*llu %*s %15s %d %d", arg, &x, &y) == 3) {
+            waiting_for_ = arg;
+            wait_at_ = script_at;
+            retry_tap_ = true;
+            retry_x_ = x;
+            retry_y_ = y;
+            next_retry_ms_ = now_ms;   // the first tap right away
+            break;
+        } else if (v == "wait" && std::sscanf(ev, "%*llu %*s %15s", arg) == 1) {
+            waiting_for_ = arg;
+            wait_at_ = script_at;   // this event's own script time
+            break;
         }
     }
     if (pad_.touching && now_ms >= touch_until_)

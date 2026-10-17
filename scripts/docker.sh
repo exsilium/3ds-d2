@@ -86,7 +86,7 @@ test)
         make_args=(-C tests/m4 run MS="${3:-20000}")
         [ -n "${4:-}" ] && make_args+=(CMD="$4")
         RUN_EXTRA=(-v "$(cd "$2" && pwd):/game:ro")
-        for v in M4_LAYOUT M4_VIRTUAL_CLOCK M4_SCRIPT RT_MSGLOG M4_PHYS_MB; do [ -n "${!v:-}" ] && RUN_EXTRA+=(-e "$v=${!v}"); done
+        for v in M4_LAYOUT M4_VIRTUAL_CLOCK M4_SCRIPT RT_MSGLOG M4_PHYS_MB M4_FAST M4_QEMU_FLAGS WX86_SON WX86_SONDUMP WX86_SONMAXS; do [ -n "${!v:-}" ] && RUN_EXTRA+=(-e "$v=${!v}"); done
         run_in "$HOSTTEST_IMAGE" make "${make_args[@]}" ;;
     *)    die "test host | test x86 [golden] | test cpu [armv7|armv6] | test m3 | test m4 <game-dir>" ;;
     esac
@@ -124,8 +124,9 @@ package-cia)   # [--full|--sdcard] <game-dir>: the game app (+ the user's own 1.
     RUN_EXTRA=("${saved_extra[@]}")
     run_in "$CTRTOOLS_IMAGE" sh scripts/package-cia.sh
     ;;
-sdcard-folder)   # <game-dir>: dist/sdcard/3ds/3ds-d2/game/ to copy once to the SD card root
-    [ -n "${1:-}" ] && [ -f "$1/Game.exe" ] || die "sdcard-folder <game-dir with Game.exe and the MPQs>"
+sdcard-folder)   # [--full] <game-dir>: dist/sdcard/3ds/3ds-d2/game/ to copy once to the SD card root
+    full=0; [ "${1:-}" = --full ] && { full=1; shift; }
+    [ -n "${1:-}" ] && [ -f "$1/Game.exe" ] || die "sdcard-folder [--full] <game-dir with Game.exe and the MPQs>"
     game="$(cd "$1" && pwd)"
     dest="$ROOT/dist/sdcard/3ds/3ds-d2/game"
     rm -rf "$ROOT/dist/sdcard" && mkdir -p "$dest"
@@ -136,11 +137,16 @@ sdcard-folder)   # <game-dir>: dist/sdcard/3ds/3ds-d2/game/ to copy once to the 
         b="$(basename "$f")"; l="$(echo "$b" | tr 'A-Z' 'a-z')"
         case "$l" in
         game.exe|d2data.mpq|d2exp.mpq|d2char.mpq|d2sfx.mpq|patch_d2.mpq) ln "$f" "$dest/$b" 2>/dev/null || cp "$f" "$dest/$b" ;;
+        *.mpq) [ "$full" = 1 ] && { ln "$f" "$dest/$b" 2>/dev/null || cp "$f" "$dest/$b"; } ;;
         esac
     done
-    for f in d2video.mpq d2xvideo.mpq d2music.mpq d2xmusic.mpq d2speech.mpq d2xtalk.mpq; do
-        python3 -I "$ROOT/packaging/cia/make_stub_mpq.py" "$dest/$f"
-    done
+    # Slim: empty MPQs for the archives the game only checks for. Full: the
+    # real ones (music and speech for sound; cinematics are never played).
+    if [ "$full" = 0 ]; then
+        for f in d2video.mpq d2xvideo.mpq d2music.mpq d2xmusic.mpq d2speech.mpq d2xtalk.mpq; do
+            python3 -I "$ROOT/packaging/cia/make_stub_mpq.py" "$dest/$f"
+        done
+    fi
     ls -la "$dest"; du -sh "$ROOT/dist/sdcard"
     echo "copy dist/sdcard/3ds onto the SD card root (it merges into the existing 3ds folder),"
     echo "then install the code-only CIA: scripts/docker.sh package-cia --sdcard"

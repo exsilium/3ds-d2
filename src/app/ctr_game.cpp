@@ -93,6 +93,12 @@ void __system_allocateHeaps(void)
     hs.region_free = (u32)osGetMemRegionFree(MEMREGION_APPLICATION) & ~0xFFFu;
     u32 want = (hs.budget < hs.region_free ? hs.budget : hs.region_free);
     want = want > __ctru_linear_heap_size ? (want - __ctru_linear_heap_size) & ~0xFFFFFu : 0;
+    // The console's heap window ends at 0x0E000000: it mapped 95 MiB and
+    // refused 99. Starting at its limit keeps Azahar (which allows more) on
+    // exactly the console's memory layout.
+    constexpr u32 kHeapWindowMax = 95u << 20;
+    if (want > kHeapWindowMax)
+        want = kHeapWindowMax;
     const MemPerm rw = (MemPerm)(MEMPERM_READ | MEMPERM_WRITE);
     for (;;) {
         hs.tries++;
@@ -141,6 +147,8 @@ uint32_t g_pal_wide[256];
 // rewritten once a second) and the runtime's messages (rows 12-29, scrolling).
 
 PrintConsole g_stats_con, g_log_con;
+int g_render_core = -1;                 // the core drawing frames (-1: the game's thread)
+volatile uint32_t g_frames_skipped = 0; // frames not shown: the previous one was still drawing
 game::Autoplay g_autoplay;
 bool g_autoplay_on = false;   // sdmc:/3ds/3ds-d2/autoplay.txt, until the first physical input
 
@@ -168,7 +176,8 @@ void show_stats(float fps, float draw_ms, float worst_ms)
     std::snprintf(line[0], 48, "3ds-d2  game time %02u:%02u:%02u", (unsigned)(t / 3600), (unsigned)(t / 60 % 60),
                   (unsigned)(t % 60));
     std::snprintf(line[1], 48, "fps %5.1f   worst frame gap %6.1f ms", fps, worst_ms);
-    std::snprintf(line[2], 48, "draw %5.2f ms/frame  frames %8u", draw_ms, (unsigned)g_timing.total_frames);
+    std::snprintf(line[2], 48, "draw %5.2f ms c%d skip %u frames %u", draw_ms, g_render_core < 0 ? 0 : g_render_core,
+                  (unsigned)g_frames_skipped, (unsigned)g_timing.total_frames);
     std::snprintf(line[3], 48, "guest heap %6u/%6u KiB pk %6u", m.heap_used >> 10, m.heap_size >> 10, m.heap_peak >> 10);
     std::snprintf(line[4], 48, "guest va   %6u/%6u KiB pk %6u", m.va_used >> 10, m.va_size >> 10, m.va_peak >> 10);
     std::snprintf(line[5], 48, "host heap  %6u/%6u KiB", (unsigned)(mi.uordblks >> 10), (unsigned)(__ctru_heap_size >> 10));
@@ -293,30 +302,124 @@ void draw_window(uint16_t *fb, const rt::Frame &f, int cx, int cy)
     }
 }
 
+// ---- the render thread -----------------------------------------------------------
+//
+// Converting and scaling a frame for the top screen costs ~6 ms on the
+// console's game core. On a New 3DS it runs on another core instead: present()
+// copies the frame (indices + palette, ~0.5 MB) and returns, and this thread
+// draws it while the game works on its next frame. A frame that arrives while
+// the previous one is still being drawn is skipped on screen (never waited for).
+
+struct Staged {
+    std::vector<uint8_t> pixels;
+    uint32_t width = 0, height = 0;
+    uint32_t palette[256];
+    bool zoom;
+    int cursor_x, cursor_y;
+};
+Staged g_staged;
+LightEvent g_render_go;
+volatile bool g_render_busy = false, g_render_quit = false;
+Thread g_render_thread = nullptr;
+
+void draw_staged()
+{
+    const Staged &st = g_staged;
+    for (int i = 0; i < 256; i++) {
+        const uint32_t p = st.palette[i], r = (p >> 16) & 0xFF, g = (p >> 8) & 0xFF, b = p & 0xFF;
+        g_pal_wide[i] = (r << 20) | (g << 10) | b;
+        g_pal565[i] = rgb565(r, g, b);
+    }
+    rt::Frame f;
+    f.pixels = st.pixels.data();
+    f.width = st.width;
+    f.height = st.height;
+    f.stride = (int32_t)st.width;
+    f.palette = st.palette;
+    uint16_t *top = (uint16_t *)gfxGetFramebuffer(GFX_TOP, GFX_LEFT, nullptr, nullptr);
+    if (st.zoom)
+        draw_window(top, f, st.cursor_x, st.cursor_y);
+    else
+        draw_stretched(top, f);
+    gfxFlushBuffers();
+    gfxSwapBuffers();
+}
+
+void render_main(void *)
+{
+    for (;;) {
+        LightEvent_Wait(&g_render_go);
+        if (g_render_quit)
+            break;
+        const uint64_t t0 = host_us();
+        draw_staged();
+        g_timing.draw_us += host_us() - t0;
+        __atomic_store_n(&g_render_busy, false, __ATOMIC_RELEASE);
+    }
+}
+
+void start_render_thread()
+{
+    LightEvent_Init(&g_render_go, RESET_ONESHOT);
+    s32 prio = 0x30;
+    svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+    // Core 2 exists on a New 3DS and is the application's to use; core 1 is
+    // the system core, usable after the app gives it a CPU time share.
+    for (int core : {2, 1}) {
+        if (core == 1 && R_FAILED(APT_SetAppCpuTimeLimit(30)))
+            continue;
+        g_render_thread = threadCreate(render_main, nullptr, 32 * 1024, prio, core, false);
+        if (g_render_thread) {
+            g_render_core = core;
+            break;
+        }
+    }
+    status("frame drawing: %s", g_render_core >= 0 ? (g_render_core == 2 ? "core 2" : "core 1 (30%)")
+                                                   : "game thread (no second core)");
+}
+
+void stop_render_thread()
+{
+    if (!g_render_thread)
+        return;
+    g_render_quit = true;
+    LightEvent_Signal(&g_render_go);
+    threadJoin(g_render_thread, U64_MAX);
+    threadFree(g_render_thread);
+    g_render_thread = nullptr;
+}
+
 void present(const rt::Frame &f)
 {
     const uint64_t t0 = host_us();
     if (g_timing.last_present_us && t0 - g_timing.last_present_us > g_timing.worst_gap_us)
         g_timing.worst_gap_us = t0 - g_timing.last_present_us;
     g_timing.last_present_us = t0;
-
     g_controls.set_frame((int)f.width, (int)f.height);
-    for (int i = 0; i < 256; i++) {
-        const uint32_t p = f.palette[i], r = (p >> 16) & 0xFF, g = (p >> 8) & 0xFF, b = p & 0xFF;
-        g_pal_wide[i] = (r << 20) | (g << 10) | b;
-        g_pal565[i] = rgb565(r, g, b);
-    }
-    uint16_t *top = (uint16_t *)gfxGetFramebuffer(GFX_TOP, GFX_LEFT, nullptr, nullptr);
-    if (g_zoom)
-        draw_window(top, f, g_controls.cursor_x(), g_controls.cursor_y());
-    else
-        draw_stretched(top, f);
-    gfxFlushBuffers();
-    gfxSwapBuffers();
-
     g_timing.frames++;
     g_timing.total_frames++;
-    g_timing.draw_us += host_us() - t0;
+
+    if (__atomic_load_n(&g_render_busy, __ATOMIC_ACQUIRE)) {
+        g_frames_skipped++;   // the screen is still showing/drawing the last one
+    } else {
+        Staged &st = g_staged;
+        st.width = f.width;
+        st.height = f.height;
+        st.pixels.resize((size_t)f.width * f.height);
+        for (uint32_t y = 0; y < f.height; y++)
+            std::memcpy(&st.pixels[(size_t)y * f.width], f.pixels + (ptrdiff_t)y * f.stride, f.width);
+        std::memcpy(st.palette, f.palette, sizeof st.palette);
+        st.zoom = g_zoom;
+        st.cursor_x = g_controls.cursor_x();
+        st.cursor_y = g_controls.cursor_y();
+        if (g_render_thread) {
+            __atomic_store_n(&g_render_busy, true, __ATOMIC_RELEASE);
+            LightEvent_Signal(&g_render_go);
+        } else {
+            draw_staged();
+            g_timing.draw_us += host_us() - t0;
+        }
+    }
     update_stats();
 }
 
@@ -384,6 +487,7 @@ void poll()
         pad.touch_x = t.px;
         pad.touch_y = t.py;
     }
+    const game::GameState gs = game::read_game_state();
     // Autoplay drives the pad until the player touches anything.
     if (g_autoplay_on) {
         if (pad.held || pad.touching || std::abs(pad.circle_x) > 40 || std::abs(pad.circle_y) > 40 ||
@@ -392,10 +496,9 @@ void poll()
             rt::logf("autoplay stopped: physical input");
         } else if (g_autoplay.active()) {
             bool shot = false;
-            pad = g_autoplay.step(rt::now_ms(), g_controls, shot);
+            pad = g_autoplay.step(rt::now_ms(), g_controls, shot, gs);
         }
     }
-    const game::GameState gs = game::read_game_state();
     // A newly focused text field (the hero name box, a game name) opens the keyboard.
     if (gs.edit_focus && gs.edit_focus != g_last_focus && !g_osk.is_open())
         g_osk.open();
@@ -513,10 +616,10 @@ int main()
     rt::RunOptions opt;
 #ifdef D2_CIA
     // The arena is carved out of the heap (16 MiB-aligned, so it needs its
-    // size + 16 MiB free at once) and the host keeps the rest: ~24 MiB for the
-    // JIT, the jump tables and the runtime in town.
-    if (__ctru_heap_size >= (104u << 20)) {
-        opt.layout = &rt::kCtrGameLayoutXL;
+    // size + 16 MiB free at once) and the host keeps the rest: the jump
+    // tables, the JIT's metadata and the runtime (JIT code is in its pool).
+    if (__ctru_heap_size >= (95u << 20)) {
+        opt.layout = &rt::kCtrGameLayoutN3;   // the console's full heap
     } else if (__ctru_heap_size >= (87u << 20)) {
         opt.layout = &rt::kCtrGameLayout;
     } else {
@@ -534,22 +637,34 @@ int main()
     opt.command_line = "game.exe -w";
     opt.cpuid_edx = rt::kCpuidNoSimd;
     opt.total_phys_mb = 64;   // the game's own 24 MiB sprite-cache floor
+    // Cheaper video defaults than a PC's (the game's Options menu still
+    // changes them): 640x480 in game (36% fewer pixels to draw, and exactly
+    // 2:1 down to the 240-line screen), low lighting, no blended shadows, no
+    // perspective.
+    opt.registry_dwords = {{"Resolution", 0}, {"Light Quality", 0}, {"Blended Shadows", 0}, {"Perspective", 0}};
     opt.real_clock = true;
     opt.sleep_ms = [](uint32_t ms) { svcSleepThread((s64)ms * 1000000); };
     opt.heartbeat_ms = 10000;
+    // Sound through ds_emul into the DSP (ctr_audio.cpp), mixed on another core.
+    setenv("WX86_SON", "vita", 1);   // ds_emul's name for the console's realtime sink
+    opt.audio = true;
     opt.log = [](const char *s) {
         char line[600];
         std::snprintf(line, sizeof line, "[rt] %s", s);
         logline(line);
         // Heartbeats: the panel shows those numbers. While the keyboard is
         // up, messages go to the log file only.
-        if (std::strncmp(s, "t=", 2) != 0 && !g_osk_shown)
+        // The sound engine's "[son]" diagnostics (WinVita writes them in
+        // French) go to game.log only.
+        if (std::strncmp(s, "t=", 2) != 0 && std::strncmp(s, "[son]", 5) != 0 && !g_osk_shown)
             std::printf("%.*s\n", 39, s);
     };
     opt.present = present;
     opt.poll_input = poll;
 
+    start_render_thread();
     rt::RunResult r = rt::run_exe(std::move(exe), opt);
+    stop_render_thread();
     if (!r.loaded)
         status("FATAL: %s", r.error.c_str());
     else

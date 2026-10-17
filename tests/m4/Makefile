@@ -11,7 +11,9 @@ ARCH  := -marm -march=armv6k -mtune=mpcore -mfpu=vfp -mfloat-abi=softfp
 INC   := -I$(ROOT)/src -I$(W)/src -I$(W)/src/dynarec86 -I$(W)/src/dynarec86/shim \
          -I$(W)/third_party/box86-dynarec/include -I$(W)/third_party/box86-dynarec
 SRCS  := game_main.cpp $(wildcard $(ROOT)/src/runtime/rt_*.cpp) $(wildcard $(ROOT)/src/game/*.cpp)
-QEMU  := qemu-arm -cpu arm11mpcore
+# M4_QEMU_FLAGS=-one-insn-per-tb makes qemu slow enough that the game is
+# CPU-bound, as on the 3DS: frames per second then compare the work per frame.
+QEMU  := qemu-arm -cpu arm11mpcore $(M4_QEMU_FLAGS)
 GAME  ?= /game
 MS    ?= 20000
 CMD   ?= game.exe -w

@@ -103,3 +103,23 @@ JIT code sits in the 16 MiB static pool, outside the heap, so in the heap figure
 What this suggests:
 - **Room left:** about 18 MiB of the 95 MiB heap is unused. The guest's VirtualAlloc, now at 28.5 of 32 MiB as the sprite cache fills, is the region to grow first.
 - **Pacing:** the game paces itself at 25 fps. 16.7 is CPU-bound.
+
+## Sound
+
+The app plays sound through WinVita's DirectSound emulation (ds_emul) and the 3DS DSP (libctru's ndsp; `src/app/ctr_audio.cpp`). The mixer runs on the New 3DS's second application core.
+
+**Before the first run:** ndsp needs the DSP firmware at `sdmc:/3ds/dspfirm.cdc`. Dump it once with the *DSP1* homebrew; many Luma3DS setups already have it. Without it the game runs silent, and `game.log` says `sound: ndspInit failed … is sdmc:/3ds/dspfirm.cdc there?`.
+
+**What you hear:**
+- **Sound effects:** `d2sfx.mpq` is real in every packaging mode, so they play.
+- **Music and speech:** the slim CIA and the SD card folder replace them with empty stubs, so there is none. For both, copy the real `d2music.mpq`, `d2xmusic.mpq`, `d2speech.mpq` and `d2xtalk.mpq` over the stubs in `3ds/3ds-d2/game/`, or build `package-cia --full`.
+
+## Frame-rate work (2026-10-17)
+
+| Change | Measure | Result |
+| --- | --- | --- |
+| 640×480 in game, low lighting, no blended shadows, no perspective (registry defaults the game's Options can still change) | Linux lane made CPU-bound (`M4_QEMU_FLAGS=-one-insn-per-tb`), town | 1.8 → 2.6 fps (+44%) |
+| Frame drawing on core 2 (copy ~0.5 MB, draw in parallel) | Azahar, town | ~9 → 13.9 fps together with the settings |
+| Console | | to be measured |
+
+The CPU-bound Linux lane is the way to compare the work per frame between builds without the console: qemu on a fast host otherwise always keeps the game at its 25 fps cap.

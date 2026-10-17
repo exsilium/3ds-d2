@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <string>
 #include <unistd.h>
 #include <utility>
@@ -43,13 +44,17 @@ int main(int argc, char **argv)
     // M4_LAYOUT=ctr: the 3DS's compact layout and its 64 MiB RAM report, to
     // check on Linux exactly what the console app will run.
     const std::string lay = std::getenv("M4_LAYOUT") ? std::getenv("M4_LAYOUT") : "";
-    const bool ctr = lay == "ctr" || lay == "ctr-xl";   // ctr-xl: the CIA's New 3DS extended-memory layout
-    opt.layout = lay == "ctr-xl" ? &rt::kCtrGameLayoutXL : ctr ? &rt::kCtrGameLayout : &rt::kGameLayout;
+    const bool ctr = lay == "ctr" || lay == "ctr-n3";   // ctr-n3: the CIA's layout on a New 3DS
+    opt.layout = lay == "ctr-n3" ? &rt::kCtrGameLayoutN3 : ctr ? &rt::kCtrGameLayout : &rt::kGameLayout;
     if (ctr)
         opt.total_phys_mb = 64;
     if (const char *mb = std::getenv("M4_PHYS_MB"))   // override the RAM the game is told about
         opt.total_phys_mb = (uint32_t)std::atoi(mb);
     opt.virtual_tick_us = 250;   // used only under M4_VIRTUAL_CLOCK
+    if (std::getenv("WX86_SON"))   // e.g. WX86_SON=wav WX86_SONDUMP=<file>: sound to a WAV file
+        opt.audio = true;
+    if (std::getenv("M4_FAST"))   // the 3DS app's video settings (src/app/ctr_game.cpp), for A/B runs
+        opt.registry_dwords = {{"Resolution", 0}, {"Light Quality", 0}, {"Blended Shadows", 0}, {"Perspective", 0}};
     opt.data_root = argv[1];
     opt.write_root = argv[2];
     opt.max_ms = (uint32_t)std::strtoul(argv[3], nullptr, 0);
@@ -97,6 +102,21 @@ int main(int argc, char **argv)
         png::write_rgb(shots + "/" + name, rgb.data(), last_w, last_h);
     };
     opt.present = [save](const rt::Frame &f) {
+        // CPU time per frame (all of the host process: translated game code,
+        // runtime, qemu): the lane's measure of how much work a frame is,
+        // since qemu on a fast host never runs short of time the way the 3DS
+        // does. Printed every 250 frames.
+        static unsigned frames = 0;
+        static double cpu0 = 0;
+        timespec ts;
+        clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);
+        const double cpu = ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+        if (++frames % 250 == 0) {
+            if (cpu0)
+                std::fprintf(stderr, "[rt] cpu %.2f ms/frame (%ux%u) at frame %u\n", (cpu - cpu0) / 250, f.width,
+                             f.height, frames);
+            cpu0 = cpu;
+        }
         last_w = f.width;
         last_h = f.height;
         last_idx.resize((size_t)f.width * f.height);
@@ -124,10 +144,10 @@ int main(int argc, char **argv)
     opt.poll_input = [] {
         const uint64_t now = rt::now_ms();
         bool shot = false;
-        const game::Pad &pad = autoplay.step(now, controls, shot);
+        const game::GameState gs = game::read_game_state();
+        const game::Pad &pad = autoplay.step(now, controls, shot, gs);
         if (shot)
             shot_now = true;
-        const game::GameState gs = game::read_game_state();
         controls.set_context(gs.in_game, gs.panel_open);
         controls.update(pad, now);
     };

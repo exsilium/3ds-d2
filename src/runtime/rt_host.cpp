@@ -3,6 +3,7 @@
 #include "runtime/rt_layout.h"
 
 #include "runtime/bridge.h"
+#include "runtime/ds_emul.h"
 #include "runtime/cpu.h"
 #include "runtime/guest_region.h"
 #include "runtime/guest_scratch.h"
@@ -363,7 +364,16 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
     install_user32(*br);
     install_advapi32(*br);
     install_misc(*br);
-    install_net(*br);
+    install_net(*br);   // includes DSOUND "no driver"; ds_emul replaces it when audio is on
+    if (g_opt.audio) {
+        dsound::set_logger([](const char *line) { logf("%s", line); });
+        dsound::HostOps ops;
+        ops.va_alloc = [](uint32_t n) -> uint32_t { return g_va.alloc(n); };
+        ops.tick_ms = [](Cpu &) -> uint32_t { return (uint32_t)now_ms(); };
+        ops.write_root = g_opt.write_root.c_str();
+        ops.mix_rate = g_opt.audio_rate;
+        dsound::install(*br, *cpu, ops);
+    }
     // Unimplemented imports: logged once per name (a game loop would flood the
     // log otherwise), and return 0.
     static std::set<std::string> reported;
@@ -397,6 +407,8 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
     sched.run();
     wx86_set_scheduler(nullptr);
     g_sched = nullptr;
+    if (g_opt.audio)
+        dsound::shutdown();
 
     const std::string why = sched.stop_reason() ? sched.stop_reason() : "";
     if (!g_exited && !g_timed_out && why == "all finished") {   // the main thread returned from its entry point

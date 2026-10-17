@@ -8,6 +8,7 @@
 #include "runtime/rt_host.h"
 
 #include "runtime/bridge.h"
+#include "runtime/ds_emul.h"
 #include "runtime/cpu.h"
 #include "runtime/guest_region.h"
 
@@ -50,6 +51,8 @@ uint32_t blit(Cpu &c, uint32_t src_dc)
     if (!d || d->bpp != 8)
         return 1;
     stats().frames++;
+    if (options().audio)
+        d2rt::dsound::frame_pump(c);   // drives a sink the game's frames pace (wav/null); no-op for a realtime one
     if (!options().present)
         return 1;
     const int32_t stride = (int32_t)(((d->width * 8 + 31) / 32) * 4);

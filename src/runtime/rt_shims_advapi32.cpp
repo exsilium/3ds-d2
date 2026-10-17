@@ -195,6 +195,8 @@ void seed()
     seed_sz(d2, "GamePath", "C:\\Game.exe");
     seed_dword(d2, "InstallType", 3);   // full install: every MPQ is local
     seed_dword(d2, "Render", 0);
+    for (const auto &kv : options().registry_dwords)
+        seed_dword(d2, kv.first.c_str(), kv.second);
 }
 
 // ---- shims ---------------------------------------------------------------------------

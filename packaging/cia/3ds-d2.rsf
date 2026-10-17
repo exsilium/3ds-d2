@@ -7,6 +7,7 @@
 #   SystemCallAccess       includes ControlProcessMemory (0x70), which makes
 #                          the JIT's code chunks executable on hardware
 #                          (src/dynarec86/shim/ctr/mman_ctr.c), and Backdoor
+#   IORegisterMapping      the DSP's memory, for sound (ndsp)
 #   RomFs                  the game files (Game.exe + MPQs), mounted from the
 #                          user's own copy at packaging time; never in the repo
 #
@@ -41,6 +42,10 @@ AccessControlInfo:
     - DirectSdmc
     - DirectSdmcWrite
   IoAccessControl:
+  # The DSP's shared memory, which ndsp (sound) writes to: a CIA must declare
+  # it, or the first access is a data abort (Azahar does not check).
+  IORegisterMapping:
+    - 1ff00000-1ff7ffff
   MemoryType              : Application
   SystemMode              : 64MB
   SystemModeExt           : 124MB

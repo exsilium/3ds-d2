@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Exile <exile@chamber.ee>
+Date: Sat, 17 Oct 2026 20:55:24 +0300
+Subject: [PATCH] audio sink: weak platform hooks outside the Vita (realtime
+ sink, audio thread)
+
+---
+ src/runtime/audio_sink_host.cpp | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/src/runtime/audio_sink_host.cpp b/src/runtime/audio_sink_host.cpp
+index 4117b60..c1722ef 100644
+--- a/src/runtime/audio_sink_host.cpp
++++ b/src/runtime/audio_sink_host.cpp
+@@ -91,14 +91,18 @@ Sink* make_null_sink() { return new NullSink(); }
+ // No host thread outside the console: the mixer falls back to the sink
+ // PULLED by the game's frame tick. Deliberate — under qemu, a real-time
+ // thread would starve the sink and the WAV evidence would be full of gaps.
+-bool thread_start(void (*)(void)) { return false; }
+-bool thread_retry(void) { return false; }
+-bool thread_stop(void) { return true; }
++//
++// Weak: another console port provides its own realtime sink and audio thread
++// under these names (the 3DS app: ndsp on a second core). Without one, the
++// behaviour above is unchanged.
++__attribute__((weak)) bool thread_start(void (*)(void)) { return false; }
++__attribute__((weak)) bool thread_retry(void) { return false; }
++__attribute__((weak)) bool thread_stop(void) { return true; }
+ 
+ // Outside the console there's no sceAudioOut: this factory exists so
+ // ds_emul.cpp compiles identically everywhere, and returns null (the mixer
+ // then falls back to the null sink, and SAYS so in the log).
+-Sink* make_vita_sink() { return nullptr; }
++__attribute__((weak)) Sink* make_vita_sink() { return nullptr; }
+ #endif
+ 
+ // ---------------------------------------------------------------------------

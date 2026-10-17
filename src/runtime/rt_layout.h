@@ -76,20 +76,22 @@ constexpr Layout kCtrGameLayout = {
     0x03f00000,
 };
 
-// The same on a New 3DS in its extended memory mode (a CIA built with
-// SystemModeExt 124MB): 80 MiB, with room for the sprite cache to grow
-// (VirtualAlloc 46 MiB) and the heap's peaks (20 MiB). The app keeps 34 MiB of
-// host heap for the JIT and 2 MiB of linear memory.
-constexpr Layout kCtrGameLayoutXL = {
-    "ctr-game-xl",
+// New 3DS hardware, CIA in extended memory mode: the kernel maps at most
+// ~95 MiB of heap (its heap window ends at 0x0E000000, docs/memory-budget.md),
+// and the arena is carved out of that heap. 75 MiB: VirtualAlloc 44 MiB (the
+// sprite cache grows towards its 24 MiB floor; sound buffers come from here
+// too), heap 17 MiB (peak 16.2). The host keeps ~20 MiB: it used 14.4 in
+// town on the console (jump tables 12), with JIT code in its own .bss pool.
+constexpr Layout kCtrGameLayoutN3 = {
+    "ctr-game-n3",
     0x00a00000,
-    0x00e00000, 0x01400000,   // 20 MiB heap
-    0x02200000, 0x02e00000,   // 46 MiB VirtualAlloc
+    0x00e00000, 0x01100000,   // 17 MiB heap
+    0x01f00000, 0x02c00000,   // 44 MiB VirtualAlloc
     0x00010000, 0x00070000,
     0x00080000, 0x00081000,
     0x00b00000, 0x00040000, 0x00df0000,
     0x00100000, 0x00300000,
-    0x05000000,
+    0x04b00000,
 };
 
 // TEB offsets used by the runtime.

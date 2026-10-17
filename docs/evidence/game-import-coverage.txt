@@ -1,0 +1,43 @@
+KERNEL32.DLL   imports=193 covered=115 missing= 78
+ADVAPI32.DLL   imports= 21 covered=  4 missing= 17
+IMM32.DLL      imports= 11 covered= 11 missing=  0
+WINTRUST.DLL   imports=  1 covered=  0 missing=  1
+CRYPT32.DLL    imports=  7 covered=  0 missing=  7
+WINMM.DLL      imports=  1 covered=  0 missing=  1
+WS2_32.DLL     imports=  0 covered=  0 missing=  0
+VERSION.DLL    imports=  1 covered=  1 missing=  0
+DSOUND.DLL     imports=  0 covered=  0 missing=  0
+DDRAW.DLL      imports=  2 covered=  2 missing=  0
+BINKW32.DLL    imports=  9 covered=  0 missing=  9
+SMACKW32.DLL   imports=  6 covered=  0 missing=  6
+IJL11.DLL      imports=  0 covered=  0 missing=  0
+PSAPI.DLL      imports=  2 covered=  1 missing=  1
+USER32.DLL     imports= 61 covered= 39 missing= 22
+GDI32.DLL      imports= 23 covered= 20 missing=  3
+SHELL32.DLL    imports=  3 covered=  2 missing=  1
+OLE32.DLL      imports=  1 covered=  0 missing=  1
+TOTAL imports=342 covered=195 (57%) missing=147
+
+KERNEL32.DLL missing (78): GetVersion GetCurrentProcess LoadLibraryA GetProcAddress GetPrivateProfileIntA DeleteFileA GetFileAttributesA CreateDirectoryA GetModuleFileNameA FindClose FindNextFileA FindFirstFileA MoveFileA GetLocalTime GetComputerNameA Process32Next Process32First CreateToolhelp32Snapshot DeleteCriticalSection OutputDebugStringA InitializeCriticalSection LeaveCriticalSection EnterCriticalSection RaiseException GetThreadContext GetCurrentDirectoryA SystemTimeToFileTime GetDiskFreeSpaceA TerminateProcess Process32FirstW OpenThread Process32NextW RtlCaptureContext LoadLibraryW CreateFileW GetProcessId Thread32First Thread32Next FormatMessageA SetUnhandledExceptionFilter GetFileAttributesW GetTempPathW FindFirstFileW CreateDirectoryW CopyFileW IsBadStringPtrA Module32FirstW Module32NextW GetModuleHandleW GetVolumeInformationA GetFileTime UnmapViewOfFile FreeResource SizeofResource LockResource LoadResource FindResourceA MapViewOfFile CreateFileMappingA GetExitCodeProcess FlushFileBuffers FileTimeToSystemTime FileTimeToLocalFileTime CreateProcessA GetTempFileNameA LoadLibraryExA ReadProcessMemory GetSystemTimeAsFileTime GlobalUnlock GlobalLock GetLogicalDriveStringsA GetTimeZoneInformation GetSystemTime CompareFileTime InterlockedCompareExchange GetFullPathNameA FatalAppExitA GetPrivateProfileStringA
+
+ADVAPI32.DLL missing (17): RegCreateKeyExA RegFlushKey RegQueryValueExA RegOpenKeyExA AllocateAndInitializeSid RegDeleteValueA StartServiceCtrlDispatcherA RegisterServiceCtrlHandlerA OpenSCManagerA RegDeleteKeyA RegCloseKey RegSetValueExA RegEnumValueA RegCreateKeyA RegOpenKeyA SetServiceStatus OpenServiceA
+
+WINTRUST.DLL missing (1): WinVerifyTrust
+
+CRYPT32.DLL missing (7): CertFreeCertificateContext CertFindCertificateInStore CryptMsgGetParam CryptQueryObject CertCloseStore CryptMsgClose CertGetNameStringW
+
+WINMM.DLL missing (1): timeGetTime
+
+BINKW32.DLL missing (9): _BinkOpen@8 _BinkNextFrame@4 _BinkCopyToBuffer@28 _BinkDoFrame@4 _BinkWait@4 _BinkClose@4 _BinkDDSurfaceType@4 _BinkSetSoundSystem@8 _BinkOpenDirectSound@4
+
+SMACKW32.DLL missing (6): _SmackWait@4 _SmackDoFrame@4 _SmackNextFrame@4 _SmackOpen@12 _SmackClose@4 _SmackToBuffer@28
+
+PSAPI.DLL missing (1): GetModuleFileNameExA
+
+USER32.DLL missing (22): MoveWindow GetClipboardData GetKeyState GetAsyncKeyState MessageBoxA wsprintfA IsWindowVisible wvsprintfA GetKeyboardLayout UnregisterClassA SetFocus ShowWindow GetWindowPlacement IsIconic GetMonitorInfoA MonitorFromWindow CloseClipboard OpenClipboard IsClipboardFormatAvailable SetClipboardData EmptyClipboard DrawTextA
+
+GDI32.DLL missing (3): SetDIBColorTable StretchBlt CreateDIBSection
+
+SHELL32.DLL missing (1): SHGetFolderPathA
+
+OLE32.DLL missing (1): CoTaskMemFree

@@ -1,0 +1,99 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Fri, 16 Oct 2026 21:05:19 +0300
+Subject: [PATCH] x87 FLD1/FLDZ: load constants through core registers on VFPv2
+
+VFPv3 'VMOV Dd, #imm' and NEON 'VMOV.I8' do not exist on ARM11. FLDZ avoids
+VSUB d,d,d, which would give NaN for an Inf/NaN previous value.
+---
+ .../box86-dynarec/dynarec/arm_emitter_v6.h    | 15 +++++++++++
+ .../box86-dynarec/dynarec/dynarec_arm_d9.c    | 27 +++++++++++++++++++
+ 2 files changed, 42 insertions(+)
+
+diff --git a/third_party/box86-dynarec/dynarec/arm_emitter_v6.h b/third_party/box86-dynarec/dynarec/arm_emitter_v6.h
+index 047a009..9235d9b 100644
+--- a/third_party/box86-dynarec/dynarec/arm_emitter_v6.h
++++ b/third_party/box86-dynarec/dynarec/arm_emitter_v6.h
+@@ -221,4 +221,19 @@ static inline void armv6_bitfield_check(int rd, int rn, int lsb, int width)
+ #undef VSWPQ
+ #define VSWPQ(Dd, Dm) ARMV6_UNSUPPORTED("VSWPQ")
+ 
++// VFPv3 "VMOV Sd/Dd, #imm" does not exist on VFPv2. Constants go through core
++// registers instead; the caller names scratch registers that are free there.
++#undef VMOV_8
++#define VMOV_8(Dd, imm8) ARMV6_UNSUPPORTED("VMOV_8 (NEON)")
++#undef VMOV_i_32
++#define VMOV_i_32(Sd, Imm8) ARMV6_UNSUPPORTED("VMOV_i_32")
++#undef VMOV_i_64
++#define VMOV_i_64(Dd, Imm8) ARMV6_UNSUPPORTED("VMOV_i_64")
++#define ARMV6_VLOAD_F32(Sd, bits32, rt) do { MOV32(rt, (uint32_t)(bits32)); VMOVtoV(Sd, rt); } while (0)
++#define ARMV6_VLOAD_F64(Dd, bits64, rlo, rhi) do {                                     \
++        MOV32(rlo, (uint32_t)((uint64_t)(bits64)));                                    \
++        MOV32(rhi, (uint32_t)((uint64_t)(bits64) >> 32));                              \
++        VMOVtoV_D(Dd, rlo, rhi);                                                       \
++    } while (0)
++
+ #endif
+diff --git a/third_party/box86-dynarec/dynarec/dynarec_arm_d9.c b/third_party/box86-dynarec/dynarec/dynarec_arm_d9.c
+index 5066faa..18c5bcb 100755
+--- a/third_party/box86-dynarec/dynarec/dynarec_arm_d9.c
++++ b/third_party/box86-dynarec/dynarec/dynarec_arm_d9.c
+@@ -220,9 +220,17 @@ uintptr_t dynarecD9(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int ninst,
+             INST_NAME("FLD1");
+             X87_PUSH_OR_FAIL(v1, dyn, ninst, x1, box86_dynarec_x87double?NEON_CACHE_ST_D:NEON_CACHE_ST_F);
+             if(ST_IS_F(0)) {
++                #if __ARM_ARCH >= 7
+                 VMOV_i_32(v1, 0b01110000);
++                #else
++                ARMV6_VLOAD_F32(v1, 0x3f800000, x2);   // 1.0f
++                #endif
+             } else {
++                #if __ARM_ARCH >= 7
+                 VMOV_i_64(v1, 0b01110000);
++                #else
++                ARMV6_VLOAD_F64(v1, 0x3ff0000000000000ull, x2, x3);   // 1.0
++                #endif
+             }
+             // should set C1 to 0
+             break;
+@@ -289,11 +297,22 @@ uintptr_t dynarecD9(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int ninst,
+         case 0xEE:
+             INST_NAME("FLDZ");
+             X87_PUSH_OR_FAIL(v1, dyn, ninst, x1, box86_dynarec_x87double?NEON_CACHE_ST_D:NEON_CACHE_ST_F);
++            #if __ARM_ARCH >= 7
+             if(ST_IS_F(0)) {
+                 VMOV_8(v1/2, 0);  // float is *2...
+             } else {
+                 VMOV_8(v1, 0);  // cannot use VMOV_i_F64
+             }
++            #else
++            // No NEON VMOV.I8 on ARMv6: zero through a core register (x1 is
++            // free after the push). VSUB d,d,d would give NaN for Inf/NaN contents.
++            MOV_IMM(x1, 0, 0);
++            if(ST_IS_F(0)) {
++                VMOVtoV(v1, x1);
++            } else {
++                VMOVtoV_D(v1, x1, x1);
++            }
++            #endif
+             // should set C1 to 0
+             break;
+ 
+@@ -360,9 +379,17 @@ uintptr_t dynarecD9(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int ninst,
+                 // a = 0, b = 1, c = 1, d = 1, efgh=0
+                 // 0b01110000
+                 if(ST_IS_F(0)) {
++                    #if __ARM_ARCH >= 7
+                     VMOV_i_32(v2, 0b01110000);
++                    #else
++                    ARMV6_VLOAD_F32(v2, 0x3f800000, x2);   // 1.0f
++                    #endif
+                 } else {
++                    #if __ARM_ARCH >= 7
+                     VMOV_i_64(v2, 0b01110000);
++                    #else
++                    ARMV6_VLOAD_F64(v2, 0x3ff0000000000000ull, x2, x3);   // 1.0
++                    #endif
+                 }
+             }
+             break;

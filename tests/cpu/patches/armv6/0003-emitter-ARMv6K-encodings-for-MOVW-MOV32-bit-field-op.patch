@@ -1,0 +1,271 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Fri, 16 Oct 2026 20:56:29 +0300
+Subject: [PATCH] emitter: ARMv6K encodings for MOVW/MOV32/bit-field ops, CP15
+ barriers, VFPv2 moves
+
+ARM11 MPCore has no MOVW/MOVT, BFI/BFC/UBFX/SBFX, RBIT, MLS, DMB/DSB or
+NEON. arm_emitter_v6.h replaces them when __ARM_ARCH < 7 with sequences that
+write only the destination register and never touch host flags. Sizes keep
+upstream's pass-stable classes. Constructs only reachable on paths ARMv6 never
+takes abort at translation time.
+---
+ .../box86-dynarec/dynarec/arm_emitter.h       |   8 +
+ .../box86-dynarec/dynarec/arm_emitter_v6.h    | 224 ++++++++++++++++++
+ 2 files changed, 232 insertions(+)
+ create mode 100644 third_party/box86-dynarec/dynarec/arm_emitter_v6.h
+
+diff --git a/third_party/box86-dynarec/dynarec/arm_emitter.h b/third_party/box86-dynarec/dynarec/arm_emitter.h
+index bdd0575..6039003 100755
+--- a/third_party/box86-dynarec/dynarec/arm_emitter.h
++++ b/third_party/box86-dynarec/dynarec/arm_emitter.h
+@@ -86,6 +86,10 @@ Op is 20-27
+         if (((uint32_t)(imm32))>>16) {          \
+         MOVT(dst, (((uint32_t)imm32)>>16));}    \
+     }
++// Instruction counts of the fixed-size forms (arm_emitter_v6.h overrides them),
++// for code that skips over a MOV32_/MOVW sequence with a hard-coded branch.
++#define ARM_MOV32F_WORDS 2
++#define ARM_MOVW_WORDS   1
+ // pseudo insruction: mov reg, #imm with imm a 32bits value, fixed size
+ #define MOV32_(dst, imm32)                  \
+     MOVW(dst, ((uint32_t)(imm32))&0xffff);  \
+@@ -1441,4 +1445,8 @@ Op is 20-27
+ #define AESMC_gen(D, size, Vd, M, Vm)   (0b1111<<28 | 0b0011<<24 | 1<<23 | (D)<<22 | 0b11<<20 | (size)<<18 | (Vd)<<12 | 0b0111<<7 | 0<<6 | (M)<<5 | (Vm))
+ #define AESMC(Dd, Dm)           EMIT(AESMC_gen(((Dd)>>4)&1, 0, (Dd)&15, ((Dm)>>4)&1, (Dm)&15))
+ 
++#if defined(__ARM_ARCH) && __ARM_ARCH < 7
++#include "arm_emitter_v6.h"
++#endif
++
+ #endif  //__ARM_EMITTER_H__
+diff --git a/third_party/box86-dynarec/dynarec/arm_emitter_v6.h b/third_party/box86-dynarec/dynarec/arm_emitter_v6.h
+new file mode 100644
+index 0000000..047a009
+--- /dev/null
++++ b/third_party/box86-dynarec/dynarec/arm_emitter_v6.h
+@@ -0,0 +1,224 @@
++#ifndef __ARM_EMITTER_V6_H__
++#define __ARM_EMITTER_V6_H__
++/*
++    ARMv6K (ARM11 MPCore, Nintendo 3DS) replacements for the ARMv7-only
++    encodings in arm_emitter.h. Included at the end of that header when
++    __ARM_ARCH < 7; nothing changes for ARMv7 builds.
++
++    Rules every sequence here follows:
++    - Only the destination register is written. Generated code has no free
++      scratch register (r0=xEmu, r4-r11 = x86 GPRs, r12=xFlags, x1-x3/x14 are
++      live at most call sites).
++    - Host condition flags are never touched: x86 flags are often carried in
++      NZCV across instructions, so no TST/CMP/S-suffixed ALU ops.
++    - A conditional variant applies the condition to every instruction (safe
++      because none of them sets flags).
++    - Sizes depend only on the immediate/field arguments. MOVW and MOV32_ keep a
++      FIXED size because Box86 uses them where the value may only settle in the
++      last pass; MOV32 may be shortest-form, as upstream's MOV32 already is.
++*/
++
++#include <stdint.h>
++#include <stdlib.h>
++
++// Constructs with no ARMv6 encoding that only appear on paths ARMv6 builds must
++// never reach (arm_div == 0, XMM/MMX cache entries, SSE opcodes with SIMD
++// hidden from CPUID). Reaching one is a translation-time failure, not silence.
++#define ARMV6_UNSUPPORTED(what) do {                                                   \
++        dynarec_log(LOG_NONE, "ARMv6 emitter: %s has no ARMv6 encoding\n", what);      \
++        abort();                                                                       \
++    } while (0)
++
++// ---- immediates ---------------------------------------------------------------
++
++// Splits v into ARM "imm8 rotated right by 2*rot" chunks, lowest bits first.
++// Returns the chunk count (0 for v == 0). Each chunk covers 8 bits starting at
++// an even bit position, so at most 4 chunks are needed.
++static inline int arm_v6_imm_chunks(uint32_t v, uint32_t imm8[4], uint32_t rot4[4])
++{
++    int n = 0;
++    while (v && n < 4) {
++        int lsb = __builtin_ctz(v) & ~1;          // even start bit
++        uint32_t chunk = (v >> lsb) & 0xff;
++        imm8[n] = chunk;
++        rot4[n] = ((32 - lsb) & 31) >> 1;         // rotate right by 32-lsb == left by lsb
++        v &= ~(0xffu << lsb);
++        n++;
++    }
++    return n;
++}
++
++#define ARMV6_MOV_IMM_gen(cond, dst, imm8, rot4) ((cond) | 0x03a00000 | ((dst) << 12) | ((rot4) << 8) | (imm8))
++#define ARMV6_MVN_IMM_gen(cond, dst, imm8, rot4) ((cond) | 0x03e00000 | ((dst) << 12) | ((rot4) << 8) | (imm8))
++#define ARMV6_ORR_IMM_gen(cond, dst, imm8, rot4) ((cond) | 0x03800000 | ((dst) << 16) | ((dst) << 12) | ((rot4) << 8) | (imm8))
++#define ARMV6_BIC_IMM_gen(cond, dst, imm8, rot4) ((cond) | 0x03c00000 | ((dst) << 16) | ((dst) << 12) | ((rot4) << 8) | (imm8))
++
++// mov reg, #imm32. Box86 sizes code in an early pass and emits it in pass 3,
++// and some values (native addresses inside the block being built) differ
++// between passes. Upstream's MOV32 is safe because its size only depends on a
++// coarse class: ~v < 0x100 (MVN), v < 0x10000 (MOVW), else MOVW+MOVT. These
++// replacements keep exactly those class boundaries, at a fixed size per class:
++// 1 word (MVN), 2 words (MOV+ORR), 4 words (MOV+3 ORR).
++#define ARMV6_MOV32_VAR(cond, dst, imm32) do {                                         \
++        uint32_t _v6v = (uint32_t)(imm32);                                             \
++        if ((~_v6v) < 0x100) {                                                         \
++            EMIT(ARMV6_MVN_IMM_gen(cond, dst, (~_v6v) & 0xff, 0));                     \
++        } else if (_v6v < 0x10000) {                                                   \
++            EMIT(ARMV6_MOV_IMM_gen(cond, dst, _v6v & 0xff, 0));                        \
++            EMIT(ARMV6_ORR_IMM_gen(cond, dst, (_v6v >> 8) & 0xff, 12));                \
++        } else {                                                                       \
++            ARMV6_MOV32_FIXED(cond, dst, _v6v);                                        \
++        }                                                                              \
++    } while (0)
++
++// Fixed-size form: one byte per instruction, always 4 words. The value is only
++// evaluated inside EMIT(): in the sizing passes EMIT drops its argument, and
++// some callers' values (e.g. arm_epilog) only exist in pass 3, as upstream.
++#define ARMV6_MOV32_FIXED(cond, dst, imm32) do {                                       \
++        EMIT(ARMV6_MOV_IMM_gen(cond, dst, ((uint32_t)(imm32)) & 0xff, 0));             \
++        EMIT(ARMV6_ORR_IMM_gen(cond, dst, (((uint32_t)(imm32)) >> 8) & 0xff, 12));     \
++        EMIT(ARMV6_ORR_IMM_gen(cond, dst, (((uint32_t)(imm32)) >> 16) & 0xff, 8));     \
++        EMIT(ARMV6_ORR_IMM_gen(cond, dst, (((uint32_t)(imm32)) >> 24) & 0xff, 4));     \
++    } while (0)
++
++// movw: always 2 words (low byte, then high byte of the 16-bit value).
++#undef MOVW
++#define MOVW(dst, imm16) do {                                                          \
++        EMIT(ARMV6_MOV_IMM_gen(c__, dst, ((uint32_t)(imm16)) & 0xff, 0));              \
++        EMIT(ARMV6_ORR_IMM_gen(c__, dst, (((uint32_t)(imm16)) >> 8) & 0xff, 12));      \
++    } while (0)
++#undef MOVW_COND
++#define MOVW_COND(cond, dst, imm16) do {                                               \
++        EMIT(ARMV6_MOV_IMM_gen(cond, dst, ((uint32_t)(imm16)) & 0xff, 0));             \
++        EMIT(ARMV6_ORR_IMM_gen(cond, dst, (((uint32_t)(imm16)) >> 8) & 0xff, 12));     \
++    } while (0)
++#undef MOVT
++#define MOVT(dst, imm16) _Static_assert(0, "MOVT has no ARMv6 encoding; use MOV32")
++#undef ARM_MOV32F_WORDS
++#define ARM_MOV32F_WORDS 4
++#undef ARM_MOVW_WORDS
++#define ARM_MOVW_WORDS   2
++#undef MOV32
++#define MOV32(dst, imm32) ARMV6_MOV32_VAR(c__, dst, imm32)
++#undef MOV32_
++#define MOV32_(dst, imm32) ARMV6_MOV32_FIXED(c__, dst, imm32)
++
++// ---- bit fields -----------------------------------------------------------------
++
++#define ARMV6_SHIFT_gen(cond, rd, rm, type, amount) \
++    ((cond) | 0x01a00000 | ((rd) << 12) | (((amount) & 31) << 7) | ((type) << 5) | (rm))
++#define ARMV6_ORR_LSL_gen(cond, rd, rn, rm, amount) \
++    ((cond) | 0x01800000 | ((rn) << 16) | ((rd) << 12) | (((amount) & 31) << 7) | (rm))
++enum { ARMV6_LSL = 0, ARMV6_LSR = 1, ARMV6_ASR = 2, ARMV6_ROR = 3 };
++
++static inline void armv6_bitfield_check(int rd, int rn, int lsb, int width)
++{
++    if (width < 1 || lsb < 0 || lsb + width > 32 || (rn >= 0 && rd == rn))
++        abort();   // a translation-time programming error, never a guest condition
++}
++
++// bfi rd, rn, #lsb, #width without a temporary: rotate the field to the top,
++// clear it, OR in rn's low bits shifted to the top, rotate back.
++#define ARMV6_BFI(cond, rd, rn, lsb, width) do {                                       \
++        int _l = (lsb), _w = (width), _r = (_l + _w) & 31;                             \
++        armv6_bitfield_check(rd, rn, _l, _w);                                          \
++        if (_w == 32) { EMIT((cond) | 0x01a00000 | ((rd) << 12) | (rn)); break; }      \
++        if (_r) EMIT(ARMV6_SHIFT_gen(cond, rd, rd, ARMV6_ROR, _r));                    \
++        EMIT(ARMV6_SHIFT_gen(cond, rd, rd, ARMV6_LSL, _w));                            \
++        EMIT(ARMV6_SHIFT_gen(cond, rd, rd, ARMV6_LSR, _w));                            \
++        EMIT(ARMV6_ORR_LSL_gen(cond, rd, rd, rn, 32 - _w));                            \
++        if (_r) EMIT(ARMV6_SHIFT_gen(cond, rd, rd, ARMV6_ROR, 32 - _r));               \
++    } while (0)
++
++// bfc rd, #lsb, #width: up to 3 BICs when the mask splits into few chunks,
++// otherwise the rotate/clear/rotate-back sequence (at most 4 words).
++#define ARMV6_BFC(cond, rd, lsb, width) do {                                           \
++        int _l = (lsb), _w = (width), _r = (_l + _w) & 31;                             \
++        armv6_bitfield_check(rd, -1, _l, _w);                                          \
++        uint32_t _m = (_w == 32) ? 0xffffffffu : (((1u << _w) - 1) << _l);             \
++        uint32_t _ci[4], _cr[4];                                                       \
++        int _n = arm_v6_imm_chunks(_m, _ci, _cr);                                      \
++        if (_n <= 3) {                                                                 \
++            for (int _k = 0; _k < _n; _k++) EMIT(ARMV6_BIC_IMM_gen(cond, rd, _ci[_k], _cr[_k])); \
++        } else {                                                                       \
++            if (_r) EMIT(ARMV6_SHIFT_gen(cond, rd, rd, ARMV6_ROR, _r));                \
++            EMIT(ARMV6_SHIFT_gen(cond, rd, rd, ARMV6_LSL, _w));                        \
++            EMIT(ARMV6_SHIFT_gen(cond, rd, rd, ARMV6_LSR, _w));                        \
++            if (_r) EMIT(ARMV6_SHIFT_gen(cond, rd, rd, ARMV6_ROR, 32 - _r));           \
++        }                                                                              \
++    } while (0)
++
++// ubfx/sbfx rd, rn, #lsb, #width: shift the field to the top, then down.
++#define ARMV6_XBFX(cond, rd, rn, lsb, width, down) do {                                \
++        int _l = (lsb), _w = (width);                                                  \
++        armv6_bitfield_check(rd, -1, _l, _w);                                          \
++        if (_w == 32) { EMIT((cond) | 0x01a00000 | ((rd) << 12) | (rn)); break; }      \
++        if (_l + _w == 32) { EMIT(ARMV6_SHIFT_gen(cond, rd, rn, down, _l)); break; }   \
++        if (_l == 0 && (down) == ARMV6_LSR && _w <= 8) {                               \
++            EMIT((cond) | 0x02000000 | ((rn) << 16) | ((rd) << 12) | ((1u << _w) - 1)); /* and */ \
++            break;                                                                     \
++        }                                                                              \
++        EMIT(ARMV6_SHIFT_gen(cond, rd, rn, ARMV6_LSL, 32 - _l - _w));                  \
++        EMIT(ARMV6_SHIFT_gen(cond, rd, rd, down, 32 - _w));                            \
++    } while (0)
++
++#undef BFI
++#define BFI(rd, rn, lsb, width) ARMV6_BFI(c__, rd, rn, lsb, width)
++#undef BFI_COND
++#define BFI_COND(cond, rd, rn, lsb, width) ARMV6_BFI(cond, rd, rn, lsb, width)
++#undef BFC
++#define BFC(rd, lsb, width) ARMV6_BFC(c__, rd, lsb, width)
++#undef BFC_COND
++#define BFC_COND(cond, rd, lsb, width) ARMV6_BFC(cond, rd, lsb, width)
++#undef UBFX
++#define UBFX(rd, rn, lsb, width) ARMV6_XBFX(c__, rd, rn, lsb, width, ARMV6_LSR)
++#undef UBFX_COND
++#define UBFX_COND(cond, rd, rn, lsb, width) ARMV6_XBFX(cond, rd, rn, lsb, width, ARMV6_LSR)
++#undef SBFX
++#define SBFX(rd, rn, lsb, width) ARMV6_XBFX(c__, rd, rn, lsb, width, ARMV6_ASR)
++
++// No ARMv6 equivalent; the three call sites (BSF/TZCNT) use a CTZ sequence instead.
++#undef RBIT
++#define RBIT(Rd, Rm) ARMV6_UNSUPPORTED("RBIT")
++#undef RBIT_COND
++#define RBIT_COND(cond, Rd, Rm) ARMV6_UNSUPPORTED("RBIT_COND")
++#undef MLS
++#define MLS(Rd, Rm, Rn, Ra) ARMV6_UNSUPPORTED("MLS")
++#undef SDIV
++#define SDIV(Rd, Rn, Rm) ARMV6_UNSUPPORTED("SDIV")
++#undef UDIV
++#define UDIV(Rd, Rn, Rm) ARMV6_UNSUPPORTED("UDIV")
++
++// ---- barriers: CP15 c7,c10 operations. Their register should be zero and no
++// register is free, so r1 is saved around a zeroed copy on the host stack. ----
++#define ARMV6_CP15_BARRIER(opc2) do {                                                  \
++        EMIT(0xe52d1004);                           /* str r1, [sp, #-4]! */           \
++        EMIT(0xe3a01000);                           /* mov r1, #0 */                   \
++        EMIT(0xee071f1a | ((opc2) << 5));           /* mcr p15, 0, r1, c7, c10, opc2 */\
++        EMIT(0xe49d1004);                           /* ldr r1, [sp], #4 */             \
++    } while (0)
++#undef DMB_ISH
++#undef DSB_ISH
++#ifdef PANDORA
++#define DMB_ISH()
++#define DSB_ISH()
++#else
++#define DMB_ISH() ARMV6_CP15_BARRIER(5)
++#define DSB_ISH() ARMV6_CP15_BARRIER(4)
++#endif
++
++// ---- VFPv2: 16 double registers, no NEON -----------------------------------------
++
++// D-register moves become VFP VMOV.F64 (VMOVD was NEON VORR). Quad moves only
++// exist for XMM cache entries, which ARMv6 builds never create.
++#undef VMOVD
++#define VMOVD(Dd, Dm) if ((Dd) != (Dm)) { VMOV_64(Dd, Dm); }
++#undef VMOVQ
++#define VMOVQ(Dd, Dm) ARMV6_UNSUPPORTED("VMOVQ")
++// D7 is the last per-instruction scratch double; swaps run between instructions.
++#undef VSWP
++#define VSWP(Dd, Dm) do { VMOV_64(7, Dd); VMOV_64(Dd, Dm); VMOV_64(Dm, 7); } while (0)
++#undef VSWPQ
++#define VSWPQ(Dd, Dm) ARMV6_UNSUPPORTED("VSWPQ")
++
++#endif

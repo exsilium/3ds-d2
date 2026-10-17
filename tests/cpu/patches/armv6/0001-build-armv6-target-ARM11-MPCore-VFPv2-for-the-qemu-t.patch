@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Fri, 16 Oct 2026 20:28:31 +0300
+Subject: [PATCH] build: armv6 target (ARM11 MPCore, VFPv2) for the qemu test
+ lane
+
+---
+ build.sh | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/build.sh b/build.sh
+index 49069a6..a27d04b 100755
+--- a/build.sh
++++ b/build.sh
+@@ -32,12 +32,21 @@ if [ "${TARGET:-}" = vita ]; then
+     # default) rejects against `void f(int)` definitions.
+     VITA_EXTRA="-I$SHIM/vita -std=gnu17 -D__vita__ -D__clear_cache(b,e)=dyn86_vita_clear_cache(b,e)"
+     CXX_VITA_EXTRA="-D__vita__ -I$SHIM/vita"
++elif [ "${TARGET:-}" = armv6 ]; then
++    # 3DS-class CPU (ARM11 MPCore, ARMv6K + VFPv2) for the qemu-arm test lane.
++    # Soft-float ABI with VFP code: Debian's hard-float libraries are ARMv7.
++    OUT="$ROOT/build-arm"
++    LIBNAME=libwinx86.a
++    CC=arm-linux-gnueabi-gcc
++    CXX=arm-linux-gnueabi-g++
++    ARCHFLAGS="-marm -march=armv6k -mtune=mpcore -mfpu=vfp -mfloat-abi=softfp"
+ else
+     OUT="$ROOT/build-arm"
+     LIBNAME=libwinx86.a
+     CC=arm-linux-gnueabihf-gcc
+     CXX=arm-linux-gnueabihf-g++
+ fi
++ARCHFLAGS="${ARCHFLAGS:--marm -march=armv7-a+simd -mfpu=neon -mfloat-abi=hard}"
+ 
+ # LIBTAG/EXTRA : construire une SAVEUR de la bibliotheque (objets et archive
+ # separes) pour un A/B a la compilation — ex. LIBTAG=_prof EXTRA="-DPROF_COUNTERS",
+@@ -53,13 +62,13 @@ if [ -n "${LIBTAG:-}" ]; then
+ fi
+ LIB="$OUT/$LIBNAME"
+ 
+-CFLAGS="-O2 -g -marm -march=armv7-a+simd -mfpu=neon -mfloat-abi=hard \
++CFLAGS="-O2 -g $ARCHFLAGS \
+   -DDYNAREC -DARM -DUSE_MMAP -DTRACE_MEMSTAT $VITA_EXTRA \
+   -I$SHIM -I$DYN86 -I$B86/include -I$B86 -I$B86/dynarec \
+   -Wno-unused-variable -Wno-unused-parameter -Wno-unused-function \
+   -Wno-unused-but-set-variable -Wno-pointer-sign ${EXTRA:-}"
+ 
+-CXXFLAGS="-std=gnu++17 -O2 -g -marm -march=armv7-a+simd -mfpu=neon -mfloat-abi=hard \
++CXXFLAGS="-std=gnu++17 -O2 -g $ARCHFLAGS \
+   -DD2RT_CPU_BOX86 $CXX_VITA_EXTRA \
+   -I$ROOT/src -I$DYN86 -I$DYN86/shim -I$B86/include -I$B86 \
+   -Wno-unused-variable -Wno-unused-parameter ${EXTRA:-}"

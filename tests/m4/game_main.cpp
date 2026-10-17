@@ -1,0 +1,144 @@
+// M4 game lane host (Linux, qemu-arm): runs Diablo II's Game.exe through
+// 3ds-d2's own Win32 runtime on the ARMv6 Box86 backend, with the 3DS's
+// settings (game layout, no-SIMD CPUID), and reports how far it got.
+//
+//   m4_host <game-dir> <write-dir> <max-ms> [command line]
+//
+// The game directory is read-only; everything the game writes goes to
+// write-dir. Guest time is real time, as on the console (max-ms included);
+// M4_VIRTUAL_CLOCK selects the scheduler's deterministic virtual clock, with
+// 250 us of guest time per thread switch so the game's polling loop sees time
+// pass (runs are then repeatable, and much faster than real time on qemu).
+//
+// Screenshots of what the game shows go to <write-dir>/../shots/ (t005.png at
+// 5 s of guest time, then 15 s, 30 s and every 30 s, plus last.png).
+//
+// M4_SCRIPT drives game::Controls (the 3DS control scheme) with scripted pad
+// events (game::Autoplay, src/game/autoplay.h), ';'-separated, e.g.
+//   "20000 tap 400 307;26000 tap 400 290;32000 text Tester;34000 press R;..."
+
+#include "game/autoplay.h"
+#include "game/controls.h"
+#include "game/d2_state.h"
+#include "runtime/rt_host.h"
+#include "png.h"
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <unistd.h>
+#include <utility>
+#include <vector>
+
+static bool shot_now = false;   // M4_SCRIPT "shot": save the next frame
+
+int main(int argc, char **argv)
+{
+    if (argc < 4) {
+        std::fprintf(stderr, "usage: %s <game-dir> <write-dir> <max-ms> [command line]\n", argv[0]);
+        return 2;
+    }
+    rt::RunOptions opt;
+    // M4_LAYOUT=ctr: the 3DS's compact layout and its 64 MiB RAM report, to
+    // check on Linux exactly what the console app will run.
+    const std::string lay = std::getenv("M4_LAYOUT") ? std::getenv("M4_LAYOUT") : "";
+    const bool ctr = lay == "ctr" || lay == "ctr-xl";   // ctr-xl: the CIA's New 3DS extended-memory layout
+    opt.layout = lay == "ctr-xl" ? &rt::kCtrGameLayoutXL : ctr ? &rt::kCtrGameLayout : &rt::kGameLayout;
+    if (ctr)
+        opt.total_phys_mb = 64;
+    if (const char *mb = std::getenv("M4_PHYS_MB"))   // override the RAM the game is told about
+        opt.total_phys_mb = (uint32_t)std::atoi(mb);
+    opt.virtual_tick_us = 250;   // used only under M4_VIRTUAL_CLOCK
+    opt.data_root = argv[1];
+    opt.write_root = argv[2];
+    opt.max_ms = (uint32_t)std::strtoul(argv[3], nullptr, 0);
+    opt.command_line = argc > 4 ? argv[4] : "game.exe -w";
+    opt.cpuid_edx = rt::kCpuidNoSimd;
+    opt.trap_report = 250;
+    opt.heartbeat_ms = 10000;
+
+    std::vector<uint8_t> exe;
+    opt.exe_name = "Game.exe";
+    if (FILE *f = std::fopen((opt.data_root + "/Game.exe").c_str(), "rb")) {
+        uint8_t buf[65536];
+        size_t n;
+        while ((n = std::fread(buf, 1, sizeof buf, f)) > 0)
+            exe.insert(exe.end(), buf, buf + n);
+        std::fclose(f);
+    }
+    if (exe.empty()) {
+        std::fprintf(stderr, "cannot read %s/Game.exe\n", argv[1]);
+        return 2;
+    }
+    opt.out = [](const char *s, size_t n) { std::fwrite(s, 1, n, stdout); std::fflush(stdout); };
+    opt.log = [](const char *s) { std::fprintf(stderr, "[rt] %s\n", s); };
+    if (!std::getenv("M4_VIRTUAL_CLOCK")) {
+        opt.real_clock = true;
+        opt.sleep_ms = [](uint32_t ms) { usleep(ms * 1000); };
+    }
+    // Screenshots: the frame is converted only when one is due; the latest is
+    // kept (indices + palette) for last.png.
+    const std::string shots = std::string(argv[2]) + "/../shots";
+    std::system(("mkdir -p '" + shots + "'").c_str());
+    static std::vector<uint8_t> last_idx;
+    static uint32_t last_pal[256], last_w = 0, last_h = 0;
+    static uint64_t next_shot = 5000;
+    auto save = [shots](const char *name) {
+        if (!last_w)
+            return;
+        std::vector<uint8_t> rgb((size_t)last_w * last_h * 3);
+        for (size_t i = 0; i < (size_t)last_w * last_h; i++) {
+            const uint32_t p = last_pal[last_idx[i]];
+            rgb[3 * i] = (uint8_t)(p >> 16);
+            rgb[3 * i + 1] = (uint8_t)(p >> 8);
+            rgb[3 * i + 2] = (uint8_t)p;
+        }
+        png::write_rgb(shots + "/" + name, rgb.data(), last_w, last_h);
+    };
+    opt.present = [save](const rt::Frame &f) {
+        last_w = f.width;
+        last_h = f.height;
+        last_idx.resize((size_t)f.width * f.height);
+        for (uint32_t y = 0; y < f.height; y++)
+            std::memcpy(&last_idx[(size_t)y * f.width], f.pixels + (ptrdiff_t)y * f.stride, f.width);
+        std::memcpy(last_pal, f.palette, sizeof last_pal);
+        const uint64_t now = rt::now_ms();
+        if (shot_now) {
+            shot_now = false;
+            char name[32];
+            std::snprintf(name, sizeof name, "s%06llu.png", (unsigned long long)now);
+            save(name);
+        }
+        if (now >= next_shot) {
+            char name[32];
+            std::snprintf(name, sizeof name, "t%03llu.png", (unsigned long long)(now / 1000));
+            save(name);
+            next_shot = next_shot < 15000 ? 15000 : next_shot < 30000 ? 30000 : next_shot + 30000;
+        }
+    };
+    static game::Autoplay autoplay;
+    if (const char *sc = std::getenv("M4_SCRIPT"))
+        autoplay.load(sc);
+    static game::Controls controls;
+    opt.poll_input = [] {
+        const uint64_t now = rt::now_ms();
+        bool shot = false;
+        const game::Pad &pad = autoplay.step(now, controls, shot);
+        if (shot)
+            shot_now = true;
+        const game::GameState gs = game::read_game_state();
+        controls.set_context(gs.in_game, gs.panel_open);
+        controls.update(pad, now);
+    };
+    rt::RunResult r = rt::run_exe(std::move(exe), opt);
+    save("last.png");
+    if (!r.loaded) {
+        std::fprintf(stderr, "[rt] FATAL %s\n", r.error.c_str());
+        return 3;
+    }
+    std::fprintf(stderr, "[rt] RESULT exited=%d timed_out=%d code=%u %s\n", r.exited, r.timed_out, r.exit_code,
+                 r.error.c_str());
+    std::fflush(stdout);
+    std::_Exit(0);
+}

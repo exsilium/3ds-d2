@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Fri, 16 Oct 2026 21:39:01 +0300
+Subject: [PATCH] memfast (D2_MEMINTRIN=3): LDR/STR pairs instead of NEON on
+ ARMv6
+
+The inline memcpy fast path copied its 32/16/8-byte chunks with NEON
+VLD1/VST1 and hard-coded skip counts for those single instructions. ARMv6
+uses post-indexed LDR/STR pairs through r14 (as the 4-byte tail already
+does) with matching skip counts. Found by running the real game: it is the
+very first block D2 executes (the MSVC runtime's memcpy).
+---
+ src/dynarec86/dyn86_memfast.h | 34 +++++++++++++++++++++++++++-------
+ 1 file changed, 27 insertions(+), 7 deletions(-)
+
+diff --git a/src/dynarec86/dyn86_memfast.h b/src/dynarec86/dyn86_memfast.h
+index f52fa98..a685ee5 100644
+--- a/src/dynarec86/dyn86_memfast.h
++++ b/src/dynarec86/dyn86_memfast.h
+@@ -73,6 +73,32 @@
+ #define D2MF_VLD1_8_W(Dd, Rn)  EMIT(Vxx1gen(1, ((Dd)>>4)&1, Rn, ((Dd)&0x0f), 0b0111, 0, 0, 13))
+ #define D2MF_VST1_8_W(Dd, Rn)  EMIT(Vxx1gen(0, ((Dd)>>4)&1, Rn, ((Dd)&0x0f), 0b0111, 0, 0, 13))
+ 
++/* The 32/16/8-byte chunks of the memcpy path. ARMv7: NEON, one instruction
++ * per 8/16 bytes. ARMv6 (no NEON): LDR/STR pairs through r14, the same
++ * post-indexed forms the 4-byte tail uses; the skip counts follow. */
++#if __ARM_ARCH >= 7
++#define D2MF_COPY_32_16_8() do {                                               \
++        TSTS_IMM8(x2, 32); D2MF_SKIP(4);                                       \
++        D2MF_VLD1Q_8_W(0, x1); D2MF_VLD1Q_8_W(2, x1);                          \
++        D2MF_VST1Q_8_W(0, x3); D2MF_VST1Q_8_W(2, x3);                          \
++        TSTS_IMM8(x2, 16); D2MF_SKIP(2);                                       \
++        D2MF_VLD1Q_8_W(0, x1); D2MF_VST1Q_8_W(0, x3);                          \
++        TSTS_IMM8(x2, 8); D2MF_SKIP(2);                                        \
++        D2MF_VLD1_8_W(0, x1);  D2MF_VST1_8_W(0, x3);                           \
++    } while(0)
++#else
++#define D2MF_COPY_WORDS(n) do {                                                \
++        for(int _w = 0; _w < (n); ++_w) {                                      \
++            D2MF_LDR_POST(c__, x14, x1, 4); D2MF_STR_POST(c__, x14, x3, 4);    \
++        }                                                                      \
++    } while(0)
++#define D2MF_COPY_32_16_8() do {                                               \
++        TSTS_IMM8(x2, 32); D2MF_SKIP(16); D2MF_COPY_WORDS(8);                  \
++        TSTS_IMM8(x2, 16); D2MF_SKIP(8);  D2MF_COPY_WORDS(4);                  \
++        TSTS_IMM8(x2, 8);  D2MF_SKIP(4);  D2MF_COPY_WORDS(2);                  \
++    } while(0)
++#endif
++
+ /* Branch to memfast_mark (the helper-call sequence emitted just after us). */
+ #define D2MF_BAIL(cond) do { j32 = dyn->memfast_mark - (dyn->arm_size + 8); Bcond((cond), j32); } while(0)
+ /* Skip the next K instructions when the tested bit is clear. */
+@@ -141,13 +167,7 @@ do {                                                                           \
+         D2MF_STRB_POST(cNE, x14, x3, 1);                                       \
+     } else {                                                                   \
+         if(dyn86_membase) { ADD_IMM8_ROR(x1, x1, mf_mb, 4); }                  \
+-        TSTS_IMM8(x2, 32); D2MF_SKIP(4);                                       \
+-        D2MF_VLD1Q_8_W(0, x1); D2MF_VLD1Q_8_W(2, x1);                          \
+-        D2MF_VST1Q_8_W(0, x3); D2MF_VST1Q_8_W(2, x3);                          \
+-        TSTS_IMM8(x2, 16); D2MF_SKIP(2);                                       \
+-        D2MF_VLD1Q_8_W(0, x1); D2MF_VST1Q_8_W(0, x3);                          \
+-        TSTS_IMM8(x2, 8); D2MF_SKIP(2);                                        \
+-        D2MF_VLD1_8_W(0, x1);  D2MF_VST1_8_W(0, x3);                           \
++        D2MF_COPY_32_16_8();                                                   \
+         TSTS_IMM8(x2, 4);                                                      \
+         D2MF_LDR_POST(cNE, x14, x1, 4);  D2MF_STR_POST(cNE, x14, x3, 4);       \
+         TSTS_IMM8(x2, 2);                                                      \

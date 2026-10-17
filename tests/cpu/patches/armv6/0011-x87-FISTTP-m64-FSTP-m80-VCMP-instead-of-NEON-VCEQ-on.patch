@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Fri, 16 Oct 2026 21:12:04 +0300
+Subject: [PATCH] x87 FISTTP m64 / FSTP m80: VCMP instead of NEON VCEQ on VFPv2
+
+Same 'unchanged since the integer/80-bit load' test as FISTP i64. For FSTP
+m80 the numeric compare differs from upstream's bitwise one only for a NaN
+loaded with FLD m80, which is then converted instead of copied verbatim.
+---
+ third_party/box86-dynarec/dynarec/dynarec_arm_db.c | 10 ++++++++++
+ third_party/box86-dynarec/dynarec/dynarec_arm_dd.c |  7 +++++++
+ 2 files changed, 17 insertions(+)
+
+diff --git a/third_party/box86-dynarec/dynarec/dynarec_arm_db.c b/third_party/box86-dynarec/dynarec/dynarec_arm_db.c
+index 99a8e54..0604efe 100755
+--- a/third_party/box86-dynarec/dynarec/dynarec_arm_db.c
++++ b/third_party/box86-dynarec/dynarec/dynarec_arm_db.c
+@@ -390,10 +390,20 @@ X87_PUSH_OR_FAIL_empty(                   , dyn, ninst, x3);
+                         LDR_IMM9(x14, x2, offsetof(fpu_ld_t, uref)-offsetof(fpu_ld_t, ld));
+                         LDR_IMM9(x3, x2, offsetof(fpu_ld_t, uref)-offsetof(fpu_ld_t, ld)+4);
+                         VMOVtoV_D(v2, x14, x3);
++                        #if __ARM_ARCH >= 7
+                         VCEQ_32(v2, v2, v1);    // same?
+                         VMOVfrV_D(x14, x3, v2);
+                         TSTS_REG_LSL_IMM5(x14, x3, 0);
+                         B_MARK(cEQ);    // different, do the conversion
++                        #else
++                        // No NEON VCEQ on VFPv2: compare numerically (host flags are
++                        // clobbered here upstream too). Differs from the bitwise test
++                        // only for a NaN loaded with FLD m80: it is then converted
++                        // from the double instead of stored as the original 10 bytes.
++                        VCMP_F64(v2, v1);
++                        VMRS_APSR();
++                        B_MARK(cNE);    // different, do the conversion
++                        #endif
+                         // same... copy STld(0).ld
+                         LDR_IMM9(x14, x2, 0);
+                         LDR_IMM9(x3, x2, 4);
+diff --git a/third_party/box86-dynarec/dynarec/dynarec_arm_dd.c b/third_party/box86-dynarec/dynarec/dynarec_arm_dd.c
+index 7048939..6eac558 100755
+--- a/third_party/box86-dynarec/dynarec/dynarec_arm_dd.c
++++ b/third_party/box86-dynarec/dynarec/dynarec_arm_dd.c
+@@ -223,10 +223,17 @@ uintptr_t dynarecDD(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int ninst,
+                         MOVW(x2, offsetof(x86emu_t, fpu_ll));   //can be optimized?
+                         ADD_REG_LSL_IMM5(x14, x14, x2, offsetof(fpu_ll_t, sref));
+                         VLDR_64(v2, x14, 0);
++                        #if __ARM_ARCH >= 7
+                         VCEQ_32(v2, v2, v1);    // compare
+                         VMOVfrV_D(x2, x3, v2);
+                         ANDS_REG_LSL_IMM5(x2, x2, x3, 0);   // if NE then values are the same!
+                         B_MARK(cEQ);    // do the i64 conversion
++                        #else
++                        // No NEON VCEQ on VFPv2 (same reasoning as FISTP i64 in df.c).
++                        VCMP_F64(v2, v1);
++                        VMRS_APSR();
++                        B_MARK(cNE);    // do the i64 conversion
++                        #endif
+                         // memcpy(ed, &STll(0).ll, sizeof(int64_t));
+                         LDRD_IMM8(x2, x14, offsetof(fpu_ll_t, sq));  // load ll
+                         B_MARK3(c__);

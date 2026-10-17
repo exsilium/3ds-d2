@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Sat, 17 Oct 2026 00:22:54 +0300
+Subject: [PATCH] cooperative scheduler (real-time mode): sync the clock before
+ a timed wait
+
+wait() computed the deadline from virt_ms_, which real-time mode only pulls
+up to the host clock when picking a thread. After a long slice it lagged,
+the deadline was already past, and Sleep(n)/timed waits returned at once.
+Found by the M3 lane (Sleep(30) measured 0-2 ms); virtual mode unchanged.
+---
+ src/runtime/sched_cooperative.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/runtime/sched_cooperative.cpp b/src/runtime/sched_cooperative.cpp
+index 60cb12f..67f74f4 100644
+--- a/src/runtime/sched_cooperative.cpp
++++ b/src/runtime/sched_cooperative.cpp
+@@ -139,6 +139,11 @@ uint32_t CooperativeScheduler::wait(Waitable* w, uint32_t timeout_ms) {
+     if (w->try_acquire(cur_)) return w->result();   // already signaled
+ #endif
+     cur_->wait_obj = w;
++    // Real-time mode: virt_ms_ is only pulled up to the host clock when a
++    // thread is picked, so after a long slice it lags real time and a deadline
++    // computed from it is already in the past (Sleep(30) returned at once).
++    // Sync first. Virtual mode is unchanged (sync_real_clock is a no-op there).
++    sync_real_clock();
+     // Absolute virtual-time deadline (0 = infinite). This is what lets a timed
+     // WaitForSingleObject actually time out under the cooperative scheduler —
+     // e.g. a render worker waiting on a frame event must still wake up to

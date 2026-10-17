@@ -1,0 +1,58 @@
+# M4 game lane, 2026-10-16: scripts/docker.sh test m4 <1.14d dir> 70000
+# Game.exe 1.14d on 3ds-d2's own runtime (src/runtime) + WinVita engine, ARMv6 Box86 backend,
+# qemu-arm -cpu arm11mpcore, kGameLayout, CPUID EDX 0x8001, real clock. Shots (not kept): t005 title, last = main menu.
+[rt] layout game: span 08000000 heap 01000000+2000000 va 03000000+4000000
+[rt] loaded Game.exe at 00400000 entry 00682985, 1 unresolved import(s)
+[rt] GetProcAddress kernel32.dll!FlsAlloc: none
+[rt] GetProcAddress kernel32.dll!FlsGetValue: none
+[rt] GetProcAddress kernel32.dll!FlsSetValue: none
+[rt] GetProcAddress kernel32.dll!FlsFree: none
+[rt] LoadLibrary .\dbghelp.dll: not found
+[rt] LoadLibrary dbghelp.dll: not found
+[rt] LoadLibrary imagehlp.dll: not found
+[rt] CreateDIBSection 800x-600 8bpp at 036d0000
+[rt] CreateDIBSection 800x-600 8bpp at 036d0000
+[rt] CreateDIBSection 800x-600 8bpp at 036d0000
+[rt] t=10s peeks=1450302 files=16 read=6915KiB dibs=3 frames=179
+[rt] debug: Disconnect from BNET
+[rt] t=20s peeks=3127998 files=17 read=7426KiB dibs=3 frames=393
+[rt] t=30s peeks=4839558 files=17 read=7426KiB dibs=3 frames=604
+[rt] t=40s peeks=6548906 files=17 read=7426KiB dibs=3 frames=816
+[rt] t=50s peeks=8195951 files=17 read=7426KiB dibs=3 frames=1027
+[rt] t=60s peeks=9906535 files=17 read=7426KiB dibs=3 frames=1238
+[rt] t=70s peeks=11611619 files=17 read=7426KiB dibs=3 frames=1450
+[rt] time limit 70000 ms reached
+[rt] scheduler stopped: shutdown requested, exit code 0
+[rt] RESULT exited=0 timed_out=1 code=0 
+  trapcnt: 46531594 prises sur 149 creneaux actifs
+    trapcnt  1:     23243663   50.0%  KERNEL32.dll!GetTickCount
+    trapcnt  2:     11613104   25.0%  KERNEL32.dll!Sleep
+    trapcnt  3:     11611619   25.0%  USER32.dll!PeekMessageA
+    trapcnt  4:        17346    0.0%  KERNEL32.dll!EnterCriticalSection
+    trapcnt  5:        17346    0.0%  KERNEL32.dll!LeaveCriticalSection
+    trapcnt  6:         2910    0.0%  KERNEL32.dll!QueryPerformanceCounter
+    trapcnt  7:         2908    0.0%  KERNEL32.dll!QueryPerformanceFrequency
+    trapcnt  8:         1454    0.0%  USER32.dll!GetClientRect
+    trapcnt  9:         1453    0.0%  USER32.dll!ReleaseDC
+    trapcnt 10:         1453    0.0%  USER32.dll!GetDC
+    trapcnt 11:         1450    0.0%  GDI32.dll!DeleteDC
+    trapcnt 12:         1450    0.0%  GDI32.dll!SetDIBColorTable
+    trapcnt 13:         1450    0.0%  GDI32.dll!SelectPalette
+    trapcnt 14:         1450    0.0%  GDI32.dll!SelectObject
+    trapcnt 15:         1450    0.0%  GDI32.dll!CreateCompatibleDC
+    trapcnt 16:         1450    0.0%  GDI32.dll!RealizePalette
+    trapcnt 17:         1450    0.0%  GDI32.dll!StretchBlt
+    trapcnt 18:         1450    0.0%  GDI32.dll!GdiFlush
+    trapcnt 19:         1223    0.0%  KERNEL32.dll!VirtualAlloc
+    trapcnt 20:          850    0.0%  KERNEL32.dll!SetFilePointer
+    trapcnt 21:          846    0.0%  KERNEL32.dll!ReadFile
+    trapcnt 22:          706    0.0%  KERNEL32.dll!TlsGetValue
+    trapcnt 23:          447    0.0%  KERNEL32.dll!WaitForSingleObject
+    trapcnt 24:          446    0.0%  KERNEL32.dll!VirtualFree
+    trapcnt 25:          343    0.0%  KERNEL32.dll!CreateEventA
+# write root:
+./Blizzard Entertainment/System Survey/ProductData/D2DV/locale
+./Blizzard Entertainment/System Survey/ProductData/D2XP/locale
+./BnetLog.txt
+./Diablo II/GameLogs/D2261016.txt
+./registry.txt

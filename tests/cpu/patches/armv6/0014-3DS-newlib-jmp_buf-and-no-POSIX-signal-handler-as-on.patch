@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Fri, 16 Oct 2026 21:24:13 +0300
+Subject: [PATCH] 3DS: newlib jmp_buf and no POSIX signal handler, as on the
+ Vita
+
+__3DS__ joins __vita__ where the guard means 'newlib, no signals'.
+Vita-SDK-specific code (kubridge, VM domains, SEH delivery) stays Vita-only.
+---
+ src/runtime/cpu_box86.cpp                      | 7 +++++--
+ third_party/box86-dynarec/dynarec/dynablock.c  | 4 ++--
+ third_party/box86-dynarec/dynarec/dynarec.c    | 2 +-
+ third_party/box86-dynarec/emu/x86emu_private.h | 3 +++
+ 4 files changed, 11 insertions(+), 5 deletions(-)
+
+diff --git a/src/runtime/cpu_box86.cpp b/src/runtime/cpu_box86.cpp
+index e0b7232..0aa76d3 100644
+--- a/src/runtime/cpu_box86.cpp
++++ b/src/runtime/cpu_box86.cpp
+@@ -44,7 +44,7 @@
+ #include "runtime/trapcnt.h"// per-slot acquisition counter: the intrinsic path
+                             // bypasses the Bridge, so this is where it must be
+                             // counted (dependency-free header)
+-#ifndef __vita__            // Vita delivers no POSIX signals; the SIGSEGV diag
++#if !defined(__vita__) && !defined(__3DS__) // no POSIX signals there; the SIGSEGV diag
+ #include <csignal>          // handler is a desktop/qemu debug aid only.
+ #include <ucontext.h>
+ #endif
+@@ -268,7 +268,7 @@ extern "C" x86emu_t* dyn86_diag_emu = nullptr;
+ // even if the scan itself re-faults. -1 = no crash log (write() is skipped).
+ extern "C" int dyn86_crash_fd = -1;
+ static uintptr_t g_mb;   // guest->host membase (defined once; H(va)=va+g_mb). Fwd for diag_segv.
+-#ifndef __vita__
++#if !defined(__vita__) && !defined(__3DS__)
+ static void diag_segv(int sig, siginfo_t* si, void* uctx) {
+     x86emu_t* e = dyn86_diag_emu;
+     uintptr_t pc = 0, lr = 0, sp = 0, r0 = 0, r1 = 0, r2 = 0;
+@@ -827,6 +827,9 @@ public:
+         dyn86_diag_emu = &emu_;
+ #ifdef __vita__
+         dyn86_vita_fault_install();    // kubridge abort handler (no-op without the plugin)
++#elif defined(__3DS__)
++        // No POSIX signals on the 3DS. A guest fault inside translated code is
++        // a CPU abort handled by the kernel/emulator; not reported here yet.
+ #else
+         struct sigaction sa;
+         std::memset(&sa, 0, sizeof sa);
+diff --git a/third_party/box86-dynarec/dynarec/dynablock.c b/third_party/box86-dynarec/dynarec/dynablock.c
+index 4726235..5687210 100755
+--- a/third_party/box86-dynarec/dynarec/dynablock.c
++++ b/third_party/box86-dynarec/dynarec/dynablock.c
+@@ -213,7 +213,7 @@ dynablock_t *AddNewDynablock(uintptr_t addr)
+ }
+ 
+ //TODO: move this to dynrec_arm.c and track allocated structure to avoid memory leak
+-#if defined(__vita__)
++#if defined(__vita__) || defined(__3DS__)
+ #define JUMPBUFF jmp_buf         /* newlib: array type, same shape as ANDROID */
+ #elif defined(ANDROID)
+ #define JUMPBUFF sigjmp_buf
+@@ -221,7 +221,7 @@ dynablock_t *AddNewDynablock(uintptr_t addr)
+ #define JUMPBUFF struct __jmp_buf_tag
+ #endif
+ static __thread JUMPBUFF dynarec_jmpbuf;
+-#if defined(ANDROID) || defined(__vita__)
++#if defined(ANDROID) || defined(__vita__) || defined(__3DS__)
+ #define DYN_JMPBUF dynarec_jmpbuf
+ #else
+ #define DYN_JMPBUF &dynarec_jmpbuf
+diff --git a/third_party/box86-dynarec/dynarec/dynarec.c b/third_party/box86-dynarec/dynarec/dynarec.c
+index 6fcfd57..f0ebffa 100755
+--- a/third_party/box86-dynarec/dynarec/dynarec.c
++++ b/third_party/box86-dynarec/dynarec/dynarec.c
+@@ -231,7 +231,7 @@ void* LinkNext(x86emu_t* emu, uintptr_t addr, void* x2)
+ }
+ #endif
+ 
+-#if defined(__vita__)
++#if defined(__vita__) || defined(__3DS__)
+ #define JUMPBUFF jmp_buf         /* matches x86emu_private.h (newlib compat) */
+ #elif defined(ANDROID)
+ #define JUMPBUFF sigjmp_buf
+diff --git a/third_party/box86-dynarec/emu/x86emu_private.h b/third_party/box86-dynarec/emu/x86emu_private.h
+index 3728eb2..775fab9 100755
+--- a/third_party/box86-dynarec/emu/x86emu_private.h
++++ b/third_party/box86-dynarec/emu/x86emu_private.h
+@@ -45,6 +45,9 @@ typedef struct emu_flags_s {
+ #if defined(__vita__)
+ #include "dyn86_vita_compat.h"   /* newlib: jmp_buf + sigsetjmp->setjmp */
+ #define JUMPBUFF jmp_buf
++#elif defined(__3DS__)
++#include "dyn86_ctr_compat.h"    /* devkitARM newlib: same as the Vita */
++#define JUMPBUFF jmp_buf
+ #elif defined(ANDROID)
+ #include <setjmp.h>
+ #define JUMPBUFF sigjmp_buf

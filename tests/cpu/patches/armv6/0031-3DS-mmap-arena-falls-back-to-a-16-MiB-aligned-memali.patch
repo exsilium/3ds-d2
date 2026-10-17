@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Sat, 17 Oct 2026 18:11:05 +0300
+Subject: [PATCH] 3DS mmap: arena falls back to a 16 MiB-aligned memalign when
+ the kernel refuses a fixed address
+
+---
+ src/dynarec86/shim/ctr/mman_ctr.c | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/src/dynarec86/shim/ctr/mman_ctr.c b/src/dynarec86/shim/ctr/mman_ctr.c
+index f9cc4e4..7e0f18b 100644
+--- a/src/dynarec86/shim/ctr/mman_ctr.c
++++ b/src/dynarec86/shim/ctr/mman_ctr.c
+@@ -142,8 +142,15 @@ void* mmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset)
+             memset(p, 0, len);
+             return p;
+         }
+-    }
+-    p = memalign(PAGE, len);
++        /* The console's kernel refuses MEMOP_ALLOC at an address of our
++         * choosing (Azahar accepts it). Then the arena comes out of libctru's
++         * heap, 16 MiB-aligned: newlib's memalign hands the alignment slack
++         * back to the heap, so it costs nothing but needs len + 16 MiB of
++         * contiguous heap while it runs (an app that wants this sizes its
++         * heap accordingly, e.g. the game CIA: all of the 124 MiB mode). */
++        p = memalign(ARENA_ALIGN, len);
++    } else
++        p = memalign(PAGE, len);
+     if (!p) {
+         errno = ENOMEM;
+         return MAP_FAILED;

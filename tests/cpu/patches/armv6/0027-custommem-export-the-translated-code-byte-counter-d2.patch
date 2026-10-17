@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Sat, 17 Oct 2026 13:45:52 +0300
+Subject: [PATCH] custommem: export the translated-code byte counter
+ (d2rt_box86_dynarec_kb)
+
+---
+ third_party/box86-dynarec/custommem.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/third_party/box86-dynarec/custommem.c b/third_party/box86-dynarec/custommem.c
+index f51cf4f..4bdb09f 100644
+--- a/third_party/box86-dynarec/custommem.c
++++ b/third_party/box86-dynarec/custommem.c
+@@ -375,6 +375,7 @@ size_t d2rt_box86_custommalloc_kb(void){
+     return 0;
+ #endif
+ }
++size_t d2rt_box86_dynarec_kb(void);   /* defined below, next to its counter */
+ size_t d2rt_box86_jmptbl_kb(void){
+ #ifdef TRACE_MEMSTAT
+     return jmptbl_allocated >> 10;
+@@ -587,6 +588,14 @@ dynablock_t* FindDynablockFromNativeAddress(void* p)
+ #ifdef TRACE_MEMSTAT
+ static uint32_t dynarec_allocated = 0;
+ #endif
++/* Bytes of translated code (AllocDynarecMap), for a port's memory panel. */
++size_t d2rt_box86_dynarec_kb(void){
++#ifdef TRACE_MEMSTAT
++    return dynarec_allocated >> 10;
++#else
++    return 0;
++#endif
++}
+ 
+ /* D2Vita (lot eviction JIT) — pourquoi ces deux symboles vivent ICI.
+  *

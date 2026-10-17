@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Sat, 17 Oct 2026 15:00:23 +0300
+Subject: [PATCH] custommem: no host-block protection records in arena mode
+ (re-entered mutex_prot; hung on the 3DS)
+
+---
+ third_party/box86-dynarec/custommem.c | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/third_party/box86-dynarec/custommem.c b/third_party/box86-dynarec/custommem.c
+index 4bdb09f..25054db 100644
+--- a/third_party/box86-dynarec/custommem.c
++++ b/third_party/box86-dynarec/custommem.c
+@@ -473,7 +473,15 @@ void* customMalloc(size_t size)
+     void* ret  = allocBlock(p_blocks[i].block, p, size, &p_blocks[i].first);
+     p_blocks[i].maxfree = getMaxFreeBlock(p_blocks[i].block, p_blocks[i].size, p_blocks[i].first);
+     mutex_unlock(&mutex_blocks);
+-    if(mapallmem)
++    /* WinVita single-arena mode (dyn86_membase != 0): memprot/mapallmem are
++     * keyed by GUEST addresses, so recording this HOST block there means
++     * nothing -- and it is reached with mutex_prot already held whenever the
++     * node allocation of an rb_set (protectDB -> rb_set -> customMalloc) is
++     * what needed the new block. On Linux the ERRORCHECK mutex hid that
++     * (EDEADLK, then an unlocked re-entrant tree update); on the 3DS the lock
++     * is not recursive and the game hung on its loading screen. */
++    extern uintptr_t dyn86_membase;
++    if(mapallmem && !dyn86_membase)
+         setProtection((uintptr_t)p, allocsize, PROT_READ | PROT_WRITE);
+     return ret;
+ }

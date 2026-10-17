@@ -1,0 +1,14 @@
+# Upstream revisions pinned at plan validation (2026-10-16). Nothing below is
+# vendored yet; each is added as a submodule at exactly this commit when the
+# milestone that needs it starts. Format: name url branch commit license-as-reported
+#
+# Licenses: "unasserted" means GitHub's license detector could not classify the
+# repository. Read the actual license files before borrowing any code.
+
+D2Vita      https://github.com/Franckrst/D2Vita.git      main    651dba6ec970dddc99c733a4bd1b58568a2c6c10  GPL-3.0
+WinVita     https://github.com/Franckrst/WinVita.git     main    8065b469da1b65b1f968024b881ef187e7f7fef7  unasserted(LICENSE+THIRD-PARTY-NOTICES.md present)
+dosbox-3ds  https://github.com/MrHuu/dosbox-3ds.git      3DS     8aee35d64693ebd2751bf45881ecccf322ff76f1  GPL-2.0(COPYING)
+azahar      https://github.com/azahar-emu/azahar.git     master  6daa07ab2a58870edfe15472003061a354bac73b  GPL-3.0
+M-HT-SR     https://github.com/M-HT/SR.git               master  ac690ddf3010bc3d2c875cb1b5e8da4f53a8d5b3  unasserted
+libctru     https://github.com/devkitPro/libctru.git     master  9b55eda44cf80b971503991e0c78f9bc8fe50425  zlib(source); the build uses the 2.7.0 package in the pinned image
+citro3d     https://github.com/devkitPro/citro3d.git     master  9f21cf7b380ce6f9e01a0420f19f0763e5443ca7  Zlib; the build uses the 1.7.1 package in the pinned image

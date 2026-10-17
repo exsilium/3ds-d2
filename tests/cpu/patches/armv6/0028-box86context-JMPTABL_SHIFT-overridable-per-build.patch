@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Sat, 17 Oct 2026 14:01:44 +0300
+Subject: [PATCH] box86context: JMPTABL_SHIFT overridable per build
+
+---
+ src/dynarec86/shim/box86context.h | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/dynarec86/shim/box86context.h b/src/dynarec86/shim/box86context.h
+index 7c5780f..e657a00 100644
+--- a/src/dynarec86/shim/box86context.h
++++ b/src/dynarec86/shim/box86context.h
+@@ -18,7 +18,12 @@ typedef struct kh_dynablocks_s kh_dynablocks_t;
+ 
+ #define DYNAMAP_SHIFT 16
+ #define DYNAMAP_SIZE (1<<(32-DYNAMAP_SHIFT))
++/* Jump-table granularity: each second-level table covers 2^JMPTABL_SHIFT
++ * bytes of guest code at 4 host bytes per guest byte, and the first level has
++ * 2^(32-JMPTABL_SHIFT) entries. Overridable per build (-DJMPTABL_SHIFT=n). */
++#ifndef JMPTABL_SHIFT
+ #define JMPTABL_SHIFT 16
++#endif
+ #define JMPTABL_SIZE (1<<(32-JMPTABL_SHIFT))
+ #define JMPTABLE_MASK ((1<<JMPTABL_SHIFT)-1)
+ 

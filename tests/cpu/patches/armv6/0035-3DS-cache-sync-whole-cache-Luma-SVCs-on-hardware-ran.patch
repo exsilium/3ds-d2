@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Sat, 17 Oct 2026 19:28:45 +0300
+Subject: [PATCH] 3DS cache sync: whole-cache Luma SVCs on hardware (range ops
+ fault on RWX pages)
+
+---
+ src/dynarec86/shim/ctr/mman_ctr.c | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/src/dynarec86/shim/ctr/mman_ctr.c b/src/dynarec86/shim/ctr/mman_ctr.c
+index 6890282..807a60e 100644
+--- a/src/dynarec86/shim/ctr/mman_ctr.c
++++ b/src/dynarec86/shim/ctr/mman_ctr.c
+@@ -237,8 +237,29 @@ int mprotect(void* addr, size_t len, int prot)
+     return 0;                      // no SIGSEGV write barrier on the 3DS
+ }
+ 
++/* Luma3DS's whole-cache SVCs: no address, hence no translation to fault on. */
++static void svc_flush_entire_dcache(void)
++{
++    __asm__ volatile("svc 0x92" ::: "r0", "memory");
++}
++static void svc_invalidate_entire_icache(void)
++{
++    __asm__ volatile("svc 0x94" ::: "r0", "memory");
++}
++
+ void dyn86_ctr_clear_cache(void* beg, void* end)
+ {
++    if (!is_emulator()) {
++        /* New 3DS (Luma3DS): the range variants fault in the kernel on code
++         * pages made RWX with MEMOP_PROT (data abort at the block's first
++         * address, DFSR 0x804: instruction-cache maintenance fault; Luma dump
++         * of 2026-10-17). The whole-cache ones need no translation. Their cost
++         * is paid once per newly translated block, not per executed one. */
++        svc_flush_entire_dcache();
++        svc_invalidate_entire_icache();
++        return;
++    }
++    /* Azahar: implements 0x54 and 0x93 but not 0x92 (finding 4). */
+     u32 a = (u32)beg & ~31u, e = ((u32)end + 31u) & ~31u;
+     svcFlushProcessDataCache(CUR_PROCESS_HANDLE, a, e - a);
+     svc_invalidate_icache_range(a, e - a);

@@ -1,0 +1,130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Fri, 16 Oct 2026 21:05:19 +0300
+Subject: [PATCH] soft-float calls: fix three latent upstream bugs; derive
+ ARM_SOFTFP from the ABI
+
+- VMOVfrV_64/VMOVtoV_64 always encoded S0/S1 (Vm computed as ((Sm)&1)>>1).
+  The call paths now use the D-register forms; the macros are corrected too.
+- call_d with two doubles loaded the call target into x3, the second
+  argument's high word. The target now goes to x14 when it would collide.
+- call_ddr popped r2/r3 without pushing them (FSCALE/ldexp stack corruption).
+ARM_SOFTFP now follows __ARM_PCS_VFP, so hard-float builds are unchanged.
+---
+ .../box86-dynarec/dynarec/arm_emitter.h       | 12 +++++++--
+ .../dynarec/dynarec_arm_helper.c              | 25 +++++++++++--------
+ 2 files changed, 25 insertions(+), 12 deletions(-)
+
+diff --git a/third_party/box86-dynarec/dynarec/arm_emitter.h b/third_party/box86-dynarec/dynarec/arm_emitter.h
+index 6039003..b43d24e 100755
+--- a/third_party/box86-dynarec/dynarec/arm_emitter.h
++++ b/third_party/box86-dynarec/dynarec/arm_emitter.h
+@@ -1,5 +1,12 @@
+ #ifndef __ARM_EMITTER_H__
+ #define __ARM_EMITTER_H__
++
++// Soft-float calling convention (doubles in core registers): follow the
++// compiler's own ABI, so generated calls into C always match how that C was
++// built. Hard-float builds (devkitARM for 3DS, armhf) leave this undefined.
++#if defined(__arm__) && !defined(__ARM_PCS_VFP) && !defined(ARM_SOFTFP)
++#define ARM_SOFTFP 1
++#endif
+ /*
+     ARM Emitter
+ 
+@@ -674,9 +681,10 @@ Op is 20-27
+ #define VMOVfrV(Rt, Sm) EMIT(c__ | (0b1110<<24) | (0b000<<21) | (1<<20) | ((((Sm)&0b11110)>>1)<<16) | ((Rt)<<12) | (0b1010<<8) | (((Sm)&1)<<7) |(0b00<<6) | (1<<4))
+ 
+ // Move between Rt to Sm and Rt2 to Sm+1 (Sm cannot be 31!, rt and Rt2 can be the same)
+-#define VMOVtoV_64(Sm, Rt, Rt2) EMIT(c__ | (0b1100<<24) | (0b010<<21) | (0<<20) | ((Rt2)<<16) | ((Rt)<<12) | (0b1010<<8) | (0b00<<6) | (1<<4) | ((Sm)&1)>>1 | ((Sm)&0b10000)<<1)
++// (fixed: upstream computed Vm as ((Sm)&1)>>1, i.e. always S0/S1)
++#define VMOVtoV_64(Sm, Rt, Rt2) EMIT(c__ | (0b1100<<24) | (0b010<<21) | (0<<20) | ((Rt2)<<16) | ((Rt)<<12) | (0b1010<<8) | (0b00<<6) | (((Sm)&1)<<5) | (1<<4) | (((Sm)>>1)&15))
+ // Move between Sm to Rt and Sm+1 to Rt2 (Sm cannot be 31!, Rt and Rt2 must be different)
+-#define VMOVfrV_64(Rt, Rt2, Sm) EMIT(c__ | (0b1100<<24) | (0b010<<21) | (1<<20) | ((Rt2)<<16) | ((Rt)<<12) | (0b1010<<8) | (0b00<<6) | (1<<4) | ((Sm)&1)>>1 | ((Sm)&0b10000)<<1)
++#define VMOVfrV_64(Rt, Rt2, Sm) EMIT(c__ | (0b1100<<24) | (0b010<<21) | (1<<20) | ((Rt2)<<16) | ((Rt)<<12) | (0b1010<<8) | (0b00<<6) | (((Sm)&1)<<5) | (1<<4) | (((Sm)>>1)&15))
+ 
+ // Move between Rt/Rt2 to Dm
+ #define VMOVtoV_D(Dm, Rt, Rt2) EMIT(c__ | (0b1100<<24) | (0b010<<21) | (0<<20) | ((Rt2)<<16) | ((Rt)<<12) | (0b1011<<8) | (0b00<<6) | (1<<4) | ((Dm)&0b1111) | (((Dm)>>4)&1)<<5)
+diff --git a/third_party/box86-dynarec/dynarec/dynarec_arm_helper.c b/third_party/box86-dynarec/dynarec/dynarec_arm_helper.c
+index 8c967dc..a36b41c 100755
+--- a/third_party/box86-dynarec/dynarec/dynarec_arm_helper.c
++++ b/third_party/box86-dynarec/dynarec/dynarec_arm_helper.c
+@@ -474,10 +474,10 @@ void call_dr(dynarec_arm_t* dyn, int ninst, int reg, int n, int s1, int ret, int
+         STR_IMM9(xFlags, xEmu, offsetof(x86emu_t, eflags));
+     }
+     #ifdef ARM_SOFTFP
+-    VMOVfrV_64(0, 1, 0);// D0 -> r0:r1
++    VMOVfrV_D(0, 1, 0);// D0 -> r0:r1
+     if(n!=1) { // n == 2, nothing else!
+         PUSH(xSP, (1<<2) | (1<<3));
+-        VMOVfrV_64(2, 3, 1);
++        VMOVfrV_D(2, 3, 1);
+     }
+     #endif
+     BLX(reg);
+@@ -486,7 +486,7 @@ void call_dr(dynarec_arm_t* dyn, int ninst, int reg, int n, int s1, int ret, int
+         POP(xSP, (1<<2) | (1<<3));
+     }
+     if(ret==-1) {
+-        VMOVtoV_64(0, 0, 1);    // load r0:r1 to D0 to simulate hardfo
++        VMOVtoV_D(0, 0, 1);    // load r0:r1 to D0 to simulate hardfo
+     }
+     #endif
+     fpu_popcache(dyn, ninst, s1);
+@@ -519,11 +519,15 @@ void call_d(dynarec_arm_t* dyn, int ninst, void* fnc, void* fnc2, int n, int reg
+         STR_IMM9(xFlags, xEmu, offsetof(x86emu_t, eflags));
+     }
+     #ifdef ARM_SOFTFP
+-    VMOVfrV_64(0, 1, 0);// D0 -> r0:r1
++    VMOVfrV_D(0, 1, 0);// D0 -> r0:r1
+     if(n!=1) { // n == 2, nothing else!
+         PUSH(xSP, (1<<2) | (1<<3));
+-        VMOVfrV_64(2, 3, 1);
++        VMOVfrV_D(2, 3, 1);
+     }
++    // The call target must not live in an argument register: CALL_2D passes
++    // reg == x3, which holds the second double's high word in soft-float.
++    // x14 (lr) is free here and BLX reads it before overwriting it.
++    if(reg <= 3) reg = x14;
+     #endif
+     MOV32(reg, (uintptr_t)fnc);
+     BLX(reg);
+@@ -538,7 +542,7 @@ void call_d(dynarec_arm_t* dyn, int ninst, void* fnc, void* fnc2, int n, int reg
+     if(n!=1) {
+         POP(xSP, (1<<2) | (1<<3));
+     }
+-    VMOVtoV_64(0, 0, 1);    // load r0:r1 to D0 to simulate hardfo
++    VMOVtoV_D(0, 0, 1);    // load r0:r1 to D0 to simulate hardfo
+     #endif
+     fpu_popcache(dyn, ninst, reg);
+     if(ret>=0) {
+@@ -567,7 +571,7 @@ void call_ddr(dynarec_arm_t* dyn, int ninst, void* fnc, void* fnc2, int arg, int
+         STR_IMM9(xFlags, xEmu, offsetof(x86emu_t, eflags));
+     }
+     #ifdef ARM_SOFTFP
+-    VMOVfrV_64(0, 1, 0);// D0 -> r0:r1
++    VMOVfrV_D(0, 1, 0);// D0 -> r0:r1
+     MOV_REG(2, arg);
+     #else
+     MOV_REG(0, arg);
+@@ -582,8 +586,9 @@ void call_ddr(dynarec_arm_t* dyn, int ninst, void* fnc, void* fnc2, int arg, int
+         BLX(reg);
+     }
+     #ifdef ARM_SOFTFP
+-    POP(xSP, (1<<2) | (1<<3));
+-    VMOVtoV_64(0, 0, 1);    // load r0:r1 to D0 to simulate hardfo
++    // (upstream also popped r2/r3 here, copied from call_d's two-double case,
++    // but call_ddr never pushes them: the unbalanced POP corrupted the stack)
++    VMOVtoV_D(0, 0, 1);    // load r0:r1 to D0 to simulate hardfo
+     #endif
+     fpu_popcache(dyn, ninst, reg);
+     if(ret>=0) {
+@@ -616,7 +621,7 @@ void call_rd(dynarec_arm_t* dyn, int ninst, void* fnc, int reg, int s1, uint32_t
+     MOV32(s1, (uintptr_t)fnc);
+     BLX(s1);
+     #ifdef ARM_SOFTFP
+-    VMOVtoV_64(0, 0, 1);    // load r0:r1 to D0 to simulate hardfo
++    VMOVtoV_D(0, 0, 1);    // load r0:r1 to D0 to simulate hardfo
+     #endif
+     fpu_popcache(dyn, ninst, s1);
+     POP(xSP, (1<<xEmu) | mask);

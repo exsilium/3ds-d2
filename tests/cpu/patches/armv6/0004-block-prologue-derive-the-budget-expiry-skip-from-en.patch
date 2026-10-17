@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Fri, 16 Oct 2026 20:56:29 +0300
+Subject: [PATCH] block prologue: derive the budget-expiry skip from encoding
+ sizes
+
+The BGT over the expiry path hard-coded 10 instructions (the ARMv7 sizes of
+MOV32_ and MOVW). With the ARMv6 encodings the path is 16 instructions and the
+branch landed inside it, exiting every block to the epilog with a garbage EIP.
+---
+ third_party/box86-dynarec/dynarec/dynarec_arm_pass.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/third_party/box86-dynarec/dynarec/dynarec_arm_pass.c b/third_party/box86-dynarec/dynarec/dynarec_arm_pass.c
+index d70aad3..6899e5c 100755
+--- a/third_party/box86-dynarec/dynarec/dynarec_arm_pass.c
++++ b/third_party/box86-dynarec/dynarec/dynarec_arm_pass.c
+@@ -236,7 +236,10 @@ uintptr_t arm_pass(dynarec_arm_t* dyn, uintptr_t addr)
+             j32 = dyn->budget_tail - (dyn->arm_size + 8);
+             Bcond(cLE, j32);
+         } else {
+-            EMIT(0xCA000000 | 9);       // BGT +10 insns (skip the expiry path)
++            // BGT over the expiry path below. Its length is computed from the
++            // per-architecture sizes of MOV32_ and MOVW (ARMv7: 2+1+1+1+1+2+1+NOP
++            // = 10 insns; ARMv6: 4+2+1+2+1+4+1+NOP = 16), so it cannot drift.
++            EMIT(0xCA000000 | (2*ARM_MOV32F_WORDS + 2*ARM_MOVW_WORDS + 4 - 1));
+             // arm_epilog's stm writes emu->ip FROM THE xEIP REGISTER (stale at
+             // block entry) — so load the resume address into xEIP, not memory.
+             // C10 (deep review): MOV32 is VARIABLE length — 1 insn when ~imm32

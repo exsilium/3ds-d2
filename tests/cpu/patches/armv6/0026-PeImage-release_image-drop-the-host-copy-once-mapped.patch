@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Sat, 17 Oct 2026 12:54:40 +0300
+Subject: [PATCH] PeImage::release_image(): drop the host copy once mapped and
+ linked
+
+---
+ src/runtime/pe_image.cpp | 7 ++++---
+ src/runtime/pe_image.h   | 6 ++++++
+ 2 files changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/src/runtime/pe_image.cpp b/src/runtime/pe_image.cpp
+index 38bbc57..a5432dc 100644
+--- a/src/runtime/pe_image.cpp
++++ b/src/runtime/pe_image.cpp
+@@ -43,12 +43,12 @@ enum { DIR_EXPORT = 0, DIR_IMPORT = 1, DIR_BASERELOC = 5 };
+ 
+ // -------- small helpers ------------------------------------------------------
+ const uint8_t* PeImage::at_rva(uint32_t rva, uint32_t need) const {
+-    if (rva >= image_size_) return nullptr;
++    if (image_.empty() || rva >= image_size_) return nullptr;   // released: see release_image()
+     if (need && (uint64_t)rva + need > image_size_) return nullptr;
+     return image_.data() + rva;
+ }
+ const char* PeImage::cstr_at_rva(uint32_t rva) const {
+-    if (rva >= image_size_) return nullptr;
++    if (image_.empty() || rva >= image_size_) return nullptr;
+     const char* p = reinterpret_cast<const char*>(image_.data() + rva);
+     // ensure NUL within image
+     for (uint32_t i = rva; i < image_size_; ++i)
+@@ -66,11 +66,12 @@ bool PeImage::read_u32(uint32_t va, uint32_t& out) const {
+ bool PeImage::write_u32(uint32_t va, uint32_t val) {
+     if (va < load_base_) return false;
+     uint32_t rva = va - load_base_;
+-    if ((uint64_t)rva + 4 > image_size_) return false;
++    if (image_.empty() || (uint64_t)rva + 4 > image_size_) return false;
+     std::memcpy(image_.data() + rva, &val, 4);
+     return true;
+ }
+ void PeImage::patch_iat(uint32_t iat_va, uint32_t value) { write_u32(iat_va, value); }
++void PeImage::release_image() { std::vector<uint8_t>().swap(image_); }
+ 
+ // -------- load ---------------------------------------------------------------
+ bool PeImage::load(const std::vector<uint8_t>& bytes, uint32_t load_base, std::string& err) {
+diff --git a/src/runtime/pe_image.h b/src/runtime/pe_image.h
+index 03c29d8..774fffb 100644
+--- a/src/runtime/pe_image.h
++++ b/src/runtime/pe_image.h
+@@ -71,6 +71,12 @@ public:
+ 
+     // Patch an IAT slot (used by the bridge). va must be a slot from imports().
+     void patch_iat(uint32_t iat_va, uint32_t value);
++    // Frees the host copy of the image once the bridge has mapped it into
++    // guest memory and linked it (commit + link). The guest copy is the one
++    // that runs; afterwards image()/at_rva() are empty and patch_iat() only
++    // updates guest memory through the bridge. Saves SizeOfImage bytes of
++    // host memory (5.7 MiB for Diablo II) where memory is tight.
++    void release_image();
+ 
+     // Raw image read/write helpers (bounds-checked, VA-based).
+     bool read_u32(uint32_t va, uint32_t& out) const;

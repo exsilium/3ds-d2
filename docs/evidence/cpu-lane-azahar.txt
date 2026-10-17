@@ -1,0 +1,21 @@
+CPU lane on Azahar 2126.2 (219d743), New 3DS mode — 2026-10-16
+Box86 ARMv6 backend: WinVita 6163f9c + tests/cpu/patches/armv6 (18 patches), devkitARM build
+results.txt sha256 c423cb24d3b62826f8af7fe178993cf0bcd7fe555598669bdb908c410a9e886b
+LANE x86-reference v1 fixture_base=00400000 scratch=00600000 stack_top=00620000 fs=ok
+DONE fixtures=86 cases=8199
+[cpu_box86] arena: block=0x9000000 size=0x800000 membase=0x9000000 (Vita single-block model)
+
+== versus tests/x86/golden/qemu-i386.txt
+DIFF enter_leave          0/6     missing=6
+DIFF x87_arith            1/10    fields=eax:9  e.g. case 1 eax=00000020->00000000
+DIFF x87_trans            8/10    fields=mem:2,membytes:2  e.g. case 3 mem=7613a90eeb131afe->87ed34d0d072d6ab
+DIFF x87_80bit            0/6     fields=mem:6,membytes:6  e.g. case 0 mem=e7c5460b406addfa->79311745a496cc29
+DIFF x87_status           0/6     fields=mem:6,membytes:6  e.g. case 0 mem=cdf89802a00f77a6->ae0751b6f1f6e2ba
+DIFF x87_misc             1/10    fields=eax:9,mem:9,membytes:9  e.g. case 1 eax=00007820->00007800 mem=4b10b260a2e91080->4f146ad2180238bf
+RESULT cpu.compare FAIL cases=8205 matching=8167 differing=38
+
+== versus tests/cpu/baseline/armv7-results.txt (upstream Box86, ARMv7, glibc)
+differs: x87_trans case 3
+differs: x87_trans case 5
+differs: x87_trans case 8
+all other lines identical; the three cases differ by 1 ulp in sin/cos/atan2 results (host libm: newlib vs glibc)

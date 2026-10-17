@@ -1,0 +1,87 @@
+ok   add                200/200  
+ok   adc                200/200  
+ok   sub                200/200  
+ok   sbb                200/200  
+ok   cmp                200/200  
+ok   and                200/200  
+ok   or                 200/200  
+ok   xor                200/200  
+ok   test               200/200  
+ok   inc                200/200  
+ok   dec                200/200  
+ok   neg                200/200  
+ok   not                200/200  
+ok   add8               200/200  
+ok   sub8               200/200  
+ok   add16              200/200  
+ok   adc16              200/200  
+ok   highregs           200/200  
+ok   mul                200/200  
+ok   imul1              200/200  
+ok   imul2              200/200  
+ok   imul3              200/200  
+ok   div                  7/7    
+ok   idiv                 6/6    
+ok   signext            200/200  
+ok   setcc              200/200  
+ok   cmovcc             200/200  
+ok   jcc                200/200  
+ok   shl_cl              80/80   
+ok   shr_cl              80/80   
+ok   sar_cl              80/80   
+ok   shl1                80/80   
+ok   shr1                80/80   
+ok   sar1                80/80   
+ok   rol_cl              80/80   
+ok   ror_cl              80/80   
+ok   rcl_cl              80/80   
+ok   rcr_cl              80/80   
+ok   shld_cl             80/80   
+ok   shrd_cl             80/80   
+ok   bt                  80/80   
+ok   bts                 80/80   
+ok   btr                 80/80   
+ok   btc                 80/80   
+ok   bt_mem              80/80   
+ok   bsf                  6/6    
+ok   bsr                  6/6    
+ok   bswap              200/200  
+ok   movx               200/200  
+ok   lea                200/200  
+ok   cmpxchg            200/200  
+ok   xadd               200/200  
+ok   unaligned          200/200  
+ok   pushpop              6/6    
+ok   pushad               6/6    
+ok   call_ret             6/6    
+ok   stdcall              6/6    
+ok   recursion            6/6    
+ok   callind              6/6    
+ok   jumptable            6/6    
+ok   callreg              6/6    
+ok   loop                 6/6    
+DIFF enter_leave          0/6     missing=6
+ok   rep_movsb            6/6    
+ok   rep_movsd            6/6    
+ok   movsd_backward       6/6    
+ok   rep_stosd            6/6    
+ok   repne_scasb          6/6    
+ok   repe_cmpsb           6/6    
+ok   lodsb_sum            6/6    
+ok   fs_teb               6/6    
+DIFF x87_arith            1/10    fields=eax:9  e.g. case 1 eax=00000020->00000000
+ok   x87_round           10/10   
+ok   x87_compare         10/10   
+ok   x87_const            6/6    
+DIFF x87_trans            9/10    fields=mem:1,membytes:1  e.g. case 5 mem=033003d7383c162c->c3817f6101a05439
+DIFF x87_80bit            0/6     fields=mem:6,membytes:6  e.g. case 0 mem=e7c5460b406addfa->79311745a496cc29
+DIFF x87_status           0/6     fields=mem:6,membytes:6  e.g. case 0 mem=cdf89802a00f77a6->ae0751b6f1f6e2ba
+ok   x87_int64           10/10   
+ok   x87_unaligned       10/10   
+DIFF x87_misc             1/10    fields=eax:9,mem:9,membytes:9  e.g. case 1 eax=00007820->00007800 mem=4b10b260a2e91080->4f146ad2180238bf
+ok   lock_ops           200/200  
+ok   rep_long             6/6    
+ok   bsf_mem              6/6    
+ok   bsr_mem              6/6    
+ok   bsf_same             6/6    
+RESULT cpu.compare FAIL cases=8205 matching=8168 differing=37

@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Fri, 16 Oct 2026 21:05:19 +0300
+Subject: [PATCH] BSF: count trailing zeros without RBIT on ARMv6
+
+ARMv6 has no RBIT. Isolate the lowest set bit (x & -x), then 31 - CLZ. No
+flag-setting instructions: the preceding B_MARK(cEQ) relies on Z.
+---
+ third_party/box86-dynarec/dynarec/dynarec_arm_0f.c   | 9 +++++++++
+ third_party/box86-dynarec/dynarec/dynarec_arm_660f.c | 8 ++++++++
+ 2 files changed, 17 insertions(+)
+
+diff --git a/third_party/box86-dynarec/dynarec/dynarec_arm_0f.c b/third_party/box86-dynarec/dynarec/dynarec_arm_0f.c
+index 6ab9607..348ac50 100755
+--- a/third_party/box86-dynarec/dynarec/dynarec_arm_0f.c
++++ b/third_party/box86-dynarec/dynarec/dynarec_arm_0f.c
+@@ -2143,8 +2143,17 @@ uintptr_t dynarec0F(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int ninst,
+                 MOVW_COND(cEQ, x1, 1);
+             }
+             B_MARK(cEQ);
++#if __ARM_ARCH >= 7
+             RBIT(x1, ed);   // reverse
+             CLZ(gd, x1);    // x2 gets leading 0 == BSF
++#else
++            // ARMv6 has no RBIT: isolate the lowest set bit, then 31 - clz.
++            // No flag-setting instructions: B_MARK(cEQ) above relies on Z.
++            RSB_IMM8(x1, ed, 0);
++            AND_REG_LSL_IMM5(x1, x1, ed, 0);
++            CLZ(x1, x1);
++            RSB_IMM8(gd, x1, 31);
++#endif
+             IFX(X_PEND | X_ZF) {
+                 MOVW(x1, 0);    //ZF not set
+             }
+diff --git a/third_party/box86-dynarec/dynarec/dynarec_arm_660f.c b/third_party/box86-dynarec/dynarec/dynarec_arm_660f.c
+index f5cf8a3..4fe5dc2 100755
+--- a/third_party/box86-dynarec/dynarec/dynarec_arm_660f.c
++++ b/third_party/box86-dynarec/dynarec/dynarec_arm_660f.c
+@@ -2188,8 +2188,16 @@ uintptr_t dynarec660F(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int nins
+             TSTS_REG_LSL_IMM5(x1, x1, 0);
+             XOR_IMM8_COND(cEQ, x1, x1, 1);
+             B_MARK(cEQ);
++#if __ARM_ARCH >= 7
+             RBIT(x1, x1);   // reverse
+             CLZ(x2, x1);    // x2 gets leading 0 == BSF
++#else
++            // ARMv6 has no RBIT: isolate the lowest set bit, then 31 - clz.
++            RSB_IMM8(x2, x1, 0);
++            AND_REG_LSL_IMM5(x2, x2, x1, 0);
++            CLZ(x2, x2);
++            RSB_IMM8(x2, x2, 31);
++#endif
+             BFI(xEAX+((nextop&0x38)>>3), x2, 0, 16);
+             XOR_REG_LSL_IMM5(x1, x1, x1, 0);    //ZF not set
+             MARK;

@@ -1,0 +1,28 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Fri, 16 Oct 2026 22:08:21 +0300
+Subject: [PATCH] soft-float call_d: only two-double calls move the call target
+ to x14
+
+One-double calls keep the caller's register (r2/r3 carry no argument
+there), so x14 stays untouched on that path, as upstream.
+---
+ third_party/box86-dynarec/dynarec/dynarec_arm_helper.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/third_party/box86-dynarec/dynarec/dynarec_arm_helper.c b/third_party/box86-dynarec/dynarec/dynarec_arm_helper.c
+index a36b41c..bafa0a0 100755
+--- a/third_party/box86-dynarec/dynarec/dynarec_arm_helper.c
++++ b/third_party/box86-dynarec/dynarec/dynarec_arm_helper.c
+@@ -526,8 +526,9 @@ void call_d(dynarec_arm_t* dyn, int ninst, void* fnc, void* fnc2, int n, int reg
+     }
+     // The call target must not live in an argument register: CALL_2D passes
+     // reg == x3, which holds the second double's high word in soft-float.
+-    // x14 (lr) is free here and BLX reads it before overwriting it.
+-    if(reg <= 3) reg = x14;
++    // x14 (lr) is free here and BLX reads it before overwriting it. One-double
++    // calls keep their register: r2/r3 carry nothing there.
++    if(n != 1 && reg <= 3) reg = x14;
+     #endif
+     MOV32(reg, (uintptr_t)fnc);
+     BLX(reg);

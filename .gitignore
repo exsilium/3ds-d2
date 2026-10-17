@@ -1,0 +1,11 @@
+/build/
+/dist/
+# User-supplied game data and saves never belong in version control.
+/game/
+/saves/
+*.mpq
+*.MPQ
+Game.exe
+*.d2s
+.DS_Store
+/containers/d2vita-ref/patches-armv6/

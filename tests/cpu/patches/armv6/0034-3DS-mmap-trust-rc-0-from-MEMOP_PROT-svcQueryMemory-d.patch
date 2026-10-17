@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Sat, 17 Oct 2026 19:15:23 +0300
+Subject: [PATCH] 3DS mmap: trust rc 0 from MEMOP_PROT (svcQueryMemory does not
+ show X on hardware)
+
+---
+ src/dynarec86/shim/ctr/mman_ctr.c | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/src/dynarec86/shim/ctr/mman_ctr.c b/src/dynarec86/shim/ctr/mman_ctr.c
+index 735d45f..6890282 100644
+--- a/src/dynarec86/shim/ctr/mman_ctr.c
++++ b/src/dynarec86/shim/ctr/mman_ctr.c
+@@ -53,13 +53,18 @@ static int make_executable(void* p, size_t len)
+         rc = svcControlProcessMemory(h, (u32)p, 0, len, MEMOP_PROT, MEMPERM_READ | MEMPERM_WRITE | MEMPERM_EXECUTE);
+         svcCloseHandle(h);
+     }
++    /* Success is rc == 0. An unimplemented SVC (Azahar) returns with r0
++     * unchanged, i.e. the duplicated handle, never 0, so this cannot be
++     * fooled the way the M1 probe once was. svcQueryMemory is only logged:
++     * on a New 3DS (Luma3DS) it still reports RW (3) after a successful
++     * MEMOP_PROT to RWX, so checking it rejected memory that was fine. */
+     MemInfo mi = {0};
+     PageInfo pi;
+-    const int queried = R_SUCCEEDED(svcQueryMemory(&mi, &pi, (u32)p));
+-    const int ok = R_SUCCEEDED(rc) && queried && (mi.perm & MEMPERM_EXECUTE);
++    svcQueryMemory(&mi, &pi, (u32)p);
++    const int ok = rc == 0;
+     if (ok ? !said_ok++ : said_fail++ < 4)
+         fprintf(stderr, "[mman] code chunk %08lx+%lx RWX: %s (rc %08lx, perm now %lx)\n", (unsigned long)(u32)p,
+-                (unsigned long)len, ok ? "ok" : "REFUSED", (unsigned long)rc, (unsigned long)mi.perm);
++                (unsigned long)len, ok ? "ok" : "REFUSED", (unsigned long)rc, (unsigned long)mi.perm);   /* perm: as svcQueryMemory reports it */
+     fflush(stderr);
+     return ok ? 0 : -1;
+ }

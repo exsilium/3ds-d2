@@ -1,0 +1,344 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Sat, 17 Oct 2026 00:19:55 +0300
+Subject: [PATCH] shims (window, locale, gdi32): explicit uint32_t lambda
+ return types
+
+On newlib uint32_t is unsigned long, so lambdas mixing 'return 0u;' with a
+uint32_t value no longer deduce one return type. Same code on glibc.
+---
+ src/runtime/win32_shims_gdi32.cpp  | 72 +++++++++++++++---------------
+ src/runtime/win32_shims_locale.cpp | 72 +++++++++++++++---------------
+ src/runtime/win32_shims_window.cpp | 62 ++++++++++++-------------
+ 3 files changed, 103 insertions(+), 103 deletions(-)
+
+diff --git a/src/runtime/win32_shims_gdi32.cpp b/src/runtime/win32_shims_gdi32.cpp
+index 934ce01..769aedf 100644
+--- a/src/runtime/win32_shims_gdi32.cpp
++++ b/src/runtime/win32_shims_gdi32.cpp
+@@ -37,52 +37,52 @@ void win32_shims_gdi32_install(Bridge& br){
+         s.fn=std::move(fn);
+         br.register_shim("GDI32.dll",name,s);
+     };
+-    GD("GetStockObject",1,[](Cpu&){ return 0x88000001u; });
+-    GD("GetDeviceCaps",2,[](Cpu&c){ uint32_t cap=c.arg(1);
++    GD("GetStockObject",1,[](Cpu&)->uint32_t{ return 0x88000001u; });
++    GD("GetDeviceCaps",2,[](Cpu&c)->uint32_t{ uint32_t cap=c.arg(1);
+         if(cap==8) return wx86_screen_w();    // HORZRES
+         if(cap==10) return wx86_screen_h();   // VERTRES
+         if(cap==12) return 32u;               // BITSPIXEL
+         if(cap==14) return 1u;                // PLANES
+         return 0u; });
+-    GD("CreateCompatibleDC",1,[](Cpu&){ return 0x87000002u; });
+-    GD("DeleteDC",1,[](Cpu&){ return 1u; });
+-    GD("DeleteObject",1,[](Cpu&){ return 1u; });
+-    GD("SelectObject",2,[](Cpu&){ return 0x88000011u; });
+-    GD("GetSystemPaletteEntries",4,[](Cpu&){ return 0u; });
+-    GD("CreatePalette",1,[](Cpu&){ return 0x88000012u; });
+-    GD("SelectPalette",3,[](Cpu&){ return 0x88000013u; });
+-    GD("RealizePalette",1,[](Cpu&){ return 0u; });
+-    GD("SetDeviceGammaRamp",2,[](Cpu&){ return 1u; });
+-    GD("GetDeviceGammaRamp",2,[](Cpu&){ return 1u; });
+-    GD("StretchDIBits",13,[](Cpu&){ return 0u; });
+-    GD("GdiFlush",0,[](Cpu&){ return 1u; });
+-    GD("GdiSetBatchLimit",1,[](Cpu&){ return 1u; });
+-    GD("CreateFontA",14,[](Cpu&){ return 0x88000020u; });
+-    GD("SetTextColor",2,[](Cpu&){ return 0u; });
+-    GD("SetBkMode",2,[](Cpu&){ return 1u; });
+-    GD("SetBkColor",2,[](Cpu&){ return 0u; });
+-    GD("GetTextExtentPoint32A",4,[](Cpu&c){ uint32_t p=c.arg(3); if(p){ c.write_u32(p,8*c.arg(2)); c.write_u32(p+4,16);} return 1u; });
+-    GD("GetTextExtentPointA",4,[](Cpu&c){ uint32_t p=c.arg(3); if(p){ c.write_u32(p,8*c.arg(2)); c.write_u32(p+4,16);} return 1u; });
+-    GD("GetDIBColorTable",4,[](Cpu&){ return 256u; });
+-    GD("SetPaletteEntries",4,[](Cpu&){ return 256u; });
+-    GD("AnimatePalette",4,[](Cpu&){ return 1u; });
+-    GD("UnrealizeObject",1,[](Cpu&){ return 1u; });
+-    GD("SetStretchBltMode",2,[](Cpu&){ return 1u; });
+-    GD("PatBlt",6,[](Cpu&){ return 1u; });
++    GD("CreateCompatibleDC",1,[](Cpu&)->uint32_t{ return 0x87000002u; });
++    GD("DeleteDC",1,[](Cpu&)->uint32_t{ return 1u; });
++    GD("DeleteObject",1,[](Cpu&)->uint32_t{ return 1u; });
++    GD("SelectObject",2,[](Cpu&)->uint32_t{ return 0x88000011u; });
++    GD("GetSystemPaletteEntries",4,[](Cpu&)->uint32_t{ return 0u; });
++    GD("CreatePalette",1,[](Cpu&)->uint32_t{ return 0x88000012u; });
++    GD("SelectPalette",3,[](Cpu&)->uint32_t{ return 0x88000013u; });
++    GD("RealizePalette",1,[](Cpu&)->uint32_t{ return 0u; });
++    GD("SetDeviceGammaRamp",2,[](Cpu&)->uint32_t{ return 1u; });
++    GD("GetDeviceGammaRamp",2,[](Cpu&)->uint32_t{ return 1u; });
++    GD("StretchDIBits",13,[](Cpu&)->uint32_t{ return 0u; });
++    GD("GdiFlush",0,[](Cpu&)->uint32_t{ return 1u; });
++    GD("GdiSetBatchLimit",1,[](Cpu&)->uint32_t{ return 1u; });
++    GD("CreateFontA",14,[](Cpu&)->uint32_t{ return 0x88000020u; });
++    GD("SetTextColor",2,[](Cpu&)->uint32_t{ return 0u; });
++    GD("SetBkMode",2,[](Cpu&)->uint32_t{ return 1u; });
++    GD("SetBkColor",2,[](Cpu&)->uint32_t{ return 0u; });
++    GD("GetTextExtentPoint32A",4,[](Cpu&c)->uint32_t{ uint32_t p=c.arg(3); if(p){ c.write_u32(p,8*c.arg(2)); c.write_u32(p+4,16);} return 1u; });
++    GD("GetTextExtentPointA",4,[](Cpu&c)->uint32_t{ uint32_t p=c.arg(3); if(p){ c.write_u32(p,8*c.arg(2)); c.write_u32(p+4,16);} return 1u; });
++    GD("GetDIBColorTable",4,[](Cpu&)->uint32_t{ return 256u; });
++    GD("SetPaletteEntries",4,[](Cpu&)->uint32_t{ return 256u; });
++    GD("AnimatePalette",4,[](Cpu&)->uint32_t{ return 1u; });
++    GD("UnrealizeObject",1,[](Cpu&)->uint32_t{ return 1u; });
++    GD("SetStretchBltMode",2,[](Cpu&)->uint32_t{ return 1u; });
++    GD("PatBlt",6,[](Cpu&)->uint32_t{ return 1u; });
+     // Line-drawing family (never called by D2 binaries, per the original
+     // note above EnableWindow): TRUE / a non-null handle, no real drawing —
+     // a caller is entitled to read back the previous pen position.
+     static uint32_t s_penX=0, s_penY=0;
+-    GD("MoveToEx",4,[](Cpu&c){ uint32_t p=c.arg(3);
++    GD("MoveToEx",4,[](Cpu&c)->uint32_t{ uint32_t p=c.arg(3);
+         if(p){ c.write_u32(p,s_penX); c.write_u32(p+4,s_penY); }
+         s_penX=c.arg(1); s_penY=c.arg(2); return 1u; });
+-    GD("LineTo",3,[](Cpu&c){ s_penX=c.arg(1); s_penY=c.arg(2); return 1u; });
+-    GD("CreatePen",3,[](Cpu&){ static uint32_t h=0x88000040u; return h++; });
+-    GD("CreateSolidBrush",1,[](Cpu&){ static uint32_t h=0x88000080u; return h++; });
+-    GD("CreateBitmap",5,[](Cpu&){ static uint32_t h=0x87000030u; return h++; });
+-    GD("CreateCompatibleBitmap",3,[](Cpu&){ static uint32_t h=0x87000060u; return h++; });
+-    GD("CreateDCA",4,[](Cpu&){ return 0x87000005u; });
+-    GD("GetCharWidthA",4,[](Cpu&c){ uint32_t f=c.arg(1),l=c.arg(2),b=c.arg(3);
++    GD("LineTo",3,[](Cpu&c)->uint32_t{ s_penX=c.arg(1); s_penY=c.arg(2); return 1u; });
++    GD("CreatePen",3,[](Cpu&)->uint32_t{ static uint32_t h=0x88000040u; return h++; });
++    GD("CreateSolidBrush",1,[](Cpu&)->uint32_t{ static uint32_t h=0x88000080u; return h++; });
++    GD("CreateBitmap",5,[](Cpu&)->uint32_t{ static uint32_t h=0x87000030u; return h++; });
++    GD("CreateCompatibleBitmap",3,[](Cpu&)->uint32_t{ static uint32_t h=0x87000060u; return h++; });
++    GD("CreateDCA",4,[](Cpu&)->uint32_t{ return 0x87000005u; });
++    GD("GetCharWidthA",4,[](Cpu&c)->uint32_t{ uint32_t f=c.arg(1),l=c.arg(2),b=c.arg(3);
+         if(b) for(uint32_t i=0;i<=l-f&&i<256;i++) c.write_u32(b+4*i,8); return 1u; });
+-    GD("GetPixel",3,[](Cpu&){ return 0u; });
++    GD("GetPixel",3,[](Cpu&)->uint32_t{ return 0u; });
+ }
+diff --git a/src/runtime/win32_shims_locale.cpp b/src/runtime/win32_shims_locale.cpp
+index f3b031e..eebb4d7 100644
+--- a/src/runtime/win32_shims_locale.cpp
++++ b/src/runtime/win32_shims_locale.cpp
+@@ -37,42 +37,42 @@ void win32_shims_locale_install(Bridge& br){
+         br.register_shim("KERNEL32.dll",name,s); };
+ 
+     // ---- console: handles, code pages, writing -------------------------------
+-    K("GetStdHandle",1,[](Cpu&c){ return c.arg(0)|0x10u; });
+-    K("SetStdHandle",2,[](Cpu&){ return 1u; });
+-    K("GetConsoleCP",0,[](Cpu&){ return 437u; });
+-    K("GetConsoleOutputCP",0,[](Cpu&){ return 437u; });
+-    K("GetConsoleMode",2,[](Cpu&c){ set_lasterr(c,6); return 0u; });              // no console
+-    K("WriteConsoleA",5,[](Cpu&c){ if(c.arg(3)) c.write_u32(c.arg(3),c.arg(2)); return 1u; });
+-    K("SetConsoleCtrlHandler",2,[](Cpu&){ return 1u; });
++    K("GetStdHandle",1,[](Cpu&c)->uint32_t{ return c.arg(0)|0x10u; });
++    K("SetStdHandle",2,[](Cpu&)->uint32_t{ return 1u; });
++    K("GetConsoleCP",0,[](Cpu&)->uint32_t{ return 437u; });
++    K("GetConsoleOutputCP",0,[](Cpu&)->uint32_t{ return 437u; });
++    K("GetConsoleMode",2,[](Cpu&c)->uint32_t{ set_lasterr(c,6); return 0u; });              // no console
++    K("WriteConsoleA",5,[](Cpu&c)->uint32_t{ if(c.arg(3)) c.write_u32(c.arg(3),c.arg(2)); return 1u; });
++    K("SetConsoleCtrlHandler",2,[](Cpu&)->uint32_t{ return 1u; });
+ 
+     // ---- environment: an EMPTY block, and every variable reported missing ----
+-    K("GetEnvironmentStringsA",0,[](Cpu&c){ uint32_t a=misc(2); c.write_u32(a,0); return a; });
+-    K("GetEnvironmentStringsW",0,[](Cpu&c){ uint32_t a=misc(4); c.write_u32(a,0); return a; });
+-    K("GetEnvironmentStrings",0,[](Cpu&c){ uint32_t a=misc(2); c.write_u32(a,0); return a; });
+-    K("GetEnvironmentVariableA",3,[](Cpu&c){ set_lasterr(c,203); return 0u; });   // ENVVAR_NOT_FOUND
+-    K("SetEnvironmentVariableA",2,[](Cpu&){ return 1u; });
++    K("GetEnvironmentStringsA",0,[](Cpu&c)->uint32_t{ uint32_t a=misc(2); c.write_u32(a,0); return a; });
++    K("GetEnvironmentStringsW",0,[](Cpu&c)->uint32_t{ uint32_t a=misc(4); c.write_u32(a,0); return a; });
++    K("GetEnvironmentStrings",0,[](Cpu&c)->uint32_t{ uint32_t a=misc(2); c.write_u32(a,0); return a; });
++    K("GetEnvironmentVariableA",3,[](Cpu&c)->uint32_t{ set_lasterr(c,203); return 0u; });   // ENVVAR_NOT_FOUND
++    K("SetEnvironmentVariableA",2,[](Cpu&)->uint32_t{ return 1u; });
+ 
+     // ---- locale: code pages, identifiers, LCTYPE table -----------------------
+-    K("GetACP",0,[](Cpu&){ return cp_ansi(); });     // code page for the active locale
+-    K("GetOEMCP",0,[](Cpu&){ return cp_oem(); });    // OEM code page for the active locale
+-    K("GetUserDefaultLCID",0,[](Cpu&){ return wx86_locale_lcid(); });
+-    K("GetSystemDefaultLCID",0,[](Cpu&){ return wx86_locale_lcid(); });
+-    K("GetSystemDefaultLangID",0,[](Cpu&){ return wx86_locale_lcid()&0xFFFFu; });
+-    K("GetThreadLocale",0,[](Cpu&){ return wx86_locale_lcid(); });
+-    K("GetUserDefaultLangID",0,[](Cpu&){ return wx86_locale_lcid()&0xFFFFu; });   // low 16 of the active LCID
++    K("GetACP",0,[](Cpu&)->uint32_t{ return cp_ansi(); });     // code page for the active locale
++    K("GetOEMCP",0,[](Cpu&)->uint32_t{ return cp_oem(); });    // OEM code page for the active locale
++    K("GetUserDefaultLCID",0,[](Cpu&)->uint32_t{ return wx86_locale_lcid(); });
++    K("GetSystemDefaultLCID",0,[](Cpu&)->uint32_t{ return wx86_locale_lcid(); });
++    K("GetSystemDefaultLangID",0,[](Cpu&)->uint32_t{ return wx86_locale_lcid()&0xFFFFu; });
++    K("GetThreadLocale",0,[](Cpu&)->uint32_t{ return wx86_locale_lcid(); });
++    K("GetUserDefaultLangID",0,[](Cpu&)->uint32_t{ return wx86_locale_lcid()&0xFFFFu; });   // low 16 of the active LCID
+     // UI-language variants: kept coherent with the active locale rather than
+     // a hardcoded constant, since some callers resolve these dynamically via
+     // GetProcAddress and act on the returned language id.
+-    K("GetSystemDefaultUILanguage",0,[](Cpu&){ return wx86_locale_lcid()&0xFFFFu; });
+-    K("GetUserDefaultUILanguage",0,[](Cpu&){ return wx86_locale_lcid()&0xFFFFu; });
++    K("GetSystemDefaultUILanguage",0,[](Cpu&)->uint32_t{ return wx86_locale_lcid()&0xFFFFu; });
++    K("GetUserDefaultUILanguage",0,[](Cpu&)->uint32_t{ return wx86_locale_lcid()&0xFFFFu; });
+     // LCID -> values table lives in guest_locale.cpp (wx86_locale_info).
+     auto locinfo=[](uint32_t lctype)->const char*{ return wx86_locale_info(lctype); };
+     static auto LI=locinfo;
+-    K("GetLocaleInfoA",4,[](Cpu&c){ uint32_t lctype=c.arg(1),buf=c.arg(2); int cch=(int)c.arg(3);
++    K("GetLocaleInfoA",4,[](Cpu&c)->uint32_t{ uint32_t lctype=c.arg(1),buf=c.arg(2); int cch=(int)c.arg(3);
+         const char* v=LI(lctype);
+         if(lctype & 0x20000000u){ /*LOCALE_RETURN_NUMBER*/ uint32_t n=(uint32_t)std::strtoul(v,nullptr,10); if(cch>=2) c.write_u32(buf,n); return 2u; }
+         int need=(int)std::strlen(v)+1; if(cch==0) return (uint32_t)need; c.write(buf,v,need); return (uint32_t)need; });
+-    K("GetLocaleInfoW",4,[](Cpu&c){ uint32_t lctype=c.arg(1),buf=c.arg(2); int cch=(int)c.arg(3);
++    K("GetLocaleInfoW",4,[](Cpu&c)->uint32_t{ uint32_t lctype=c.arg(1),buf=c.arg(2); int cch=(int)c.arg(3);
+         const char* v=LI(lctype);
+         if(lctype & 0x20000000u){ uint32_t n=(uint32_t)std::strtoul(v,nullptr,10); if(cch>=2) c.write_u32(buf,n); return 2u; }
+         int need=(int)std::strlen(v)+1; if(cch==0) return (uint32_t)need;
+@@ -82,49 +82,49 @@ void win32_shims_locale_install(Bridge& br){
+     // Character classification: body lives in guest_locale.cpp (wx86_ctype1).
+     auto ctype1=[](uint32_t ch)->uint16_t{ return wx86_ctype1(ch); };
+     static auto CT1=ctype1;
+-    K("GetStringTypeW",4,[](Cpu&c){ uint32_t it=c.arg(0),src=c.arg(1); int cch=(int)c.arg(2); uint32_t out=c.arg(3);
++    K("GetStringTypeW",4,[](Cpu&c)->uint32_t{ uint32_t it=c.arg(0),src=c.arg(1); int cch=(int)c.arg(2); uint32_t out=c.arg(3);
+         auto w=gread_wc(c,src,cch); for(size_t i=0;i<w.size();i++) gwrite_wc(c,out+2*i, it==1?CT1(w[i]):0); return 1u; });
+-    K("GetStringTypeA",5,[](Cpu&c){ uint32_t it=c.arg(1),src=c.arg(2); int cch=(int)c.arg(3); uint32_t out=c.arg(4);
++    K("GetStringTypeA",5,[](Cpu&c)->uint32_t{ uint32_t it=c.arg(1),src=c.arg(2); int cch=(int)c.arg(3); uint32_t out=c.arg(4);
+         auto s=gread_mb(c,src,cch); for(size_t i=0;i<s.size();i++) gwrite_wc(c,out+2*i, it==1?CT1((uint8_t)s[i]):0); return 1u; });
+-    K("LCMapStringW",6,[](Cpu&c){ uint32_t fl=c.arg(1),src=c.arg(2); int cch=(int)c.arg(3); uint32_t dst=c.arg(4); int cd=(int)c.arg(5);
++    K("LCMapStringW",6,[](Cpu&c)->uint32_t{ uint32_t fl=c.arg(1),src=c.arg(2); int cch=(int)c.arg(3); uint32_t dst=c.arg(4); int cd=(int)c.arg(5);
+         auto w=gread_wc(c,src,cch); int outn=(int)w.size()+(cch<0?1:0); if(cd==0) return (uint32_t)outn;
+         int n=0; for(size_t i=0;i<w.size()&&n<cd;i++){ uint16_t ch=w[i];
+             if((fl&0x100)&&ch>='A'&&ch<='Z') ch+=32; if((fl&0x200)&&ch>='a'&&ch<='z') ch-=32; gwrite_wc(c,dst+2*n++,ch); }
+         if(cch<0&&n<cd) gwrite_wc(c,dst+2*n++,0); return (uint32_t)n; });
+-    K("LCMapStringA",6,[](Cpu&c){ uint32_t fl=c.arg(1),src=c.arg(2); int cch=(int)c.arg(3); uint32_t dst=c.arg(4); int cd=(int)c.arg(5);
++    K("LCMapStringA",6,[](Cpu&c)->uint32_t{ uint32_t fl=c.arg(1),src=c.arg(2); int cch=(int)c.arg(3); uint32_t dst=c.arg(4); int cd=(int)c.arg(5);
+         auto s=gread_mb(c,src,cch); int outn=(int)s.size()+(cch<0?1:0); if(cd==0) return (uint32_t)outn;
+         int n=0; for(size_t i=0;i<s.size()&&n<cd;i++){ uint8_t ch=(uint8_t)s[i];
+             if((fl&0x100)&&ch>='A'&&ch<='Z') ch+=32; if((fl&0x200)&&ch>='a'&&ch<='z') ch-=32; c.write(dst+n++,&ch,1); }
+         if(cch<0&&n<cd){ uint8_t z=0; c.write(dst+n++,&z,1);} return (uint32_t)n; });
+-    K("MultiByteToWideChar",6,[](Cpu&c){ uint32_t src=c.arg(2); int cb=(int)c.arg(3); uint32_t dst=c.arg(4); int cch=(int)c.arg(5);
++    K("MultiByteToWideChar",6,[](Cpu&c)->uint32_t{ uint32_t src=c.arg(2); int cb=(int)c.arg(3); uint32_t dst=c.arg(4); int cch=(int)c.arg(5);
+         auto s=gread_mb(c,src,cb); int outn=(int)s.size()+(cb<0?1:0); if(cch==0) return (uint32_t)outn;
+         int n=0; for(size_t i=0;i<s.size()&&n<cch;i++) gwrite_wc(c,dst+2*n++,(uint16_t)(uint8_t)s[i]);
+         if(cb<0&&n<cch) gwrite_wc(c,dst+2*n++,0); return (uint32_t)n; });
+-    K("WideCharToMultiByte",8,[](Cpu&c){ uint32_t src=c.arg(2); int cw=(int)c.arg(3); uint32_t dst=c.arg(4); int cb=(int)c.arg(5);
++    K("WideCharToMultiByte",8,[](Cpu&c)->uint32_t{ uint32_t src=c.arg(2); int cw=(int)c.arg(3); uint32_t dst=c.arg(4); int cb=(int)c.arg(5);
+         auto w=gread_wc(c,src,cw); int outn=(int)w.size()+(cw<0?1:0); if(cb==0) return (uint32_t)outn;
+         int n=0; for(size_t i=0;i<w.size()&&n<cb;i++){ uint8_t b=(uint8_t)(w[i]&0xff); c.write(dst+n++,&b,1); }
+         if(cw<0&&n<cb){ uint8_t z=0; c.write(dst+n++,&z,1);} return (uint32_t)n; });
+-    K("CompareStringW",6,[](Cpu&c){ auto a=gread_wc(c,c.arg(2),(int)c.arg(3)<0?-1:(int)c.arg(3));
++    K("CompareStringW",6,[](Cpu&c)->uint32_t{ auto a=gread_wc(c,c.arg(2),(int)c.arg(3)<0?-1:(int)c.arg(3));
+         auto b=gread_wc(c,c.arg(4),(int)c.arg(5)<0?-1:(int)c.arg(5));
+         size_t i=0; for(; i<a.size()&&i<b.size(); ++i){ if(a[i]!=b[i]) break; }
+         uint16_t x=i<a.size()?a[i]:0, y=i<b.size()?b[i]:0;
+         return x<y?1u:(x>y?3u:2u); });                                          // CSTR_LESS/EQUAL/GREATER
+-    K("CompareStringA",6,[](Cpu&c){ bool ic=(c.arg(1)&1)!=0;      // NORM_IGNORECASE
++    K("CompareStringA",6,[](Cpu&c)->uint32_t{ bool ic=(c.arg(1)&1)!=0;      // NORM_IGNORECASE
+         auto rd=[&](uint32_t p,int n){ std::string r; uint8_t b; for(int i=0;(n<0||i<n)&&i<0x10000;i++){ c.read(p+i,&b,1); if(!b&&n<0) break; if(n>=0&&i>=n) break; r+=(char)b; } return r; };
+         std::string a=rd(c.arg(2),(int)c.arg(3)), b2=rd(c.arg(4),(int)c.arg(5));
+         if(ic){ for(auto&ch:a) ch=(char)std::tolower((unsigned char)ch); for(auto&ch:b2) ch=(char)std::tolower((unsigned char)ch); }
+         int r=a.compare(b2); return r<0?1u:(r==0?2u:3u); });      // CSTR_LESS/EQUAL/GREATER
+     // lstrcmpA/lstrcpyA: not required by any shipped guest, kept
+     // Win32-faithful regardless.
+-    K("lstrlenA",1,[](Cpu&c){ uint32_t p=c.arg(0); if(!p) return 0u; uint32_t n=0; uint8_t b=0;
++    K("lstrlenA",1,[](Cpu&c)->uint32_t{ uint32_t p=c.arg(0); if(!p) return 0u; uint32_t n=0; uint8_t b=0;
+         while(n<0x100000){ c.read(p+n,&b,1); if(!b) break; ++n; } return n; });
+-    K("lstrcmpA",2,[](Cpu&c){ uint32_t a=c.arg(0),b=c.arg(1);
++    K("lstrcmpA",2,[](Cpu&c)->uint32_t{ uint32_t a=c.arg(0),b=c.arg(1);
+         if(!a||!b) return a==b?0u:(a?1u:0xFFFFFFFFu);
+         for(uint32_t i=0;i<0x100000;i++){ uint8_t x=0,y=0; c.read(a+i,&x,1); c.read(b+i,&y,1);
+             if(x!=y) return x<y?0xFFFFFFFFu:1u;
+             if(!x) return 0u; }
+         return 0u; });
+-    K("lstrcpyA",2,[](Cpu&c){ uint32_t d=c.arg(0),s2=c.arg(1);
++    K("lstrcpyA",2,[](Cpu&c)->uint32_t{ uint32_t d=c.arg(0),s2=c.arg(1);
+         if(!d||!s2) return 0u;
+         for(uint32_t i=0;i<0x100000;i++){ uint8_t b=0; c.read(s2+i,&b,1); c.write(d+i,&b,1); if(!b) break; }
+         return d; });                                        // Win32 returns the DESTINATION
+@@ -135,11 +135,11 @@ void win32_shims_locale_install(Bridge& br){
+         else { std::time_t t=std::time(nullptr); std::tm tmv{}; localtime_r(&t,&tmv);
+                v[0]=tmv.tm_year+1900; v[1]=tmv.tm_mon+1; v[3]=tmv.tm_mday; v[4]=tmv.tm_hour; v[5]=tmv.tm_min; v[6]=tmv.tm_sec; }
+         return v[idx]; };
+-    K("GetDateFormatA",6,[sysnow](Cpu&c){ uint32_t buf=c.arg(4),cch=c.arg(5);
++    K("GetDateFormatA",6,[sysnow](Cpu&c)->uint32_t{ uint32_t buf=c.arg(4),cch=c.arg(5);
+         char t[16]; int n=std::snprintf(t,sizeof t,"%02d/%02d/%04d",sysnow(c,c.arg(2),3),sysnow(c,c.arg(2),1),sysnow(c,c.arg(2),0))+1;
+         if(!cch) return (uint32_t)n; if(!buf||(int)cch<n){ set_lasterr(c,122); return 0u; }
+         c.write(buf,t,(uint32_t)n); return (uint32_t)n; });
+-    K("GetTimeFormatA",6,[sysnow](Cpu&c){ uint32_t buf=c.arg(4),cch=c.arg(5);
++    K("GetTimeFormatA",6,[sysnow](Cpu&c)->uint32_t{ uint32_t buf=c.arg(4),cch=c.arg(5);
+         char t[16]; int n=std::snprintf(t,sizeof t,"%02d:%02d:%02d",sysnow(c,c.arg(2),4),sysnow(c,c.arg(2),5),sysnow(c,c.arg(2),6))+1;
+         if(!cch) return (uint32_t)n; if(!buf||(int)cch<n){ set_lasterr(c,122); return 0u; }
+         c.write(buf,t,(uint32_t)n); return (uint32_t)n; });
+diff --git a/src/runtime/win32_shims_window.cpp b/src/runtime/win32_shims_window.cpp
+index 90a8b72..dd8fb35 100644
+--- a/src/runtime/win32_shims_window.cpp
++++ b/src/runtime/win32_shims_window.cpp
+@@ -69,24 +69,24 @@ void win32_shims_window_install(Bridge& br){
+         s.fn=std::move(fn);
+         br.register_shim("USER32.dll",name,s);
+     };
+-    U("DefWindowProcA",4,[](Cpu&){ return 0u; });
+-    U("LoadIconA",2,[](Cpu&){ return 0x86000002u; });
+-    U("LoadCursorA",2,[](Cpu&){ return 0x86000003u; });
+-    U("LoadImageA",6,[](Cpu&){ return 0x86000001u; });
+-    U("UpdateWindow",1,[](Cpu&){ return 1u; });
+-    U("SetWindowPos",7,[](Cpu&){ return 1u; });
+-    U("SetForegroundWindow",1,[](Cpu&){ return 1u; });
+-    U("BringWindowToTop",1,[](Cpu&){ return 1u; });
+-    U("AdjustWindowRectEx",4,[](Cpu&){ return 1u; });
+-    U("AdjustWindowRect",3,[](Cpu&){ return 1u; });
+-    U("GetClientRect",2,[](Cpu&c){ uint32_t r=c.arg(1); c.write_u32(r,0); c.write_u32(r+4,0);
++    U("DefWindowProcA",4,[](Cpu&)->uint32_t{ return 0u; });
++    U("LoadIconA",2,[](Cpu&)->uint32_t{ return 0x86000002u; });
++    U("LoadCursorA",2,[](Cpu&)->uint32_t{ return 0x86000003u; });
++    U("LoadImageA",6,[](Cpu&)->uint32_t{ return 0x86000001u; });
++    U("UpdateWindow",1,[](Cpu&)->uint32_t{ return 1u; });
++    U("SetWindowPos",7,[](Cpu&)->uint32_t{ return 1u; });
++    U("SetForegroundWindow",1,[](Cpu&)->uint32_t{ return 1u; });
++    U("BringWindowToTop",1,[](Cpu&)->uint32_t{ return 1u; });
++    U("AdjustWindowRectEx",4,[](Cpu&)->uint32_t{ return 1u; });
++    U("AdjustWindowRect",3,[](Cpu&)->uint32_t{ return 1u; });
++    U("GetClientRect",2,[](Cpu&c)->uint32_t{ uint32_t r=c.arg(1); c.write_u32(r,0); c.write_u32(r+4,0);
+         c.write_u32(r+8,wx86_screen_w()); c.write_u32(r+12,wx86_screen_h()); return 1u; });
+-    U("GetWindowRect",2,[](Cpu&c){ uint32_t r=c.arg(1); c.write_u32(r,0); c.write_u32(r+4,0);
++    U("GetWindowRect",2,[](Cpu&c)->uint32_t{ uint32_t r=c.arg(1); c.write_u32(r,0); c.write_u32(r+4,0);
+         c.write_u32(r+8,wx86_screen_w()); c.write_u32(r+12,wx86_screen_h()); return 1u; });
+-    U("ScreenToClient",2,[](Cpu&){ return 1u; });
+-    U("ClientToScreen",2,[](Cpu&){ return 1u; });
+-    U("GetDC",1,[](Cpu&){ return 0x87000001u; });
+-    U("ReleaseDC",2,[](Cpu&){ return 1u; });
++    U("ScreenToClient",2,[](Cpu&)->uint32_t{ return 1u; });
++    U("ClientToScreen",2,[](Cpu&)->uint32_t{ return 1u; });
++    U("GetDC",1,[](Cpu&)->uint32_t{ return 0x87000001u; });
++    U("ReleaseDC",2,[](Cpu&)->uint32_t{ return 1u; });
+     // BeginPaint/EndPaint (never called by D2 binaries — same note as
+     // EnableWindow in win32_shims_user32.cpp): the hdc returned is the same
+     // fake handle as GetDC — two distinct handles for the same window would
+@@ -102,21 +102,21 @@ void win32_shims_window_install(Bridge& br){
+                 c.write_u32(ps+0x1c,0u);               // fIncUpdate
+                 for(uint32_t i=0;i<32;i+=4) c.write_u32(ps+0x20+i,0u); }   // rgbReserved
+         return 0x87000001u; });
+-    U("EndPaint",2,[](Cpu&){ return 1u; });
+-    U("SetCursor",1,[](Cpu&){ return 0u; });
+-    U("ShowCursor",1,[](Cpu&c){ static int32_t disp=0; disp += c.arg(0)?1:-1; return (uint32_t)disp; });   // real display counter
+-    U("ClipCursor",1,[](Cpu&){ return 1u; });
++    U("EndPaint",2,[](Cpu&)->uint32_t{ return 1u; });
++    U("SetCursor",1,[](Cpu&)->uint32_t{ return 0u; });
++    U("ShowCursor",1,[](Cpu&c)->uint32_t{ static int32_t disp=0; disp += c.arg(0)?1:-1; return (uint32_t)disp; });   // real display counter
++    U("ClipCursor",1,[](Cpu&)->uint32_t{ return 1u; });
+     // 1.14d's WM_MOUSEMOVE handler calls this on first move (TME_LEAVE).
+     // Success is enough: the virtual cursor never leaves the window, so no
+     // WM_MOUSELEAVE needs to be synthesized.
+-    U("TrackMouseEvent",1,[](Cpu&){ return 1u; });
+-    U("GetCursorPos",1,[](Cpu&c){ uint32_t p=c.arg(0); uint32_t x,y; wx86_get_cursor(&x,&y);
++    U("TrackMouseEvent",1,[](Cpu&)->uint32_t{ return 1u; });
++    U("GetCursorPos",1,[](Cpu&c)->uint32_t{ uint32_t p=c.arg(0); uint32_t x,y; wx86_get_cursor(&x,&y);
+         c.write_u32(p,x); c.write_u32(p+4,y); return 1u; });
+-    U("SetCursorPos",2,[](Cpu&c){ wx86_set_cursor(c.arg(0),c.arg(1)); return 1u; });
+-    U("PostQuitMessage",1,[](Cpu&){ return 0u; });
+-    U("TranslateMessage",1,[](Cpu&){ return 0u; });
+-    U("SystemParametersInfoA",4,[](Cpu&){ return 1u; });
+-    U("GetSystemMetrics",1,[](Cpu&c){ uint32_t i=c.arg(0);
++    U("SetCursorPos",2,[](Cpu&c)->uint32_t{ wx86_set_cursor(c.arg(0),c.arg(1)); return 1u; });
++    U("PostQuitMessage",1,[](Cpu&)->uint32_t{ return 0u; });
++    U("TranslateMessage",1,[](Cpu&)->uint32_t{ return 0u; });
++    U("SystemParametersInfoA",4,[](Cpu&)->uint32_t{ return 1u; });
++    U("GetSystemMetrics",1,[](Cpu&c)->uint32_t{ uint32_t i=c.arg(0);
+         if(i==0) return wx86_screen_w(); if(i==1) return wx86_screen_h(); return 0u; });
+     // Without this shim, MapVirtualKeyA returned 0 for EVERY conversion
+     // ("this key doesn't exist") — some callers use it to convert between
+@@ -129,9 +129,9 @@ void win32_shims_window_install(Bridge& br){
+                      if(code>=0x30&&code<=0x39) return code;
+                      if(code==0x20) return 0x20; return 0u; }
+         return 0u; });
+-    U("SetWindowTextA",2,[](Cpu&){ return 1u; });
+-    U("GetWindowThreadProcessId",2,[](Cpu&c){ if(c.arg(1)) c.write_u32(c.arg(1),1); return 1u; });
+-    U("EnumDisplaySettingsA",3,[](Cpu&c){ uint32_t dm=c.arg(2);
++    U("SetWindowTextA",2,[](Cpu&)->uint32_t{ return 1u; });
++    U("GetWindowThreadProcessId",2,[](Cpu&c)->uint32_t{ if(c.arg(1)) c.write_u32(c.arg(1),1); return 1u; });
++    U("EnumDisplaySettingsA",3,[](Cpu&c)->uint32_t{ uint32_t dm=c.arg(2);
+         if(dm){ c.write_u32(dm+0x2c,32); c.write_u32(dm+0x30,wx86_screen_w()); c.write_u32(dm+0x34,wx86_screen_h()); c.write_u32(dm+0x38,60); } return 1u; });
+-    U("ChangeDisplaySettingsA",2,[](Cpu&){ return 0u; });   // DISP_CHANGE_SUCCESSFUL
++    U("ChangeDisplaySettingsA",2,[](Cpu&)->uint32_t{ return 0u; });   // DISP_CHANGE_SUCCESSFUL
+ }

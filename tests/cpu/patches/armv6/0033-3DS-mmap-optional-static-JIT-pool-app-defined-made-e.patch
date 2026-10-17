@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Sat, 17 Oct 2026 19:07:23 +0300
+Subject: [PATCH] 3DS mmap: optional static JIT pool (app-defined, made
+ executable once)
+
+---
+ src/dynarec86/shim/ctr/mman_ctr.c | 43 +++++++++++++++++++++++++++++++
+ 1 file changed, 43 insertions(+)
+
+diff --git a/src/dynarec86/shim/ctr/mman_ctr.c b/src/dynarec86/shim/ctr/mman_ctr.c
+index 3bb493b..735d45f 100644
+--- a/src/dynarec86/shim/ctr/mman_ctr.c
++++ b/src/dynarec86/shim/ctr/mman_ctr.c
+@@ -129,6 +129,42 @@ static int arena_free(void* p)
+     return 0;
+ }
+ 
++/* Static JIT pool. An app may define a page-aligned array and its size
++ * (weak here: apps that do not get the heap path below). Code chunks are
++ * carved from it with a bump pointer (Box86 never returns its code chunks);
++ * the whole pool is made executable once. It lives in the program's .bss,
++ * outside the console's 96 MiB heap window, and a console that will not make
++ * heap pages executable may accept it. When the pool is missing, refused or
++ * full, chunks come from the heap as before. */
++extern uint8_t dyn86_ctr_jitpool[] __attribute__((weak));
++extern const uint32_t dyn86_ctr_jitpool_size __attribute__((weak));
++static uint32_t g_pool_used = 0;
++static int g_pool_state = 0;   /* 0 untried, 1 executable, -1 unusable */
++
++static void* jitpool_take(size_t len)
++{
++    if (!dyn86_ctr_jitpool || !&dyn86_ctr_jitpool_size || !dyn86_ctr_jitpool_size)
++        return NULL;
++    if (g_pool_state == 0) {
++        g_pool_state = make_executable(dyn86_ctr_jitpool, dyn86_ctr_jitpool_size) == 0 ? 1 : -1;
++        fprintf(stderr, "[mman] static JIT pool %08lx+%lx: %s\n", (unsigned long)(uintptr_t)dyn86_ctr_jitpool,
++                (unsigned long)dyn86_ctr_jitpool_size, g_pool_state > 0 ? "executable" : "refused, using the heap");
++        fflush(stderr);
++    }
++    if (g_pool_state < 0 || g_pool_used + len > dyn86_ctr_jitpool_size)
++        return NULL;
++    void* p = dyn86_ctr_jitpool + g_pool_used;
++    g_pool_used += (uint32_t)len;
++    memset(p, 0, len);
++    return p;
++}
++
++static int in_jitpool(void* p)
++{
++    return dyn86_ctr_jitpool && (uint8_t*)p >= dyn86_ctr_jitpool &&
++           (uint8_t*)p < dyn86_ctr_jitpool + dyn86_ctr_jitpool_size;
++}
++
+ void* mmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset)
+ {
+     (void)fd; (void)offset;
+@@ -143,6 +179,11 @@ void* mmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset)
+     // on top made it look for size + 16 MiB more, which a 72 MiB arena in a
+     // 96 MiB heap cannot get.
+     void* p = NULL;
++    if (prot & PROT_EXEC) {
++        p = jitpool_take(len);
++        if (p)
++            return p;
++    }
+     if ((flags & MAP_NORESERVE) && !(prot & PROT_EXEC)) {
+         p = arena_alloc(len);
+         if (p) {
+@@ -174,6 +215,8 @@ void* mmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset)
+ int munmap(void* addr, size_t length)
+ {
+     (void)length;
++    if (in_jitpool(addr))
++        return 0;   /* pool chunks are never reused (Box86 keeps its code chunks anyway) */
+     if (arena_free(addr))
+         return 0;
+     // Executable chunks are never returned on hardware: their pages would go

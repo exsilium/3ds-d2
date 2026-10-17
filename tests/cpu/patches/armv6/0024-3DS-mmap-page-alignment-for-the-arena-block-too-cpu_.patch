@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Sat, 17 Oct 2026 10:12:38 +0300
+Subject: [PATCH] 3DS mmap: page alignment for the arena block too (cpu_box86
+ aligns membase itself)
+
+---
+ src/dynarec86/shim/ctr/mman_ctr.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/src/dynarec86/shim/ctr/mman_ctr.c b/src/dynarec86/shim/ctr/mman_ctr.c
+index 0660838..ed88fbb 100644
+--- a/src/dynarec86/shim/ctr/mman_ctr.c
++++ b/src/dynarec86/shim/ctr/mman_ctr.c
+@@ -64,8 +64,12 @@ void* mmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset)
+         return MAP_FAILED;
+     }
+     size_t len = (length + PAGE - 1) & ~(size_t)(PAGE - 1);
+-    size_t align = (flags & MAP_NORESERVE) ? 0x1000000u : PAGE;
+-    void* p = memalign(align, len);
++    // Page alignment only, also for the arena (MAP_NORESERVE): cpu_box86
++    // already oversizes that request by the slack it needs and aligns
++    // membase inside the block itself. Asking memalign for 16 MiB alignment
++    // on top made it look for size + 16 MiB more, which a 72 MiB arena in a
++    // 96 MiB heap cannot get.
++    void* p = memalign(PAGE, len);
+     if (!p) {
+         errno = ENOMEM;
+         return MAP_FAILED;

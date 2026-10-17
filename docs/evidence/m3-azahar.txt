@@ -1,0 +1,41 @@
+M3 on Azahar 2126.2 (219d743), New 3DS mode, real-time clock — 2026-10-16
+PE32 fixture tests/pe/m3test.c (sha256 bc5b11d2c8e811e0) through src/runtime/rt_* + WinVita 6163f9c with tests/cpu/patches/armv6 (21 patches), ARMv6 Box86 backend
+
+M3 test begin
+CHECK virtualalloc ok
+CHECK virtualalloc.rw ok
+CHECK virtualfree ok
+CHECK heapalloc.zeroed ok
+CHECK heapfree ok
+CHECK file.create ok
+CHECK file.write ok
+CHECK file.close ok
+CHECK file.read ok
+CHECK file.size ok
+CHECK file.missing ok
+INFO time.sleep(30) measured_ms=30
+CHECK time.sleep ok
+CHECK time.qpc ok
+CHECK tls.alloc ok
+CHECK tls.main ok
+CHECK teb.self ok
+CHECK tls.in_teb ok
+CHECK event.create ok
+CHECK thread.create ok
+CHECK thread.param ok
+CHECK tls.worker ok
+CHECK event.wait ok
+CHECK thread.join ok
+CHECK thread.exitcode ok
+CHECK tls.isolated ok
+CHECK window.register ok
+CHECK window.create ok
+CHECK sendmessage.callback ok
+CHECK messageloop.quit ok
+CHECK messageloop.dispatch ok
+RESULT m3 30/30
+M3 DONE exited=1 code=0
+
+runtime.log:
+[rt] loaded  at 00400000 entry 004011a5, 0 unresolved import(s)
+[rt] scheduler stopped: shutdown requested, exit code 0

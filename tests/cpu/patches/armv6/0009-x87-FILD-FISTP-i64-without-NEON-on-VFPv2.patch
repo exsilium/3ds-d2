@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Fri, 16 Oct 2026 21:10:09 +0300
+Subject: [PATCH] x87 FILD/FISTP i64 without NEON on VFPv2
+
+FILD builds 2^32 through two S-register halves instead of VEOR + VMOV.16 and
+stores the cached reference with VSTR (into the aligned emu struct).
+FISTP's 'unchanged since FILD' test uses VCMP.F64 + VMRS instead of VCEQ.32;
+upstream already clobbers host flags at this point.
+---
+ .../box86-dynarec/dynarec/dynarec_arm_df.c    | 22 +++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/third_party/box86-dynarec/dynarec/dynarec_arm_df.c b/third_party/box86-dynarec/dynarec/dynarec_arm_df.c
+index e00f2ca..1148799 100755
+--- a/third_party/box86-dynarec/dynarec/dynarec_arm_df.c
++++ b/third_party/box86-dynarec/dynarec/dynarec_arm_df.c
+@@ -319,16 +319,29 @@ uintptr_t dynarecDF(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int ninst,
+                         MARK;
+                         VMOVtoV(s0, x3);    // last time x3 is used
+                         VCVT_F64_U32(v1, s0);
++                        #if __ARM_ARCH >= 7
+                         VEOR(v2, v2, v2);
+                         MOVW(x3, 0x41F0);
+                         VMOVtoDx_16(v2, 3, x3);
++                        #else
++                        // v2 = 2^32 (0x41F00000:00000000) through its two S halves;
++                        // no NEON VEOR / 16-bit lane move on VFPv2. x3 is free here.
++                        MOV_IMM(x3, 0, 0);
++                        VMOVtoV(v2*2, x3);
++                        MOV32(x3, 0x41F00000);
++                        VMOVtoV(v2*2+1, x3);
++                        #endif
+                         VMUL_F64(v1, v1, v2); // v1 = double high part of i64
+                         VMOVtoV(s0, x2);
+                         VCVT_F64_U32(v2, s0);
+                         VADD_F64(v1, v1, v2);
+                         TSTS_IMM8(x14, 1);
+                         VNEG_F64_cond(cNE, v1, v1);
++                        #if __ARM_ARCH >= 7
+                         VST1_64(v1, x1);    // Store STll(0).ref
++                        #else
++                        VSTR_64(v1, x1, 0); // Store STll(0).ref (x1 points into the aligned emu struct)
++                        #endif
+                     }
+                     break;
+                 case 6:
+@@ -383,10 +396,19 @@ uintptr_t dynarecDF(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int ninst,
+                         MOVW(x2, offsetof(x86emu_t, fpu_ll));   //can be optimized?
+                         ADD_REG_LSL_IMM5(x14, x14, x2, offsetof(fpu_ll_t, sref));
+                         VLDR_64(v2, x14, 0);
++                        #if __ARM_ARCH >= 7
+                         VCEQ_32(v2, v2, v1);    // compare
+                         VMOVfrV_D(x2, x3, v2);
+                         ANDS_REG_LSL_IMM5(x2, x2, x3, 0);   // if NE then values are the same!
+                         B_MARK(cEQ);    // do the i64 conversion
++                        #else
++                        // No NEON VCEQ: compare numerically. Host flags are already
++                        // clobbered here upstream (ANDS). +0/-0 both store integer 0,
++                        // and FILD never caches a NaN, so the outcome is the same.
++                        VCMP_F64(v2, v1);
++                        VMRS_APSR();
++                        B_MARK(cNE);    // do the i64 conversion
++                        #endif
+                         // memcpy(ed, &STll(0).ll, sizeof(int64_t));
+                         LDRD_IMM8(x2, x14, offsetof(fpu_ll_t, sq));  // load ll
+                         B_MARK3(c__);

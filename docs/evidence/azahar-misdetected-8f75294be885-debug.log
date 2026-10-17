@@ -1,0 +1,49 @@
+3ds-d2 build_id=8f75294be885 flavor=debug
+TARGET name=n3ds-hw emulator=0 new3ds=1 luma=1 luma_version=00000000 speedup=1 emu_build="" emu_commit=""
+RESULT m0.log_file PASS path=sdmc:/3ds/3ds-d2/logs/n3ds-hw-8f75294be885-debug.log
+SD previous_fixture none
+RESULT m0.sd_fixture PASS path=sdmc:/3ds/3ds-d2/fixture.bin bytes=4128 wrote=1 read=1
+MEM app_region size=100663296 used=130023424 free=4265607168 real_app_region=130023424
+MEM ctru heap=96280576 linear_heap=33554432 linear_free=31941632
+MEM process private_and_shared=130027520
+RESULT mem.largest_alloc INFO heap_bytes=96186552 linear_bytes=31916032
+MAP 00100000-0011f000 r-x code
+MAP 0011f000-00121000 r-- code
+MAP 00121000-0012a000 rw- private
+MAP 0012a000-08000000 --- free
+MAP 08000000-0dbd2000 rw- private
+MAP 0dbd2000-0fffc000 --- free
+MAP 0fffc000-10000000 rw- locked
+MAP 10000000-10002000 r-- shared
+MAP 10002000-10003000 rw- shared
+MAP 10003000-1f000000 --- free
+MAP 1f000000-1f600000 rw- io
+MAP 1f600000-1ff50000 --- free
+MAP 1ff50000-1ff58000 r-- io
+MAP 1ff58000-1ff70000 --- free
+MAP 1ff70000-1ff78000 r-- io
+MAP 1ff78000-1ff80000 --- free
+MAP 1ff80000-1ff82000 r-- shared
+MAP 1ff82000-1ff83000 rw- locked
+MAP 1ff83000-30000000 --- free
+MAP 30000000-32000000 rw- continuous
+MAP 32000000-40000000 --- free
+RESULT mem.image_base_0x00400000_free INFO free=yes region=0012a000+7ed6000
+CHECKPOINT svcControlProcessMemory(PROT,RWX) size=262144
+RESULT jit.alloc PASS method="hw:svc70-prot-rwx+svc54+svc93" size=262144 rc=0x00000000 rw=0x800d000 rx=0x800d000
+RESULT jit.exec_first PASS got=0x12345678 want=0x12345678
+RESULT jit.rewrite_same_addr PASS got=0x0badf00d want=0x0badf00d
+RESULT jit.stale_without_icache_inval INFO observed=new got=0x5eedbeef
+RESULT jit.rewrite_after_stale PASS got=0x5eedbeef want=0x5eedbeef
+RESULT jit.args PASS got=0x0000002a want=0x0000002a
+RESULT jit.branch_first PASS got=0xc0de0001 want=0xc0de0001
+RESULT jit.branch_target_rewrite PASS got=0xc0de0002 want=0xc0de0002 synced=target_only
+RESULT jit.across_yields PASS got=0x00002222 want=0x00002222
+RESULT jit.thread_exec PASS got=0x00003333 want=0x00003333
+RESULT jit.thread_rewrite_main_exec PASS got=0x00004444 want=0x00004444
+RESULT jit.pool_reuse PASS slots=16320 rounds=8 mismatches=0
+RESULT jit.sync_cost INFO small_sync_avg_ns=39261 whole_pool_sync_us=39 pool_bytes=261120
+RESULT jit.summary PASS passed=11 failed=0 info=2
+CHECKPOINT svcControlMemory(MAP) dst=00400000 size=65536
+RESULT map.svcControlMemory.64k INFO outcome=mapped alias=ok exec=skipped unmap_rc=00000000
+CHECKPOINT svcControlProcessMemory(MAP) dst=00400000 size=65536

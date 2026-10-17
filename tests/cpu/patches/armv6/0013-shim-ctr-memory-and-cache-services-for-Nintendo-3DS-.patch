@@ -1,0 +1,227 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Fri, 16 Oct 2026 21:24:13 +0300
+Subject: [PATCH] shim/ctr: memory and cache services for Nintendo 3DS
+ (devkitARM)
+
+Mirrors shim/vita: dlfcn.h stub, sys/mman.h facade, newlib jmp_buf compat.
+mman_ctr.c backs mmap with memalign (16 MiB alignment for the NORESERVE
+arena and its probe, so the arena wastes no slack; the 3DS cannot
+overcommit). Executable chunks are plain heap in Azahar (no NX, no SVC 0x70)
+and RWX via svcControlProcessMemory on Luma hardware, checked with
+svcQueryMemory. Cache sync: svcFlushProcessDataCache + Luma SVC 0x93.
+---
+ src/dynarec86/shim/ctr/dlfcn.h            |  18 ++++
+ src/dynarec86/shim/ctr/dyn86_ctr_compat.h |  17 ++++
+ src/dynarec86/shim/ctr/mman_ctr.c         | 103 ++++++++++++++++++++++
+ src/dynarec86/shim/ctr/sys/mman.h         |  42 +++++++++
+ 4 files changed, 180 insertions(+)
+ create mode 100644 src/dynarec86/shim/ctr/dlfcn.h
+ create mode 100644 src/dynarec86/shim/ctr/dyn86_ctr_compat.h
+ create mode 100644 src/dynarec86/shim/ctr/mman_ctr.c
+ create mode 100644 src/dynarec86/shim/ctr/sys/mman.h
+
+diff --git a/src/dynarec86/shim/ctr/dlfcn.h b/src/dynarec86/shim/ctr/dlfcn.h
+new file mode 100644
+index 0000000..86d6146
+--- /dev/null
++++ b/src/dynarec86/shim/ctr/dlfcn.h
+@@ -0,0 +1,18 @@
++/* src/dynarec86/shim/ctr/dlfcn.h — stub for the single dlsym call in
++ * custommem.c: `cur_brk = dlsym(RTLD_NEXT, "__curbrk")`, which is NULL-guarded
++ * at every use (brk emulation approximation). No dynamic linking on the 3DS either. */
++#pragma once
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define RTLD_NEXT    ((void*)-1)
++#define RTLD_DEFAULT ((void*)0)
++
++static inline void* dlsym(void* handle, const char* symbol) {
++    (void)handle; (void)symbol; return 0;
++}
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/src/dynarec86/shim/ctr/dyn86_ctr_compat.h b/src/dynarec86/shim/ctr/dyn86_ctr_compat.h
+new file mode 100644
+index 0000000..9da3434
+--- /dev/null
++++ b/src/dynarec86/shim/ctr/dyn86_ctr_compat.h
+@@ -0,0 +1,17 @@
++/* src/dynarec86/shim/ctr/dyn86_ctr_compat.h — newlib compat for the Box86 core
++ * on Nintendo 3DS (devkitARM). Pulled in by x86emu_private.h under __3DS__.
++ *
++ * Same situation as the Vita: no POSIX signals, so Box86's jmpbuf (only used to
++ * unwind out of a SIGSEGV handler during translation) is a plain jmp_buf. */
++#pragma once
++#include <setjmp.h>
++
++#ifndef sigsetjmp
++#define sigsetjmp(env, savemask) setjmp(env)
++#define siglongjmp(env, val)     longjmp(env, val)
++#endif
++
++/* __clear_cache is rewritten to this by the build (-D…): data cache clean
++ * (svcFlushProcessDataCache) + instruction cache invalidate (Luma SVC 0x93,
++ * which Azahar also implements and uses to drop its own translations). */
++void dyn86_ctr_clear_cache(void* beg, void* end);
+diff --git a/src/dynarec86/shim/ctr/mman_ctr.c b/src/dynarec86/shim/ctr/mman_ctr.c
+new file mode 100644
+index 0000000..0660838
+--- /dev/null
++++ b/src/dynarec86/shim/ctr/mman_ctr.c
+@@ -0,0 +1,103 @@
++/* src/dynarec86/shim/ctr/mman_ctr.c — memory and cache services for the Box86
++ * dynarec on Nintendo 3DS. See sys/mman.h for the contract.
++ *
++ * Executable memory follows the M1 probe (3ds-d2 src/platform/ctr/jitmem_ctr.c):
++ *  - Azahar fetches instructions from any mapped page (no NX check) and does
++ *    not implement svcControlProcessMemory, so code chunks are plain heap.
++ *  - On hardware (Luma3DS), code chunks are re-protected RWX with
++ *    svcControlProcessMemory(MEMOP_PROT) and the result is checked with
++ *    svcQueryMemory, because an unimplemented SVC can look like success.
++ * Cache sync: svcFlushProcessDataCache (0x54) then Luma's
++ * svcInvalidateInstructionCacheRange (0x93); Azahar implements 0x93 by
++ * invalidating its own translation cache. */
++#include <3ds.h>
++#include <errno.h>
++#include <malloc.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include "sys/mman.h"
++
++#define PAGE 0x1000u
++
++static int g_emulator = -1;
++static int is_emulator(void)
++{
++    if (g_emulator < 0) {
++        s64 v = 0;
++        g_emulator = R_SUCCEEDED(svcGetSystemInfo(&v, 0x20000, 0)) && v != 0;
++    }
++    return g_emulator;
++}
++
++static Result svc_invalidate_icache_range(u32 addr, u32 size)
++{
++    register u32 r0 __asm__("r0") = addr;
++    register u32 r1 __asm__("r1") = size;
++    __asm__ volatile("svc 0x93" : "+r"(r0) : "r"(r1) : "memory");
++    return (Result)r0;
++}
++
++static int make_executable(void* p, size_t len)
++{
++    if (is_emulator())
++        return 0;
++    Handle h;
++    if (R_FAILED(svcDuplicateHandle(&h, CUR_PROCESS_HANDLE)))
++        return -1;
++    Result rc = svcControlProcessMemory(h, (u32)p, 0, len, MEMOP_PROT, MEMPERM_READ | MEMPERM_WRITE | MEMPERM_EXECUTE);
++    svcCloseHandle(h);
++    if (R_FAILED(rc))
++        return -1;
++    MemInfo mi;
++    PageInfo pi;
++    if (R_FAILED(svcQueryMemory(&mi, &pi, (u32)p)) || !(mi.perm & MEMPERM_EXECUTE))
++        return -1;
++    return 0;
++}
++
++void* mmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset)
++{
++    (void)fd; (void)offset;
++    if (addr && (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE))) {
++        errno = ENOMEM;            // fixed placement is never used in arena mode
++        return MAP_FAILED;
++    }
++    size_t len = (length + PAGE - 1) & ~(size_t)(PAGE - 1);
++    size_t align = (flags & MAP_NORESERVE) ? 0x1000000u : PAGE;
++    void* p = memalign(align, len);
++    if (!p) {
++        errno = ENOMEM;
++        return MAP_FAILED;
++    }
++    memset(p, 0, len);             // mmap'd anonymous memory reads as zero
++    if ((prot & PROT_EXEC) && make_executable(p, len) != 0) {
++        free(p);
++        errno = EACCES;
++        return MAP_FAILED;
++    }
++    return p;
++}
++
++int munmap(void* addr, size_t length)
++{
++    (void)length;
++    // Executable chunks are never returned on hardware: their pages would go
++    // back to the heap still RWX. (Box86 keeps code chunks for the process
++    // lifetime; this only matters for the arena probe, which is RW.)
++    free(addr);
++    return 0;
++}
++
++int mprotect(void* addr, size_t len, int prot)
++{
++    (void)addr; (void)len; (void)prot;
++    return 0;                      // no SIGSEGV write barrier on the 3DS
++}
++
++void dyn86_ctr_clear_cache(void* beg, void* end)
++{
++    u32 a = (u32)beg & ~31u, e = ((u32)end + 31u) & ~31u;
++    svcFlushProcessDataCache(CUR_PROCESS_HANDLE, a, e - a);
++    svc_invalidate_icache_range(a, e - a);
++}
+diff --git a/src/dynarec86/shim/ctr/sys/mman.h b/src/dynarec86/shim/ctr/sys/mman.h
+new file mode 100644
+index 0000000..5e92c3a
+--- /dev/null
++++ b/src/dynarec86/shim/ctr/sys/mman.h
+@@ -0,0 +1,42 @@
++/* src/dynarec86/shim/ctr/sys/mman.h — mmap façade for the Box86 dynarec on
++ * Nintendo 3DS (devkitARM newlib has no <sys/mman.h>).
++ *
++ * The surface custommem.c and cpu_box86.cpp use:
++ *   - mmap(NULL, len, RW,  ANON|PRIVATE)            internal allocator blocks
++ *   - mmap(NULL, len, RWX, ANON|PRIVATE)            dynarec code chunks
++ *   - mmap(NULL, len, RW,  ANON|PRIVATE|NORESERVE)  the guest arena (and its
++ *     probe): returned 16 MiB-aligned so the arena code computes zero slack —
++ *     the 3DS cannot overcommit, so slack would be real, wasted memory
++ *   - munmap(exact base, len), mprotect (no-op: no SIGSEGV write barrier)
++ * Implementation: mman_ctr.c. */
++#pragma once
++#include <stddef.h>
++#include <sys/types.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define PROT_NONE  0x0
++#define PROT_READ  0x1
++#define PROT_WRITE 0x2
++#define PROT_EXEC  0x4
++
++#define MAP_PRIVATE   0x02
++#define MAP_FIXED     0x10
++#define MAP_ANONYMOUS 0x20
++#define MAP_ANON      MAP_ANONYMOUS
++#define MAP_NORESERVE 0x4000
++#define MAP_FIXED_NOREPLACE 0x100000
++
++#define MAP_FAILED ((void*)-1)
++
++void* mmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset);
++int   munmap(void* addr, size_t length);
++int   mprotect(void* addr, size_t len, int prot);
++
++void dyn86_ctr_clear_cache(void* beg, void* end);
++
++#ifdef __cplusplus
++}
++#endif

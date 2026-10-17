@@ -1,0 +1,205 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Fri, 16 Oct 2026 20:29:31 +0300
+Subject: [PATCH] lock helpers: CP15 data memory barrier on ARMv6K (no DMB
+ instruction)
+
+---
+ .../box86-dynarec/dynarec/arm_lock_helper.S   | 61 +++++++++++--------
+ 1 file changed, 37 insertions(+), 24 deletions(-)
+
+diff --git a/third_party/box86-dynarec/dynarec/arm_lock_helper.S b/third_party/box86-dynarec/dynarec/arm_lock_helper.S
+index 7c4a287..af3f885 100755
+--- a/third_party/box86-dynarec/dynarec/arm_lock_helper.S
++++ b/third_party/box86-dynarec/dynarec/arm_lock_helper.S
+@@ -2,6 +2,19 @@
+ // there is 2 part: read and write
+ // write return 0 on success, 1 on fail (value has been changed)
+ 
++// Data memory barrier. ARMv6K has no DMB instruction; the CP15 c7,c10,5
++// operation is its equivalent and is permitted in user mode. Its register
++// operand should be zero; r12 is scratch here because these helpers are only
++// called from C (AAPCS), never from generated code (where r12 is xFlags).
++.macro DMB_ISH
++#if __ARM_ARCH >= 7
++    dmb     ish
++#else
++    mov     r12, #0
++    mcr     p15, 0, r12, c7, c10, 5
++#endif
++.endm
++
+ .text
+ .align 4
+ 
+@@ -27,7 +40,7 @@
+ 
+ arm_lock_read_b:
+     // address is r0, return is r0
+-    dmb     ish
++    DMB_ISH
+     ldrexb  r0, [r0]
+     bx      lr
+ 
+@@ -39,7 +52,7 @@ arm_lock_write_b:
+ 
+ arm_lock_read_h:
+     // address is r0, return is r0
+-    dmb     ish
++    DMB_ISH
+     ldrexh  r0, [r0]
+     bx      lr
+ 
+@@ -52,7 +65,7 @@ arm_lock_write_h:
+ arm_lock_read_d:
+     // address is r0, return is r0
+     // r0 needs to be aligned
+-    dmb     ish
++    DMB_ISH
+     ldrex   r0, [r0]
+     bx      lr
+ 
+@@ -65,7 +78,7 @@ arm_lock_write_d:
+ 
+ arm_lock_read_dd:
+     // address is r2, return is r0, r1
+-    dmb     ish
++    DMB_ISH
+     ldrexd  r2, r3, [r2]
+     str     r2, [r0]
+     str     r3, [r1]
+@@ -81,7 +94,7 @@ arm_lock_write_dd:
+ arm_lock_xchg:
+     // address is r0, value is r1, return old value in r0
+     // r0 needs to be aligned
+-    dmb     ish
++    DMB_ISH
+     ldrex   r2, [r0]
+     strex   r3, r1, [r0]
+     cmp     r3, #1
+@@ -92,7 +105,7 @@ arm_lock_xchg:
+ arm_lock_storeifnull:
+     // address is r0, value is r1, r1 store to r0 only if [r0] is 0. return old [r0] value
+     // r0 needs to be aligned
+-    dmb     ish
++    DMB_ISH
+     ldrex   r2, [r0]
+     cmp     r2, #0
+     bne     arm_lock_storeifnull_exit
+@@ -101,11 +114,11 @@ arm_lock_storeifnull:
+     beq     arm_lock_storeifnull
+ arm_lock_storeifnull_exit:
+     mov     r0, r2
+-    dmb     ish
++    DMB_ISH
+     bx      lr
+ 
+ arm_lock_storeifref2:
+-    dmb     ish
++    DMB_ISH
+ arm_lock_storeifref2_loop:
+     // address is r0, value is r1, r1 store to r0 only if [r0] is r2. return old [r0] value (so r2 or old value)
+     ldrex   r3, [r0]
+@@ -117,11 +130,11 @@ arm_lock_storeifref2_loop:
+     beq     arm_lock_storeifref2_loop   // audit S7: retry THIS function's loop (returns old value), not storeifref's
+     mov     r0, r2
+ arm_lock_storeifref2_exit:
+-    dmb     ish
++    DMB_ISH
+     bx      lr
+ 
+ arm_lock_storeifref:
+-    dmb     ish
++    DMB_ISH
+ arm_lock_storeifref_loop:
+     // address is r0, value is r1, r1 store to r0 only if [r0] is r2. return new [r0] value (so r1 or old value)
+     ldrex   r3, [r0]
+@@ -133,11 +146,11 @@ arm_lock_storeifref_loop:
+     beq     arm_lock_storeifref_loop
+     mov     r0, r1
+ arm_lock_storeifref_exit:
+-    dmb     ish
++    DMB_ISH
+     bx      lr
+ 
+ arm_lock_decifnot0b:
+-    dmb     ish
++    DMB_ISH
+ arm_lock_decifnot0b_0:
+     ldrexb  r1, [r0]
+     cmp     r1, #0
+@@ -146,12 +159,12 @@ arm_lock_decifnot0b_0:
+     strexb  r2, r3, [r0]
+     cmp     r2, #1
+     beq     arm_lock_decifnot0b_0
+-    dmb     ish
++    DMB_ISH
+     mov     r0, r1
+     bx      lr
+ 
+ arm_lock_incb:
+-    dmb     ish
++    DMB_ISH
+ arm_lock_incb_0:
+     ldrexb  r1, [r0]
+     add     r1, r1, #1
+@@ -159,11 +172,11 @@ arm_lock_incb_0:
+     cmp     r2, #1
+     beq     arm_lock_incb_0
+ arm_lock_incb_exit:
+-    dmb     ish
++    DMB_ISH
+     bx      lr
+ 
+ arm_lock_incif0b:
+-    dmb     ish
++    DMB_ISH
+ arm_lock_incif0b_0:
+     ldrexb  r1, [r0]
+     cmp     r1, #0
+@@ -172,24 +185,24 @@ arm_lock_incif0b_0:
+     strexb  r2, r3, [r0]
+     cmp     r2, #1
+     beq     arm_lock_incif0b_0
+-    dmb     ish
++    DMB_ISH
+     mov     r0, r1
+     bx      lr
+ 
+ arm_lock_stored:
+-    dmb     ish
++    DMB_ISH
+     str     r1, [r0]
+-    dmb     ish
++    DMB_ISH
+     bx      lr
+ 
+ arm_lock_storeb:
+-    dmb     ish
++    DMB_ISH
+     strb    r1, [r0]
+-    dmb     ish
++    DMB_ISH
+     bx      lr
+ 
+ arm_lock_storeif0b:
+-    dmb     ish
++    DMB_ISH
+ arm_lock_storeif0b_0:
+     ldrexb  r2, [r0]
+     cmp     r2, #0
+@@ -198,12 +211,12 @@ arm_lock_storeif0b_0:
+     cmp     r3, #1
+     beq     arm_lock_storeif0b_0
+     mov     r2, #0
+-    dmb     ish
++    DMB_ISH
+ arm_lock_storeif0b_exit:
+     mov     r0, r2
+     bx      lr
+ 
+ arm_lock_readb:
+-    dmb     ish
++    DMB_ISH
+     ldrb    r0, [r0]
+     bx      lr

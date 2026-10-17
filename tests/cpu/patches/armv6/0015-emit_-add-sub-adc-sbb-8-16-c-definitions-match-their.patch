@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Fri, 16 Oct 2026 21:24:13 +0300
+Subject: [PATCH] emit_{add,sub,adc,sbb}{8,16}c: definitions match their
+ int32_t prototypes
+
+int and int32_t are the same type on glibc but not on newlib (long), where
+the mismatch is a hard 'conflicting types' error.
+---
+ .../dynarec/dynarec_arm_emit_math.c              | 16 ++++++++--------
+ 1 file changed, 8 insertions(+), 8 deletions(-)
+
+diff --git a/third_party/box86-dynarec/dynarec/dynarec_arm_emit_math.c b/third_party/box86-dynarec/dynarec/dynarec_arm_emit_math.c
+index 428875c..01712c5 100755
+--- a/third_party/box86-dynarec/dynarec/dynarec_arm_emit_math.c
++++ b/third_party/box86-dynarec/dynarec/dynarec_arm_emit_math.c
+@@ -344,7 +344,7 @@ void emit_add8(dynarec_arm_t* dyn, int ninst, int s1, int s2, int s3, int s4, in
+ }
+ 
+ // emit ADD8 instruction, from s1 , const c, store result in s1 using s3 and s4 as scratch, with save_s4 is s4 need to be saved
+-void emit_add8c(dynarec_arm_t* dyn, int ninst, int s1, int c, int s3, int s4)
++void emit_add8c(dynarec_arm_t* dyn, int ninst, int s1, int32_t c, int s3, int s4)
+ {
+     IFX(X_PEND) {
+         MOVW(s3, c&0xff);
+@@ -448,7 +448,7 @@ void emit_sub8(dynarec_arm_t* dyn, int ninst, int s1, int s2, int s3, int s4, in
+ }
+ 
+ // emit SUB8 instruction, from s1 , constant c, store result in s1 using s3 and s4 as scratch
+-void emit_sub8c(dynarec_arm_t* dyn, int ninst, int s1, int c, int s3, int s4)
++void emit_sub8c(dynarec_arm_t* dyn, int ninst, int s1, int32_t c, int s3, int s4)
+ {
+     IFX(X_PEND) {
+         MOVW(s3, c&0xff);
+@@ -553,7 +553,7 @@ void emit_add16(dynarec_arm_t* dyn, int ninst, int s1, int s2, int s3, int s4, i
+ }
+ 
+ // emit ADD16 instruction, from s1 , const c, store result in s1 using s3 and s4 as scratch, with save_s4 is s4 need to be saved
+-void emit_add16c(dynarec_arm_t* dyn, int ninst, int s1, int c, int s3, int s4)
++void emit_add16c(dynarec_arm_t* dyn, int ninst, int s1, int32_t c, int s3, int s4)
+ {
+     IFX(X_PEND) {
+         MOVW(s3, c);
+@@ -674,7 +674,7 @@ void emit_sub16(dynarec_arm_t* dyn, int ninst, int s1, int s2, int s3, int s4, i
+ }
+ 
+ // emit SUB16 instruction, from s1 , constant c, store result in s1 using s3 and s4 as scratch
+-void emit_sub16c(dynarec_arm_t* dyn, int ninst, int s1, int c, int s3, int s4)
++void emit_sub16c(dynarec_arm_t* dyn, int ninst, int s1, int32_t c, int s3, int s4)
+ {
+     IFX(X_PEND) {
+         MOVW(s3, c);
+@@ -1185,7 +1185,7 @@ void emit_adc8(dynarec_arm_t* dyn, int ninst, int s1, int s2, int s3, int s4, in
+ }
+ 
+ // emit ADC8 instruction, from s1 , const c, store result in s1 using s3 and s4 as scratch, with save_s4 is s4 need to be saved
+-void emit_adc8c(dynarec_arm_t* dyn, int ninst, int s1, int c, int s3, int s4)
++void emit_adc8c(dynarec_arm_t* dyn, int ninst, int s1, int32_t c, int s3, int s4)
+ {
+     IFX(X_PEND) {
+         MOVW(s3, c&0xff);
+@@ -1291,7 +1291,7 @@ void emit_adc16(dynarec_arm_t* dyn, int ninst, int s1, int s2, int s3, int s4, i
+ }
+ 
+ // emit ADC16 instruction, from s1 , const c, store result in s1 using s3 and s4 as scratch, with save_s4 is s4 need to be saved
+-void emit_adc16c(dynarec_arm_t* dyn, int ninst, int s1, int c, int s3, int s4)
++void emit_adc16c(dynarec_arm_t* dyn, int ninst, int s1, int32_t c, int s3, int s4)
+ {
+     IFX(X_PEND) {
+         MOVW(s3, c);
+@@ -1539,7 +1539,7 @@ void emit_sbb8(dynarec_arm_t* dyn, int ninst, int s1, int s2, int s3, int s4, in
+ }
+ 
+ // emit SBB8 instruction, from s1 , constant c, store result in s1 using s3 and s4 as scratch
+-void emit_sbb8c(dynarec_arm_t* dyn, int ninst, int s1, int c, int s3, int s4)
++void emit_sbb8c(dynarec_arm_t* dyn, int ninst, int s1, int32_t c, int s3, int s4)
+ {
+     IFX(X_PEND) {
+         MOVW(s3, c&0xff);
+@@ -1648,7 +1648,7 @@ void emit_sbb16(dynarec_arm_t* dyn, int ninst, int s1, int s2, int s3, int s4, i
+ }
+ 
+ // emit SBB16 instruction, from s1 , constant c, store result in s1 using s3 and s4 as scratch
+-void emit_sbb16c(dynarec_arm_t* dyn, int ninst, int s1, int c, int s3, int s4)
++void emit_sbb16c(dynarec_arm_t* dyn, int ninst, int s1, int32_t c, int s3, int s4)
+ {
+     IFX(X_PEND) {
+         MOVW(s3, c);

@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Fri, 16 Oct 2026 21:10:09 +0300
+Subject: [PATCH] REP MOVSD: the NEON fast path (D2_REPMOVS, opt-in) is
+ ARMv7-only
+
+---
+ third_party/box86-dynarec/dynarec/dynarec_arm_00.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/third_party/box86-dynarec/dynarec/dynarec_arm_00.c b/third_party/box86-dynarec/dynarec/dynarec_arm_00.c
+index 476c785..55533ab 100755
+--- a/third_party/box86-dynarec/dynarec/dynarec_arm_00.c
++++ b/third_party/box86-dynarec/dynarec/dynarec_arm_00.c
+@@ -2649,7 +2649,8 @@ uintptr_t dynarec00(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int ninst,
+                         TSTS_REG_LSL_IMM5(xECX, xECX, 0);
+                         B_NEXT(cEQ);    // end of loop
+                         SMREAD();
+-                        if(dyn86_repmovs) {
++                        // The fast path copies with NEON Q registers: ARMv7 only.
++                        if(dyn86_repmovs && __ARM_ARCH >= 7) {
+                             /* D2Vita (D2_REPMOVS=1) : chemin rapide, 16 octets par tour.
+                              * Le chemin d'origine coute 8 instructions PAR MOT sous
+                              * fastmmu (2 ADD de base, 2 post-increments, LDR, STR,

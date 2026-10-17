@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Sat, 17 Oct 2026 19:02:23 +0300
+Subject: [PATCH] 3DS mmap: log the outcome of making code chunks executable
+
+---
+ src/dynarec86/shim/ctr/mman_ctr.c | 27 +++++++++++++++++----------
+ 1 file changed, 17 insertions(+), 10 deletions(-)
+
+diff --git a/src/dynarec86/shim/ctr/mman_ctr.c b/src/dynarec86/shim/ctr/mman_ctr.c
+index 7e0f18b..3bb493b 100644
+--- a/src/dynarec86/shim/ctr/mman_ctr.c
++++ b/src/dynarec86/shim/ctr/mman_ctr.c
+@@ -43,18 +43,25 @@ static int make_executable(void* p, size_t len)
+ {
+     if (is_emulator())
+         return 0;
++    /* Every outcome is logged once per kind: this is the first thing that
++     * differs from Azahar on a console, and a refusal here kills the guest
++     * (no interpreter) without any other trace. */
++    static int said_ok = 0, said_fail = 0;
+     Handle h;
+-    if (R_FAILED(svcDuplicateHandle(&h, CUR_PROCESS_HANDLE)))
+-        return -1;
+-    Result rc = svcControlProcessMemory(h, (u32)p, 0, len, MEMOP_PROT, MEMPERM_READ | MEMPERM_WRITE | MEMPERM_EXECUTE);
+-    svcCloseHandle(h);
+-    if (R_FAILED(rc))
+-        return -1;
+-    MemInfo mi;
++    Result rc = svcDuplicateHandle(&h, CUR_PROCESS_HANDLE);
++    if (R_SUCCEEDED(rc)) {
++        rc = svcControlProcessMemory(h, (u32)p, 0, len, MEMOP_PROT, MEMPERM_READ | MEMPERM_WRITE | MEMPERM_EXECUTE);
++        svcCloseHandle(h);
++    }
++    MemInfo mi = {0};
+     PageInfo pi;
+-    if (R_FAILED(svcQueryMemory(&mi, &pi, (u32)p)) || !(mi.perm & MEMPERM_EXECUTE))
+-        return -1;
+-    return 0;
++    const int queried = R_SUCCEEDED(svcQueryMemory(&mi, &pi, (u32)p));
++    const int ok = R_SUCCEEDED(rc) && queried && (mi.perm & MEMPERM_EXECUTE);
++    if (ok ? !said_ok++ : said_fail++ < 4)
++        fprintf(stderr, "[mman] code chunk %08lx+%lx RWX: %s (rc %08lx, perm now %lx)\n", (unsigned long)(u32)p,
++                (unsigned long)len, ok ? "ok" : "REFUSED", (unsigned long)rc, (unsigned long)mi.perm);
++    fflush(stderr);
++    return ok ? 0 : -1;
+ }
+ 
+ /* Arena blocks (MAP_NORESERVE): mapped with svcControlMemory(MEMOP_ALLOC)

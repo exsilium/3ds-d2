@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Sat, 17 Oct 2026 09:55:06 +0300
+Subject: [PATCH] cooperative scheduler: optional virtual time tick per switch
+ (set_virtual_tick_us)
+
+---
+ src/runtime/sched_cooperative.cpp | 19 ++++++++++++++-----
+ src/runtime/sched_cooperative.h   |  8 ++++++++
+ 2 files changed, 22 insertions(+), 5 deletions(-)
+
+diff --git a/src/runtime/sched_cooperative.cpp b/src/runtime/sched_cooperative.cpp
+index 67f74f4..dec267b 100644
+--- a/src/runtime/sched_cooperative.cpp
++++ b/src/runtime/sched_cooperative.cpp
+@@ -189,13 +189,15 @@ GuestThread* CooperativeScheduler::pick_ready() {
+                 t->state = S::Ready;
+                 wake_signal_++;
+                 sw_rec(t->id, 5, 0, t->ctx.eip);          // WAKEsig
+-            } else if (real_now_ && real_expire_ && t->wake_deadline && virt_ms_ >= t->wake_deadline
++            } else if (((real_now_ && real_expire_) || (virt_tick_us_ && !real_now_)) && t->wake_deadline
++                       && virt_ms_ >= t->wake_deadline
+                        && !(defer_towake_ && preempted_last_ && preempted_last_ != t
+                             && preempted_last_->state == S::Ready)) {
+-                // Real-time mode only: expire timed waits even while other
+-                // threads are runnable (a Sleep(100) must last ~100 real ms,
+-                // not "until nothing else runs"). Virtual mode keeps the old
+-                // idle-only expiry — that's the tested deterministic baseline.
++                // Real-time mode, or virtual mode with a switch tick: expire
++                // timed waits even while other threads are runnable (a
++                // Sleep(100) must last ~100 ms, not "until nothing else
++                // runs"). Plain virtual mode keeps the old idle-only expiry —
++                // that's the tested deterministic baseline.
+                 t->wait_obj = nullptr; t->wake_deadline = 0;
+                 if (t->wake_writes_eax) t->ctx.gpr[0] = t->wake_timeout_eax;  // WAIT_TIMEOUT (or shim override)
+                 t->wake_writes_eax = true; t->wake_timeout_eax = 0x102;
+@@ -382,6 +384,13 @@ void CooperativeScheduler::run() {
+             return; }
+         ++switches_; t->slices++;
+         run_slice(t);
++        if (virt_tick_us_ && !real_now_) {      // set_virtual_tick_us: switches cost time
++            virt_us_acc_ += virt_tick_us_;
++            if (virt_us_acc_ >= 1000) {
++                virt_ms_ += virt_us_acc_ / 1000; virt_us_acc_ %= 1000;
++                if (time_sink_) time_sink_(virt_ms_);
++            }
++        }
+     }
+     stop_reason_ = shutdown_ ? "shutdown requested" : "max switches";
+ }
+diff --git a/src/runtime/sched_cooperative.h b/src/runtime/sched_cooperative.h
+index 4d43e00..0025dd3 100644
+--- a/src/runtime/sched_cooperative.h
++++ b/src/runtime/sched_cooperative.h
+@@ -65,6 +65,13 @@ public:
+ 
+     // Diagnostics / safety.
+     void set_max_switches(uint64_t n) { max_switches_ = n; }
++    // Virtual mode: advance virtual time by `us` microseconds per switch (a
++    // yield or the end of a slice), so a guest that polls the clock while it
++    // yields (Sleep(0) loops) sees time pass, deterministically. With a tick
++    // set, timed waits also expire as soon as virtual time passes their
++    // deadline, as in real-time mode. 0 (default): time advances only when
++    // every thread waits -- the original behaviour.
++    void set_virtual_tick_us(uint32_t us) { virt_tick_us_ = us; }
+     void set_quantum(uint32_t insns) { quantum_ = insns; }   // preemption slice length
+     // Loader-lock semantics: pin the CURRENT thread so a time-slice preempt
+     // re-runs it instead of switching away. Used around a DLL's DllMain (CRT
+@@ -224,6 +231,7 @@ private:
+     bool preempted_ = false;
+     bool hook_installed_ = false;
+     bool stack_overrun_warned_ = false;   // one-shot worker-stack overrun warning
++    uint32_t virt_tick_us_ = 0, virt_us_acc_ = 0;                // set_virtual_tick_us
+     uint64_t virt_ms_ = 0;                                // virtual clock for timed waits
+     std::function<void(uint64_t)> time_sink_;             // fires when virt_ms_ advances
+     std::function<void(uint32_t)> probe_;                 // optional breakpoint probe

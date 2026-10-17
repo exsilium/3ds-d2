@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Sat, 17 Oct 2026 14:31:18 +0300
+Subject: [PATCH] 3DS mmap: look for the arena from the bottom of the heap area
+
+---
+ src/dynarec86/shim/ctr/mman_ctr.c | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/src/dynarec86/shim/ctr/mman_ctr.c b/src/dynarec86/shim/ctr/mman_ctr.c
+index a7700df..f9cc4e4 100644
+--- a/src/dynarec86/shim/ctr/mman_ctr.c
++++ b/src/dynarec86/shim/ctr/mman_ctr.c
+@@ -58,18 +58,20 @@ static int make_executable(void* p, size_t len)
+ }
+ 
+ /* Arena blocks (MAP_NORESERVE): mapped with svcControlMemory(MEMOP_ALLOC)
+- * at 16 MiB-aligned addresses above libctru's heap, so the guest arena gets
++ * at 16 MiB-aligned free addresses in the heap area, so the guest arena gets
+  * its exact membase alignment without the up-to-16 MiB of slack an aligned
+  * carve-out of the heap costs. Needs the app to leave that memory free (a
+  * fixed __ctru_heap_size). Falls back to the heap when it is not free. */
+-extern u32 __ctru_heap, __ctru_heap_size;
+ #define ARENA_ALIGN 0x1000000u
+ #define ARENA_TOP   0x0F000000u   /* below the main thread's stack */
+ static struct { u32 addr, size; } g_blocks[8];
+ 
+ static void* arena_alloc(size_t len)
+ {
+-    u32 next = (__ctru_heap + __ctru_heap_size + ARENA_ALIGN - 1) & ~(ARENA_ALIGN - 1);
++    /* From the bottom of the heap area: an app that moved libctru's heap up
++     * (the game CIA) leaves its arena there; otherwise the scan below steps
++     * over the heap to the first free aligned slot. */
++    u32 next = OS_HEAP_AREA_BEGIN;
+     for (int i = 0; i < 8; i++)
+         if (g_blocks[i].size) {
+             u32 end = (g_blocks[i].addr + g_blocks[i].size + ARENA_ALIGN - 1) & ~(ARENA_ALIGN - 1);

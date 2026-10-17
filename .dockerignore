@@ -1,0 +1,4 @@
+# The build context is only used for the Dockerfile; sources are bind-mounted.
+# Exclude everything so game data or saves can never be sent to the daemon.
+*
+!Dockerfile

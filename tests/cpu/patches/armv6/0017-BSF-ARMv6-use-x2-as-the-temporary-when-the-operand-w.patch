@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Fri, 16 Oct 2026 22:01:53 +0300
+Subject: [PATCH] BSF (ARMv6): use x2 as the temporary when the operand was
+ loaded into x1
+
+With a memory operand GETED loads the value into x1, so the CTZ sequence
+overwrote its own input and returned 31 - clz(-v & -v). Found by running the
+real game (0x517abb: bsf eax, [ebp+8]) and comparing an ARMv6 run with an
+ARMv7 run transfer by transfer; now covered by the bsf_mem fixture.
+---
+ third_party/box86-dynarec/dynarec/dynarec_arm_0f.c | 13 +++++++++----
+ 1 file changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/third_party/box86-dynarec/dynarec/dynarec_arm_0f.c b/third_party/box86-dynarec/dynarec/dynarec_arm_0f.c
+index 348ac50..3f3b43d 100755
+--- a/third_party/box86-dynarec/dynarec/dynarec_arm_0f.c
++++ b/third_party/box86-dynarec/dynarec/dynarec_arm_0f.c
+@@ -2149,10 +2149,15 @@ uintptr_t dynarec0F(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int ninst,
+ #else
+             // ARMv6 has no RBIT: isolate the lowest set bit, then 31 - clz.
+             // No flag-setting instructions: B_MARK(cEQ) above relies on Z.
+-            RSB_IMM8(x1, ed, 0);
+-            AND_REG_LSL_IMM5(x1, x1, ed, 0);
+-            CLZ(x1, x1);
+-            RSB_IMM8(gd, x1, 31);
++            // With a memory operand GETED loads the value into x1 itself, so
++            // the temporary must then be another scratch register (x2).
++            {
++                const int t = (ed == x1) ? x2 : x1;
++                RSB_IMM8(t, ed, 0);
++                AND_REG_LSL_IMM5(t, t, ed, 0);
++                CLZ(t, t);
++                RSB_IMM8(gd, t, 31);
++            }
+ #endif
+             IFX(X_PEND | X_ZF) {
+                 MOVW(x1, 0);    //ZF not set

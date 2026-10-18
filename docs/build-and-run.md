@@ -19,13 +19,13 @@ scripts/docker.sh test m4 <game-dir> [guest-ms] [cmdline]   # the real Game.exe 
 # build/cpu/ctr/m3.3dsx (built with the CPU-lane apps) runs the same fixture in Azahar;
 # output: sdmc:/3ds/3ds-d2/m3/out.txt
 AZAHAR=/path/to/azahar scripts/run-game-azahar.sh [--install <dir with Game.exe + MPQs>]   # the game in Azahar (docs/controls.md)
-scripts/docker.sh package-cia <game-dir>   # game app + your 1.14d files -> dist/cia/*.cia for a New 3DS (docs/hardware-test.md)
+scripts/docker.sh package-cia      # the hardware build -> dist/cia/3ds-d2-<build-id>.cia (docs/hardware-test.md)
 scripts/docker.sh package          # release build -> dist/<build-id>/ + SHA256SUMS + manifest.json
 scripts/docker.sh repro            # two clean builds from different paths must match
 scripts/docker.sh lock             # regenerate containers/toolchain.lock after an image change
 ```
 
-The build ID is a hash of `src/`, `Makefile` and `Dockerfile`. It appears on screen, in log file names, in the SD fixture and in `manifest.json`. A commit hash is recorded too once the repository has commits.
+The build ID is a hash of `src/`, both apps' build rules, the `Dockerfile`, the CPU backend's patch series and the CIA packaging. It appears on screen, in log file names, in the SD fixture and in `manifest.json`. A commit hash is recorded too once the repository has commits.
 
 Builds run as the host user, with the repository bind-mounted and networking disabled. The Docker build context contains only the `Dockerfile` (see `.dockerignore`), so game files can never reach an image.
 

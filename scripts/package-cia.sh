@@ -1,22 +1,22 @@
 #!/bin/sh
-# Packs the game app (CIA flavour) and the user's own Diablo II 1.14d files into
-# an installable CIA for a New 3DS. Runs inside the ctrtools image, started by
-# `scripts/docker.sh package-cia [--full|--sdcard] <game-dir>`, which stages
-# the RomFS in build/cia/romfs/game/ by bind-mounting the user's files there
-# one by one (read-only: nothing is copied). D2_CIA_MODE:
-#   slim    (default) Game.exe, d2data, d2exp, d2char, d2sfx, patch_d2; the
-#           cinematic, music and speech archives become empty MPQs. The game
-#           only checks that they exist; the 3DS build plays no Bink video and
-#           has no audio yet. ~0.8 GB instead of 1.9.
-#   full    every file of the install.
-#   sdcard  no game files: the app reads them from sdmc:/3ds/3ds-d2/game/.
-# The result goes to dist/cia/ (git-ignored). Except for sdcard, it contains
-# the user's game files: it is for their own console, not for distribution.
+# Packs the game app (CIA flavour) into an installable CIA for a New 3DS. Runs
+# inside the ctrtools image, started by `scripts/docker.sh package-cia
+# [--slim|--full <game-dir>]`. D2_CIA_MODE:
+#   sdcard  (default) the app alone, ~2 MB: it reads the game files from
+#           sdmc:/3ds/3ds-d2/game/ (copied there once). dist/cia/3ds-d2-<id>.cia
+#   slim    with the user's Game.exe, d2data, d2exp, d2char, d2sfx and patch_d2
+#           in its RomFS; the cinematic, music and speech archives become empty
+#           MPQs (the game only checks that they exist). ~0.8 GB. ...-slim.cia
+#   full    with every file of the user's install. ~1.9 GB. ...-full.cia
+# The game directory is staged in build/cia/romfs/game/ by bind-mounting the
+# user's files there one by one (read-only: nothing is copied). The result
+# goes to dist/cia/ (git-ignored). Except for sdcard, it contains the user's
+# game files: it is for their own console, not for distribution.
 set -eu
 cd /work
 elf=build/cpu/ctr/3ds-d2-game-cia.elf
 [ -f "$elf" ] || { echo "package-cia.sh: $elf missing" >&2; exit 1; }
-mode="${D2_CIA_MODE:-slim}"
+mode="${D2_CIA_MODE:-sdcard}"
 romfs=build/cia/romfs
 game="$romfs/game"
 needed="d2data.mpq d2exp.mpq d2char.mpq d2sfx.mpq d2music.mpq d2speech.mpq d2video.mpq \
@@ -44,17 +44,22 @@ esac
 
 work=build/cia
 out=dist/cia
+version=0.1.0   # the title version FBI and the HOME menu show (major.minor.micro)
 mkdir -p "$out"
 python3 -I packaging/cia/make_art.py "$work"
 bannertool makebanner -i "$work/banner.png" -a "$work/banner.wav" -o "$work/banner.bnr" >/dev/null
-bannertool makesmdh -s "3ds-d2" -l "Diablo II (your 1.14d copy) on the 3DS" -p "3ds-d2" \
+bannertool makesmdh -s "3ds-d2" -l "Diablo II LoD 1.14d on the n3DS" -p "https://github.com/exsilium/3ds-d2" \
     -i "$work/icon.png" -o "$work/icon.icn" >/dev/null
 
 id="$(sh scripts/build-id.sh 2>/dev/null || echo unversioned)"
-cia="$out/3ds-d2-game-$id-$mode.cia"
+case "$mode" in sdcard) cia="$out/3ds-d2-$id.cia" ;; *) cia="$out/3ds-d2-$id-$mode.cia" ;; esac
 size="$(du -shL "$romfs" | cut -f1)"
 echo "packing $cia ($mode, RomFS $size)..."
+IFS=. read -r v_major v_minor v_micro <<EOF_VERSION
+$version
+EOF_VERSION
 makerom -f cia -o "$cia" -target t -elf "$elf" -rsf packaging/cia/3ds-d2.rsf \
+    -ver $(( (v_major << 10) | (v_minor << 4) | v_micro )) \
     -icon "$work/icon.icn" -banner "$work/banner.bnr" \
     -DAPP_TITLE=3ds-d2 -DAPP_PRODUCT_CODE=CTR-H-D2DS -DAPP_UNIQUE_ID=0xD2D3D -DAPP_ROMFS="$romfs"
 # The console's AM hashes the whole content at the end of an install: check
@@ -67,6 +72,7 @@ echo "hashes verified (content, exheader, logo)"
 cp "$elf" "${cia%.cia}.elf"   # the exact code of this CIA: decodes its crash dumps (tools/luma_dump.py)
 {
     echo "cia: $(basename "$cia")"
+    echo "version: $version"
     echo "mode: $mode"
     echo "size: $(stat -c %s "$cia")"
     echo "sha256: $(sha256sum "$cia" | cut -d' ' -f1)"

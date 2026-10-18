@@ -16,11 +16,18 @@ WORKDIR /work
 # built from source at pinned commits inside the toolchain image. Used by
 # scripts/package-cia.sh; the game files it packs are bind-mounted at run time
 # and never enter this image.
+# makerom fix: its version.h defines VER_MAJOR 0 and VER_MINOR 19 (its own
+# version), which shadow the title-version indices of the same names in
+# user_settings.c, so a title version's minor field (-ver, -minor) is written
+# to titleVersion[19] and lost: 0.1.0 came out as 0.0.0. Renaming the
+# program-version macros restores the indices.
 FROM toolchain AS ctrtools
 ARG MAKEROM_COMMIT=e8f5f529c54ff9b22a2491a480ffa69206bf7b19
 ARG BANNERTOOL_COMMIT=da573b13418acd0ac1803b43b30e8a155e5f83e2
 RUN git clone -q https://github.com/3DSGuy/Project_CTR.git /tmp/pc \
  && git -C /tmp/pc checkout -q "$MAKEROM_COMMIT" \
+ && sed -i 's/\bVER_\(MAJOR\|MINOR\|PATCH\)\b/MAKEROM_VER_\1/' /tmp/pc/makerom/src/version.h \
+ && sed -i '/APP_NAME, VER_MAJOR/s/VER_\(MAJOR\|MINOR\|PATCH\)/MAKEROM_VER_\1/g' /tmp/pc/makerom/src/user_settings.c \
  && make -C /tmp/pc/makerom deps >/dev/null && make -C /tmp/pc/makerom >/dev/null \
  && install -m 755 "$(find /tmp/pc/makerom -type f -name makerom -perm -u+x | head -1)" /usr/local/bin/makerom \
  && make -C /tmp/pc/ctrtool deps >/dev/null && make -C /tmp/pc/ctrtool >/dev/null \

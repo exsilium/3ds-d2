@@ -124,7 +124,7 @@ $(OUT)/3ds-d2-game-cia.elf: $(filter-out $(OUT)/game/ctr_game.o,$(GAMEOBJ)) $(OU
 $(OUT)/3ds-d2-game.elf: $(GAMEOBJ)
 	$(CXX) $(LDFLAGS) $^ -lctru -lm -o $@
 $(OUT)/3ds-d2-game.smdh:
-	@mkdir -p $(@D); smdhtool --create "3ds-d2" "Diablo II on the 3DS (your 1.14d files)" "3ds-d2" $(CTRULIB)/default_icon.png $@
+	@mkdir -p $(@D); smdhtool --create "3ds-d2" "Diablo II LoD 1.14d on the n3DS" "3ds-d2" $(CTRULIB)/default_icon.png $@
 $(OUT)/3ds-d2-game.3dsx: $(OUT)/3ds-d2-game.elf $(OUT)/3ds-d2-game.smdh
 	3dsxtool $< $@ --smdh=$(OUT)/3ds-d2-game.smdh
 	@echo "built $@"

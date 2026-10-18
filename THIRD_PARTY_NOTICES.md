@@ -31,6 +31,7 @@
 - WinVita: MIT (`LICENSE`); see also its `THIRD-PARTY-NOTICES.md`.
 - DOSBox-3DS: GPL-2.0-or-later. Its `ctr_memory.c` (credited to PicoDrive) was only read, to confirm how `svcControlProcessMemory` is called. None of its code is used.
 - D2Vita (GPL-3.0) was used only as a behavioural reference for the 1.14d game, read inside the measurement image. No D2Vita source is copied or translated into this repository; the few game facts taken from it (memory addresses, behaviour) are documented where they are used.
+- FFmpeg (LGPL-2.1): its Bink decoder was read as a format reference and is the test oracle of `tests/bink/compare.sh`. No FFmpeg code is used. The Bink format's constant tables in `src/game/bink/bink_tables.cpp` (Huffman code sets, scan orders, run patterns, dequantisation matrices) carry the same values as FFmpeg's `libavcodec/binkdata.h`, from which they were transcribed: they are format constants that any compatible decoder must reproduce.
 - Azahar: GPL-3.0. It is used only as a test target and is not distributed.
 
 No Blizzard executable, archive or extracted asset may appear in this repository, any build image or any release.

@@ -21,11 +21,34 @@ namespace rt {
 // A finished game frame (the source of a blit to the window): an 8-bit
 // indexed image in guest memory plus its palette (0x00RRGGBB). Valid only
 // during the present callback.
+//
+// Or a cinematic's frame (src/game/cinematics.cpp): then yuv[0] is set,
+// pixels and palette are null, and the picture is planar YUV 4:2:0 (BT.601,
+// limited range) of width x height, its chroma planes half size rounded up.
 struct Frame {
     const uint8_t *pixels;   // top row
     uint32_t width, height;
     int32_t stride;          // bytes from one row to the next (negative for a bottom-up DIB)
     const uint32_t *palette; // 256 entries
+    const uint8_t *yuv[3] = {nullptr, nullptr, nullptr};
+    uint32_t yuv_stride[3] = {0, 0, 0};
+    // The height the picture is meant to have at its width: twice `height`
+    // for a video stored at half height. Gives its aspect ratio.
+    uint32_t display_height = 0;
+};
+
+// A cinematic's soundtrack, played by the platform beside the game's own
+// sound (DirectSound is idle while a video plays): interleaved 16-bit PCM.
+// write() never blocks; played() is the playback clock the video follows.
+class VideoAudio {
+public:
+    virtual ~VideoAudio() = default;
+    virtual bool open(uint32_t rate, uint32_t channels) = 0;
+    // Queues up to `frames` frames (a sample per channel each); returns how
+    // many it took (fewer when its queue is full).
+    virtual uint32_t write(const int16_t *pcm, uint32_t frames) = 0;
+    virtual uint64_t played() = 0;   // frames heard since open()
+    virtual void close() = 0;
 };
 
 struct RunOptions {
@@ -73,6 +96,8 @@ struct RunOptions {
     std::function<void(d2rt::Cpu &)> install_native;
     bool audio = false;
     int audio_rate = 22050;
+    // Where cinematics play their sound (null: they play silent).
+    VideoAudio *video_audio = nullptr;
 };
 
 constexpr uint32_t kCpuidNoSimd = 0x00008001;   // FPU | CMOV
@@ -139,6 +164,10 @@ uint32_t guest_call(d2rt::Cpu &c, uint32_t va, std::initializer_list<uint32_t> a
 // thread holds). Use it for DispatchMessageA and SendMessageA.
 void tail_call(d2rt::Cpu &c, uint32_t va, uint32_t shim_argc, std::initializer_list<uint32_t> args);
 void request_exit(uint32_t code);
+bool exit_requested();
+// Blocks the calling guest thread for `ms` (0: yields) from inside a shim,
+// running the other guest threads meanwhile, exactly as Sleep does.
+void sleep_guest(uint32_t ms);
 // The guest's clock: the scheduler's (virtual or real), so GetTickCount, QPC,
 // Sleep and timed waits always agree.
 uint64_t now_ms();
@@ -175,6 +204,11 @@ std::string module_name_of(uint32_t base);
 // saved registers are untouched by a shim. Returns false if the bytes differ.
 bool hook_function(d2rt::Cpu &c, uint32_t va, const uint8_t *expect, uint32_t n, uint32_t stack_args,
                    std::function<uint32_t(d2rt::Cpu &)> fn, const char *name);
+// Native code the guest can call (or a guest function pointer can hold):
+// registers `fn` as a shim taking `stack_args` dwords, popped on return,
+// and returns its guest address (0 on failure). hook_function is this plus
+// a jmp over a guest function.
+uint32_t native_entry(const char *name, uint32_t stack_args, std::function<uint32_t(d2rt::Cpu &)> fn);
 
 void install_kernel32(d2rt::Bridge &br);
 void install_advapi32(d2rt::Bridge &br);
@@ -192,6 +226,13 @@ void input_button(bool right, bool down);         // at the cursor
 void input_key(uint8_t vk, bool down);            // WM_KEYDOWN/UP (Alt: WM_SYSKEY*); Enter, Esc, Backspace add WM_CHAR
 void input_char(uint32_t ch);                     // WM_CHAR (text entry)
 bool input_ready();                               // the main window exists and is active
+
+// For a native loop that owns the message pump while it runs (the
+// cinematics player): samples the controls as PeekMessageA does, then
+// removes and returns the oldest queued keyboard or mouse message. Other
+// messages stay queued for the game.
+struct InputMessage { uint32_t message, wparam, lparam; };
+bool take_input_message(InputMessage &m);
 
 }  // namespace rt
 

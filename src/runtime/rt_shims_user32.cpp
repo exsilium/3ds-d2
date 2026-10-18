@@ -332,6 +332,26 @@ void input_char(uint32_t ch) { post(WM_CHAR, ch, 1); }
 
 bool input_ready() { return g_main_hwnd != 0 && g_activated; }
 
+bool take_input_message(InputMessage &m)
+{
+    if (options().poll_input) {
+        const uint64_t now = now_ms();
+        if (now - g_last_poll >= 16) {
+            g_last_poll = now;
+            options().poll_input();
+        }
+    }
+    for (auto it = g_queue.begin(); it != g_queue.end(); ++it) {
+        const uint32_t msg = it->message;
+        if ((msg >= WM_KEYDOWN && msg <= 0x0109) || (msg >= WM_MOUSEMOVE && msg <= 0x020E)) {   // WM_KEYFIRST..LAST, WM_MOUSEFIRST..LAST
+            m = {msg, it->wparam, it->lparam};
+            g_queue.erase(it);
+            return true;
+        }
+    }
+    return false;
+}
+
 void install_user32(Bridge &br)
 {
     auto U = [&](const char *name, uint32_t argc, std::function<uint32_t(Cpu &)> fn) {

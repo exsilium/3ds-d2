@@ -13,17 +13,24 @@
 // Screenshots of what the game shows go to <write-dir>/../shots/ (t005.png at
 // 5 s of guest time, then 15 s, 30 s and every 30 s, plus last.png).
 //
+// M4_VIDEO=1 plays the game's cinematics (game::install_cinematics); off by
+// default so scripted runs keep reaching the menu at the same time.
+// M4_VIDEO_WAV=<file> records their soundtrack, paced as a console would
+// play it.
+//
 // M4_SCRIPT drives game::Controls (the 3DS control scheme) with scripted pad
 // events (game::Autoplay, src/game/autoplay.h), ';'-separated, e.g.
 //   "20000 tap 400 307;26000 tap 400 290;32000 text Tester;34000 press R;..."
 
 #include "game/autoplay.h"
+#include "game/cinematics.h"
 #include "game/controls.h"
 #include "game/d2_native.h"
 #include "game/d2_state.h"
 #include "runtime/rt_host.h"
 #include "png.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -39,6 +46,69 @@ void dyn86_hotprof_dump(FILE *f, int top);
 }
 
 static bool shot_now = false;   // M4_SCRIPT "shot": save the next frame
+
+// The cinematics' sound on the lane: a consumer that plays in real time on
+// the guest clock (so the player paces itself as on the console), with
+// 300 ms of queue; M4_VIDEO_WAV keeps what it "played" in a WAV file.
+class LaneVideoAudio : public rt::VideoAudio {
+public:
+    bool open(uint32_t rate, uint32_t channels) override
+    {
+        rate_ = rate, channels_ = channels, written_ = 0, start_us_ = 0;
+        if (const char *path = std::getenv("M4_VIDEO_WAV")) {
+            wav_ = std::fopen(path, created_ ? "r+b" : "wb");
+            if (wav_ && !created_)
+                header(0);
+            if (wav_)
+                std::fseek(wav_, 0, SEEK_END);
+            created_ = wav_ != nullptr;
+        }
+        return true;
+    }
+    uint32_t write(const int16_t *pcm, uint32_t frames) override
+    {
+        if (!start_us_)
+            start_us_ = rt::now_us();
+        const uint64_t queued = written_ - played(), cap = rate_ * 3 / 10;
+        const uint32_t n = queued >= cap ? 0 : (uint32_t)std::min<uint64_t>(frames, cap - queued);
+        if (wav_ && n) {
+            std::fwrite(pcm, 2 * channels_, n, wav_);
+            data_bytes_ += 2 * channels_ * n;
+        }
+        written_ += n;
+        return n;
+    }
+    uint64_t played() override
+    {
+        return start_us_ ? std::min<uint64_t>(written_, (rt::now_us() - start_us_) * rate_ / 1000000) : 0;
+    }
+    void close() override
+    {
+        if (wav_) {   // every video appends to one file; the header covers them all
+            std::fflush(wav_);
+            std::fseek(wav_, 0, SEEK_SET);
+            header(data_bytes_);
+            std::fclose(wav_);
+            wav_ = nullptr;
+        }
+    }
+
+private:
+    void header(uint32_t data)
+    {
+        const uint32_t byte_rate = rate_ * channels_ * 2;
+        const uint16_t align = (uint16_t)(channels_ * 2), bits = 16, fmt = 1, ch = (uint16_t)channels_;
+        const uint32_t riff = 36 + data, fmt_len = 16;
+        std::fwrite("RIFF", 1, 4, wav_), std::fwrite(&riff, 4, 1, wav_), std::fwrite("WAVEfmt ", 1, 8, wav_);
+        std::fwrite(&fmt_len, 4, 1, wav_), std::fwrite(&fmt, 2, 1, wav_), std::fwrite(&ch, 2, 1, wav_);
+        std::fwrite(&rate_, 4, 1, wav_), std::fwrite(&byte_rate, 4, 1, wav_), std::fwrite(&align, 2, 1, wav_);
+        std::fwrite(&bits, 2, 1, wav_), std::fwrite("data", 1, 4, wav_), std::fwrite(&data, 4, 1, wav_);
+    }
+    uint32_t rate_ = 0, channels_ = 0, data_bytes_ = 0;
+    uint64_t written_ = 0, start_us_ = 0;
+    FILE *wav_ = nullptr;
+    bool created_ = false;
+};
 
 int main(int argc, char **argv)
 {
@@ -65,10 +135,18 @@ int main(int argc, char **argv)
     // with it the map seed; installed late, both runs share the same world.
     static d2rt::Cpu *g_cpu = nullptr;
     static const bool native_late = std::getenv("M4_NATIVE") && std::string(std::getenv("M4_NATIVE")) == "late";
-    if (native_late)
-        opt.install_native = [](d2rt::Cpu &c) { g_cpu = &c; };
-    else if (!std::getenv("M4_NATIVE") || std::string(std::getenv("M4_NATIVE")) != "0")
-        opt.install_native = [](d2rt::Cpu &c) { game::install_d2_native(c); };
+    static const bool native_now = !native_late && (!std::getenv("M4_NATIVE") || std::string(std::getenv("M4_NATIVE")) != "0");
+    static const bool video = std::getenv("M4_VIDEO") && std::string(std::getenv("M4_VIDEO")) != "0";
+    opt.install_native = [](d2rt::Cpu &c) {
+        if (native_late)
+            g_cpu = &c;
+        if (native_now)
+            game::install_d2_native(c);
+        if (video)
+            game::install_cinematics(c);
+    };
+    static LaneVideoAudio video_audio;
+    opt.video_audio = &video_audio;
     if (std::getenv("WX86_SON"))   // e.g. WX86_SON=wav WX86_SONDUMP=<file>: sound to a WAV file
         opt.audio = true;
     if (std::getenv("M4_FAST"))   // the 3DS app's video settings (src/app/ctr_game.cpp), for A/B runs
@@ -106,12 +184,24 @@ int main(int argc, char **argv)
     std::system(("mkdir -p '" + shots + "'").c_str());
     static std::vector<uint8_t> last_idx;
     static uint32_t last_pal[256], last_w = 0, last_h = 0;
+    static bool last_yuv = false;   // a cinematic's frame: last_idx holds its Y, U and V planes
     static uint64_t next_shot = 5000;
     auto save = [shots](const char *name) {
         if (!last_w)
             return;
         std::vector<uint8_t> rgb((size_t)last_w * last_h * 3);
+        const uint32_t cw = (last_w + 1) / 2, ch = (last_h + 1) / 2;
+        const uint8_t *py = last_idx.data(), *pu = py + (size_t)last_w * last_h, *pv = pu + (size_t)cw * ch;
+        auto clip = [](int v) { return (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v); };
         for (size_t i = 0; i < (size_t)last_w * last_h; i++) {
+            if (last_yuv) {   // BT.601, limited range
+                const size_t x = i % last_w, y = i / last_w, c = (y / 2) * cw + x / 2;
+                const int Y = 298 * (py[i] - 16), U = pu[c] - 128, V = pv[c] - 128;
+                rgb[3 * i] = clip((Y + 409 * V + 128) >> 8);
+                rgb[3 * i + 1] = clip((Y - 100 * U - 208 * V + 128) >> 8);
+                rgb[3 * i + 2] = clip((Y + 516 * U + 128) >> 8);
+                continue;
+            }
             const uint32_t p = last_pal[last_idx[i]];
             rgb[3 * i] = (uint8_t)(p >> 16);
             rgb[3 * i + 1] = (uint8_t)(p >> 8);
@@ -125,6 +215,42 @@ int main(int argc, char **argv)
     // code must not change a single one.
     static FILE *framehash = std::getenv("M4_FRAMEHASH") ? std::fopen(std::getenv("M4_FRAMEHASH"), "w") : nullptr;
     opt.present = [save, shots](const rt::Frame &f) {
+        if (f.yuv[0]) {
+            // A cinematic's frame: hashed (Y, U, V) and kept for the screenshots.
+            const uint32_t cw = (f.width + 1) / 2, ch = (f.height + 1) / 2;
+            last_w = f.width;
+            last_h = f.height;
+            last_yuv = true;
+            last_idx.resize((size_t)f.width * f.height + 2 * (size_t)cw * ch);
+            uint8_t *o = last_idx.data();
+            for (int p = 0; p < 3; p++) {
+                const uint32_t w = p ? cw : f.width, rows = p ? ch : f.height;
+                for (uint32_t y = 0; y < rows; y++, o += w)
+                    std::memcpy(o, f.yuv[p] + (size_t)y * f.yuv_stride[p], w);
+            }
+            if (framehash) {
+                static unsigned n = 0;
+                uint32_t h = 2166136261u;
+                for (uint8_t b : last_idx)
+                    h = (h ^ b) * 16777619u;
+                std::fprintf(framehash, "video %u %08x %ux%u\n", n++, h, f.width, f.height);
+            }
+            const uint64_t now = rt::now_ms();
+            if (shot_now) {
+                shot_now = false;
+                char name[32];
+                std::snprintf(name, sizeof name, "s%06llu.png", (unsigned long long)now);
+                save(name);
+            }
+            if (now >= next_shot) {
+                char name[32];
+                std::snprintf(name, sizeof name, "t%03llu.png", (unsigned long long)(now / 1000));
+                save(name);
+                next_shot = next_shot < 15000 ? 15000 : next_shot < 30000 ? 30000 : next_shot + 30000;
+            }
+            return;
+        }
+        last_yuv = false;
         if (framehash) {
             static unsigned n = 0;
             uint32_t h = 2166136261u;

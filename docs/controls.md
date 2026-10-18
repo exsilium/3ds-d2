@@ -42,6 +42,10 @@ The mapping lives in `src/game/controls.cpp`. It follows the ideas D2Vita proved
 | Start | Enter: confirm, e.g. OK after typing a character name |
 | Select | Close all panels (Space) |
 
+## Cinematics
+
+A, B, Start (Escape), R + Start (Enter) or a tap on the touchpad skips the video playing, as a key or click does on the PC. The press is held back until it is released, so it does not also act on the next screen. [cinematics.md](cinematics.md) explains the player.
+
 ## How input reaches the game
 
 Each poll (every ≥ 16 ms, from the game's own message pump) becomes the window messages Windows would send:

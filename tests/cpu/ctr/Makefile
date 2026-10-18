@@ -65,8 +65,9 @@ M3OBJ := $(CPUOBJ) $(addprefix $(OUT)/rt/,$(RTFULL:.cpp=.o)) $(addprefix $(OUT)/
 
 # The game app (src/app/ctr_game.cpp): the same runtime plus the controls.
 GAMESRC := $(notdir $(wildcard $(ROOT)/src/game/*.cpp))
+BINKSRC := $(notdir $(wildcard $(ROOT)/src/game/bink/*.cpp))
 GAMEOBJ := $(CPUOBJ) $(addprefix $(OUT)/rt/,$(RTFULL:.cpp=.o)) $(addprefix $(OUT)/m3/,$(M3SRC:.cpp=.o)) \
-           $(addprefix $(OUT)/game/,$(GAMESRC:.cpp=.o)) $(OUT)/game/ctr_game.o $(OUT)/game/ctr_audio.o $(OUT)/runner/ctr_stubs.o
+           $(addprefix $(OUT)/game/,$(GAMESRC:.cpp=.o)) $(addprefix $(OUT)/game/bink/,$(BINKSRC:.cpp=.o)) $(OUT)/game/ctr_game.o $(OUT)/game/ctr_audio.o $(OUT)/runner/ctr_stubs.o
 
 .PHONY: all clean
 all: $(OUT)/cpu-lane.3dsx $(OUT)/m3.3dsx $(OUT)/3ds-d2-game.3dsx $(OUT)/3ds-d2-game-cia.elf
@@ -109,6 +110,9 @@ $(OUT)/m3.3dsx: $(OUT)/m3.elf $(OUT)/m3.smdh
 	@echo "built $@"
 
 $(OUT)/game/%.o: $(ROOT)/src/game/%.cpp $(wildcard $(ROOT)/src/game/*.h) $(wildcard $(ROOT)/src/runtime/rt_*.h)
+	@mkdir -p $(@D); $(CXX) $(CXXFLAGS) -O2 -I$(ROOT)/src -c $< -o $@
+# The Bink decoder: hot integer code, built for speed like the blitters.
+$(OUT)/game/bink/%.o: $(ROOT)/src/game/bink/%.cpp $(wildcard $(ROOT)/src/game/bink/*.h)
 	@mkdir -p $(@D); $(CXX) $(CXXFLAGS) -O2 -I$(ROOT)/src -c $< -o $@
 $(OUT)/game/ctr_game.o: $(ROOT)/src/app/ctr_game.cpp $(wildcard $(ROOT)/src/game/*.h) $(wildcard $(ROOT)/src/runtime/rt_*.h)
 	@mkdir -p $(@D); $(CXX) $(CXXFLAGS) -O2 -I$(ROOT)/src -c $< -o $@

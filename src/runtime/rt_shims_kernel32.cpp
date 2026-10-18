@@ -481,6 +481,8 @@ std::string module_name_of(uint32_t base)
     return m && m->image ? m->name : std::string();
 }
 
+void sleep_guest(uint32_t ms) { wx86_wait_sleep(ms); }
+
 void install_kernel32(Bridge &br)
 {
     auto K = [&](const char *name, uint32_t argc, std::function<uint32_t(Cpu &)> fn) {
@@ -712,7 +714,7 @@ void install_kernel32(Bridge &br)
     // ---- time ----
     K("GetTickCount", 0, [](Cpu &) { return (uint32_t)now_ms(); });
     K("Sleep", 1, [](Cpu &c) {
-        wx86_wait_sleep(c.arg(0));
+        sleep_guest(c.arg(0));
         return 0u;
     });
     K("QueryPerformanceFrequency", 1, [](Cpu &c) {

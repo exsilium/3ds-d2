@@ -10,9 +10,10 @@
 #   scripts/docker.sh test cpu [armv7|armv6]  the same fixtures through the Box86 backend
 #   scripts/docker.sh test m3            a PE32 through the Win32 runtime on the ARMv6 backend
 #   scripts/docker.sh package           release build -> dist/<build-id>/ with manifest
-#   scripts/docker.sh package-cia <game-dir>  game app + your 1.14d files (slim: no video/music/speech) -> dist/cia/
-#   scripts/docker.sh package-cia --full <game-dir>   ... with every MPQ
-#   scripts/docker.sh package-cia --sdcard    small CIA; the game files go to sdmc:/3ds/3ds-d2/game/
+#   scripts/docker.sh package-cia             the hardware build: dist/cia/3ds-d2-<build-id>.cia (~2 MB),
+#                                             reading the game files from sdmc:/3ds/3ds-d2/game/
+#   scripts/docker.sh package-cia --slim <game-dir>   ... with your 1.14d files inside (no video/music/speech)
+#   scripts/docker.sh package-cia --full <game-dir>   ... with every MPQ inside
 #   scripts/docker.sh sdcard-folder <game-dir>   dist/sdcard/3ds/3ds-d2/game/ for that (copy once)
 #   scripts/docker.sh repro              two clean release builds must match byte-for-byte
 #   scripts/docker.sh shell [hosttest]   interactive shell in a build image
@@ -95,14 +96,14 @@ package)
     do_build release
     run_in "$TOOLCHAIN_IMAGE" sh scripts/package.sh release
     ;;
-package-cia)   # [--full|--sdcard] <game-dir>: the game app (+ the user's own 1.14d files) -> dist/cia/*.cia
-    mode=slim
-    case "${1:-}" in --full) mode=full; shift ;; --sdcard) mode=sdcard; shift ;; esac
+package-cia)   # [--slim|--full <game-dir>]: the game app (+ the user's own 1.14d files) -> dist/cia/*.cia
+    mode=sdcard
+    case "${1:-}" in --slim) mode=slim; shift ;; --full) mode=full; shift ;; --sdcard) shift ;; esac
     stage="$ROOT/build/cia/romfs/game"
     rm -rf "$ROOT/build/cia/romfs" && mkdir -p "$stage"
     RUN_EXTRA=(-e "D2_CIA_MODE=$mode")
     if [ "$mode" != sdcard ]; then
-        [ -n "${1:-}" ] && [ -f "$1/Game.exe" ] || die "package-cia [--full|--sdcard] <game-dir with Game.exe and the MPQs>"
+        [ -n "${1:-}" ] && [ -f "$1/Game.exe" ] || die "package-cia --$mode <game-dir with Game.exe and the MPQs>"
         game="$(cd "$1" && pwd)"
         # Slim: only what the game reads without audio or cinematics; the rest
         # become empty MPQs (package-cia.sh). Files are bind-mounted one by one
@@ -149,7 +150,7 @@ sdcard-folder)   # [--full] <game-dir>: dist/sdcard/3ds/3ds-d2/game/ to copy onc
     fi
     ls -la "$dest"; du -sh "$ROOT/dist/sdcard"
     echo "copy dist/sdcard/3ds onto the SD card root (it merges into the existing 3ds folder),"
-    echo "then install the code-only CIA: scripts/docker.sh package-cia --sdcard"
+    echo "then install the CIA from: scripts/docker.sh package-cia"
     ;;
 repro)
     ensure_image toolchain "$TOOLCHAIN_IMAGE"

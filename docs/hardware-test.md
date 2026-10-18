@@ -3,19 +3,22 @@
 ## Build the CIA
 
 ```sh
-scripts/docker.sh package-cia ../3ds-d2-gamefiles/1.14d            # slim (default), ~850 MB
-scripts/docker.sh package-cia --full ../3ds-d2-gamefiles/1.14d     # every MPQ, ~2 GB
-scripts/docker.sh package-cia --sdcard                             # ~2 MB; game files on the SD card
+scripts/docker.sh package-cia                                      # the hardware build, ~2 MB
+scripts/docker.sh package-cia --slim ../3ds-d2-gamefiles/1.14d     # with the game files inside, ~850 MB
+scripts/docker.sh package-cia --full ../3ds-d2-gamefiles/1.14d     # with every MPQ inside, ~2 GB
 ```
 
-The result is `dist/cia/3ds-d2-game-<build-id>-<mode>.cia`, with a `.txt` next to it listing its SHA-256 and the files inside. Every run checks the CIA's content, exheader and logo hashes with `ctrtool`, the same hashes the console's AM checks at the end of an install.
+The hardware build is `dist/cia/3ds-d2-<build-id>.cia`. It holds the app only and reads the game files from `sdmc:/3ds/3ds-d2/game/`, so a new build is a 2 MB install. The two bundled variants add `-slim` or `-full` to the name. A `.txt` next to each CIA lists its version, SHA-256 and the files inside. Every run checks the CIA's content, exheader and logo hashes with `ctrtool`, the same hashes the console's AM checks at the end of an install.
 
-The three modes:
-- **slim:** the CIA carries Game.exe, d2data, d2exp, d2char, d2sfx and patch_d2 from your install, and nothing else. The cinematic, music and speech archives become empty 288-byte MPQs (`packaging/cia/make_stub_mpq.py`). The game only checks that those exist and open, and asks for the Expansion disc if they are missing. The 3DS build plays no video and has no audio yet. Verified on the Linux lane and in Azahar: menu, character creation, Rogue Encampment.
-- **full:** every file; needed once audio exists.
-- **sdcard:** no game files inside (~2 MB), for quick reinstalls. `scripts/docker.sh sdcard-folder <game-dir>` prepares `dist/sdcard/3ds/3ds-d2/game/`, the slim file set (822 MB, hard links). Copy `dist/sdcard/3ds` onto the SD card root once.
+The build ID is a hash of everything that goes into the CIA: `src/`, the build rules, the CPU backend's patch series and the packaging (`scripts/package-cia.sh`, `packaging/cia/`). The title version (`version=` in `scripts/package-cia.sh`, now 0.1.0) is what FBI and the HOME menu show.
 
-Except for sdcard, the CIA contains your copy of the game: it is for your console only. `dist/` is git-ignored.
+The game files on the SD card, once: copy `Game.exe` and the MPQs of your 1.14d install to `sdmc:/3ds/3ds-d2/game/`. `scripts/docker.sh sdcard-folder [--full] <game-dir>` prepares that folder in `dist/sdcard/3ds/3ds-d2/game/` (hard links, nothing copied). Copy `dist/sdcard/3ds` onto the SD card root. Sound needs the real music and speech archives, so use `--full` there (or copy the install as is).
+
+The bundled variants:
+- **slim:** the CIA carries Game.exe, d2data, d2exp, d2char, d2sfx and patch_d2 from your install, and nothing else. The cinematic, music and speech archives become empty 288-byte MPQs (`packaging/cia/make_stub_mpq.py`). The game only checks that those exist and open, and asks for the Expansion disc if they are missing.
+- **full:** every file.
+
+The bundled variants contain your copy of the game: they are for your console only. `dist/` is git-ignored.
 
 What the CIA asks the console for (`packaging/cia/3ds-d2.rsf`):
 - **Memory:** the New 3DS's extended memory mode, 124 MiB instead of the ~96 MiB a `.3dsx` gets.
@@ -56,7 +59,7 @@ Logs are on the SD card in `3ds/3ds-d2/logs/`: `game.log` for the runtime, and `
 - **Luma's crash screen.** Luma3DS shows the exception on screen and saves a dump to `luma/dumps/arm11/crash_dump_*.dmp` on the SD card. Decode it against the ELF saved next to that CIA:
 
   ```sh
-  python3 -I tools/luma_dump.py crash_dump_00000000.dmp dist/cia/3ds-d2-game-<id>-slim.elf
+  python3 -I tools/luma_dump.py crash_dump_00000000.dmp dist/cia/3ds-d2-<id>.elf
   ```
 
   It prints the registers and the source line of the PC, the LR and every stack word that points into the app.

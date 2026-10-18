@@ -53,6 +53,13 @@ Stats g_stats;
 uint64_t g_next_beat = 0;
 uint32_t g_exit_code = 0;
 wx86::GuestRegion g_heap, g_va;
+// When the layout puts the heap and VirtualAlloc ranges side by side (all of
+// them do), both are faces of one pool: the heap grows up from its base, VA
+// down from the top. D2's heap peaks while loading (~16 MiB at hero
+// selection) and its VirtualAlloc in play (44 MiB in Blood Moor on the
+// console), so fixed ranges ran out of VA with half the heap idle.
+wx86::GuestRegion g_pool;
+uint32_t g_pool_size = 0;   // 0: separate ranges
 
 // VirtualQuery support for WinVita's memory shims: report the arena regions.
 bool vquery(uint32_t addr, uint32_t &base, uint32_t &size, uint32_t &state, uint32_t &type, uint32_t &protect,
@@ -93,10 +100,40 @@ bool guest_read(uint32_t va, void *out, uint32_t n)
     return g_br->cpu()->read(va, out, n);
 }
 
+bool hook_function(Cpu &c, uint32_t va, const uint8_t *expect, uint32_t n, uint32_t stack_args,
+                   std::function<uint32_t(Cpu &)> fn, const char *name)
+{
+    if (n < 5)
+        return false;
+    std::vector<uint8_t> have(n);
+    if (!c.read(va, have.data(), n) || std::memcmp(have.data(), expect, n) != 0) {
+        logf("native %s: bytes at %08x differ, not hooked", name, va);
+        return false;
+    }
+    Shim s;
+    s.argc = stack_args;
+    s.stdcall_cleanup = true;
+    s.tag = std::string("3DSD2NATIVE!") + name;
+    s.fn = std::move(fn);
+    g_br->register_shim("3DSD2NATIVE", name, s);
+    const uint32_t trap = g_br->shim_trap("3DSD2NATIVE", name);
+    if (!trap)
+        return false;
+    uint8_t jmp[5] = {0xE9};
+    const uint32_t rel = trap - (va + 5);
+    std::memcpy(jmp + 1, &rel, 4);
+    c.write(va, jmp, 5);
+    c.invalidate_code(va, 5);
+    logf("native %s at %08x", name, va);
+    return true;
+}
+
 MemoryReport memory_report()
 {
     const Layout &L = layout();
-    return {g_heap.used_bytes(), g_heap.peak(), L.heap_size, g_va.used_bytes(), g_va.peak(), L.va_size,
+    const uint32_t heap = g_heap.used_bytes(), va = g_va.used_bytes();
+    const uint32_t free = g_pool_size ? g_pool_size - heap - va : L.heap_size + L.va_size - heap - va;
+    return {heap, g_heap.peak(), L.heap_size, va, g_va.peak(), L.va_size, free, g_va.largest_free(),
             (uint32_t)d2rt_box86_dynarec_kb(), (uint32_t)d2rt_box86_custommalloc_kb(), (uint32_t)d2rt_box86_jmptbl_kb()};
 }
 Bridge &bridge() { return *g_br; }
@@ -140,10 +177,12 @@ void check_time_limit(uint64_t ms)
 {
     if (g_opt.heartbeat_ms && ms >= g_next_beat) {
         g_next_beat = ms + g_opt.heartbeat_ms;
-        logf("t=%llus peeks=%u files=%u read=%lluKiB frames=%u heap=%u/%uKiB va=%u/%uKiB jit=%u meta=%u jmptbl=%uKiB",
+        logf("t=%llus peeks=%u files=%u read=%lluKiB frames=%u heap=%u/%uKiB va=%u/%uKiB free=%uKiB jit=%u meta=%u jmptbl=%uKiB",
              (unsigned long long)(ms / 1000), g_stats.peeks, g_stats.files_opened,
              (unsigned long long)(g_stats.bytes_read >> 10), g_stats.frames, g_heap.used_bytes() >> 10,
-             g_heap.peak() >> 10, g_va.used_bytes() >> 10, g_va.peak() >> 10, (unsigned)d2rt_box86_dynarec_kb(),
+             g_heap.peak() >> 10, g_va.used_bytes() >> 10, g_va.peak() >> 10,
+             (unsigned)((g_pool_size ? g_pool_size - g_heap.cur() - g_va.cur() : g_va.largest_free()) >> 10),
+             (unsigned)d2rt_box86_dynarec_kb(),
              (unsigned)d2rt_box86_custommalloc_kb(), (unsigned)d2rt_box86_jmptbl_kb());
     }
     if (g_opt.max_ms && ms >= g_opt.max_ms && !g_timed_out && g_sched) {
@@ -332,8 +371,15 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
             logf("%s full: want %u KiB, live %u KiB, peak %u KiB, largest free %u KiB", f.name, f.want >> 10,
                  f.cur >> 10, f.peak >> 10, f.largest >> 10);
     });
-    g_heap.init(L.heap_base, L.heap_size, 16, "heap");
-    g_va.init(L.va_base, L.va_size, 0x10000, "va");
+    if (L.heap_base + L.heap_size == L.va_base) {
+        g_pool_size = L.heap_size + L.va_size;
+        g_pool.init(L.heap_base, g_pool_size, 16, "pool");
+        g_heap.share(g_pool, 16, false, "heap");
+        g_va.share(g_pool, 0x10000, true, "va");
+    } else {
+        g_heap.init(L.heap_base, L.heap_size, 16, "heap");
+        g_va.init(L.va_base, L.va_size, 0x10000, "va");
+    }
     wx86_scratch_init(L.scratch_base, L.scratch_size);
     cpu->write_u32(L.peb + 0x08, g_exe_base);   // PEB.ImageBaseAddress
     init_teb(*cpu, L.main_tib, L.main_stack + 0x200000, L.main_stack);
@@ -389,6 +435,8 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
         return res;
     }
     img->release_image();   // the guest copy is mapped and linked: the host copy is dead weight
+    if (g_opt.install_native)
+        g_opt.install_native(*cpu);
     res.unresolved_imports = br->unresolved_count();
     res.loaded = true;
     logf("loaded %s at %08x entry %08x, %u unresolved import(s)", g_opt.exe_name.c_str(), g_exe_base,

@@ -78,10 +78,12 @@ constexpr Layout kCtrGameLayout = {
 
 // New 3DS hardware, CIA in extended memory mode: the kernel maps at most
 // ~95 MiB of heap (its heap window ends at 0x0E000000, docs/memory-budget.md),
-// and the arena is carved out of that heap. 75 MiB: VirtualAlloc 44 MiB (the
-// sprite cache grows towards its 24 MiB floor; sound buffers come from here
-// too), heap 17 MiB (peak 16.2). The host keeps ~20 MiB: it used 14.4 in
-// town on the console (jump tables 12), with JIT code in its own .bss pool.
+// and the arena is carved out of that heap. 75 MiB, of which heap and
+// VirtualAlloc share one 61 MiB pool (rt_host.cpp: the heap grows up, VA
+// down). The heap peaks at ~16 MiB while loading, then holds ~8 in play;
+// VirtualAlloc reached 44.5 MiB in Blood Moor, where a fixed 44 MiB range
+// ran out. The host keeps ~20 MiB: it used 14.4 in town on the console
+// (jump tables 12), with JIT code in its own .bss pool.
 constexpr Layout kCtrGameLayoutN3 = {
     "ctr-game-n3",
     0x00a00000,

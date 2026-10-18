@@ -68,6 +68,9 @@ struct RunOptions {
     // Hz into the sink its settings pick (WX86_SON: "vita" = the platform's
     // realtime sink, "wav" with WX86_SONDUMP, "null"). Off: DirectSoundCreate
     // reports "no driver" and the game runs silent.
+    // Called once after linking, before the game runs: the place to replace
+    // guest functions with native code (hook_function below).
+    std::function<void(d2rt::Cpu &)> install_native;
     bool audio = false;
     int audio_rate = 22050;
 };
@@ -98,6 +101,9 @@ Stats &stats();
 struct MemoryReport {
     uint32_t heap_used, heap_peak, heap_size;
     uint32_t va_used, va_peak, va_size;
+    // The heap and VA ranges are one pool when adjacent (rt_host.cpp): what
+    // is left of it, and its largest free block.
+    uint32_t free, largest_free;
     // Host memory of the CPU backend (0 when the build does not count it):
     uint32_t jit_code_kb;    // translated ARM code
     uint32_t jit_meta_kb;    // block descriptors and the rest of its own allocator
@@ -159,6 +165,16 @@ std::string guest_full_path(const std::string &guest);   // "C:\\..." form
 
 // Name of a loaded module ("game.exe", "glide3x.dll"); empty if unknown (rt_shims_kernel32.cpp).
 std::string module_name_of(uint32_t base);
+
+// Replaces the guest function at `va` with native code: checks that the
+// function starts with `expect` (n bytes, so a different executable is left
+// alone), registers `fn` as a shim taking `stack_args` dwords (stdcall: the
+// shim's return pops them, as the original's `ret`), and writes a jmp to the
+// shim's trap over the function's first bytes. The guest stack and registers
+// arrive exactly as the original would see them (ecx/edx included); callee-
+// saved registers are untouched by a shim. Returns false if the bytes differ.
+bool hook_function(d2rt::Cpu &c, uint32_t va, const uint8_t *expect, uint32_t n, uint32_t stack_args,
+                   std::function<uint32_t(d2rt::Cpu &)> fn, const char *name);
 
 void install_kernel32(d2rt::Bridge &br);
 void install_advapi32(d2rt::Bridge &br);

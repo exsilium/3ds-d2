@@ -33,6 +33,11 @@ CFLAGS := -O2 -g $(ARCH) -std=gnu17 $(DEFS) $(INC) -ffile-prefix-map=$(abspath $
           -Wno-error=incompatible-pointer-types -w
 CXXFLAGS := -O2 -g $(ARCH) -std=gnu++17 -D__3DS__ -DD2RT_CPU_BOX86 -I$(CTR) -I$(W)/src -I$(DYN86) \
           -I$(SHIM) -I$(B86)/include -I$(B86) -I$(CTRULIB)/include -ffile-prefix-map=$(abspath $(ROOT))=. -w
+# Header dependencies (-MMD): without them a changed header (guest_region.h
+# gained members) left older objects compiled against the old class layout,
+# and the app crashed at its first HeapAlloc.
+CFLAGS += -MMD -MP
+CXXFLAGS += -MMD -MP
 LDFLAGS := -specs=3dsx.specs -g $(ARCH) -L$(CTRULIB)/lib -Wl,-Map,$(OUT)/cpu-lane.map
 
 CORE := dynarec/dynarec.c dynarec/dynablock.c dynarec/dynarec_arm.c dynarec/dynarec_arm_functions.c \
@@ -131,6 +136,8 @@ $(OUT)/cpu-lane.smdh:
 $(OUT)/cpu-lane.3dsx: $(OUT)/cpu-lane.elf $(OUT)/cpu-lane.smdh
 	3dsxtool $< $@ --smdh=$(OUT)/cpu-lane.smdh
 	@echo "built $@"
+
+-include $(shell find $(OUT) -name '*.d' 2>/dev/null)
 
 clean:
 	rm -rf $(OUT)

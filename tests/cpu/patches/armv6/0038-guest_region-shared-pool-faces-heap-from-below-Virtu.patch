@@ -1,0 +1,110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Exile <exile@chamber.ee>
+Date: Sun, 18 Oct 2026 10:33:32 +0300
+Subject: [PATCH] guest_region: shared pool faces (heap from below,
+ VirtualAlloc from above)
+
+---
+ src/runtime/guest_region.h | 65 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 64 insertions(+), 1 deletion(-)
+
+diff --git a/src/runtime/guest_region.h b/src/runtime/guest_region.h
+index a51f35a..866849f 100644
+--- a/src/runtime/guest_region.h
++++ b/src/runtime/guest_region.h
+@@ -63,9 +63,31 @@ public:
+         name_ = nm; base_ = b; limit_ = b + sz; align_ = al; freeb_[b] = sz;
+     }
+ 
++    // Makes this region a FACE of `pool`: blocks come from the pool's range
++    // and free map, aligned (and sized) to `al`, from the bottom of the
++    // first free block that fits or, with `top`, from the top of the last.
++    // Two faces of one pool grow towards each other (HeapAlloc from below,
++    // VirtualAlloc from above), so whichever needs the memory gets it: a
++    // game whose heap peaks while loading and whose VirtualAlloc peaks in
++    // play fits a pool smaller than the sum of two fixed ranges. Each face
++    // keeps its own block map, so size_of, block_of and the counters see
++    // only its own blocks. The pool itself is not allocated from directly.
++    void share(GuestRegion& pool, uint32_t al, bool top, const char* nm) {
++        pool_ = &pool; align_ = al; top_ = top; name_ = nm;
++        base_ = pool.base_; limit_ = pool.limit_; freeb_.clear();
++    }
++
+     // Returns the guest address of an n-byte block, or 0. First-fit over
+     // the free-block map, which is ordered by address.
+     uint32_t alloc(uint32_t n) {
++        if (pool_) {
++            const uint32_t a = (n > limit_ - base_) ? 0 : pool_->carve(n, align_, top_);
++            if (!a) { record_fail(n); return 0; }
++            const uint32_t sz = pool_->used_[a];
++            used_[a] = sz;
++            cur_ += sz; if (cur_ > peak_) peak_ = cur_;
++            return a;
++        }
+         // (n + align - 1) overflows for n >= 0xFFFFFFF1, which would let a
+         // "negative" request succeed with a tiny block. Rejecting anything
+         // the region can't hold closes both cases at once.
+@@ -90,6 +112,11 @@ public:
+     // a region that allocates and frees in a loop ends up fragmented into
+     // unusable blocks while nearly empty.
+     bool free(uint32_t a) {
++        if (pool_) {
++            auto it = used_.find(a); if (it == used_.end()) return false;
++            cur_ -= it->second; used_.erase(it);
++            return pool_->free(a);
++        }
+         auto it = used_.find(a); if (it == used_.end()) return false;
+         uint32_t sz = it->second; used_.erase(it); cur_ -= sz;
+         auto nx = freeb_.lower_bound(a);
+@@ -109,7 +136,7 @@ public:
+         return (a >= it->first && a < it->first + it->second) ? it->first : 0;
+     }
+     uint32_t size_of(uint32_t a) { auto it = used_.find(a); return it == used_.end() ? 0 : it->second; }
+-    uint32_t largest_free() { uint32_t m = 0; for (auto& p : freeb_) if (p.second > m) m = p.second; return m; }
++    uint32_t largest_free() { if (pool_) return pool_->largest_free(); uint32_t m = 0; for (auto& p : freeb_) if (p.second > m) m = p.second; return m; }
+     // Recomputes the sum of allocated blocks. cur() gives the same value in
+     // O(1); used_bytes() is the reference reading (it can't drift), used
+     // for end-of-session diagnostics.
+@@ -125,6 +152,42 @@ public:
+ private:
+     void record_fail(uint32_t n);
+ 
++    // A block of n bytes rounded up to al, at an al-aligned address (al a
++    // power of two, at least this pool's alignment), bottom-up or top-down.
++    uint32_t carve(uint32_t n, uint32_t al, bool top) {
++        if (al < align_) al = align_;
++        uint32_t sz = (n + al - 1) & ~(al - 1);
++        if (!sz) sz = al;
++        auto take = [&](std::map<uint32_t, uint32_t>::iterator it, uint32_t a) {
++            const uint32_t fb = it->first, fe = it->first + it->second;
++            freeb_.erase(it);
++            if (a > fb) freeb_[fb] = a - fb;
++            if (a + sz < fe) freeb_[a + sz] = fe - (a + sz);
++            used_[a] = sz;
++            cur_ += sz; if (cur_ > peak_) peak_ = cur_;
++            return a;
++        };
++        if (top) {
++            for (auto it = freeb_.end(); it != freeb_.begin();) {
++                --it;
++                const uint32_t fe = it->first + it->second;
++                if (it->second < sz) continue;
++                const uint32_t a = (fe - sz) & ~(al - 1);
++                if (a >= it->first) return take(it, a);
++            }
++        } else {
++            for (auto it = freeb_.begin(); it != freeb_.end(); ++it) {
++                const uint32_t a = (it->first + al - 1) & ~(al - 1);
++                if (a >= it->first && a - it->first <= it->second && it->first + it->second - a >= sz)
++                    return take(it, a);
++            }
++        }
++        return 0;
++    }
++
++    GuestRegion* pool_ = nullptr;   // set by share(): this region is a face of it
++    bool top_ = false;
++
+     const char* name_ = "region";
+     uint32_t base_ = 0, limit_ = 0, align_ = 16;
+     uint32_t cur_ = 0, peak_ = 0;

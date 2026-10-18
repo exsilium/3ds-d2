@@ -261,7 +261,23 @@ int main(int argc, char **argv)
             }
             for (int i = 0; i < 256; i++)
                 h = (h ^ f.palette[i]) * 16777619u;
-            std::fprintf(framehash, "%u %08x %ux%u\n", n, h, f.width, f.height);
+            // M4_HASHMEM=<va>:<bytes>: a guest memory range hashed with each
+            // frame, for native code whose result the pixels may not show
+            // (the light grid, 0x7b0e68:0x4800).
+            static const char *hm = std::getenv("M4_HASHMEM");
+            if (hm) {
+                char *end = nullptr;
+                const uint32_t va = (uint32_t)std::strtoul(hm, &end, 0);
+                const uint32_t len = end && *end == ':' ? (uint32_t)std::strtoul(end + 1, nullptr, 0) : 0;
+                std::vector<uint8_t> mem(len);
+                uint32_t mh = 2166136261u;
+                if (len && rt::guest_read(va, mem.data(), len))
+                    for (uint8_t b : mem)
+                        mh = (mh ^ b) * 16777619u;
+                std::fprintf(framehash, "%u %08x %ux%u mem %08x\n", n, h, f.width, f.height, mh);
+            } else {
+                std::fprintf(framehash, "%u %08x %ux%u\n", n, h, f.width, f.height);
+            }
             // M4_DUMPFRAME=<n>: that frame's raw indices, for comparing two runs.
             static const char *dump = std::getenv("M4_DUMPFRAME");
             if (dump && n == (unsigned)std::atoi(dump)) {

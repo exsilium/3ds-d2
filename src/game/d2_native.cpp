@@ -1,4 +1,5 @@
-// Native replacements for Diablo II 1.14d's hottest drawing routines.
+// Native replacements for Diablo II 1.14d's hottest drawing routines and
+// its per-frame light-occlusion grid.
 //
 // The game draws floors and walls in software, almost entirely in a few leaf
 // routines that remap pixels through a 256-byte shade table. Translated to
@@ -30,6 +31,7 @@ namespace {
 uint8_t *g_base = nullptr;
 inline uint8_t *H(uint32_t va) { return g_base + va; }
 inline int32_t I32(uint32_t va) { int32_t v; std::memcpy(&v, H(va), 4); return v; }
+inline uint32_t U32(uint32_t va) { uint32_t v; std::memcpy(&v, H(va), 4); return v; }
 
 // Globals of the tile renderer (see the specification).
 constexpr uint32_t kPitch = 0x007d544c;       // destination row pitch
@@ -371,6 +373,95 @@ uint32_t dc6_blend_clipped(Cpu &c)
     }
 }
 
+// ---- the light-occlusion grid ---------------------------------------------------
+//
+// Every frame the game rebuilds a 48x48 grid of light-blocking subtiles
+// around the view: 2,304 room lookups and collision queries, each a chain
+// of small calls. On the console this was ~21% of a town frame, almost all
+// of it call and return overhead in translated code.
+
+constexpr uint32_t kPlayerUnit = 0x007a6a70;   // the player's unit, or 0
+constexpr uint32_t kGridX = 0x007b0a54, kGridY = 0x007b0a58;   // grid origin, in subtiles
+constexpr uint32_t kLightGrid = 0x007b0e68;    // 48x48 cells of 8 bytes; the first dword is "blocked"
+
+// D2's room: neighbour list at +0x00, its length at +0x24, collision data
+// at +0x20, bounds in subtiles at +0x4c (x), +0x50 (y), +0x54 (w), +0x58 (h).
+inline bool room_has(uint32_t r, int32_t x, int32_t y)
+{
+    const int32_t rx = I32(r + 0x4c), ry = I32(r + 0x50);
+    return x >= rx && x < rx + I32(r + 0x54) && y >= ry && y < ry + I32(r + 0x58);
+}
+
+// 463740(ecx=room, edx=x, [8]=y): the room itself or the neighbour holding
+// (x, y), else 0.
+uint32_t room_find(uint32_t room, int32_t x, int32_t y)
+{
+    if (!room)
+        return 0;
+    if (room_has(room, x, y))
+        return room;
+    const uint32_t list = U32(room), count = U32(room + 0x24);
+    for (uint32_t i = 0; i < count; i++) {
+        const uint32_t n = U32(list + 4 * i);
+        if (n && room_has(n, x, y))
+            return n;
+    }
+    return 0;
+}
+
+// 620bb0([8]=unit): the unit's room. Types 2, 4 and 5 (objects, items,
+// tiles) hold it at [[+0x2c]]; the others at [[+0x2c]+0x1c] when they have
+// a path. (A null unit is a fatal error in the game; the caller checks.)
+uint32_t unit_room(uint32_t unit)
+{
+    const uint32_t type = U32(unit), path = U32(unit + 0x2c);
+    if (type == 2 || type == 4 || type == 5)
+        return U32(path);
+    return path ? U32(path + 0x1c) : 0;
+}
+
+// 64cb30([8]=room, [c]=x, [10]=y, [14]=mask), ret 0x10: the collision word
+// at (x, y) masked, or 0x27 (blocked) outside any room or collision data.
+uint32_t collision(uint32_t room, int32_t x, int32_t y, uint16_t mask)
+{
+    const uint32_t r = room_find(room, x, y);
+    if (!r)
+        return 0x27;
+    const uint32_t c = U32(r + 0x20);   // 61a010
+    if (!c)
+        return 0x27;
+    const uint32_t grid = U32(c + 0x20);
+    if (!grid)
+        return 0x27;
+    const uint32_t i = ((uint32_t)y - U32(c + 4)) * U32(c + 8) - U32(c) + (uint32_t)x;
+    uint16_t w;
+    std::memcpy(&w, H(grid + 2 * i), 2);
+    return w & mask;
+}
+
+// 4756d0(): marks the cells whose subtile blocks light (mask 0x22). The cells
+// are only ever set here, never cleared. The room found for one cell is the
+// starting point for the next; where none holds it, the player's room again.
+uint32_t light_grid(Cpu &)
+{
+    const uint32_t player = U32(kPlayerUnit);
+    if (!player)
+        return 0;
+    uint32_t room = unit_room(player);
+    if (!room)
+        return 0;
+    for (int32_t y = 0; y < 48; y++)
+        for (int32_t x = 0; x < 48; x++) {
+            const int32_t gx = (int32_t)((uint32_t)I32(kGridX) + (uint32_t)x);
+            const int32_t gy = (int32_t)((uint32_t)I32(kGridY) + (uint32_t)y);
+            const uint32_t r = room_find(room, gx, gy);
+            room = r ? r : unit_room(player);
+            if ((uint16_t)collision(room, gx, gy, 0x22))
+                std::memcpy(H(kLightGrid + 8 * (uint32_t)(y * 48 + x)), "\1\0\0\0", 4);
+        }
+    return 0;
+}
+
 }  // namespace
 
 int install_d2_native(Cpu &c)
@@ -409,6 +500,8 @@ int install_d2_native(Cpu &c)
     HOOK(c, 0x00606da0, k606da0, sizeof k606da0, 5, dc6_copy_clipped, "Dc6CopyClipped");
     HOOK(c, 0x00606e40, k606e40, sizeof k606e40, 4, dc6_blend, "Dc6Blend");
     HOOK(c, 0x00607060, k607060, sizeof k607060, 7, dc6_blend_clipped, "Dc6BlendClipped");
+    static const uint8_t k4756d0[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x08, 0x53, 0xe8};
+    HOOK(c, 0x004756d0, k4756d0, sizeof k4756d0, 0, light_grid, "LightGrid");
 #undef HOOK
     return n;
 }

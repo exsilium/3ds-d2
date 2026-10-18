@@ -29,12 +29,14 @@
 #include <3ds/allocator/mappable.h>
 
 #include <cstdarg>
+#include <fcntl.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <malloc.h>
 #include <string>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -689,6 +691,42 @@ bool read_file(const std::string &path, std::vector<uint8_t> &out)
     return ok;
 }
 
+#ifdef PROF_COUNTERS
+// The SD card's cost model, for sizing the game-file read cache
+// (rt_shims_files.cpp): reads of each size at scattered offsets of an MPQ,
+// as the game reads them. Time per read = per-call overhead + size /
+// bandwidth; two sizes give both.
+void sd_benchmark(const std::string &path)
+{
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    struct stat st;
+    if (fd < 0 || ::fstat(fd, &st) != 0 || st.st_size < (1 << 20)) {
+        status("sd bench: cannot open %s", path.c_str());
+        if (fd >= 0)
+            ::close(fd);
+        return;
+    }
+    std::vector<uint8_t> buf(64 * 1024);
+    uint32_t seed = 0x2545F491;
+    for (uint32_t size : {512u, 2048u, 4096u, 8192u, 16384u, 32768u, 65536u}) {
+        constexpr int kReads = 24;
+        uint64_t ticks = 0;
+        for (int i = 0; i < kReads; i++) {
+            seed = seed * 1664525u + 1013904223u;
+            const off_t at = (off_t)((seed % (uint32_t)(st.st_size - 65536)) & ~511u);
+            const uint64_t t0 = svcGetSystemTick();
+            ::lseek(fd, at, SEEK_SET);
+            if (::read(fd, buf.data(), size) != (ssize_t)size)
+                status("sd bench: short read at %ld", (long)at);
+            ticks += svcGetSystemTick() - t0;
+        }
+        const double ms = ticks / (SYSCLOCK_ARM11 / 1000.0) / kReads;
+        status("sd bench: %5u B: %6.3f ms/read, %5.0f KiB/s", (unsigned)size, ms, size / 1024.0 / (ms / 1000.0));
+    }
+    ::close(fd);
+}
+#endif
+
 void wait_for_start()
 {
     std::printf("\nPress START to exit.\n");
@@ -742,6 +780,9 @@ int main()
         return 1;
     }
     status("Game.exe: %u bytes. Starting...", (unsigned)exe.size());
+#ifdef PROF_COUNTERS
+    sd_benchmark(game_dir + "/d2data.mpq");
+#endif
 
     {
         std::vector<uint8_t> script;

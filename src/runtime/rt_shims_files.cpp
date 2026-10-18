@@ -281,17 +281,17 @@ FileStats g_file_stats;
 // filled whole by one read each; least recently used is replaced. Reads of a
 // block or more go straight to their destination.
 //
-// Sizes from the game's own reads (RT_FILETRACE on the Linux lane, from the
-// menus into the Rogue Encampment: 3,500 reads, 40% under 1 KiB, mostly in
-// d2data.mpq) replayed against cost models: when each file system call costs
-// more than its bytes, as the console's 400-750 KiB/s through stdio suggests,
-// 32 KiB x 16 halves the cost, with 1.7x the bytes read. Block memory is
-// allocated on first use and capped in total (kCap): past it, a file reuses
-// its own blocks.
+// Sizes: the console's SD reads are bandwidth-bound (~5 MB/s: a 32 KiB read
+// takes 6-7 ms), so every byte read and not used costs time, and the host
+// heap has only a few MiB to spare in play (4 MiB of blocks exhausted it in
+// Blood Moor: the JIT's metadata allocation failed). Small blocks still
+// merge the game's many sub-KiB reads (40% of them, RT_FILETRACE on the
+// Linux lane) and serve its re-reads. Block memory is allocated on first use
+// and capped in total (kCap): past it, a file reuses its own blocks.
 class ReadCache {
 public:
-    static constexpr uint32_t kBlock = 32 * 1024, kBlocks = 16;
-    static constexpr uint64_t kCap = 4u << 20;
+    static constexpr uint32_t kBlock = 8 * 1024, kBlocks = 8;
+    static constexpr uint64_t kCap = 1u << 20;
 
     ReadCache(int fd, uint64_t size) : fd_(fd), size_(size) {}
     ~ReadCache()

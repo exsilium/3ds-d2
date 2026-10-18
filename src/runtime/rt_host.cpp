@@ -41,6 +41,7 @@ extern uint64_t dyn86_ctr_cache_sync_ticks __attribute__((weak));
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <malloc.h>
 #include <memory>
 #include <set>
 #include <vector>
@@ -295,13 +296,19 @@ void check_time_limit(uint64_t ms)
     if (g_opt.heartbeat_ms && ms >= g_next_beat) {
         g_next_beat = ms + g_opt.heartbeat_ms;
         prof_report(ms);
-        logf("t=%llus peeks=%u files=%u read=%lluKiB frames=%u heap=%u/%uKiB va=%u/%uKiB free=%uKiB jit=%u meta=%u jmptbl=%uKiB",
+#ifdef __GLIBC__
+        const size_t host_used = mallinfo2().uordblks;
+#else
+        const size_t host_used = mallinfo().uordblks;
+#endif
+        logf("t=%llus peeks=%u files=%u read=%lluKiB frames=%u heap=%u/%uKiB va=%u/%uKiB free=%uKiB jit=%u meta=%u jmptbl=%uKiB "
+             "host=%uKiB",
              (unsigned long long)(ms / 1000), g_stats.peeks, g_stats.files_opened,
              (unsigned long long)(g_stats.bytes_read >> 10), g_stats.frames, g_heap.used_bytes() >> 10,
              g_heap.peak() >> 10, g_va.used_bytes() >> 10, g_va.peak() >> 10,
              (unsigned)((g_pool_size ? g_pool_size - g_heap.cur() - g_va.cur() : g_va.largest_free()) >> 10),
              (unsigned)d2rt_box86_dynarec_kb(),
-             (unsigned)d2rt_box86_custommalloc_kb(), (unsigned)d2rt_box86_jmptbl_kb());
+             (unsigned)d2rt_box86_custommalloc_kb(), (unsigned)d2rt_box86_jmptbl_kb(), (unsigned)(host_used >> 10));
     }
     if (g_opt.max_ms && ms >= g_opt.max_ms && !g_timed_out && g_sched) {
         g_timed_out = true;

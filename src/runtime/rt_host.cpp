@@ -100,6 +100,17 @@ bool guest_read(uint32_t va, void *out, uint32_t n)
     return g_br->cpu()->read(va, out, n);
 }
 
+uint32_t native_entry(const char *name, uint32_t stack_args, std::function<uint32_t(Cpu &)> fn)
+{
+    Shim s;
+    s.argc = stack_args;
+    s.stdcall_cleanup = true;
+    s.tag = std::string("3DSD2NATIVE!") + name;
+    s.fn = std::move(fn);
+    g_br->register_shim("3DSD2NATIVE", name, s);
+    return g_br->shim_trap("3DSD2NATIVE", name);
+}
+
 bool hook_function(Cpu &c, uint32_t va, const uint8_t *expect, uint32_t n, uint32_t stack_args,
                    std::function<uint32_t(Cpu &)> fn, const char *name)
 {
@@ -110,13 +121,7 @@ bool hook_function(Cpu &c, uint32_t va, const uint8_t *expect, uint32_t n, uint3
         logf("native %s: bytes at %08x differ, not hooked", name, va);
         return false;
     }
-    Shim s;
-    s.argc = stack_args;
-    s.stdcall_cleanup = true;
-    s.tag = std::string("3DSD2NATIVE!") + name;
-    s.fn = std::move(fn);
-    g_br->register_shim("3DSD2NATIVE", name, s);
-    const uint32_t trap = g_br->shim_trap("3DSD2NATIVE", name);
+    const uint32_t trap = native_entry(name, stack_args, std::move(fn));
     if (!trap)
         return false;
     uint8_t jmp[5] = {0xE9};
@@ -238,6 +243,8 @@ void request_exit(uint32_t code)
     if (g_sched)
         g_sched->request_shutdown();
 }
+
+bool exit_requested() { return g_exited; }
 
 void logf(const char *fmt, ...)
 {

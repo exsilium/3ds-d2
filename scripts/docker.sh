@@ -14,6 +14,7 @@
 #                                             reading the game files from sdmc:/3ds/3ds-d2/game/
 #   scripts/docker.sh package-cia --slim <game-dir>   ... with your 1.14d files inside (no video/music/speech)
 #   scripts/docker.sh package-cia --full <game-dir>   ... with every MPQ inside
+#   scripts/docker.sh package-cia --prof [...]        the profiling build (game.log gets a profile every 10 s)
 #   scripts/docker.sh sdcard-folder <game-dir>   dist/sdcard/3ds/3ds-d2/game/ for that (copy once)
 #   scripts/docker.sh repro              two clean release builds must match byte-for-byte
 #   scripts/docker.sh shell [hosttest]   interactive shell in a build image
@@ -96,12 +97,13 @@ package)
     do_build release
     run_in "$TOOLCHAIN_IMAGE" sh scripts/package.sh release
     ;;
-package-cia)   # [--slim|--full <game-dir>]: the game app (+ the user's own 1.14d files) -> dist/cia/*.cia
+package-cia)   # [--prof] [--slim|--full <game-dir>]: the game app (+ the user's own 1.14d files) -> dist/cia/*.cia
+    prof=0; [ "${1:-}" = --prof ] && { prof=1; shift; }   # the profiling build: ...-prof.cia
     mode=sdcard
     case "${1:-}" in --slim) mode=slim; shift ;; --full) mode=full; shift ;; --sdcard) shift ;; esac
     stage="$ROOT/build/cia/romfs/game"
     rm -rf "$ROOT/build/cia/romfs" && mkdir -p "$stage"
-    RUN_EXTRA=(-e "D2_CIA_MODE=$mode")
+    RUN_EXTRA=(-e "D2_CIA_MODE=$mode" -e "D2_CIA_PROF=$prof")
     if [ "$mode" != sdcard ]; then
         [ -n "${1:-}" ] && [ -f "$1/Game.exe" ] || die "package-cia --$mode <game-dir with Game.exe and the MPQs>"
         game="$(cd "$1" && pwd)"
@@ -121,7 +123,11 @@ package-cia)   # [--slim|--full <game-dir>]: the game app (+ the user's own 1.14
     ensure_image ctrtools "$CTRTOOLS_IMAGE"
     saved_extra=("${RUN_EXTRA[@]}"); RUN_EXTRA=()
     run_in "$HOSTTEST_IMAGE" make -C tests/cpu VARIANT=armv6 lib >/dev/null     # the patched backend tree
-    run_in "$TOOLCHAIN_IMAGE" make -s -j8 -C tests/cpu/ctr ../../../build/cpu/ctr/3ds-d2-game-cia.elf
+    if [ "$prof" = 1 ]; then
+        run_in "$TOOLCHAIN_IMAGE" make -s -j8 -C tests/cpu/ctr PROF=1 ../../../build/cpu/ctr-prof/3ds-d2-game-cia.elf
+    else
+        run_in "$TOOLCHAIN_IMAGE" make -s -j8 -C tests/cpu/ctr ../../../build/cpu/ctr/3ds-d2-game-cia.elf
+    fi
     RUN_EXTRA=("${saved_extra[@]}")
     run_in "$CTRTOOLS_IMAGE" sh scripts/package-cia.sh
     ;;

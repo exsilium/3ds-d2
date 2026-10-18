@@ -432,26 +432,56 @@ game::Osk g_osk;
 bool g_osk_shown = false;            // what the log window shows now: the keyboard or the log
 bool g_wait_release = false;         // after the keyboard closes: ignore buttons until all are up
 uint32_t g_last_focus = 0;           // the last focused edit box seen (auto-open on a new one)
-constexpr int kOskTopRow = 13;       // the keyboard draws in the log window (rows 13-29)
+// The keyboard is drawn in pixels straight into the bottom screen's
+// framebuffer (single-buffered, the one the consoles print into), in the
+// 320x140 area under the stats panel, which ends at text row 11 (y 95).
+// Pixels, not console text: keys and labels then line up with the touch
+// areas exactly, and labels sit in the middle of their 22-pixel keys.
+// (Console windows do not land where consoleSetWindow says: the log
+// window, set at row 13, prints from row 12, which put the text-grid
+// keyboard a row above its touch areas.)
+constexpr int kOskY = 100;
+extern "C" const uint8_t default_font_bin[];   // libctru's console font: 8x8, 1 bpp, bit 7 leftmost
+
+inline void osk_px(uint16_t *fb, int x, int y, uint16_t c)
+{
+    if (x >= 0 && x < 320 && y >= 0 && y < 240)
+        fb[x * 240 + (239 - y)] = c;   // the framebuffer is column-major, bottom to top
+}
+
+void osk_fill(uint16_t *fb, int x, int y, int w, int h, uint16_t c)
+{
+    for (int i = 0; i < w; i++)
+        for (int j = 0; j < h; j++)
+            osk_px(fb, x + i, y + j, c);
+}
+
+void osk_text(uint16_t *fb, int x, int y, const std::string &s, uint16_t c)
+{
+    for (size_t i = 0; i < s.size(); i++) {
+        const uint8_t *g = default_font_bin + (uint8_t)s[i] * 8;
+        for (int r = 0; r < 8; r++)
+            for (int b = 0; b < 8; b++)
+                if (g[r] & (0x80 >> b))
+                    osk_px(fb, x + (int)i * 8 + b, y + r, c);
+    }
+}
 
 void draw_osk()
 {
-    consoleSelect(&g_log_con);
-    std::printf("\x1b[2J");
+    uint16_t *fb = g_log_con.frameBuffer;
+    if (!g_osk.is_open()) {
+        consoleSelect(&g_log_con);
+        std::printf("\x1b[2J");
+    }
+    osk_fill(fb, 0, kOskY, game::Osk::kWidth, game::Osk::kHeight, 0);
     if (g_osk.is_open()) {
-        const std::vector<game::Osk::Row> rows = g_osk.rows();
-        for (int r = 0; r < (int)rows.size(); r++) {
-            std::printf("\x1b[%d;1H", r + 1);
-            bool on = false;
-            // 39 columns: a character in the 40th would wrap and scroll the window.
-            for (int c = 0; c < 39; c++) {
-                if (rows[r].key[c] != on) {
-                    on = rows[r].key[c];
-                    std::printf(on ? "\x1b[47;30m" : "\x1b[0m");
-                }
-                std::putchar(rows[r].text[c]);
-            }
-            std::printf("\x1b[0m");
+        const uint16_t key = rgb565(200, 200, 200), down = rgb565(80, 80, 80);
+        osk_text(fb, 0, kOskY + 2, g_osk.title(), rgb565(255, 255, 255));
+        for (const game::Osk::KeyView &k : g_osk.keys()) {
+            osk_fill(fb, k.x, kOskY + k.y, k.w, k.h, k.pressed ? down : key);
+            osk_text(fb, k.x + (k.w - 8 * (int)k.label.size()) / 2, kOskY + k.y + (k.h - 8) / 2, k.label,
+                     k.pressed ? rgb565(255, 255, 255) : 0);
         }
     }
     g_osk_shown = g_osk.is_open();
@@ -519,7 +549,7 @@ void poll()
         // an idle pad, which also releases anything that was held.
         g_osk.buttons(pressed);
         if (touch_down)
-            g_osk.tap(pad.touch_x / 8, pad.touch_y / 8 - kOskTopRow);
+            g_osk.tap(pad.touch_x, pad.touch_y - kOskY);
         if (!g_osk.is_open())
             g_wait_release = true;   // the button that closed it must not reach the game
         pad = game::Pad();

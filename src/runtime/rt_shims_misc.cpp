@@ -1,8 +1,11 @@
 // The small DLLs: WINMM, SHELL32, OLE32, CRYPT32/WINTRUST, BINKW32, SMACKW32,
 // and the GDI32 calls WinVita leaves out.
 //
-// Videos: BinkOpen/SmackOpen fail, which the game treats as "no cinematic"
-// and skips. Decoding Bink on an ARM11 would cost more than the game itself.
+// Videos: only the game's DirectDraw, Direct3D and Glide renderers call
+// binkw32, so in the GDI renderer the runtime runs it is never called; the
+// cinematics are played natively instead (src/game/cinematics.cpp). The GDI
+// renderer calls smackw32 for .smk resources (its function table +0x40),
+// which no traced run reached. Both stay failing, as a safety net.
 // Code signing: there is nothing to verify offline, so every check reports
 // "not signed" and the game carries on (it only matters to Battle.net).
 #include "runtime/rt_host.h"
@@ -109,7 +112,7 @@ void install_misc(Bridge &br)
         return 1u;   // characters written, the NUL included
     });
 
-    // ---- video: no cinematics ----
+    // ---- video: unused (see the top of the file) ----
     const struct { const char *dll, *name; uint32_t argc, value; } videos[] = {
         {"BINKW32.dll", "_BinkOpen@8", 2, 0},          {"BINKW32.dll", "_BinkClose@4", 1, 0},
         {"BINKW32.dll", "_BinkNextFrame@4", 1, 0},     {"BINKW32.dll", "_BinkDoFrame@4", 1, 0},

@@ -11,11 +11,14 @@
 // ndsp needs the DSP firmware at sdmc:/3ds/dspfirm.cdc (dumped once with the
 // DSP1 homebrew on a console; Azahar's HLE DSP does not need it). Without it
 // the sink fails to open and ds_emul falls back to silence, saying so.
+//
+// The cinematics' soundtrack goes to a second DSP channel (NdspVideoAudio).
 #include "runtime/audio_sink.h"
 #include "runtime/rt_host.h"
 
 #include <3ds.h>
 
+#include <algorithm>
 #include <cstring>
 
 namespace d2rt {
@@ -108,6 +111,113 @@ private:
     ndspWaveBuf bufs_[kBuffers];
 };
 
+// The cinematics' soundtrack (rt::VideoAudio): ndsp channel 1 at the video's
+// own rate, beside ds_emul's channel 0 (ndspInit is reference-counted). The
+// player writes from the game thread and must never wait, so write() takes
+// what fits in eight buffers of 1024 frames (~190 ms at 44.1 kHz) and
+// returns. A buffer is queued when full, or at once while fewer than two
+// are queued, so the DSP never runs dry for want of a full buffer.
+class NdspVideoAudio : public rt::VideoAudio {
+public:
+    bool open(uint32_t rate, uint32_t channels) override
+    {
+        if (channels < 1 || channels > 2 || R_FAILED(ndspInit()))
+            return false;
+        channels_ = channels;
+        pcm_ = (int16_t *)linearAlloc(kFrames * kBufs * channels * sizeof(int16_t));
+        if (!pcm_) {
+            ndspExit();
+            return false;
+        }
+        ndspChnReset(kChannel);
+        ndspChnSetInterp(kChannel, NDSP_INTERP_LINEAR);
+        ndspChnSetRate(kChannel, (float)rate);
+        ndspChnSetFormat(kChannel, channels == 2 ? NDSP_FORMAT_STEREO_PCM16 : NDSP_FORMAT_MONO_PCM16);
+        float mix[12] = {1.0f, 1.0f};
+        ndspChnSetMix(kChannel, mix);
+        std::memset(bufs_, 0, sizeof bufs_);
+        for (int i = 0; i < kBufs; i++) {
+            bufs_[i].data_pcm16 = pcm_ + (size_t)i * kFrames * channels;
+            bufs_[i].status = NDSP_WBUF_FREE;
+        }
+        next_ = 0, fill_ = 0, submitted_ = 0;
+        open_ = true;
+        return true;
+    }
+
+    uint32_t write(const int16_t *pcm, uint32_t frames) override
+    {
+        uint32_t taken = 0;
+        while (open_ && taken < frames) {
+            ndspWaveBuf &b = bufs_[next_];
+            if (b.status == NDSP_WBUF_QUEUED || b.status == NDSP_WBUF_PLAYING)
+                break;   // all eight in use
+            const uint32_t n = std::min<uint32_t>(frames - taken, kFrames - fill_);
+            std::memcpy(b.data_pcm16 + (size_t)fill_ * channels_, pcm + (size_t)taken * channels_,
+                        (size_t)n * channels_ * sizeof(int16_t));
+            fill_ += n, taken += n;
+            if (fill_ == kFrames || queued() < 2)
+                submit();
+        }
+        return taken;
+    }
+
+    uint64_t played() override
+    {
+        if (!open_)
+            return 0;
+        uint64_t pending = 0;
+        for (const ndspWaveBuf &b : bufs_)
+            if (b.status == NDSP_WBUF_QUEUED || b.status == NDSP_WBUF_PLAYING)
+                pending += b.nsamples;
+        pending -= std::min<uint64_t>(pending, ndspChnGetSamplePos(kChannel));
+        return submitted_ - pending;
+    }
+
+    void close() override
+    {
+        if (!open_)
+            return;
+        open_ = false;
+        ndspChnWaveBufClear(kChannel);
+        ndspChnReset(kChannel);
+        linearFree(pcm_);
+        pcm_ = nullptr;
+        ndspExit();
+    }
+
+private:
+    static constexpr int kChannel = 1, kBufs = 8;
+    static constexpr uint32_t kFrames = 1024;
+
+    int queued() const
+    {
+        int n = 0;
+        for (const ndspWaveBuf &b : bufs_)
+            n += b.status == NDSP_WBUF_QUEUED || b.status == NDSP_WBUF_PLAYING;
+        return n;
+    }
+    void submit()
+    {
+        ndspWaveBuf &b = bufs_[next_];
+        b.nsamples = fill_;
+        DSP_FlushDataCache(b.data_pcm16, fill_ * channels_ * sizeof(int16_t));
+        ndspChnWaveBufAdd(kChannel, &b);
+        submitted_ += fill_;
+        fill_ = 0;
+        next_ = (next_ + 1) % kBufs;
+    }
+
+    bool open_ = false;
+    uint32_t channels_ = 2, fill_ = 0;
+    int next_ = 0;
+    uint64_t submitted_ = 0;
+    int16_t *pcm_ = nullptr;
+    ndspWaveBuf bufs_[kBufs];
+};
+
+NdspVideoAudio g_video_audio;
+
 Thread g_thread = nullptr;
 void (*g_body)(void) = nullptr;
 
@@ -116,6 +226,8 @@ void thread_entry(void *) { g_body(); }
 }  // namespace
 
 Sink *make_vita_sink() { return new NdspSink(); }   // ds_emul's name for "the console's realtime sink"
+
+rt::VideoAudio *video_sink() { return &g_video_audio; }
 
 bool thread_start(void (*body)(void))
 {

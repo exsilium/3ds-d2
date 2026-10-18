@@ -279,7 +279,7 @@ The plan asks whether audit effort and measured overhead justify continuing with
 | KERNEL32 | 78 | file search, attributes and directories; critical sections; `LoadLibrary`/`GetProcAddress`; resources; file mapping; toolhelp; time conversions; INI files; wide-character variants |
 | USER32 | 22 | keyboard state, window placement and visibility, `wsprintfA`/`wvsprintfA`, clipboard, monitor info, `MessageBoxA`, `DrawTextA` |
 | ADVAPI32 | 17 | registry (and service-control calls the game makes but doesn't depend on) |
-| BINKW32 / SMACKW32 | 15 | cinematic video players. They can report "no video" first; D2Vita stubs them. |
+| BINKW32 / SMACKW32 | 15 | cinematic video players, used only by the DirectDraw/Direct3D/Glide renderers; never called in GDI mode ([cinematics.md](cinematics.md)) |
 | CRYPT32 / WINTRUST | 8 | signature and anti-cheat checks: only meaningful online |
 | GDI32, WINMM, SHELL32, PSAPI, OLE32 | 7 | `CreateDIBSection`/`StretchBlt`/`SetDIBColorTable`, `timeGetTime`, `SHGetFolderPathA`, `GetModuleFileNameExA`, `CoTaskMemFree` |
 
@@ -321,7 +321,7 @@ The game's own log reports the environment the runtime presents:
 | `rt_shims_kernel32.cpp` | modules: the exe; PE DLLs from disk, with DllMain run; system DLLs as pseudo-handles whose `GetProcAddress` returns shim traps; the 1.13 split DLLs refused. Also critical sections (on WinVita's engine table), TLS in the TEB, wall time (a fixed epoch under the virtual clock, for lockstep runs), resources walked in guest memory, toolhelp, process and debug calls. |
 | `rt_shims_advapi32.cpp` | an in-memory registry shared by all roots. The install keys are seeded to match the drive layout. It persists to `write_root/registry.txt` only when a value changes, which spares the SD card. |
 | `rt_shims_user32.cpp` | window activation on `ShowWindow` (the game needs `WM_ACTIVATEAPP`), virtual-key state fed by `rt::set_key`, a single-buffer `wsprintfA` for its per-frame UI text, clipboard, monitor and placement |
-| `rt_shims_misc.cpp` | GDI DIB sections, DC selection, color tables and blits feeding `present`. Bink/Smack fail to open, so cinematics are skipped. Signature checks report "not signed". Also `timeGetTime` and `SHGetFolderPathA`. |
+| `rt_shims_misc.cpp` | GDI DIB sections, DC selection, color tables and blits feeding `present`. Bink/Smack fail to open (unused: cinematics are played natively, [cinematics.md](cinematics.md)). Signature checks report "not signed". Also `timeGetTime` and `SHGetFolderPathA`. |
 | `rt_shims_net.cpp` | WS2_32/WSOCK32 by ordinal and name, for an offline host: names resolve to loopback and sockets fail with "network down". DirectSound reports "no driver" until an ndsp sink exists. |
 
 ARMv6 patch 0022 makes the CPUID leaf-1 EDX bits a run-time setting (`wx86_set_cpuid1_edx`). The 3DS host reports FPU|CMOV only, so the game never runs SSE code that the ARM11 would have to emulate (§3a).

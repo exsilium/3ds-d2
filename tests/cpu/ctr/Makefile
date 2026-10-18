@@ -38,6 +38,14 @@ CXXFLAGS := -O2 -g $(ARCH) -std=gnu++17 -D__3DS__ -DD2RT_CPU_BOX86 -I$(CTR) -I$(
 # and the app crashed at its first HeapAlloc.
 CFLAGS += -MMD -MP
 CXXFLAGS += -MMD -MP
+# PROF=1 (package-cia --prof): the profiling build. WinVita's PROF_COUNTERS
+# (run/shim time split, EIP samples per guest thread) reported to game.log
+# every 10 s; objects in their own directory so the two builds never mix.
+ifeq ($(PROF),1)
+OUT := $(ROOT)/build/cpu/ctr-prof
+CFLAGS += -DPROF_COUNTERS
+CXXFLAGS += -DPROF_COUNTERS
+endif
 LDFLAGS := -specs=3dsx.specs -g $(ARCH) -L$(CTRULIB)/lib -Wl,-Map,$(OUT)/cpu-lane.map
 
 CORE := dynarec/dynarec.c dynarec/dynablock.c dynarec/dynarec_arm.c dynarec/dynarec_arm_functions.c \

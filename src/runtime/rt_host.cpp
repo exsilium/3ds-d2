@@ -10,6 +10,7 @@
 #include "runtime/guest_thread.h"
 #include "runtime/guest_thread_ctx.h"
 #include "runtime/host_clock.h"
+#include "runtime/prof.h"
 #include "runtime/sched_cooperative.h"
 #include "runtime/win32_shims_advapi32.h"
 #include "runtime/win32_shims_gdi32.h"
@@ -29,14 +30,20 @@ extern "C" {
 size_t d2rt_box86_dynarec_kb(void);
 size_t d2rt_box86_custommalloc_kb(void);
 size_t d2rt_box86_jmptbl_kb(void);
+// The console's cache maintenance per translated block (mman_ctr.c). Weak:
+// the Linux lanes have no such counters.
+extern uint32_t dyn86_ctr_cache_syncs __attribute__((weak));
+extern uint64_t dyn86_ctr_cache_sync_ticks __attribute__((weak));
 }
 
+#include <algorithm>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <set>
+#include <vector>
 
 using namespace d2rt;
 
@@ -178,10 +185,95 @@ uint32_t guest_call(Cpu &c, uint32_t va, std::initializer_list<uint32_t> args)
 }
 
 namespace {
+// What the last heartbeat interval cost. Always: scheduler idle time and the
+// console's cache maintenance. With PROF_COUNTERS (package-cia --prof): the
+// split between translated code and shims, the busiest shims, and an EIP
+// profile per guest thread (one sample per preempted slice), after which the
+// samples are reset so every interval is a profile of its own.
+struct ProfMark {
+    uint64_t ms, idle_ms, switches, sync_ticks;
+    uint32_t syncs, frames;
+    uint64_t run_ns, trap_ns, trap_calls, waits, waits_now, cs, cs_contended;
+} g_mark{};
+
+#ifdef PROF_COUNTERS
+struct ThreadProf { uint32_t tid, entry; uint64_t samples, blocks; };
+
+void log_eips(const char *head, const std::vector<std::pair<uint32_t, uint64_t>> &v)
+{
+    char line[400];
+    size_t off = std::snprintf(line, sizeof line, "%s", head);
+    for (const auto &e : v) {
+        const int w = std::snprintf(line + off, sizeof line - off, " %08x:%llu", (unsigned)e.first,
+                                    (unsigned long long)e.second);
+        if (w <= 0 || off + w >= sizeof line)
+            break;
+        off += w;
+    }
+    logf("%s", line);
+}
+#endif
+
+void prof_report(uint64_t ms)
+{
+    const uint32_t syncs = &dyn86_ctr_cache_syncs ? dyn86_ctr_cache_syncs : 0;
+    const uint64_t ticks = &dyn86_ctr_cache_sync_ticks ? dyn86_ctr_cache_sync_ticks : 0;
+    ProfMark now{ms, g_sched ? g_sched->idle_ms_ : 0, g_sched ? g_sched->switches() : 0, ticks, syncs, g_stats.frames};
+    logf("prof: %llu ms, frames %u, idle %llu ms, switches %llu, cache syncs %u (%llu us)",
+         (unsigned long long)(now.ms - g_mark.ms), now.frames - g_mark.frames,
+         (unsigned long long)(now.idle_ms - g_mark.idle_ms), (unsigned long long)(now.switches - g_mark.switches),
+         now.syncs - g_mark.syncs, (unsigned long long)((now.sync_ticks - g_mark.sync_ticks) / 268u));   // 268 MHz tick
+#ifdef PROF_COUNTERS
+    now.run_ns = prof::run_ns;
+    now.trap_ns = prof::trap_ns;
+    now.trap_calls = prof::trap_calls;
+    now.waits = prof::wait_calls;
+    now.waits_now = prof::wait_immediate;
+    now.cs = prof::cs_enter;
+    now.cs_contended = prof::cs_contended;
+    logf("prof: run %llu ms (shims %llu ms in %llu calls), waits %llu (%llu immediate), cs %llu (%llu contended), "
+         "samples %llu",
+         (unsigned long long)((now.run_ns - g_mark.run_ns) / 1000000), (unsigned long long)((now.trap_ns - g_mark.trap_ns) / 1000000),
+         (unsigned long long)(now.trap_calls - g_mark.trap_calls), (unsigned long long)(now.waits - g_mark.waits),
+         (unsigned long long)(now.waits_now - g_mark.waits_now), (unsigned long long)(now.cs - g_mark.cs),
+         (unsigned long long)(now.cs_contended - g_mark.cs_contended), (unsigned long long)prof::eip_samples());
+    char shims[400];
+    if (g_br && g_br->prof_window(shims, sizeof shims, 12))
+        logf("prof shims:%s", shims);
+
+    std::vector<ThreadProf> threads;
+    prof::threads([](uint32_t tid, uint32_t entry, uint64_t samples, uint64_t blocks, void *u) {
+        static_cast<std::vector<ThreadProf> *>(u)->push_back({tid, entry, samples, blocks});
+    }, &threads);
+    using Eips = std::vector<std::pair<uint32_t, uint64_t>>;
+    const auto collect = [](uint32_t eip, uint64_t hits, void *u) { static_cast<Eips *>(u)->push_back({eip, hits}); };
+    for (const ThreadProf &t : threads) {
+        if (!t.samples && !t.blocks)
+            continue;
+        logf("prof thread %u (entry %08x): %llu samples, %llu blocks", t.tid, t.entry,
+             (unsigned long long)t.samples, (unsigned long long)t.blocks);
+        Eips v;
+        prof::top_eips_tid(t.tid, 40, collect, &v);
+        for (size_t i = 0; i < v.size(); i += 20) {
+            char head[32];
+            std::snprintf(head, sizeof head, "prof eip t%u", t.tid);
+            log_eips(head, Eips(v.begin() + i, v.begin() + std::min(v.size(), i + 20)));
+        }
+    }
+    Eips buckets;   // 64-byte buckets, all threads: hot loops spread over several EIPs
+    prof::top_eips(40, collect, &buckets);
+    for (size_t i = 0; i < buckets.size(); i += 20)
+        log_eips("prof bucket", Eips(buckets.begin() + i, buckets.begin() + std::min(buckets.size(), i + 20)));
+    prof::reset_samples();
+#endif
+    g_mark = now;
+}
+
 void check_time_limit(uint64_t ms)
 {
     if (g_opt.heartbeat_ms && ms >= g_next_beat) {
         g_next_beat = ms + g_opt.heartbeat_ms;
+        prof_report(ms);
         logf("t=%llus peeks=%u files=%u read=%lluKiB frames=%u heap=%u/%uKiB va=%u/%uKiB free=%uKiB jit=%u meta=%u jmptbl=%uKiB",
              (unsigned long long)(ms / 1000), g_stats.peeks, g_stats.files_opened,
              (unsigned long long)(g_stats.bytes_read >> 10), g_stats.frames, g_heap.used_bytes() >> 10,

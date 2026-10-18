@@ -183,8 +183,13 @@ void show_stats(float fps, float draw_ms, float worst_ms)
     // Each line is padded to 39 columns: a 40th character would wrap the
     // 40-column window and scroll the panel.
     char line[12][48];
-    std::snprintf(line[0], 48, "3ds-d2  game time %02u:%02u:%02u", (unsigned)(t / 3600), (unsigned)(t / 60 % 60),
-                  (unsigned)(t % 60));
+#ifdef PROF_COUNTERS
+    const char *build = "  PROF";   // the profiling build (package-cia --prof)
+#else
+    const char *build = "";
+#endif
+    std::snprintf(line[0], 48, "3ds-d2  game time %02u:%02u:%02u%s", (unsigned)(t / 3600), (unsigned)(t / 60 % 60),
+                  (unsigned)(t % 60), build);
     std::snprintf(line[1], 48, "fps %5.1f   worst frame gap %6.1f ms", fps, worst_ms);
     std::snprintf(line[2], 48, "draw %5.2f ms c%d skip %u frames %u", draw_ms, g_render_core < 0 ? 0 : g_render_core,
                   (unsigned)g_frames_skipped, (unsigned)g_timing.total_frames);
@@ -797,7 +802,9 @@ int main()
         // up, messages go to the log file only.
         // The sound engine's "[son]" diagnostics (WinVita writes them in
         // French) go to game.log only.
-        if (std::strncmp(s, "t=", 2) != 0 && std::strncmp(s, "[son]", 5) != 0 && !g_osk_shown)
+        // So do the per-interval profile lines ("prof...").
+        if (std::strncmp(s, "t=", 2) != 0 && std::strncmp(s, "[son]", 5) != 0 && std::strncmp(s, "prof", 4) != 0 &&
+            !g_osk_shown)
             std::printf("%.*s\n", 39, s);
     };
     opt.present = present;

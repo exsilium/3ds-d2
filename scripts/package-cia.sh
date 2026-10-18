@@ -14,7 +14,9 @@
 # game files: it is for their own console, not for distribution.
 set -eu
 cd /work
-elf=build/cpu/ctr/3ds-d2-game-cia.elf
+# D2_CIA_PROF=1: the profiling build (built into build/cpu/ctr-prof).
+prof="${D2_CIA_PROF:-0}"
+if [ "$prof" = 1 ]; then elf=build/cpu/ctr-prof/3ds-d2-game-cia.elf; else elf=build/cpu/ctr/3ds-d2-game-cia.elf; fi
 [ -f "$elf" ] || { echo "package-cia.sh: $elf missing" >&2; exit 1; }
 mode="${D2_CIA_MODE:-sdcard}"
 romfs=build/cia/romfs
@@ -53,6 +55,7 @@ bannertool makesmdh -s "3ds-d2" -l "Diablo II LoD 1.14d on the n3DS" -p "https:/
 
 id="$(sh scripts/build-id.sh 2>/dev/null || echo unversioned)"
 case "$mode" in sdcard) cia="$out/3ds-d2-$id.cia" ;; *) cia="$out/3ds-d2-$id-$mode.cia" ;; esac
+[ "$prof" = 1 ] && cia="${cia%.cia}-prof.cia"
 size="$(du -shL "$romfs" | cut -f1)"
 echo "packing $cia ($mode, RomFS $size)..."
 IFS=. read -r v_major v_minor v_micro <<EOF_VERSION
@@ -74,6 +77,7 @@ cp "$elf" "${cia%.cia}.elf"   # the exact code of this CIA: decodes its crash du
     echo "cia: $(basename "$cia")"
     echo "version: $version"
     echo "mode: $mode"
+    [ "$prof" = 1 ] && echo "build: profiling (PROF_COUNTERS)"
     echo "size: $(stat -c %s "$cia")"
     echo "sha256: $(sha256sum "$cia" | cut -d' ' -f1)"
     if [ "$mode" != sdcard ]; then

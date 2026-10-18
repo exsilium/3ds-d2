@@ -13,26 +13,26 @@ enum Code : int { kBack = 1, kEnter = 2, kShift = 3, kClose = 4 };   // otherwis
 
 struct Key {
     int code;
-    int row, col, width;   // in character cells; every key is 2 rows tall
+    int row, unit, units;   // key row 0-4; position and width in key units (10 per row)
     const char *label;
 };
 
-// Five rows of keys, 2 cells tall with a blank row between them, under a
-// one-line title. Keys are 3 cells wide with a 1-cell gap: 10 per row.
-constexpr int kTop = 2;
+// Five rows of keys under a one-line title. A key unit is a 32-pixel cell
+// holding a 29-pixel key; rows are 25 pixels apart with 22-pixel keys.
+constexpr int kUnit = 32, kKeyW = kUnit - 3, kMargin = 2;
+constexpr int kRowPitch = 25, kKeyH = kRowPitch - 3, kKeysTop = 14;
 const Key kKeys[] = {
-    {'1', 0, 0, 3, "1"}, {'2', 0, 4, 3, "2"}, {'3', 0, 8, 3, "3"}, {'4', 0, 12, 3, "4"}, {'5', 0, 16, 3, "5"},
-    {'6', 0, 20, 3, "6"}, {'7', 0, 24, 3, "7"}, {'8', 0, 28, 3, "8"}, {'9', 0, 32, 3, "9"}, {'0', 0, 36, 3, "0"},
-    {'q', 1, 0, 3, "q"}, {'w', 1, 4, 3, "w"}, {'e', 1, 8, 3, "e"}, {'r', 1, 12, 3, "r"}, {'t', 1, 16, 3, "t"},
-    {'y', 1, 20, 3, "y"}, {'u', 1, 24, 3, "u"}, {'i', 1, 28, 3, "i"}, {'o', 1, 32, 3, "o"}, {'p', 1, 36, 3, "p"},
-    {'a', 2, 0, 3, "a"}, {'s', 2, 4, 3, "s"}, {'d', 2, 8, 3, "d"}, {'f', 2, 12, 3, "f"}, {'g', 2, 16, 3, "g"},
-    {'h', 2, 20, 3, "h"}, {'j', 2, 24, 3, "j"}, {'k', 2, 28, 3, "k"}, {'l', 2, 32, 3, "l"}, {kBack, 2, 36, 3, "<-"},
-    {'z', 3, 0, 3, "z"}, {'x', 3, 4, 3, "x"}, {'c', 3, 8, 3, "c"}, {'v', 3, 12, 3, "v"}, {'b', 3, 16, 3, "b"},
-    {'n', 3, 20, 3, "n"}, {'m', 3, 24, 3, "m"}, {'-', 3, 28, 3, "-"}, {'_', 3, 32, 3, "_"}, {'.', 3, 36, 3, "."},
-    {kShift, 4, 0, 7, "Shift"}, {' ', 4, 8, 15, "Space"}, {kEnter, 4, 24, 7, "OK"}, {kClose, 4, 32, 7, "Close"},
+    {'1', 0, 0, 1, "1"}, {'2', 0, 1, 1, "2"}, {'3', 0, 2, 1, "3"}, {'4', 0, 3, 1, "4"}, {'5', 0, 4, 1, "5"},
+    {'6', 0, 5, 1, "6"}, {'7', 0, 6, 1, "7"}, {'8', 0, 7, 1, "8"}, {'9', 0, 8, 1, "9"}, {'0', 0, 9, 1, "0"},
+    {'q', 1, 0, 1, "q"}, {'w', 1, 1, 1, "w"}, {'e', 1, 2, 1, "e"}, {'r', 1, 3, 1, "r"}, {'t', 1, 4, 1, "t"},
+    {'y', 1, 5, 1, "y"}, {'u', 1, 6, 1, "u"}, {'i', 1, 7, 1, "i"}, {'o', 1, 8, 1, "o"}, {'p', 1, 9, 1, "p"},
+    {'a', 2, 0, 1, "a"}, {'s', 2, 1, 1, "s"}, {'d', 2, 2, 1, "d"}, {'f', 2, 3, 1, "f"}, {'g', 2, 4, 1, "g"},
+    {'h', 2, 5, 1, "h"}, {'j', 2, 6, 1, "j"}, {'k', 2, 7, 1, "k"}, {'l', 2, 8, 1, "l"}, {kBack, 2, 9, 1, "<-"},
+    {'z', 3, 0, 1, "z"}, {'x', 3, 1, 1, "x"}, {'c', 3, 2, 1, "c"}, {'v', 3, 3, 1, "v"}, {'b', 3, 4, 1, "b"},
+    {'n', 3, 5, 1, "n"}, {'m', 3, 6, 1, "m"}, {'-', 3, 7, 1, "-"}, {'_', 3, 8, 1, "_"}, {'.', 3, 9, 1, "."},
+    {kShift, 4, 0, 2, "Shift"}, {' ', 4, 2, 4, "Space"}, {kEnter, 4, 6, 2, "OK"}, {kClose, 4, 8, 2, "Close"},
 };
-
-int key_row(const Key &k) { return kTop + k.row * 3; }
+constexpr int kKeyCount = sizeof kKeys / sizeof kKeys[0];
 
 }  // namespace
 
@@ -75,16 +75,21 @@ void Osk::press(int code)
     dirty_ = true;
 }
 
-bool Osk::tap(int col, int row)
+bool Osk::tap(int x, int y)
 {
-    // Every cell of a key row belongs to a key: a key's hit area also covers
-    // the gap column to its right and the blank row under it, so a tap that
-    // lands between keys still types the nearer one.
-    for (size_t i = 0; i < sizeof kKeys / sizeof kKeys[0]; i++) {
+    // Every pixel from the first key row down belongs to a key: a key's hit
+    // area is its whole cell, including the gaps to its right and below, and
+    // the edges extend to the area's border, so a tap between keys still
+    // types the nearer one.
+    if (y < kKeysTop - 2)
+        return false;
+    int row = (y - kKeysTop) / kRowPitch, unit = (x - kMargin) / kUnit;
+    row = row < 0 ? 0 : row > 4 ? 4 : row;
+    unit = x < kMargin ? 0 : unit > 9 ? 9 : unit;
+    for (int i = 0; i < kKeyCount; i++) {
         const Key &k = kKeys[i];
-        const int r = key_row(k);
-        if (row >= r && row < r + 3 && col >= k.col && col <= k.col + k.width) {
-            flash_ = (int)i;
+        if (k.row == row && unit >= k.unit && unit < k.unit + k.units) {
+            flash_ = i;
             flash_until_ms_ = now_ms_ + 150;
             press(k.code);
             return true;
@@ -114,22 +119,23 @@ void Osk::buttons(uint32_t pressed)
         press(kClose);
 }
 
-std::vector<Osk::Row> Osk::rows() const
+std::string Osk::title() const
 {
-    std::vector<Row> out(kRows, Row{std::string(kCols, ' '), std::vector<bool>(kCols, false)});
-    const std::string title = shift_ ? "Keyboard  [SHIFT]  B:del Y:shift Start:OK" : "Keyboard  B:del Y:shift Start:OK Sel:close";
-    out[0].text.replace(0, title.size() < (size_t)kCols ? title.size() : kCols, title, 0, kCols);
-    for (const Key &k : kKeys) {
-        const int r = key_row(k);
+    // 40 characters fill the 320-pixel line.
+    return shift_ ? "SHIFT  B:del Y:shift Start:OK Sel:close" : "Keys   B:del Y:shift Start:OK Sel:close";
+}
+
+std::vector<Osk::KeyView> Osk::keys() const
+{
+    std::vector<KeyView> out;
+    out.reserve(kKeyCount);
+    for (int i = 0; i < kKeyCount; i++) {
+        const Key &k = kKeys[i];
         std::string label = k.label;
         if (shift_ && label.size() == 1 && std::isalpha((unsigned char)label[0]))
             label[0] = (char)std::toupper((unsigned char)label[0]);
-        const bool flashed = &k - kKeys == flash_;   // just pressed: drawn inverted for a moment
-        for (int dr = 0; dr < 2; dr++)
-            for (int c = 0; c < k.width; c++)
-                out[r + dr].key[k.col + c] = !flashed;
-        const int pad = (k.width - (int)label.size()) / 2;
-        out[r].text.replace(k.col + (pad > 0 ? pad : 0), label.size(), label);
+        out.push_back({kMargin + k.unit * kUnit, kKeysTop + k.row * kRowPitch, k.units * kUnit - (kUnit - kKeyW), kKeyH,
+                       label, i == flash_});
     }
     return out;
 }

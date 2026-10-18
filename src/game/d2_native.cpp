@@ -1,5 +1,5 @@
 // Native replacements for Diablo II 1.14d's hottest drawing routines and
-// its per-frame light-occlusion grid.
+// its per-frame lighting (the light-occlusion grid and its sampling).
 //
 // The game draws floors and walls in software, almost entirely in a few leaf
 // routines that remap pixels through a 256-byte shade table. Translated to
@@ -462,6 +462,53 @@ uint32_t light_grid(Cpu &)
     return 0;
 }
 
+// 4ddef0(eax=dst, [8]=tx, [c]=ty, [10]=ambient), ret 0xc: the light of an
+// 8x8 block of subtiles around tile (tx, ty), into 64 entries of 12 bytes
+// (bytes 0-3 of each). Without `ambient`, each subtile samples the light
+// grid through 475aa0: the cell's byte 4, and with coloured light
+// (dword 712b8c) bytes 5-7 too, else those three stay as they were. On
+// the console the 64 calls per block were ~16% of a town frame.
+constexpr uint32_t kColoredLight = 0x00712b8c;
+constexpr uint32_t kAmbientSource = 0x007a0634;
+
+uint32_t light_block(Cpu &c)
+{
+    uint32_t dst = c.reg(R_EAX);
+    const uint32_t tx = c.arg(0), ty = c.arg(1), ambient = c.arg(2);
+    if (ambient) {
+        // The original's own calls: 61c0e0 gives the intensity, 61c0b0 writes
+        // the colour into the top bytes of the argument slots, which keep
+        // whatever they held when it finds no light (a quirk kept as is).
+        const uint32_t esp = c.reg(R_ESP);   // [esp] = return address
+        const uint8_t level = (uint8_t)rt::guest_call(c, 0x0061c0e0, {U32(kAmbientSource)});
+        rt::guest_call(c, 0x0061c0b0, {U32(kAmbientSource), esp + 7, esp + 11, esp + 15});
+        const uint8_t e[4] = {level, *H(esp + 7), *H(esp + 11), *H(esp + 15)};
+        for (int i = 0; i < 64; i++, dst += 12)
+            std::memcpy(H(dst), e, 4);
+        return 0;
+    }
+    const int32_t ox = I32(kGridX), oy = I32(kGridY);
+    const bool colored = U32(kColoredLight) != 0;
+    const uint32_t x0 = tx * 8 - 8, y0 = ty * 8 - 8;   // subtile coordinates, as the original computes them
+    for (uint32_t row = 0; row < 8; row++) {
+        int32_t cy = (int32_t)((uint32_t)((int32_t)(y0 + 8 * row) >> 3) - (uint32_t)oy);
+        cy = cy < 0 ? 0 : cy > 47 ? 47 : cy;
+        for (uint32_t col = 0; col < 8; col++, dst += 12) {
+            int32_t cx = (int32_t)((uint32_t)((int32_t)(x0 + 8 * col) >> 3) - (uint32_t)ox);
+            cx = cx < 0 ? 0 : cx > 47 ? 47 : cx;
+            const uint8_t *cell = H(kLightGrid + 8 * (uint32_t)(cy * 48 + cx));
+            uint8_t *d = H(dst);
+            d[0] = cell[4];
+            if (colored) {
+                d[1] = cell[5];
+                d[2] = cell[6];
+                d[3] = cell[7];
+            }
+        }
+    }
+    return 0;
+}
+
 }  // namespace
 
 int install_d2_native(Cpu &c)
@@ -502,6 +549,8 @@ int install_d2_native(Cpu &c)
     HOOK(c, 0x00607060, k607060, sizeof k607060, 7, dc6_blend_clipped, "Dc6BlendClipped");
     static const uint8_t k4756d0[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x08, 0x53, 0xe8};
     HOOK(c, 0x004756d0, k4756d0, sizeof k4756d0, 0, light_grid, "LightGrid");
+    static const uint8_t k4ddef0[] = {0x55, 0x8b, 0xec, 0x51, 0x83, 0x7d, 0x10, 0x00, 0x53};
+    HOOK(c, 0x004ddef0, k4ddef0, sizeof k4ddef0, 3, light_block, "LightBlock");
 #undef HOOK
     return n;
 }

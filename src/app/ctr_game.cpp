@@ -17,6 +17,7 @@
 // palette lookup per sample, no texture upload, no GPU state.
 #include "game/autoplay.h"
 #include "game/controls.h"
+#include "game/d2_native.h"
 #include "game/d2_state.h"
 #include "game/osk.h"
 #include "runtime/rt_host.h"
@@ -178,8 +179,10 @@ void show_stats(float fps, float draw_ms, float worst_ms)
     std::snprintf(line[1], 48, "fps %5.1f   worst frame gap %6.1f ms", fps, worst_ms);
     std::snprintf(line[2], 48, "draw %5.2f ms c%d skip %u frames %u", draw_ms, g_render_core < 0 ? 0 : g_render_core,
                   (unsigned)g_frames_skipped, (unsigned)g_timing.total_frames);
-    std::snprintf(line[3], 48, "guest heap %6u/%6u KiB pk %6u", m.heap_used >> 10, m.heap_size >> 10, m.heap_peak >> 10);
-    std::snprintf(line[4], 48, "guest va   %6u/%6u KiB pk %6u", m.va_used >> 10, m.va_size >> 10, m.va_peak >> 10);
+    // Heap and VA share one pool: their sizes are what each has taken.
+    std::snprintf(line[3], 48, "guest heap %6u pk %6u free %6u", m.heap_used >> 10, m.heap_peak >> 10, m.free >> 10);
+    std::snprintf(line[4], 48, "guest va   %6u pk %6u big  %6u", m.va_used >> 10, m.va_peak >> 10,
+                  m.largest_free >> 10);
     std::snprintf(line[5], 48, "host heap  %6u/%6u KiB", (unsigned)(mi.uordblks >> 10), (unsigned)(__ctru_heap_size >> 10));
     std::snprintf(line[6], 48, "linear free %5u KiB", (unsigned)(linearSpaceFree() >> 10));
     std::snprintf(line[7], 48, "app free    %5u KiB", (unsigned)(osGetMemRegionFree(MEMREGION_APPLICATION) >> 10));
@@ -648,6 +651,8 @@ int main()
     // Sound through ds_emul into the DSP (ctr_audio.cpp), mixed on another core.
     setenv("WX86_SON", "vita", 1);   // ds_emul's name for the console's realtime sink
     opt.audio = true;
+    // Native floor, wall and sprite blitters in place of their translations.
+    opt.install_native = [](d2rt::Cpu &c) { game::install_d2_native(c); };
     opt.log = [](const char *s) {
         char line[600];
         std::snprintf(line, sizeof line, "[rt] %s", s);

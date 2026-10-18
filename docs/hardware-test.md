@@ -120,6 +120,17 @@ The app plays sound through WinVita's DirectSound emulation (ds_emul) and the 3D
 | --- | --- | --- |
 | 640×480 in game, low lighting, no blended shadows, no perspective (registry defaults the game's Options can still change) | Linux lane made CPU-bound (`M4_QEMU_FLAGS=-one-insn-per-tb`), town | 1.8 → 2.6 fps (+44%) |
 | Frame drawing on core 2 (copy ~0.5 MB, draw in parallel) | Azahar, town | ~9 → 13.9 fps together with the settings |
+| Native floor, wall and sprite blitters (`src/game/d2_native.cpp`: 8 leaf routines hooked at their entries) | same lane, town, frames per 10 s | 22.8 → 32.7 (+43%); all 3,960 frames of a scripted session hash identical (`M4_NATIVE=late`) |
 | Console | | to be measured |
 
 The CPU-bound Linux lane is the way to compare the work per frame between builds without the console: qemu on a fast host otherwise always keeps the game at its 25 fps cap.
+
+Checking a native routine: `M4_FRAMEHASH` on the virtual clock, `M4_NATIVE=0` against `M4_NATIVE=late`. The late mode installs the hooks on arrival in the game world. Routines that also run in the menus (the DC6 sprites) otherwise shift the moment the game is created: the scheduler preempts by instruction count and virtual time advances per switch, so the map seed and the whole world come out different, though correctly drawn. `D2_NATIVE_MASK` enables a subset of the hooks for bisecting, and `M4_DUMPFRAME=<n>` saves one frame's raw pixels.
+
+## Blood Moor: VirtualAlloc ran out (2026-10-18)
+
+After about four and a half minutes, three of them in Blood Moor, the console logged `va full: want 512 KiB, live 44416 KiB, largest free 384 KiB`. The 44 MiB VirtualAlloc range was full, while the heap range held 8.2 MiB of its 17 (peak 9.7). The game kept going after the failed allocation, the sound looped, and translated code then faulted on a wild guest pointer (data abort, far = membase + 0x357db9e8, outside the 75 MiB arena).
+
+Fix: the heap and VirtualAlloc ranges are now one 61 MiB pool (`GuestRegion::share`): the heap grows up from its base and VirtualAlloc down from the top. The heap peaks while loading (15.9 MiB at hero selection on the Linux lane) and then drops to ~7–8 MiB in play, which is when VirtualAlloc grows, so the same arena now leaves VirtualAlloc ~53 MiB in play instead of 44. The panel shows what is left of the pool (`free`) and its largest block (`big`).
+
+If long sessions fill the pool too, the next lever is D2's sprite cache: `0x457300` clamps it to at least 24 MiB (`mov edx, 0x1800000` at `0x4573e7`). Its own formula gives 13–15 MiB for the 64 MiB we report.

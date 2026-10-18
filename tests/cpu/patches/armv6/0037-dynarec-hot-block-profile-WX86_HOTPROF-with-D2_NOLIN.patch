@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Exile <exile@chamber.ee>
+Date: Sat, 17 Oct 2026 21:57:04 +0300
+Subject: [PATCH] dynarec: hot block profile (WX86_HOTPROF with D2_NOLINK)
+
+---
+ third_party/box86-dynarec/dynarec/dynarec.c | 46 +++++++++++++++++++++
+ 1 file changed, 46 insertions(+)
+
+diff --git a/third_party/box86-dynarec/dynarec/dynarec.c b/third_party/box86-dynarec/dynarec/dynarec.c
+index f0ebffa..48c8322 100755
+--- a/third_party/box86-dynarec/dynarec/dynarec.c
++++ b/third_party/box86-dynarec/dynarec/dynarec.c
+@@ -93,8 +93,54 @@ void dyn86_dump_eipring(void)
+     }
+     fflush(stderr);
+ }
++/* WX86_HOTPROF=1 (with D2_NOLINK=1, so every block-to-block transfer comes
++ * through LinkNext): counts executions per block entry address, for finding
++ * the guest's hot code. Off: one predictable branch per LinkNext.
++ * dyn86_hotprof_dump() prints the top entries weighted by block size. */
++#define HOTPROF_SLOTS 65536
++static int g_hotprof = -1;
++static uint32_t g_hp_addr[HOTPROF_SLOTS], g_hp_count[HOTPROF_SLOTS];
++static void hotprof_hit(uint32_t addr)
++{
++    uint32_t h = (addr * 2654435761u) >> 16;
++    for (int probe = 0; probe < 32; ++probe, h = (h + 1) & (HOTPROF_SLOTS - 1)) {
++        if (g_hp_addr[h] == addr) { g_hp_count[h]++; return; }
++        if (!g_hp_addr[h]) { g_hp_addr[h] = addr; g_hp_count[h] = 1; return; }
++    }
++}
++void dyn86_hotprof_reset(void) { memset(g_hp_addr, 0, sizeof g_hp_addr); memset(g_hp_count, 0, sizeof g_hp_count); }
++void dyn86_hotprof_dump(FILE* f, int top)
++{
++    if (g_hotprof <= 0) return;
++    static uint32_t idx[HOTPROF_SLOTS];
++    static uint64_t weight[HOTPROF_SLOTS];
++    int n = 0;
++    uint64_t total = 0;
++    for (int i = 0; i < HOTPROF_SLOTS; ++i) if (g_hp_addr[i]) {
++        dynablock_t* db = getDB(g_hp_addr[i]);
++        const uint32_t size = (db && db->x86_size) ? db->x86_size : 1;
++        weight[i] = (uint64_t)g_hp_count[i] * size;
++        total += weight[i];
++        idx[n++] = i;
++    }
++    for (int k = 0; k < top && k < n; ++k) {      /* partial selection sort: top N */
++        int best = k;
++        for (int j = k + 1; j < n; ++j) if (weight[idx[j]] > weight[idx[best]]) best = j;
++        uint32_t t = idx[k]; idx[k] = idx[best]; idx[best] = t;
++        const uint32_t i = idx[k];
++        dynablock_t* db = getDB(g_hp_addr[i]);
++        fprintf(f, "[hotprof] %2d %08x +%-4u x%-10u %5.2f%%\n", k + 1, g_hp_addr[i],
++                db ? (unsigned)db->x86_size : 0u, g_hp_count[i], total ? 100.0 * weight[i] / total : 0.0);
++    }
++    fprintf(f, "[hotprof] %d blocks, %llu x86 bytes executed\n", n, (unsigned long long)total);
++}
++
+ void* LinkNext(x86emu_t* emu, uintptr_t addr, void* x2)
+ {
++    if (g_hotprof) {
++        if (g_hotprof < 0) g_hotprof = getenv("WX86_HOTPROF") ? 1 : 0;
++        if (g_hotprof) hotprof_hit((uint32_t)addr);
++    }
+     // D2Vita preemption seam: chains to not-yet-translated targets (and, with
+     // D2_NOLINK=1, ALL chains) funnel through here; dyn86_should_break()
+     // (explicit stop flag) diverts to the epilog with quit set, leaving emu

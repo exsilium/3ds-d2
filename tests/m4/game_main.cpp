@@ -19,6 +19,7 @@
 
 #include "game/autoplay.h"
 #include "game/controls.h"
+#include "game/d2_native.h"
 #include "game/d2_state.h"
 #include "runtime/rt_host.h"
 #include "png.h"
@@ -31,6 +32,11 @@
 #include <unistd.h>
 #include <utility>
 #include <vector>
+
+extern "C" {
+void dyn86_hotprof_reset(void);
+void dyn86_hotprof_dump(FILE *f, int top);
+}
 
 static bool shot_now = false;   // M4_SCRIPT "shot": save the next frame
 
@@ -51,6 +57,18 @@ int main(int argc, char **argv)
     if (const char *mb = std::getenv("M4_PHYS_MB"))   // override the RAM the game is told about
         opt.total_phys_mb = (uint32_t)std::atoi(mb);
     opt.virtual_tick_us = 250;   // used only under M4_VIRTUAL_CLOCK
+    // Native drawing routines, as in the 3DS app; M4_NATIVE=0 runs the
+    // translated originals (the A/B for byte-exactness and speed).
+    // M4_NATIVE=late installs them on arrival in the game world instead: the
+    // scheduler preempts by instruction count and the clock advances per
+    // switch, so faster menu code changes the moment the game is created and
+    // with it the map seed; installed late, both runs share the same world.
+    static d2rt::Cpu *g_cpu = nullptr;
+    static const bool native_late = std::getenv("M4_NATIVE") && std::string(std::getenv("M4_NATIVE")) == "late";
+    if (native_late)
+        opt.install_native = [](d2rt::Cpu &c) { g_cpu = &c; };
+    else if (!std::getenv("M4_NATIVE") || std::string(std::getenv("M4_NATIVE")) != "0")
+        opt.install_native = [](d2rt::Cpu &c) { game::install_d2_native(c); };
     if (std::getenv("WX86_SON"))   // e.g. WX86_SON=wav WX86_SONDUMP=<file>: sound to a WAV file
         opt.audio = true;
     if (std::getenv("M4_FAST"))   // the 3DS app's video settings (src/app/ctr_game.cpp), for A/B runs
@@ -101,7 +119,35 @@ int main(int argc, char **argv)
         }
         png::write_rgb(shots + "/" + name, rgb.data(), last_w, last_h);
     };
-    opt.present = [save](const rt::Frame &f) {
+    // M4_FRAMEHASH=<file>: one line per presented frame, "<n> <hash>" (FNV-1a
+    // over the pixels and the palette). Two runs of the same script on the
+    // virtual clock must match line for line; a native replacement of game
+    // code must not change a single one.
+    static FILE *framehash = std::getenv("M4_FRAMEHASH") ? std::fopen(std::getenv("M4_FRAMEHASH"), "w") : nullptr;
+    opt.present = [save, shots](const rt::Frame &f) {
+        if (framehash) {
+            static unsigned n = 0;
+            uint32_t h = 2166136261u;
+            for (uint32_t y = 0; y < f.height; y++) {
+                const uint8_t *row = f.pixels + (ptrdiff_t)y * f.stride;
+                for (uint32_t x = 0; x < f.width; x++)
+                    h = (h ^ row[x]) * 16777619u;
+            }
+            for (int i = 0; i < 256; i++)
+                h = (h ^ f.palette[i]) * 16777619u;
+            std::fprintf(framehash, "%u %08x %ux%u\n", n, h, f.width, f.height);
+            // M4_DUMPFRAME=<n>: that frame's raw indices, for comparing two runs.
+            static const char *dump = std::getenv("M4_DUMPFRAME");
+            if (dump && n == (unsigned)std::atoi(dump)) {
+                if (FILE *o = std::fopen((shots + "/frame.raw").c_str(), "wb")) {
+                    for (uint32_t y = 0; y < f.height; y++)
+                        std::fwrite(f.pixels + (ptrdiff_t)y * f.stride, 1, f.width, o);
+                    std::fwrite(f.palette, 4, 256, o);
+                    std::fclose(o);
+                }
+            }
+            n++;
+        }
         // CPU time per frame (all of the host process: translated game code,
         // runtime, qemu): the lane's measure of how much work a frame is,
         // since qemu on a fast host never runs short of time the way the 3DS
@@ -145,6 +191,19 @@ int main(int argc, char **argv)
         const uint64_t now = rt::now_ms();
         bool shot = false;
         const game::GameState gs = game::read_game_state();
+        // WX86_HOTPROF: profile only the game world, from 10 s after arriving.
+        static uint64_t in_game_since = 0;
+        static bool reset_done = false;
+        if (gs.in_game && !in_game_since) {
+            in_game_since = now;
+            if (g_cpu)
+                game::install_d2_native(*g_cpu);
+        }
+        if (in_game_since && !reset_done && now - in_game_since > 10000 && std::getenv("WX86_HOTPROF")) {
+            dyn86_hotprof_reset();
+            reset_done = true;
+            std::fprintf(stderr, "[rt] hotprof: counting from here (in game)\n");
+        }
         const game::Pad &pad = autoplay.step(now, controls, shot, gs);
         if (shot)
             shot_now = true;
@@ -152,6 +211,7 @@ int main(int argc, char **argv)
         controls.update(pad, now);
     };
     rt::RunResult r = rt::run_exe(std::move(exe), opt);
+    dyn86_hotprof_dump(stderr, 60);
     save("last.png");
     if (!r.loaded) {
         std::fprintf(stderr, "[rt] FATAL %s\n", r.error.c_str());

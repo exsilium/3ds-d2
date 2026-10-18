@@ -14,8 +14,11 @@
 // Controls: src/game/controls.h.
 //
 // The frame is drawn by the CPU straight into the RGB565 framebuffer: a
-// palette lookup per sample, no texture upload, no GPU state.
+// palette lookup per sample, no texture upload, no GPU state. Cinematics
+// (src/game/cinematics.cpp) arrive as YUV and are drawn the same way, scaled
+// to fit the screen with their aspect ratio; their sound is ctr_audio.cpp's.
 #include "game/autoplay.h"
+#include "game/cinematics.h"
 #include "game/controls.h"
 #include "game/d2_native.h"
 #include "game/d2_state.h"
@@ -124,6 +127,12 @@ u32 __ctru_heap_size = 24u << 20;
 u32 __ctru_linear_heap_size = 1u << 20;
 #endif
 }
+
+namespace d2rt {
+namespace audio {
+rt::VideoAudio *video_sink();   // ctr_audio.cpp
+}  // namespace audio
+}  // namespace d2rt
 
 namespace {
 
@@ -305,6 +314,63 @@ void draw_window(uint16_t *fb, const rt::Frame &f, int cx, int cy)
     }
 }
 
+// A cinematic's YUV 4:2:0 frame, scaled to fit the screen with its aspect
+// ratio (640x292: 400x182; 640x480: 320x240) on black. Each output pixel
+// averages a 2x2 block of luma and takes the chroma under it; BT.601
+// limited range through tables. The rows outer, as in draw_stretched.
+struct YuvTables {
+    int32_t y[256], rv[256], gu[256], gv[256], bu[256];
+    uint16_t r[1024], g[1024], b[1024];   // clamped 0..255, then placed in RGB565; index + 512
+    YuvTables()
+    {
+        for (int i = 0; i < 256; i++) {
+            y[i] = 298 * (i - 16) + 128;   // 1.164 (Y - 16), with the rounding of the >> 8 below
+            rv[i] = 409 * (i - 128);
+            gu[i] = -100 * (i - 128);
+            gv[i] = -208 * (i - 128);
+            bu[i] = 516 * (i - 128);
+        }
+        for (int i = 0; i < 1024; i++) {
+            const int v = i - 512 < 0 ? 0 : i - 512 > 255 ? 255 : i - 512;
+            r[i] = (uint16_t)((v >> 3) << 11);
+            g[i] = (uint16_t)((v >> 2) << 5);
+            b[i] = (uint16_t)(v >> 3);
+        }
+    }
+};
+
+void draw_yuv(uint16_t *fb, const uint8_t *const plane[3], const uint32_t stride[3], uint32_t width, uint32_t height,
+              uint32_t display_height)
+{
+    static const YuvTables t;
+    static int sx[400];
+    std::memset(fb, 0, 400 * 240 * sizeof(uint16_t));
+    // Fit width x display_height into 400x240.
+    int ow = 400, oh = (int)(display_height * 400 / width);
+    if (oh > 240)
+        oh = 240, ow = (int)(width * 240 / display_height);
+    const int x0 = (400 - ow) / 2, y0 = (240 - oh) / 2;
+    for (int x = 0; x < ow; x++) {
+        sx[x] = x * (int)width / ow;
+        if (sx[x] + 1 >= (int)width)
+            sx[x] = (int)width - 2;
+    }
+    for (int y = 0; y < oh; y++) {
+        const int sy = y * (int)height / oh;
+        const uint8_t *r0 = plane[0] + (size_t)sy * stride[0];
+        const uint8_t *r1 = sy + 1 < (int)height ? r0 + stride[0] : r0;
+        const uint8_t *u = plane[1] + (size_t)(sy >> 1) * stride[1], *v = plane[2] + (size_t)(sy >> 1) * stride[2];
+        uint16_t *out = fb + (size_t)x0 * 240 + (239 - (y0 + y));
+        for (int x = 0; x < ow; x++, out += 240) {
+            const int i = sx[x], c = i >> 1;
+            const int yy = t.y[(r0[i] + r0[i + 1] + r1[i] + r1[i + 1] + 2) >> 2];
+            const int cu = u[c], cv = v[c];
+            *out = (uint16_t)(t.r[512 + ((yy + t.rv[cv]) >> 8)] | t.g[512 + ((yy + t.gu[cu] + t.gv[cv]) >> 8)] |
+                              t.b[512 + ((yy + t.bu[cu]) >> 8)]);
+        }
+    }
+}
+
 // ---- the render thread -----------------------------------------------------------
 //
 // Converting and scaling a frame for the top screen costs ~6 ms on the
@@ -314,11 +380,13 @@ void draw_window(uint16_t *fb, const rt::Frame &f, int cx, int cy)
 // the previous one is still being drawn is skipped on screen (never waited for).
 
 struct Staged {
-    std::vector<uint8_t> pixels;
+    std::vector<uint8_t> pixels;   // indices, or a cinematic's Y, U, V planes one after the other
     uint32_t width = 0, height = 0;
     uint32_t palette[256];
     bool zoom;
     int cursor_x, cursor_y;
+    bool yuv = false;
+    uint32_t display_height = 0;
 };
 Staged g_staged;
 LightEvent g_render_go;
@@ -328,6 +396,17 @@ Thread g_render_thread = nullptr;
 void draw_staged()
 {
     const Staged &st = g_staged;
+    uint16_t *top = (uint16_t *)gfxGetFramebuffer(GFX_TOP, GFX_LEFT, nullptr, nullptr);
+    if (st.yuv) {
+        const uint32_t cw = (st.width + 1) / 2, ch = (st.height + 1) / 2;
+        const uint8_t *planes[3] = {st.pixels.data(), st.pixels.data() + (size_t)st.width * st.height,
+                                    st.pixels.data() + (size_t)st.width * st.height + (size_t)cw * ch};
+        const uint32_t strides[3] = {st.width, cw, cw};
+        draw_yuv(top, planes, strides, st.width, st.height, st.display_height);
+        gfxFlushBuffers();
+        gfxSwapBuffers();
+        return;
+    }
     for (int i = 0; i < 256; i++) {
         const uint32_t p = st.palette[i], r = (p >> 16) & 0xFF, g = (p >> 8) & 0xFF, b = p & 0xFF;
         g_pal_wide[i] = (r << 20) | (g << 10) | b;
@@ -339,7 +418,6 @@ void draw_staged()
     f.height = st.height;
     f.stride = (int32_t)st.width;
     f.palette = st.palette;
-    uint16_t *top = (uint16_t *)gfxGetFramebuffer(GFX_TOP, GFX_LEFT, nullptr, nullptr);
     if (st.zoom)
         draw_window(top, f, st.cursor_x, st.cursor_y);
     else
@@ -398,14 +476,37 @@ void present(const rt::Frame &f)
     if (g_timing.last_present_us && t0 - g_timing.last_present_us > g_timing.worst_gap_us)
         g_timing.worst_gap_us = t0 - g_timing.last_present_us;
     g_timing.last_present_us = t0;
-    g_controls.set_frame((int)f.width, (int)f.height);
+    if (!f.yuv[0])   // a cinematic's size is not the game's: the cursor keeps the game's frame
+        g_controls.set_frame((int)f.width, (int)f.height);
     g_timing.frames++;
     g_timing.total_frames++;
 
     if (__atomic_load_n(&g_render_busy, __ATOMIC_ACQUIRE)) {
         g_frames_skipped++;   // the screen is still showing/drawing the last one
+    } else if (f.yuv[0]) {
+        Staged &st = g_staged;
+        const uint32_t cw = (f.width + 1) / 2, ch = (f.height + 1) / 2;
+        st.yuv = true;
+        st.width = f.width;
+        st.height = f.height;
+        st.display_height = f.display_height;
+        st.pixels.resize((size_t)f.width * f.height + 2 * (size_t)cw * ch);
+        uint8_t *o = st.pixels.data();
+        for (int p = 0; p < 3; p++) {
+            const uint32_t w = p ? cw : f.width, rows = p ? ch : f.height;
+            for (uint32_t y = 0; y < rows; y++, o += w)
+                std::memcpy(o, f.yuv[p] + (size_t)y * f.yuv_stride[p], w);
+        }
+        if (g_render_thread) {
+            __atomic_store_n(&g_render_busy, true, __ATOMIC_RELEASE);
+            LightEvent_Signal(&g_render_go);
+        } else {
+            draw_staged();
+            g_timing.draw_us += host_us() - t0;
+        }
     } else {
         Staged &st = g_staged;
+        st.yuv = false;
         st.width = f.width;
         st.height = f.height;
         st.pixels.resize((size_t)f.width * f.height);
@@ -681,8 +782,13 @@ int main()
     // Sound through ds_emul into the DSP (ctr_audio.cpp), mixed on another core.
     setenv("WX86_SON", "vita", 1);   // ds_emul's name for the console's realtime sink
     opt.audio = true;
-    // Native floor, wall and sprite blitters in place of their translations.
-    opt.install_native = [](d2rt::Cpu &c) { game::install_d2_native(c); };
+    // Native floor, wall and sprite blitters in place of their translations,
+    // and the native cinematics player.
+    opt.install_native = [](d2rt::Cpu &c) {
+        game::install_d2_native(c);
+        game::install_cinematics(c);
+    };
+    opt.video_audio = d2rt::audio::video_sink();
     opt.log = [](const char *s) {
         char line[600];
         std::snprintf(line, sizeof line, "[rt] %s", s);

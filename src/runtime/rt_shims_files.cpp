@@ -12,6 +12,14 @@
 // Cheap on the ARM11: ReadFile/WriteFile move bytes straight between the host
 // stream and guest memory (no staging buffer), file handles are a fixed-size
 // table, and directory listings are read once.
+//
+// Read-only files from the game install (the MPQs) bypass stdio. The game
+// reads them in small sector-sized pieces with a seek before most of them,
+// and stdio dropped its small buffer at every fseek: on the console each
+// call became an SD access, at 400-750 KiB/s. Such a file is an unbuffered
+// descriptor under a per-handle block cache (ReadCache), and its position is
+// kept here, so SetFilePointer never reaches the file system. Files the
+// guest may write keep stdio, so no cache can go stale against a write.
 #include "runtime/rt_host.h"
 #include "runtime/rt_layout.h"
 
@@ -19,12 +27,16 @@
 #include "runtime/cpu.h"
 #include "runtime/guest_region.h"
 #include "runtime/guest_sync.h"
+#include "runtime/host_clock.h"
 
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <dirent.h>
+#include <fcntl.h>
+#include <memory>
 #include <string>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -263,9 +275,133 @@ bool resolve_write(const std::string &rel, bool copy_up, std::string &host)
 
 // ---- handles -----------------------------------------------------------------------
 
+FileStats g_file_stats;
+
+// A read-only file's recently read blocks. kBlock-aligned blocks of the file,
+// filled whole by one read each; least recently used is replaced. Reads of a
+// block or more go straight to their destination.
+//
+// Sizes from the game's own reads (RT_FILETRACE on the Linux lane, from the
+// menus into the Rogue Encampment: 3,500 reads, 40% under 1 KiB, mostly in
+// d2data.mpq) replayed against cost models: when each file system call costs
+// more than its bytes, as the console's 400-750 KiB/s through stdio suggests,
+// 32 KiB x 16 halves the cost, with 1.7x the bytes read. Block memory is
+// allocated on first use and capped in total (kCap): past it, a file reuses
+// its own blocks.
+class ReadCache {
+public:
+    static constexpr uint32_t kBlock = 32 * 1024, kBlocks = 16;
+    static constexpr uint64_t kCap = 4u << 20;
+
+    ReadCache(int fd, uint64_t size) : fd_(fd), size_(size) {}
+    ~ReadCache()
+    {
+        for (const Block &b : blocks_)
+            if (b.data)
+                g_file_stats.cache_bytes -= kBlock;
+    }
+
+    // Copies up to n bytes at `pos` to dst; returns how many (fewer at EOF).
+    uint32_t read(uint64_t pos, uint8_t *dst, uint32_t n)
+    {
+        if (pos >= size_)
+            return 0;
+        if (n > size_ - pos)
+            n = (uint32_t)(size_ - pos);
+        if (n >= kBlock) {
+            g_file_stats.direct++;
+            return disk_read(pos, dst, n);
+        }
+        uint32_t done = 0;
+        while (done < n) {
+            const uint64_t at = pos + done;
+            const Block *b = block_at(at - at % kBlock);
+            if (!b)
+                break;
+            const uint32_t off = (uint32_t)(at - b->base);
+            if (off >= b->len)
+                break;
+            const uint32_t take = b->len - off < n - done ? b->len - off : n - done;
+            std::memcpy(dst + done, b->data.get() + off, take);
+            done += take;
+        }
+        return done;
+    }
+
+private:
+    struct Block {
+        uint64_t base = ~0ull;
+        uint32_t len = 0, used = 0;
+        std::unique_ptr<uint8_t[]> data;
+    };
+
+    const Block *block_at(uint64_t base)
+    {
+        Block *victim = &blocks_[0], *oldest = nullptr;   // least recently used: any, and with memory
+        for (Block &b : blocks_) {
+            if (b.base == base && b.data) {
+                b.used = ++clock_;
+                g_file_stats.hits++;
+                return &b;
+            }
+            if (b.used < victim->used)
+                victim = &b;
+            if (b.data && (!oldest || b.used < oldest->used))
+                oldest = &b;
+        }
+        if (!victim->data && oldest && g_file_stats.cache_bytes + kBlock > kCap)
+            victim = oldest;   // at the cap: reuse a block instead of allocating
+        if (!victim->data) {
+            victim->data.reset(new (std::nothrow) uint8_t[kBlock]);
+            if (!victim->data)
+                return nullptr;
+            g_file_stats.cache_bytes += kBlock;
+        }
+        const uint64_t left = size_ - base;
+        victim->base = ~0ull;
+        victim->len = disk_read(base, victim->data.get(), left < kBlock ? (uint32_t)left : kBlock);
+        victim->base = base;
+        victim->used = ++clock_;
+        g_file_stats.fills++;
+        return victim;
+    }
+
+    uint32_t disk_read(uint64_t pos, uint8_t *dst, uint32_t n)
+    {
+        const uint64_t t0 = wx86_now_us();
+        uint32_t done = 0;
+        if (::lseek(fd_, (off_t)pos, SEEK_SET) == (off_t)pos)
+            while (done < n) {
+                const ssize_t got = ::read(fd_, dst + done, n - done);
+                if (got <= 0)
+                    break;
+                done += (uint32_t)got;
+            }
+        g_file_stats.disk_reads++;
+        g_file_stats.disk_bytes += done;
+        g_file_stats.disk_us += wx86_now_us() - t0;
+        return done;
+    }
+
+    int fd_;
+    uint64_t size_;
+    uint32_t clock_ = 0;
+    Block blocks_[kBlocks];
+};
+
 struct RtFile : Waitable {
-    FILE *fp = nullptr;
+    FILE *fp = nullptr;              // files the guest may write: stdio
+    int fd = -1;                     // read-only game files: a descriptor under `cache`
+    uint64_t pos = 0, size = 0;      // ...whose position is kept here and size fixed at open
+    std::unique_ptr<ReadCache> cache;
     std::string host;
+    ~RtFile() override
+    {
+        if (fp)
+            std::fclose(fp);
+        if (fd >= 0)
+            ::close(fd);
+    }
     bool try_acquire(GuestThread *) override { return true; }
     bool ready(GuestThread *) override { return true; }
     const char *kind() const override { return "file"; }
@@ -342,6 +478,29 @@ size_t stream_write(Cpu &c, FILE *fp, uint32_t va, uint32_t n)
     std::vector<uint8_t> tmp(n);
     c.read(va, tmp.data(), n);
     return std::fwrite(tmp.data(), 1, n, fp);
+}
+
+// ReadFile on a cached file: from its position, into guest memory.
+uint32_t cached_read(Cpu &c, RtFile &f, uint32_t va, uint32_t n)
+{
+    // RT_FILETRACE=1: every read on stderr ("ftrace <fd> <pos> <n>"), for
+    // sizing the cache against the game's real access pattern.
+    static const bool trace = std::getenv("RT_FILETRACE") != nullptr;
+    if (trace)
+        std::fprintf(stderr, "ftrace %d %llu %u\n", f.fd, (unsigned long long)f.pos, n);
+    if (!n)
+        return 0;
+    uint32_t got;
+    if (void *p = c.hostptr(va, n)) {
+        got = f.cache->read(f.pos, static_cast<uint8_t *>(p), n);
+    } else {
+        std::vector<uint8_t> tmp(n);
+        got = f.cache->read(f.pos, tmp.data(), n);
+        if (got)
+            c.write(va, tmp.data(), got);
+    }
+    f.pos += got;
+    return got;
 }
 
 // ---- wildcard match (FindFirstFile: '*', '?', case-insensitive; "*.*" is "*") ----
@@ -627,14 +786,26 @@ uint32_t create_file(Cpu &c, const std::string &guest, uint32_t access, uint32_t
             return kInvalidHandle;
         }
     }
-    FILE *fp = std::fopen(host.c_str(), mode);
-    if (!fp) {
+    auto *f = new RtFile();
+    f->host = host;
+    // Read-only and in the game install: the cached path (see the top).
+    const std::string &data = data_root();
+    if (std::strcmp(mode, "rb") == 0 && split_roots() && host.compare(0, data.size(), data) == 0) {
+        f->fd = ::open(host.c_str(), O_RDONLY);
+        struct stat fst;
+        if (f->fd >= 0 && ::fstat(f->fd, &fst) == 0) {
+            f->size = (uint64_t)fst.st_size;
+            f->cache.reset(new ReadCache(f->fd, f->size));
+        } else if (f->fd >= 0) {
+            ::close(f->fd);
+            f->fd = -1;
+        }
+    }
+    if (!f->cache && !(f->fp = std::fopen(host.c_str(), mode))) {
+        delete f;
         set_last_error(c, ERROR_ACCESS_DENIED);
         return kInvalidHandle;
     }
-    auto *f = new RtFile();
-    f->fp = fp;
-    f->host = host;
     stats().files_opened++;
     set_last_error(c, (exists && (disp == 2 || disp == 4)) ? (uint32_t)ERROR_ALREADY_EXISTS : 0u);
     return wx86_handle_add(f);
@@ -716,6 +887,8 @@ uint32_t module_file_name(Cpu &c, uint32_t module, uint32_t buf, uint32_t size)
 
 }  // namespace
 
+const FileStats &file_stats() { return g_file_stats; }
+
 bool host_path(const std::string &guest, bool write, std::string &host)
 {
     const std::string rel = normalize(guest);
@@ -761,9 +934,17 @@ void install_files(Bridge &br)
         RtFile *f = file_of(c.arg(0));
         const uint32_t buf = c.arg(1), n = c.arg(2), pread = c.arg(3), ov = c.arg(4);
         if (!f) { set_last_error(c, ERROR_INVALID_HANDLE); return 0; }
-        if (ov)   // OVERLAPPED: the offset is in the structure; completes synchronously
-            std::fseek(f->fp, (long)c.read_u32(ov + 8), SEEK_SET);
-        const uint32_t got = (uint32_t)stream_read(c, f->fp, buf, n);
+        uint32_t got;
+        g_file_stats.calls++;
+        if (f->cache) {
+            if (ov)   // OVERLAPPED: the offset is in the structure; completes synchronously
+                f->pos = c.read_u32(ov + 8);
+            got = cached_read(c, *f, buf, n);
+        } else {
+            if (ov)
+                std::fseek(f->fp, (long)c.read_u32(ov + 8), SEEK_SET);
+            got = (uint32_t)stream_read(c, f->fp, buf, n);
+        }
         stats().bytes_read += got;
         if (pread)
             c.write_u32(pread, got);
@@ -791,6 +972,7 @@ void install_files(Bridge &br)
         }
         RtFile *f = file_of(h);
         if (!f) { set_last_error(c, ERROR_INVALID_HANDLE); return 0; }
+        if (f->cache) { set_last_error(c, ERROR_ACCESS_DENIED); return 0; }   // opened for reading only
         if (ov)
             std::fseek(f->fp, (long)c.read_u32(ov + 8), SEEK_SET);
         const uint32_t put = (uint32_t)stream_write(c, f->fp, buf, n);
@@ -811,6 +993,17 @@ void install_files(Bridge &br)
             off = (int64_t)(((uint64_t)c.read_u32(phigh) << 32) | c.arg(1));
             c.write_u32(phigh, 0);
         }
+        if (f->cache) {   // position only: nothing reaches the file system
+            g_file_stats.seeks++;
+            const int64_t base = whence == SEEK_CUR ? (int64_t)f->pos : whence == SEEK_END ? (int64_t)f->size : 0;
+            if (base + off < 0) {
+                set_last_error(c, 131);   // ERROR_NEGATIVE_SEEK
+                return 0xFFFFFFFFu;
+            }
+            f->pos = (uint64_t)(base + off);
+            set_last_error(c, 0);
+            return (uint32_t)f->pos;
+        }
         if (std::fseek(f->fp, (long)off, whence) != 0) {
             set_last_error(c, 131);   // ERROR_NEGATIVE_SEEK
             return 0xFFFFFFFFu;
@@ -821,10 +1014,12 @@ void install_files(Bridge &br)
     K("GetFileSize", 2, [](Cpu &c) -> uint32_t {
         RtFile *f = file_of(c.arg(0));
         if (!f) { set_last_error(c, ERROR_INVALID_HANDLE); return 0xFFFFFFFFu; }
+        if (c.arg(1)) c.write_u32(c.arg(1), 0);
+        if (f->cache)
+            return (uint32_t)f->size;
         std::fflush(f->fp);
         struct stat st;
         if (::fstat(fileno(f->fp), &st) != 0) return 0xFFFFFFFFu;
-        if (c.arg(1)) c.write_u32(c.arg(1), 0);
         return (uint32_t)st.st_size;
     });
     K("GetFileType", 1, [](Cpu &c) -> uint32_t {
@@ -834,18 +1029,19 @@ void install_files(Bridge &br)
     });
     K("FlushFileBuffers", 1, [](Cpu &c) -> uint32_t {
         RtFile *f = file_of(c.arg(0));
-        return f && std::fflush(f->fp) == 0;
+        return f && (f->cache || std::fflush(f->fp) == 0);
     });
     K("SetEndOfFile", 1, [](Cpu &c) -> uint32_t {
         RtFile *f = file_of(c.arg(0));
         if (!f) { set_last_error(c, ERROR_INVALID_HANDLE); return 0; }
+        if (f->cache) { set_last_error(c, ERROR_ACCESS_DENIED); return 0; }
         std::fflush(f->fp);
         return ::ftruncate(fileno(f->fp), std::ftell(f->fp)) == 0;
     });
     K("GetFileTime", 4, [](Cpu &c) -> uint32_t {
         RtFile *f = file_of(c.arg(0));
         struct stat st;
-        if (!f || ::fstat(fileno(f->fp), &st) != 0) { set_last_error(c, ERROR_INVALID_HANDLE); return 0; }
+        if (!f || ::fstat(f->cache ? f->fd : fileno(f->fp), &st) != 0) { set_last_error(c, ERROR_INVALID_HANDLE); return 0; }
         const uint64_t ft = filetime_of(st.st_mtime);
         for (int i = 1; i <= 3; i++)
             if (const uint32_t p = c.arg(i)) {
@@ -1041,9 +1237,13 @@ void install_files(Bridge &br)
     K("CreateFileMappingA", 6, [](Cpu &c) -> uint32_t {
         RtFile *f = file_of(c.arg(0));
         if (!f) { set_last_error(c, ERROR_INVALID_HANDLE); return 0; }   // pagefile-backed sections: not needed yet
-        std::fflush(f->fp);
         struct stat st;
-        ::fstat(fileno(f->fp), &st);
+        if (f->cache) {
+            ::fstat(f->fd, &st);
+        } else {
+            std::fflush(f->fp);
+            ::fstat(fileno(f->fp), &st);
+        }
         auto *m = new RtMapping();
         m->host = f->host;
         m->size = c.arg(4) ? c.arg(4) : (uint32_t)st.st_size;
@@ -1090,9 +1290,8 @@ void install_files(Bridge &br)
     K("CloseHandle", 1, [](Cpu &c) -> uint32_t {
         const uint32_t h = c.arg(0);
         if (RtFile *f = file_of(h)) {
-            std::fclose(f->fp);
             wx86_handle_erase(h);
-            delete f;
+            delete f;   // closes its stream or descriptor
             return 1;
         }
         if (RtMapping *m = object_of<RtMapping>(h, "fmap")) {

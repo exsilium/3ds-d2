@@ -121,6 +121,19 @@ struct Stats {
 };
 Stats &stats();
 
+// The read cache of game files (rt_shims_files.cpp): cumulative counters,
+// reported per interval with the heartbeat.
+struct FileStats {
+    uint64_t calls = 0;       // ReadFile calls on any file
+    uint64_t hits = 0;        // cached blocks reused
+    uint64_t fills = 0;       // blocks read from the file system
+    uint64_t direct = 0;      // reads of a block or more, straight to the guest
+    uint64_t seeks = 0;       // SetFilePointer on cached files (no file system access)
+    uint64_t disk_reads = 0, disk_bytes = 0, disk_us = 0;   // file system reads by the cache
+    uint64_t cache_bytes = 0; // block memory held now (freed with its handle)
+};
+const FileStats &file_stats();
+
 // Guest memory use, for on-screen diagnostics (walks the allocators: call it
 // about once a second, not per frame).
 struct MemoryReport {

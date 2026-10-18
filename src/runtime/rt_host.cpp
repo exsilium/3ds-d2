@@ -193,6 +193,7 @@ namespace {
 struct ProfMark {
     uint64_t ms, idle_ms, switches, sync_ticks;
     uint32_t syncs, frames;
+    FileStats files;
     uint64_t run_ns = 0, trap_ns = 0, trap_calls = 0, waits = 0, waits_now = 0, cs = 0, cs_contended = 0;
 } g_mark{};
 
@@ -218,11 +219,20 @@ void prof_report(uint64_t ms)
 {
     const uint32_t syncs = &dyn86_ctr_cache_syncs ? dyn86_ctr_cache_syncs : 0;
     const uint64_t ticks = &dyn86_ctr_cache_sync_ticks ? dyn86_ctr_cache_sync_ticks : 0;
-    ProfMark now{ms, g_sched ? g_sched->idle_ms_ : 0, g_sched ? g_sched->switches() : 0, ticks, syncs, g_stats.frames};
+    ProfMark now{ms, g_sched ? g_sched->idle_ms_ : 0, g_sched ? g_sched->switches() : 0, ticks, syncs, g_stats.frames,
+                 file_stats()};
     logf("prof: %llu ms, frames %u, idle %llu ms, switches %llu, cache syncs %u (%llu us)",
          (unsigned long long)(now.ms - g_mark.ms), now.frames - g_mark.frames,
          (unsigned long long)(now.idle_ms - g_mark.idle_ms), (unsigned long long)(now.switches - g_mark.switches),
          now.syncs - g_mark.syncs, (unsigned long long)((now.sync_ticks - g_mark.sync_ticks) / 268u));   // 268 MHz tick
+    const FileStats &f = now.files, &f0 = g_mark.files;
+    logf("prof files: %llu reads, %llu hits, %llu fills, %llu direct, %llu seeks; disk %llu reads %llu KiB in %llu ms; "
+         "cache %llu KiB",
+         (unsigned long long)(f.calls - f0.calls), (unsigned long long)(f.hits - f0.hits),
+         (unsigned long long)(f.fills - f0.fills), (unsigned long long)(f.direct - f0.direct),
+         (unsigned long long)(f.seeks - f0.seeks), (unsigned long long)(f.disk_reads - f0.disk_reads),
+         (unsigned long long)((f.disk_bytes - f0.disk_bytes) >> 10), (unsigned long long)((f.disk_us - f0.disk_us) / 1000),
+         (unsigned long long)(f.cache_bytes >> 10));
 #ifdef PROF_COUNTERS
     now.run_ns = prof::run_ns;
     now.trap_ns = prof::trap_ns;

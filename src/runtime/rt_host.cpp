@@ -193,11 +193,11 @@ namespace {
 struct ProfMark {
     uint64_t ms, idle_ms, switches, sync_ticks;
     uint32_t syncs, frames;
-    uint64_t run_ns, trap_ns, trap_calls, waits, waits_now, cs, cs_contended;
+    uint64_t run_ns = 0, trap_ns = 0, trap_calls = 0, waits = 0, waits_now = 0, cs = 0, cs_contended = 0;
 } g_mark{};
 
 #ifdef PROF_COUNTERS
-struct ThreadProf { uint32_t tid, entry; uint64_t samples, blocks; };
+struct ThreadProf { uint32_t tid, entry; uint64_t samples, blocks, run_ns = 0, trap_ns = 0, slices = 0; };
 
 void log_eips(const char *head, const std::vector<std::pair<uint32_t, uint64_t>> &v)
 {
@@ -245,13 +245,24 @@ void prof_report(uint64_t ms)
     prof::threads([](uint32_t tid, uint32_t entry, uint64_t samples, uint64_t blocks, void *u) {
         static_cast<std::vector<ThreadProf> *>(u)->push_back({tid, entry, samples, blocks});
     }, &threads);
+    // Time per thread: unlike the samples, it also covers threads that always
+    // yield before their quantum expires.
+    prof::thread_times([](uint32_t tid, uint64_t run, uint64_t trap, uint64_t slices, void *u) {
+        for (ThreadProf &t : *static_cast<std::vector<ThreadProf> *>(u))
+            if (t.tid == tid) {
+                t.run_ns = run;
+                t.trap_ns = trap;
+                t.slices = slices;
+            }
+    }, &threads);
     using Eips = std::vector<std::pair<uint32_t, uint64_t>>;
     const auto collect = [](uint32_t eip, uint64_t hits, void *u) { static_cast<Eips *>(u)->push_back({eip, hits}); };
     for (const ThreadProf &t : threads) {
-        if (!t.samples && !t.blocks)
+        if (!t.samples && !t.blocks && !t.slices)
             continue;
-        logf("prof thread %u (entry %08x): %llu samples, %llu blocks", t.tid, t.entry,
-             (unsigned long long)t.samples, (unsigned long long)t.blocks);
+        logf("prof thread %u (entry %08x): run %llu ms (shims %llu ms) in %llu slices, %llu samples, %llu blocks",
+             t.tid, t.entry, (unsigned long long)(t.run_ns / 1000000), (unsigned long long)(t.trap_ns / 1000000),
+             (unsigned long long)t.slices, (unsigned long long)t.samples, (unsigned long long)t.blocks);
         Eips v;
         prof::top_eips_tid(t.tid, 40, collect, &v);
         for (size_t i = 0; i < v.size(); i += 20) {

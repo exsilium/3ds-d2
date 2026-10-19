@@ -14,6 +14,7 @@
 // arguments popped by the callee), which rt::hook_function maps directly.
 // No caller reads EAX afterwards; callee-saved registers are untouched here.
 #include "game/d2_native.h"
+#include "game/pklib_explode.h"
 
 #include "runtime/cpu.h"
 #include "runtime/rt_host.h"
@@ -983,6 +984,18 @@ private:
 
 HuffTree g_huff;   // guest threads all run on the host's one game thread
 
+// 41e000(ecx=dst, edx=&dst bytes, [8]=src, [c]=src bytes), ret 0xc: Storm's
+// PKWARE "explode" wrapper. The original allocates a work buffer, runs the
+// library with callbacks that clip at both buffers' ends, frees it, and
+// stores the bytes written in *edx (pklib_explode.cpp).
+uint32_t pk_decode(Cpu &c)
+{
+    const uint32_t plen = c.reg(R_EDX), src = c.arg(0), src_len = c.arg(1);
+    const uint32_t n = pk_explode(H(src), src_len, H(c.reg(R_ECX)), U32(plen));
+    std::memcpy(H(plen), &n, 4);
+    return 0;
+}
+
 uint32_t huffman_decode(Cpu &c)
 {
     const uint32_t plen = c.reg(R_EDX);
@@ -1046,6 +1059,8 @@ int install_d2_native(Cpu &c)
     HOOK(c, 0x0041dce0, k41dce0, sizeof k41dce0, 3, adpcm_decode, "AdpcmDecode", true);
     static const uint8_t k41f9e0[] = {0x55, 0x8b, 0xec, 0xb8, 0x80, 0x3a, 0x00, 0x00, 0xe8};
     HOOK(c, 0x0041f9e0, k41f9e0, sizeof k41f9e0, 3, huffman_decode, "HuffmanDecode", true);
+    static const uint8_t k41e000[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x18, 0x53, 0x56, 0x57, 0x6a, 0x00};
+    HOOK(c, 0x0041e000, k41e000, sizeof k41e000, 3, pk_decode, "PkExplode", true);
 #undef HOOK
     return n;
 }

@@ -11,6 +11,12 @@
     - `khash.h` (MIT);
     - the Realmode X86 Emulator Library's `x86primop` (a permissive BSD-like license with a non-endorsement clause).
   - Binary releases must carry these notices.
+- **StormLib** (MIT, Copyright (c) 1999-2013 Ladislav Zezula): two decoders are ported from it into this project's native replacements of the game's own.
+  - `src/game/pklib_explode.cpp` is a port of `src/pklib/explode.c` (PKWARE DCL explode), tables included.
+  - The Huffman decoder in `src/game/d2_native.cpp` (`HuffTree`) follows `src/huffman/huff.cpp`.
+  - Binary releases must carry StormLib's MIT notice:
+
+    > Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions: The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 - **libctru** (zlib), from the pinned devkitARM image.
   - `src/app/ctr_game.cpp` replaces libctru's `__system_allocateHeaps` with a version modelled on libctru 2.7.0's, and says so in place.
 - **newlib and libstdc++** from devkitARM, under their own licenses. libstdc++ is GPL with the GCC runtime library exception, which places no license condition on the resulting binaries.

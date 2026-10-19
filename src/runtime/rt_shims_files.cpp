@@ -567,6 +567,8 @@ void io_worker_main()
         g_io_tail.store(t + 1, std::memory_order_release);
         r->state.store(2, std::memory_order_release);   // before the count: the scheduler polls while it is nonzero
         wx86_host_pending(-1);
+        if (options().io_done)
+            options().io_done();
     }
 }
 
@@ -1087,6 +1089,8 @@ void start_async_io()
     g_io_quit = false;
     g_io_on = options().real_clock && options().io_start && options().io_wait && options().io_wake &&
               options().io_start(io_worker_main);
+    if (g_io_on && options().io_done && options().io_idle_wait)
+        wx86_set_host_waiter([](uint32_t ms) { options().io_idle_wait(ms); });
     logf("file reads: %s", g_io_on ? "asynchronous (I/O worker)" : "synchronous");
 }
 
@@ -1094,6 +1098,7 @@ void stop_async_io()
 {
     if (!g_io_on)
         return;
+    wx86_set_host_waiter(nullptr);
     g_io_quit = true;
     options().io_wake();   // the worker drains the queue, then returns
     g_io_on = false;

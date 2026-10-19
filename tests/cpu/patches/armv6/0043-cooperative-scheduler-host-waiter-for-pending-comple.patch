@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Mon, 19 Oct 2026 15:58:02 +0300
+Subject: [PATCH] cooperative scheduler: host waiter for pending completions
+
+While host completions are pending and every guest thread is blocked,
+the scheduler slept 1 ms between polls: up to 1 ms of latency per
+completed read, ~0.2 s per 10 s with ~200 reads while walking in Blood
+Moor. wx86_set_host_waiter() lets the host supply the wait instead, one
+that returns as soon as its I/O side signals a completion.
+---
+ src/runtime/sched_cooperative.cpp | 15 +++++++++++----
+ src/runtime/sched_cooperative.h   |  4 ++++
+ 2 files changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/src/runtime/sched_cooperative.cpp b/src/runtime/sched_cooperative.cpp
+index 38fedaf..36fa142 100644
+--- a/src/runtime/sched_cooperative.cpp
++++ b/src/runtime/sched_cooperative.cpp
+@@ -157,9 +157,7 @@ uint32_t CooperativeScheduler::wait(Waitable* w, uint32_t timeout_ms) {
+     return 0;                                        // placeholder; EAX set to result on wake
+ }
+ 
+-static std::atomic<int> g_host_pending{0};
+-void wx86_host_pending(int delta) { g_host_pending.fetch_add(delta, std::memory_order_acq_rel); }
+-int wx86_host_pending_count() { return g_host_pending.load(std::memory_order_acquire); }
++
+ 
+ void CooperativeScheduler::notify(Waitable*) { /* pick_ready() re-checks blocked threads */ }
+ 
+@@ -181,6 +179,12 @@ void CooperativeScheduler::sync_real_clock() {
+     if (v > virt_ms_) { virt_ms_ = v; if (time_sink_) time_sink_(virt_ms_); }
+ }
+ 
++static std::atomic<int> g_host_pending{0};
++void wx86_host_pending(int delta) { g_host_pending.fetch_add(delta, std::memory_order_acq_rel); }
++int wx86_host_pending_count() { return g_host_pending.load(std::memory_order_acquire); }
++static std::atomic<void (*)(uint32_t)> g_host_waiter{nullptr};
++void wx86_set_host_waiter(void (*wait_ms)(uint32_t)) { g_host_waiter.store(wait_ms, std::memory_order_release); }
++
+ GuestThread* CooperativeScheduler::pick_ready() {
+     for (;;) {
+         // Wake any Blocked thread whose Waitable is now acquirable.
+@@ -224,7 +228,10 @@ GuestThread* CooperativeScheduler::pick_ready() {
+         // deadline, or report a deadlock when nothing has one.
+         if (wx86_host_pending_count() > 0 && real_now_ && real_sleep_) {
+             idle_ms_ += 1;
+-            real_sleep_(1);
++            if (void (*w)(uint32_t) = g_host_waiter.load(std::memory_order_acquire))
++                w(1);   // returns as soon as a completion is signalled
++            else
++                real_sleep_(1);
+             sync_real_clock();
+             continue;
+         }
+diff --git a/src/runtime/sched_cooperative.h b/src/runtime/sched_cooperative.h
+index cc05567..cf57523 100644
+--- a/src/runtime/sched_cooperative.h
++++ b/src/runtime/sched_cooperative.h
+@@ -31,6 +31,10 @@ namespace d2rt {
+ // Real-clock mode only. Safe from any thread.
+ void wx86_host_pending(int delta);
+ int  wx86_host_pending_count();
++// Optional: how the all-blocked scheduler waits while host completions are
++// pending, at most `ms`, returning early when one is signalled (instead of a
++// plain sleep). The host's I/O side signals it at each completion.
++void wx86_set_host_waiter(void (*wait_ms)(uint32_t ms));
+ 
+ class CooperativeScheduler : public ThreadScheduler {
+ public:

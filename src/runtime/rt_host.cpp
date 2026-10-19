@@ -281,7 +281,8 @@ void prof_report(uint64_t ms)
              t.tid, t.entry, (unsigned long long)(t.run_ns / 1000000), (unsigned long long)(t.trap_ns / 1000000),
              (unsigned long long)t.slices, (unsigned long long)t.samples, (unsigned long long)t.blocks);
         Eips v;
-        prof::top_eips_tid(t.tid, 40, collect, &v);
+        // Time samples spread over many EIPs: the busy threads get a longer list.
+        prof::top_eips_tid(t.tid, t.samples > 1000 ? 120 : 40, collect, &v);
         for (size_t i = 0; i < v.size(); i += 20) {
             char head[32];
             std::snprintf(head, sizeof head, "prof eip t%u", t.tid);

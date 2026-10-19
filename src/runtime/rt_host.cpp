@@ -599,6 +599,21 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
             }))
             logf("%s: served in line", imp[1]);
     }
+    // The hottest other imports go through the bridge without leaving the
+    // dynarec loop (WinVita's in-line shim path): same shim, no trap. Under
+    // the cooperative scheduler a shim that must wait yields, and the in-line
+    // path turns a yield into a clean stop, as a trap would. Per call this
+    // saved about half of what these cost at their call sites.
+    static const char *const kInLineImports[][2] = {{"KERNEL32.dll", "EnterCriticalSection"},
+                                                    {"KERNEL32.dll", "LeaveCriticalSection"},
+                                                    {"KERNEL32.dll", "QueryPerformanceCounter"},
+                                                    {"USER32.dll", "wsprintfA"},
+                                                    {"GDI32.dll", "StretchBlt"}};
+    for (const auto &imp : kInLineImports)
+        if (const uint32_t slot = br->shim_trap_existing(imp[0], imp[1])) {
+            cpu->set_inline_shim(slot);
+            logf("%s: in line", imp[1]);
+        }
     res.unresolved_imports = br->unresolved_count();
     res.loaded = true;
     logf("loaded %s at %08x entry %08x, %u unresolved import(s)", g_opt.exe_name.c_str(), g_exe_base,

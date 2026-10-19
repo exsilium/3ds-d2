@@ -1,0 +1,204 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Mon, 19 Oct 2026 14:46:58 +0300
+Subject: [PATCH] cooperative scheduler: host-side completions (asynchronous
+ I/O)
+
+wx86_host_pending(delta) counts waitables that a host thread, not guest
+code, will signal (asynchronous file reads). pick_ready() assumed that
+nothing can signal while every guest thread is blocked: it slept to the
+nearest deadline, or reported a deadlock when none had one. While host
+completions are pending it now naps 1 ms and polls again. Real-clock
+mode only, so the virtual clock stays deterministic.
+---
+ src/runtime/sched_cooperative.cpp | 139 +++++++++++++++++-------------
+ src/runtime/sched_cooperative.h   |   8 ++
+ 2 files changed, 86 insertions(+), 61 deletions(-)
+
+diff --git a/src/runtime/sched_cooperative.cpp b/src/runtime/sched_cooperative.cpp
+index 02309b8..38fedaf 100644
+--- a/src/runtime/sched_cooperative.cpp
++++ b/src/runtime/sched_cooperative.cpp
+@@ -1,5 +1,7 @@
+ // src/runtime/sched_cooperative.cpp — see sched_cooperative.h.
+ #include "runtime/sched_cooperative.h"
++
++#include <atomic>
+ #include "runtime/prof.h"
+ 
+ // Engine-owned progress log (platform/vita_host.h): writes a durable line on
+@@ -155,6 +157,10 @@ uint32_t CooperativeScheduler::wait(Waitable* w, uint32_t timeout_ms) {
+     return 0;                                        // placeholder; EAX set to result on wake
+ }
+ 
++static std::atomic<int> g_host_pending{0};
++void wx86_host_pending(int delta) { g_host_pending.fetch_add(delta, std::memory_order_acq_rel); }
++int wx86_host_pending_count() { return g_host_pending.load(std::memory_order_acquire); }
++
+ void CooperativeScheduler::notify(Waitable*) { /* pick_ready() re-checks blocked threads */ }
+ 
+ void CooperativeScheduler::exit_current(uint32_t code) {
+@@ -176,72 +182,83 @@ void CooperativeScheduler::sync_real_clock() {
+ }
+ 
+ GuestThread* CooperativeScheduler::pick_ready() {
+-    // Wake any Blocked thread whose Waitable is now acquirable.
+-    for (auto& up : threads_) {
+-        GuestThread* t = up.get();
+-        if (t->state == S::Blocked && t->wait_obj) {
+-            Waitable* w = static_cast<Waitable*>(t->wait_obj);
+-            if (w->try_acquire(t)) {
+-                t->wait_obj = nullptr;
+-                if (t->wake_writes_eax) t->ctx.gpr[0] = w->result();   // EAX = WAIT_OBJECT_0(+index)
+-                t->wake_writes_eax = true; t->wake_timeout_eax = 0x102;
+-                t->wake_deadline = 0;
+-                t->state = S::Ready;
+-                wake_signal_++;
+-                sw_rec(t->id, 5, 0, t->ctx.eip);          // WAKEsig
+-            } else if (((real_now_ && real_expire_) || (virt_tick_us_ && !real_now_)) && t->wake_deadline
+-                       && virt_ms_ >= t->wake_deadline
+-                       && !(defer_towake_ && preempted_last_ && preempted_last_ != t
+-                            && preempted_last_->state == S::Ready)) {
+-                // Real-time mode, or virtual mode with a switch tick: expire
+-                // timed waits even while other threads are runnable (a
+-                // Sleep(100) must last ~100 ms, not "until nothing else
+-                // runs"). Plain virtual mode keeps the old idle-only expiry —
+-                // that's the tested deterministic baseline.
+-                t->wait_obj = nullptr; t->wake_deadline = 0;
+-                if (t->wake_writes_eax) t->ctx.gpr[0] = t->wake_timeout_eax;  // WAIT_TIMEOUT (or shim override)
+-                t->wake_writes_eax = true; t->wake_timeout_eax = 0x102;
+-                t->state = S::Ready;
+-                wake_timeout_++;
+-                sw_rec(t->id, 6, 0, t->ctx.eip);          // WAKEto (real-expiry)
++    for (;;) {
++        // Wake any Blocked thread whose Waitable is now acquirable.
++        for (auto& up : threads_) {
++            GuestThread* t = up.get();
++            if (t->state == S::Blocked && t->wait_obj) {
++                Waitable* w = static_cast<Waitable*>(t->wait_obj);
++                if (w->try_acquire(t)) {
++                    t->wait_obj = nullptr;
++                    if (t->wake_writes_eax) t->ctx.gpr[0] = w->result();   // EAX = WAIT_OBJECT_0(+index)
++                    t->wake_writes_eax = true; t->wake_timeout_eax = 0x102;
++                    t->wake_deadline = 0;
++                    t->state = S::Ready;
++                    wake_signal_++;
++                    sw_rec(t->id, 5, 0, t->ctx.eip);          // WAKEsig
++                } else if (((real_now_ && real_expire_) || (virt_tick_us_ && !real_now_)) && t->wake_deadline
++                           && virt_ms_ >= t->wake_deadline
++                           && !(defer_towake_ && preempted_last_ && preempted_last_ != t
++                                && preempted_last_->state == S::Ready)) {
++                    // Real-time mode, or virtual mode with a switch tick: expire
++                    // timed waits even while other threads are runnable (a
++                    // Sleep(100) must last ~100 ms, not "until nothing else
++                    // runs"). Plain virtual mode keeps the old idle-only expiry —
++                    // that's the tested deterministic baseline.
++                    t->wait_obj = nullptr; t->wake_deadline = 0;
++                    if (t->wake_writes_eax) t->ctx.gpr[0] = t->wake_timeout_eax;  // WAIT_TIMEOUT (or shim override)
++                    t->wake_writes_eax = true; t->wake_timeout_eax = 0x102;
++                    t->state = S::Ready;
++                    wake_timeout_++;
++                    sw_rec(t->id, 6, 0, t->ctx.eip);          // WAKEto (real-expiry)
++                }
+             }
+         }
+-    }
+-    size_t n = threads_.size();
+-    for (size_t i = 0; i < n; ++i) {
+-        size_t idx = (rr_ + 1 + i) % n;
+-        if (threads_[idx]->state == S::Ready) { rr_ = idx; return threads_[idx].get(); }
+-    }
+-    // No thread runnable now — but a timed wait may be due. Advance virtual time
+-    // to the nearest finite deadline and wake that thread with WAIT_TIMEOUT(0x102).
+-    GuestThread* soonest = nullptr;
+-    for (auto& up : threads_) { GuestThread* t = up.get();
+-        if (t->state == S::Blocked && t->wake_deadline)
+-            if (!soonest || t->wake_deadline < soonest->wake_deadline) soonest = t; }
+-    if (soonest) {
+-        if (real_now_) {
+-            // Real-time mode: nothing can signal a Waitable while every guest
+-            // thread is blocked (signals only come from guest code), so it is
+-            // safe to sleep the host thread until the nearest timed deadline.
+-            for (;;) {
+-                sync_real_clock();
+-                if (virt_ms_ >= soonest->wake_deadline || !real_sleep_) break;
+-                uint64_t d = soonest->wake_deadline - virt_ms_;
+-                idle_ms_ += (d > 100 ? 100 : d);   // D2_PHASEPROF: host nap time given back
+-                real_sleep_((uint32_t)(d > 100 ? 100 : d));
++        size_t n = threads_.size();
++        for (size_t i = 0; i < n; ++i) {
++            size_t idx = (rr_ + 1 + i) % n;
++            if (threads_[idx]->state == S::Ready) { rr_ = idx; return threads_[idx].get(); }
++        }
++        // Nothing runnable, but a host thread (asynchronous I/O) will signal a
++        // waitable: nap briefly and poll again rather than sleep to the next
++        // deadline, or report a deadlock when nothing has one.
++        if (wx86_host_pending_count() > 0 && real_now_ && real_sleep_) {
++            idle_ms_ += 1;
++            real_sleep_(1);
++            sync_real_clock();
++            continue;
++        }
++        // No thread runnable now — but a timed wait may be due. Advance virtual time
++        // to the nearest finite deadline and wake that thread with WAIT_TIMEOUT(0x102).
++        GuestThread* soonest = nullptr;
++        for (auto& up : threads_) { GuestThread* t = up.get();
++            if (t->state == S::Blocked && t->wake_deadline)
++                if (!soonest || t->wake_deadline < soonest->wake_deadline) soonest = t; }
++        if (soonest) {
++            if (real_now_) {
++                // Real-time mode: nothing can signal a Waitable while every guest
++                // thread is blocked (signals only come from guest code), so it is
++                // safe to sleep the host thread until the nearest timed deadline.
++                for (;;) {
++                    sync_real_clock();
++                    if (virt_ms_ >= soonest->wake_deadline || !real_sleep_) break;
++                    uint64_t d = soonest->wake_deadline - virt_ms_;
++                    idle_ms_ += (d > 100 ? 100 : d);   // D2_PHASEPROF: host nap time given back
++                    real_sleep_((uint32_t)(d > 100 ? 100 : d));
++                }
+             }
++            virt_ms_ = soonest->wake_deadline > virt_ms_ ? soonest->wake_deadline : virt_ms_;
++            if (time_sink_) time_sink_(virt_ms_);
++            wake_timeout_++;
++            soonest->wait_obj = nullptr; soonest->wake_deadline = 0;
++            if (soonest->wake_writes_eax) soonest->ctx.gpr[0] = soonest->wake_timeout_eax;  // WAIT_TIMEOUT (or shim override)
++            soonest->wake_writes_eax = true; soonest->wake_timeout_eax = 0x102;
++            soonest->state = S::Ready;
++            sw_rec(soonest->id, 7, 0, soonest->ctx.eip);      // WAKEidle (all-blocked timeout)
++            return soonest;
+         }
+-        virt_ms_ = soonest->wake_deadline > virt_ms_ ? soonest->wake_deadline : virt_ms_;
+-        if (time_sink_) time_sink_(virt_ms_);
+-        wake_timeout_++;
+-        soonest->wait_obj = nullptr; soonest->wake_deadline = 0;
+-        if (soonest->wake_writes_eax) soonest->ctx.gpr[0] = soonest->wake_timeout_eax;  // WAIT_TIMEOUT (or shim override)
+-        soonest->wake_writes_eax = true; soonest->wake_timeout_eax = 0x102;
+-        soonest->state = S::Ready;
+-        sw_rec(soonest->id, 7, 0, soonest->ctx.eip);      // WAKEidle (all-blocked timeout)
+-        return soonest;
++        return nullptr;
+     }
+-    return nullptr;
+ }
+ 
+ void CooperativeScheduler::run_slice(GuestThread* t) {
+diff --git a/src/runtime/sched_cooperative.h b/src/runtime/sched_cooperative.h
+index 0025dd3..cc05567 100644
+--- a/src/runtime/sched_cooperative.h
++++ b/src/runtime/sched_cooperative.h
+@@ -24,6 +24,14 @@ extern "C" { extern uint32_t d2rt_sw_seq; }   // C-visible scheduler event count
+                                               // in sched_cooperative.cpp)
+ namespace d2rt {
+ 
++// Host-side completions in flight (asynchronous I/O): waitables that a host
++// thread, not guest code, will signal. While any is pending, a cooperative
++// scheduler with every guest thread blocked naps 1 ms and polls again,
++// instead of sleeping to the next deadline or reporting a deadlock.
++// Real-clock mode only. Safe from any thread.
++void wx86_host_pending(int delta);
++int  wx86_host_pending_count();
++
+ class CooperativeScheduler : public ThreadScheduler {
+ public:
+     // stack_region: guest VA where per-thread stacks are carved (each `stack`

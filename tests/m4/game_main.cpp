@@ -33,10 +33,12 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -355,6 +357,30 @@ int main(int argc, char **argv)
         controls.set_context(gs.in_game, gs.panel_open);
         controls.update(pad, now);
     };
+    // M4_ASYNCIO=1 (real clock only): asynchronous file reads with a worker
+    // thread, as on the console. Not deterministic; off by default.
+    static std::mutex io_mutex;
+    static std::condition_variable io_cv;
+    static bool io_signaled = false;
+    static std::thread io_thread;
+    if (std::getenv("M4_ASYNCIO") && !std::getenv("M4_VIRTUAL_CLOCK")) {
+        opt.io_start = [](void (*worker)()) {
+            io_thread = std::thread(worker);
+            return true;
+        };
+        opt.io_wait = [] {
+            std::unique_lock<std::mutex> lock(io_mutex);
+            io_cv.wait(lock, [] { return io_signaled; });
+            io_signaled = false;
+        };
+        opt.io_wake = [] {
+            {
+                std::lock_guard<std::mutex> lock(io_mutex);
+                io_signaled = true;
+            }
+            io_cv.notify_one();
+        };
+    }
 #ifdef PROF_COUNTERS
     // M4_PROF: the time-based profile sampler, as on the console (2 ms).
     static std::atomic<bool> sampler_stop{false};
@@ -366,6 +392,8 @@ int main(int argc, char **argv)
     });
 #endif
     rt::RunResult r = rt::run_exe(std::move(exe), opt);
+    if (io_thread.joinable())
+        io_thread.join();
 #ifdef PROF_COUNTERS
     sampler_stop = true;
     sampler.join();

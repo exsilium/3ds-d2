@@ -231,9 +231,10 @@ void prof_report(uint64_t ms)
          (unsigned long long)(now.idle_ms - g_mark.idle_ms), (unsigned long long)(now.switches - g_mark.switches),
          now.syncs - g_mark.syncs, (unsigned long long)((now.sync_ticks - g_mark.sync_ticks) / 268u));   // 268 MHz tick
     const FileStats &f = now.files, &f0 = g_mark.files;
-    logf("prof files: %llu reads, %llu hits, %llu fills, %llu direct, %llu seeks; disk %llu reads %llu KiB in %llu ms; "
-         "cache %llu KiB",
-         (unsigned long long)(f.calls - f0.calls), (unsigned long long)(f.hits - f0.hits),
+    logf("prof files: %llu reads (%llu async), %llu hits, %llu fills, %llu direct, %llu seeks; disk %llu reads %llu KiB in "
+         "%llu ms; cache %llu KiB",
+         (unsigned long long)(f.calls - f0.calls), (unsigned long long)(f.async - f0.async),
+         (unsigned long long)(f.hits - f0.hits),
          (unsigned long long)(f.fills - f0.fills), (unsigned long long)(f.direct - f0.direct),
          (unsigned long long)(f.seeks - f0.seeks), (unsigned long long)(f.disk_reads - f0.disk_reads),
          (unsigned long long)((f.disk_bytes - f0.disk_bytes) >> 10), (unsigned long long)((f.disk_us - f0.disk_us) / 1000),
@@ -614,7 +615,9 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
     wx86_set_scheduler(&sched);
     sched.set_main(img->entry_va(), L.main_stack + 0x200000 - 0x100, L.main_tib);
     g_tick_cpu.store(cpu, std::memory_order_release);
+    start_async_io();
     sched.run();
+    stop_async_io();
     g_tick_cpu.store(nullptr, std::memory_order_release);
     wx86_set_scheduler(nullptr);
     g_sched = nullptr;

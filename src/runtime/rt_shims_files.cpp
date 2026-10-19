@@ -285,16 +285,17 @@ FileStats g_file_stats;
 // filled whole by one read each; least recently used is replaced. Reads of a
 // block or more go straight to their destination.
 //
-// Sizes: the console's SD reads are bandwidth-bound (~5 MB/s: a 32 KiB read
-// takes 6-7 ms), so every byte read and not used costs time, and the host
-// heap has only a few MiB to spare in play (4 MiB of blocks exhausted it in
-// Blood Moor: the JIT's metadata allocation failed). Small blocks still
-// merge the game's many sub-KiB reads (40% of them, RT_FILETRACE on the
-// Linux lane) and serve its re-reads. Block memory is allocated on first use
+// Sizes, from the console's own SD costs (sd bench: ~1.85 ms per read plus
+// ~0.09 ms per KiB) replayed over the game's reads (RT_FILETRACE on the
+// Linux lane): 16 KiB blocks, 8 per file, and a miss on the block right
+// after the previous fill reading the next one too, take ~27% less SD time
+// than 8 KiB blocks without read-ahead; larger blocks or more read-ahead
+// read too much the game never uses. Memory is tight (4 MiB of blocks ran
+// the host heap out in Blood Moor), so blocks are allocated on first use
 // and capped in total (kCap): past it, a file reuses its own blocks.
 class ReadCache {
 public:
-    static constexpr uint32_t kBlock = 8 * 1024, kBlocks = 8;
+    static constexpr uint32_t kBlock = 16 * 1024, kBlocks = 8;
     static constexpr uint64_t kCap = 1u << 20;
 
     ReadCache(int fd, uint64_t size) : fd_(fd), size_(size) {}
@@ -305,9 +306,9 @@ public:
                 g_file_stats.cache_bytes -= kBlock;
     }
 
-    // Threads: one thread fills blocks (read(): the game's own thread, or the
-    // I/O worker when reads are asynchronous); try_read() may run on another
-    // at the same time. The lock covers the block table and try_read's copy,
+    // Threads: one thread fills blocks (read(): the game's own thread, or,
+    // when reads are asynchronous, the I/O worker alone); try_read() may run
+    // on another at the same time. The lock covers the block table and try_read's copy,
     // never a disk read: a block being filled is unlisted (base ~0) until its
     // bytes are in.
     std::atomic<int> inflight{0};   // asynchronous requests on this file not yet done
@@ -397,40 +398,78 @@ private:
 
     // The block at `base`, read from the file if it isn't cached. Only the
     // filling thread changes blocks, so a block it returns stays valid.
+    // A block to fill: the least recently used, allocated while under the
+    // cap. Not `keep` (the other block of the same fill). Null: none.
+    Block *victim(const Block *keep)
+    {
+        Block *any = nullptr, *with_memory = nullptr;
+        for (Block &b : blocks_) {
+            if (&b == keep)
+                continue;
+            if (!any || b.used < any->used)
+                any = &b;
+            if (b.data && (!with_memory || b.used < with_memory->used))
+                with_memory = &b;
+        }
+        if (any && !any->data && with_memory && g_file_stats.cache_bytes + kBlock > kCap)
+            any = with_memory;   // at the cap: reuse a block instead of allocating
+        if (any && !any->data) {
+            any->data.reset(new (std::nothrow) uint8_t[kBlock]);
+            if (!any->data)
+                return with_memory;
+            g_file_stats.cache_bytes += kBlock;
+        }
+        return any;
+    }
+
+    // The block at `base`, read from the file if it isn't cached. A miss on
+    // the block right after the previous fill (a file read in order) reads
+    // the following block too, in the same call. Only the filling thread
+    // changes blocks, so a block it returns stays valid.
     const Block *block_at(uint64_t base)
     {
         Guard g(lock_);
-        Block *victim = &blocks_[0], *oldest = nullptr;   // least recently used: any, and with memory
-        for (Block &b : blocks_) {
-            if (b.base == base && b.data) {
-                b.used = ++clock_;
-                g_file_stats.hits++;
-                return &b;
-            }
-            if (b.used < victim->used)
-                victim = &b;
-            if (b.data && (!oldest || b.used < oldest->used))
-                oldest = &b;
+        if (Block *b = find(base)) {
+            b->used = ++clock_;
+            g_file_stats.hits++;
+            return b;
         }
-        if (!victim->data && oldest && g_file_stats.cache_bytes + kBlock > kCap)
-            victim = oldest;   // at the cap: reuse a block instead of allocating
-        if (!victim->data) {
-            victim->data.reset(new (std::nothrow) uint8_t[kBlock]);
-            if (!victim->data)
-                return nullptr;
-            g_file_stats.cache_bytes += kBlock;
-        }
+        Block *first = victim(nullptr);
+        if (!first)
+            return nullptr;
+        const bool ahead = base == last_fill_ + kBlock && base + kBlock < size_ && !find(base + kBlock);
+        Block *second = ahead ? victim(first) : nullptr;
+        first->base = ~0ull;   // unlisted while they are filled
+        if (second)
+            second->base = ~0ull;
         const uint64_t left = size_ - base;
-        victim->base = ~0ull;   // unlisted while it is filled
+        const uint32_t want = (uint32_t)std::min<uint64_t>(left, second ? 2 * kBlock : kBlock);
         lock_.clear(std::memory_order_release);
-        const uint32_t len = disk_read(base, victim->data.get(), left < kBlock ? (uint32_t)left : kBlock);
+        uint32_t len;
+        if (second) {   // one read for both blocks
+            static uint8_t span[2 * kBlock];   // the filling thread's alone
+            len = disk_read(base, span, want);
+            std::memcpy(first->data.get(), span, std::min(len, kBlock));
+            if (len > kBlock)
+                std::memcpy(second->data.get(), span + kBlock, len - kBlock);
+        } else {
+            len = disk_read(base, first->data.get(), want);
+        }
         while (lock_.test_and_set(std::memory_order_acquire)) {
         }
-        victim->len = len;
-        victim->base = base;
-        victim->used = ++clock_;
+        first->len = std::min(len, kBlock);
+        first->base = base;
+        first->used = ++clock_;
+        last_fill_ = base;
+        if (second && len > kBlock) {
+            second->len = len - kBlock;
+            second->base = base + kBlock;
+            second->used = clock_;   // older than `first` is once that is read
+            last_fill_ = base + kBlock;
+            g_file_stats.fills++;
+        }
         g_file_stats.fills++;
-        return victim;
+        return first;
     }
 
     uint32_t disk_read(uint64_t pos, uint8_t *dst, uint32_t n)
@@ -453,6 +492,7 @@ private:
     int fd_;
     uint64_t size_;
     uint32_t clock_ = 0;
+    uint64_t last_fill_ = ~0ull - kBlock;   // the last block filled: a miss right after it reads ahead
     Block blocks_[kBlocks];
     std::atomic_flag lock_ = ATOMIC_FLAG_INIT;
 };
@@ -550,6 +590,14 @@ IoRequest *io_submit(ReadCache *cache, uint64_t pos, uint8_t *dst, uint32_t n)
         return &r;
     }
     return nullptr;
+}
+
+// Waiting on the I/O worker from the game's own thread (a full request
+// pool, or a read that must complete before ReadFile returns).
+void io_pause()
+{
+    if (options().sleep_ms)
+        options().sleep_ms(1);
 }
 
 struct FindEntry {
@@ -1098,14 +1146,27 @@ void install_files(Bridge &br)
         if (!f) { set_last_error(c, ERROR_INVALID_HANDLE); return 0; }
         uint32_t got;
         g_file_stats.calls++;
-        if (f->cache && !ov && n && g_io_on) {
+        if (f->cache && n && g_io_on) {
             // Asynchronous: what is cached is copied now; a miss goes to the
-            // worker and this guest thread waits for it. The file can't
-            // change size, so the count and the new position are known now.
+            // worker, the only thread that fills caches in this mode. A
+            // plain read waits for it as a guest wait (the other guest
+            // threads run); an OVERLAPPED one, or one without a direct
+            // pointer, waits here. The file can't change size, so the count
+            // and the new position are known at once.
+            if (ov)   // OVERLAPPED: the offset is in the structure; completes synchronously
+                f->pos = c.read_u32(ov + 8);
+            std::vector<uint8_t> tmp;
             uint8_t *dst = static_cast<uint8_t *>(c.hostptr(buf, n));
-            if (dst && !f->cache->try_read(f->pos, dst, n, got)) {
+            if (!dst) {
+                tmp.resize(n);
+                dst = tmp.data();
+            }
+            if (!f->cache->try_read(f->pos, dst, n, got)) {
                 got = f->pos < f->size ? (uint32_t)std::min<uint64_t>(n, f->size - f->pos) : 0;
-                if (IoRequest *r = io_submit(f->cache.get(), f->pos, dst, n)) {
+                IoRequest *r;
+                while (!(r = io_submit(f->cache.get(), f->pos, dst, n)))
+                    io_pause();   // every request in flight
+                if (!ov && tmp.empty()) {
                     f->pos += got;
                     stats().bytes_read += got;
                     g_file_stats.async++;
@@ -1113,23 +1174,16 @@ void install_files(Bridge &br)
                         c.write_u32(pread, got);
                     return wx86_sched()->wait(r, 0xFFFFFFFFu);   // EAX = TRUE when it wakes
                 }
-                dst = nullptr;   // every request busy: read below, once this file has none in flight
+                while (r->state.load(std::memory_order_acquire) != 2)
+                    io_pause();
+                r->state.store(0, std::memory_order_release);   // free the request
             }
-            if (dst) {
-                f->pos += got;
-            } else {
-                while (f->cache->inflight.load(std::memory_order_acquire) > 0)
-                    if (options().sleep_ms)
-                        options().sleep_ms(1);
-                got = cached_read(c, *f, buf, n);
-            }
+            if (!tmp.empty() && got)
+                c.write(buf, tmp.data(), got);
+            f->pos += got;
         } else if (f->cache) {
-            if (ov) {   // OVERLAPPED: the offset is in the structure; completes synchronously
-                while (f->cache->inflight.load(std::memory_order_acquire) > 0)
-                    if (options().sleep_ms)
-                        options().sleep_ms(1);
+            if (ov)   // OVERLAPPED: the offset is in the structure; completes synchronously
                 f->pos = c.read_u32(ov + 8);
-            }
             got = cached_read(c, *f, buf, n);
         } else {
             if (ov)

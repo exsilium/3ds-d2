@@ -624,6 +624,107 @@ uint32_t floor_tile(Cpu &c)
     return 0;
 }
 
+// ---- sound: MPQ ADPCM ---------------------------------------------------------------
+//
+// The game's sounds are compressed WAVs in the MPQs, decoded by the loader
+// thread as they stream: Blizzard's ADPCM (Storm's DecompressADPCM), a tight
+// loop the profile showed as most of the loader's own time in town.
+
+constexpr uint32_t kAdpcmSteps = 0x006cfd38;    // 89 dword step sizes
+constexpr uint32_t kAdpcmIndexAdj = 0x006cfcb8; // 32 dword step-index changes
+uint32_t g_adpcm_step[89];
+int32_t g_adpcm_adj[32];
+
+// 41dce0(ecx=dst, eax=src bytes, [8]=dst bytes, [c]=src, [10]=channels),
+// ret 0xc: returns the bytes written. Input: a byte at +1 with the shift,
+// then a 16-bit first sample per channel, then one byte per sample (the
+// channels alternating): bit 7 clear, a delta (bits 0-5 select fractions of
+// the step, bit 6 its sign); set, a code: 0 repeats the sample (step index
+// down 1), 1 and 2 move the step index by +8 / -8 without a sample.
+uint32_t adpcm_decode(Cpu &c)
+{
+    const uint32_t dst0 = c.reg(R_ECX);
+    uint32_t dst = dst0;
+    const uint32_t src = c.arg(1), end = src + c.reg(R_EAX), channels = c.arg(2);
+    uint32_t avail = c.arg(0);
+    int32_t pred[2] = {0, 0}, index[2] = {0x2c, 0x2c};
+    const uint32_t shift = *H(src + 1) & 31u;   // x86 masks a 32-bit shift count
+    uint32_t p = src + 2;
+    const auto put = [&](int32_t v) {
+        const int16_t w = (int16_t)v;
+        std::memcpy(H(dst), &w, 2);
+        dst += 2;
+        avail -= 2;
+    };
+    for (uint32_t i = 0; i < channels; i++) {
+        int16_t s;
+        std::memcpy(&s, H(p), 2);
+        p += 2;
+        pred[i & 1] = s;   // (the original's frame holds two)
+        if (avail < 2)
+            return dst - dst0;
+        put(s);
+    }
+    if (p >= end)
+        return dst - dst0;
+    uint32_t ch = channels - 1;
+    while (p < end) {
+        if (channels == 2)
+            ch = ch == 0;
+        const uint8_t b = *H(p++);
+        int32_t &ix = index[ch & 1];
+        if (b & 0x80) {
+            switch (b & 0x7f) {
+            case 0:
+                if (ix)
+                    ix--;
+                if (avail < 2)
+                    return dst - dst0;
+                put(pred[ch & 1]);
+                break;
+            case 1:
+                ix = ix + 8 > 0x58 ? 0x58 : ix + 8;
+                if (channels == 2)
+                    ch = ch == 0;   // no sample: the same channel decodes next
+                break;
+            case 2:
+                ix = ix - 8 < 0 ? 0 : ix - 8;
+                if (channels == 2)
+                    ch = ch == 0;
+                break;
+            default:
+                break;
+            }
+            continue;
+        }
+        const uint32_t step = g_adpcm_step[ix];
+        uint32_t diff = step >> shift;
+        if (b & 0x01) diff += step;
+        if (b & 0x02) diff += step >> 1;
+        if (b & 0x04) diff += step >> 2;
+        if (b & 0x08) diff += step >> 3;
+        if (b & 0x10) diff += step >> 4;
+        if (b & 0x20) diff += step >> 5;
+        int32_t v = pred[ch & 1];
+        if (b & 0x40) {
+            v = (int32_t)((uint32_t)v - diff);
+            if (v <= -32768)
+                v = -32768;
+        } else {
+            v = (int32_t)((uint32_t)v + diff);
+            if (v >= 32767)
+                v = 32767;
+        }
+        pred[ch & 1] = v;
+        if (avail < 2)
+            return dst - dst0;
+        put(v);
+        ix += g_adpcm_adj[b & 0x1f];
+        ix = ix < 0 ? 0 : ix > 0x58 ? 0x58 : ix;
+    }
+    return dst - dst0;
+}
+
 }  // namespace
 
 int install_d2_native(Cpu &c)
@@ -670,6 +771,12 @@ int install_d2_native(Cpu &c)
     HOOK(c, 0x004ddef0, k4ddef0, sizeof k4ddef0, 3, light_block, "LightBlock");
     static const uint8_t k4f8b80[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x48, 0x53, 0x8b, 0x1d};
     HOOK(c, 0x004f8b80, k4f8b80, sizeof k4f8b80, 2, floor_tile, "FloorTile");
+    for (int i = 0; i < 89; i++)
+        g_adpcm_step[i] = U32(kAdpcmSteps + 4 * i);
+    for (int i = 0; i < 32; i++)
+        g_adpcm_adj[i] = I32(kAdpcmIndexAdj + 4 * i);
+    static const uint8_t k41dce0[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x1c, 0x53, 0x56, 0x8b, 0x75, 0x0c};
+    HOOK(c, 0x0041dce0, k41dce0, sizeof k41dce0, 3, adpcm_decode, "AdpcmDecode", true);
 #undef HOOK
     return n;
 }

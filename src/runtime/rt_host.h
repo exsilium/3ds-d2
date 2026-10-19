@@ -134,6 +134,12 @@ struct FileStats {
 };
 const FileStats &file_stats();
 
+// Time-based profile sampling (PROF_COUNTERS builds; a no-op otherwise): a
+// host timer thread calls this at a fixed period, on another core. It ends
+// the running guest thread's slice at its next translated block, and the
+// scheduler samples where it stopped. Safe from any thread, at any time.
+void profile_tick();
+
 // Guest memory use, for on-screen diagnostics (walks the allocators: call it
 // about once a second, not per frame).
 struct MemoryReport {

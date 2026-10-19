@@ -37,6 +37,7 @@ extern uint64_t dyn86_ctr_cache_sync_ticks __attribute__((weak));
 }
 
 #include <algorithm>
+#include <atomic>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -54,6 +55,7 @@ namespace {
 RunOptions g_opt;
 Bridge *g_br = nullptr;
 CooperativeScheduler *g_sched = nullptr;
+std::atomic<Cpu *> g_tick_cpu{nullptr};   // the CPU while the scheduler runs (profile_tick)
 uint32_t g_exe_base = 0;
 bool g_exited = false;
 bool g_timed_out = false;
@@ -195,7 +197,7 @@ struct ProfMark {
     uint64_t ms, idle_ms, switches, sync_ticks;
     uint32_t syncs, frames;
     FileStats files;
-    uint64_t run_ns = 0, trap_ns = 0, trap_calls = 0, waits = 0, waits_now = 0, cs = 0, cs_contended = 0;
+    uint64_t run_ns = 0, trap_ns = 0, trap_calls = 0, waits = 0, waits_now = 0, cs = 0, cs_contended = 0, ticks = 0;
 } g_mark{};
 
 #ifdef PROF_COUNTERS
@@ -242,12 +244,16 @@ void prof_report(uint64_t ms)
     now.waits_now = prof::wait_immediate;
     now.cs = prof::cs_enter;
     now.cs_contended = prof::cs_contended;
+    now.ticks = prof::ticks();
     logf("prof: run %llu ms (shims %llu ms in %llu calls), waits %llu (%llu immediate), cs %llu (%llu contended), "
          "samples %llu",
          (unsigned long long)((now.run_ns - g_mark.run_ns) / 1000000), (unsigned long long)((now.trap_ns - g_mark.trap_ns) / 1000000),
          (unsigned long long)(now.trap_calls - g_mark.trap_calls), (unsigned long long)(now.waits - g_mark.waits),
          (unsigned long long)(now.waits_now - g_mark.waits_now), (unsigned long long)(now.cs - g_mark.cs),
          (unsigned long long)(now.cs_contended - g_mark.cs_contended), (unsigned long long)prof::eip_samples());
+    if (now.ticks != g_mark.ticks)   // time-based sampling: ticks not sampled landed outside guest slices
+        logf("prof: %llu timer ticks, %llu in guest slices", (unsigned long long)(now.ticks - g_mark.ticks),
+             (unsigned long long)prof::eip_samples());
     char shims[400];
     if (g_br && g_br->prof_window(shims, sizeof shims, 12))
         logf("prof shims:%s", shims);
@@ -335,6 +341,16 @@ void tail_call(Cpu &c, uint32_t va, uint32_t shim_argc, std::initializer_list<ui
     }
     c.set_reg(R_ESP, entry - (4 + 4 * shim_argc));   // the bridge's epilogue adds that back
     g_br->redirect_next(va);
+}
+
+void profile_tick()
+{
+#ifdef PROF_COUNTERS
+    if (Cpu *c = g_tick_cpu.load(std::memory_order_acquire)) {
+        prof::tick();
+        c->nudge_thread_budget(nullptr);   // the cooperative scheduler's one emu: no registry walk
+    }
+#endif
 }
 
 uint64_t now_ms()
@@ -579,7 +595,9 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
     sched.set_time_sink([](uint64_t ms) { check_time_limit(ms); });
     wx86_set_scheduler(&sched);
     sched.set_main(img->entry_va(), L.main_stack + 0x200000 - 0x100, L.main_tib);
+    g_tick_cpu.store(cpu, std::memory_order_release);
     sched.run();
+    g_tick_cpu.store(nullptr, std::memory_order_release);
     wx86_set_scheduler(nullptr);
     g_sched = nullptr;
     if (g_opt.audio)

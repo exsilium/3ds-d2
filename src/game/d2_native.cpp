@@ -1005,6 +1005,55 @@ uint32_t huffman_decode(Cpu &c)
     return 0;
 }
 
+// ---- string tables -------------------------------------------------------------------
+//
+// D2Lang's lookup of a string by its key (0x524d30 tries the patch, expansion
+// and base tables in turn): a hash, then a probe through the table's nodes
+// comparing keys byte by byte. About 16% of the main thread while an area
+// loads.
+
+// 5249e0(key, size): the ELF hash of the key (signed chars), modulo size.
+uint32_t lang_hash(uint32_t key, uint32_t size)
+{
+    uint32_t h = 0;
+    for (const uint8_t *s = H(key); *s; s++) {
+        h = (h << 4) + (uint32_t)(int32_t)(int8_t)*s;
+        if (const uint32_t hi = h & 0xf0000000u)
+            h = ((hi >> 24) ^ h) & 0x0fffffffu;
+    }
+    return h % size;
+}
+
+// 524c60(edi=table, [8]=string pointers, [c]=key, [10]=&string), ret 0xc:
+// the string's index (ax), 0xffff if the key isn't there. Nodes of 17 bytes
+// after the header's index array: a used flag (1), the index (+1), the key's
+// offset from the table (+7). At most [table+0xd] probes, from the hash on.
+// (A found key whose string pointer is null is a fatal error in the game;
+// here it returns as found, with that null.)
+uint32_t lang_lookup(Cpu &c)
+{
+    const uint32_t table = c.reg(R_EDI), strings = c.arg(0), key = c.arg(1), out = c.arg(2);
+    uint16_t keys;
+    std::memcpy(&keys, H(table + 2), 2);
+    const uint32_t nodes = table + 2u * keys + 0x15;
+    const uint32_t size = U32(table + 4), probes = U32(table + 0xd);
+    uint32_t i = lang_hash(key, size);
+    for (uint32_t n = 0; n < probes;) {
+        const uint32_t node = nodes + 17 * i;
+        n++;
+        if (*H(node) == 1 && std::strcmp(reinterpret_cast<const char *>(H(U32(node + 7) + table)),
+                                         reinterpret_cast<const char *>(H(key))) == 0) {
+            const uint32_t str = U32(strings + 4 * i);
+            std::memcpy(H(out), &str, 4);
+            uint16_t index;
+            std::memcpy(&index, H(node + 1), 2);
+            return (i & 0xffff0000u) | index;
+        }
+        i = (uint32_t)((int32_t)(i + 1) % (int32_t)size);
+    }
+    return (i & 0xffff0000u) | 0xffffu;
+}
+
 }  // namespace
 
 int install_d2_native(Cpu &c)
@@ -1061,6 +1110,8 @@ int install_d2_native(Cpu &c)
     HOOK(c, 0x0041f9e0, k41f9e0, sizeof k41f9e0, 3, huffman_decode, "HuffmanDecode", true);
     static const uint8_t k41e000[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x18, 0x53, 0x56, 0x57, 0x6a, 0x00};
     HOOK(c, 0x0041e000, k41e000, sizeof k41e000, 3, pk_decode, "PkExplode", true);
+    static const uint8_t k524c60[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x08, 0x0f, 0xb7, 0x47, 0x02};
+    HOOK(c, 0x00524c60, k524c60, sizeof k524c60, 3, lang_lookup, "LangLookup", true);
 #undef HOOK
     return n;
 }

@@ -29,12 +29,14 @@
 #include <3ds/allocator/mappable.h>
 
 #include <cstdarg>
+#include <fcntl.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <malloc.h>
 #include <string>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -183,8 +185,13 @@ void show_stats(float fps, float draw_ms, float worst_ms)
     // Each line is padded to 39 columns: a 40th character would wrap the
     // 40-column window and scroll the panel.
     char line[12][48];
-    std::snprintf(line[0], 48, "3ds-d2  game time %02u:%02u:%02u", (unsigned)(t / 3600), (unsigned)(t / 60 % 60),
-                  (unsigned)(t % 60));
+#ifdef PROF_COUNTERS
+    const char *build = "  PROF";   // the profiling build (package-cia --prof)
+#else
+    const char *build = "";
+#endif
+    std::snprintf(line[0], 48, "3ds-d2  game time %02u:%02u:%02u%s", (unsigned)(t / 3600), (unsigned)(t / 60 % 60),
+                  (unsigned)(t % 60), build);
     std::snprintf(line[1], 48, "fps %5.1f   worst frame gap %6.1f ms", fps, worst_ms);
     std::snprintf(line[2], 48, "draw %5.2f ms c%d skip %u frames %u", draw_ms, g_render_core < 0 ? 0 : g_render_core,
                   (unsigned)g_frames_skipped, (unsigned)g_timing.total_frames);
@@ -459,6 +466,70 @@ void start_render_thread()
                                                    : "game thread (no second core)");
 }
 
+#ifdef PROF_COUNTERS
+// The time-based profile sampler (rt::profile_tick): every 2 ms, from core 2
+// at a priority above the drawing and the mixer, so its period holds while
+// core 0 runs the game.
+Thread g_sampler = nullptr;
+volatile bool g_sampler_stop = false;
+
+void sampler_main(void *)
+{
+    while (!g_sampler_stop) {
+        svcSleepThread(2000000);
+        rt::profile_tick();
+    }
+}
+
+void start_sampler()
+{
+    s32 prio = 0x30;
+    svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+    g_sampler = threadCreate(sampler_main, nullptr, 4 * 1024, prio - 3, g_render_core >= 0 ? g_render_core : 2, false);
+    status("profile sampler: %s", g_sampler ? "every 2 ms" : "not started (instruction-quantum samples)");
+}
+
+void stop_sampler()
+{
+    if (!g_sampler)
+        return;
+    g_sampler_stop = true;
+    threadJoin(g_sampler, U64_MAX);
+    threadFree(g_sampler);
+    g_sampler = nullptr;
+}
+#endif
+
+// Asynchronous file reads (RunOptions::io_start): the runtime's I/O worker on
+// the second core, above the drawing, so a finished SD read reaches the
+// waiting guest thread at once. It sleeps on an event between requests.
+LightEvent g_io_event;
+LightEvent g_io_done_event;   // a read completed: wakes an idle scheduler (RunOptions::io_done)
+Thread g_io_thread = nullptr;
+void (*g_io_worker)() = nullptr;
+
+void io_main(void *) { g_io_worker(); }
+
+bool start_io_thread(void (*worker)())
+{
+    g_io_worker = worker;
+    LightEvent_Init(&g_io_event, RESET_ONESHOT);
+    LightEvent_Init(&g_io_done_event, RESET_ONESHOT);
+    s32 prio = 0x30;
+    svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+    g_io_thread = threadCreate(io_main, nullptr, 16 * 1024, prio - 1, g_render_core >= 0 ? g_render_core : 2, false);
+    return g_io_thread != nullptr;
+}
+
+void join_io_thread()
+{
+    if (!g_io_thread)
+        return;
+    threadJoin(g_io_thread, U64_MAX);   // the runtime has told it to stop
+    threadFree(g_io_thread);
+    g_io_thread = nullptr;
+}
+
 void stop_render_thread()
 {
     if (!g_render_thread)
@@ -684,6 +755,42 @@ bool read_file(const std::string &path, std::vector<uint8_t> &out)
     return ok;
 }
 
+#ifdef PROF_COUNTERS
+// The SD card's cost model, for sizing the game-file read cache
+// (rt_shims_files.cpp): reads of each size at scattered offsets of an MPQ,
+// as the game reads them. Time per read = per-call overhead + size /
+// bandwidth; two sizes give both.
+void sd_benchmark(const std::string &path)
+{
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    struct stat st;
+    if (fd < 0 || ::fstat(fd, &st) != 0 || st.st_size < (1 << 20)) {
+        status("sd bench: cannot open %s", path.c_str());
+        if (fd >= 0)
+            ::close(fd);
+        return;
+    }
+    std::vector<uint8_t> buf(64 * 1024);
+    uint32_t seed = 0x2545F491;
+    for (uint32_t size : {512u, 2048u, 4096u, 8192u, 16384u, 32768u, 65536u}) {
+        constexpr int kReads = 24;
+        uint64_t ticks = 0;
+        for (int i = 0; i < kReads; i++) {
+            seed = seed * 1664525u + 1013904223u;
+            const off_t at = (off_t)((seed % (uint32_t)(st.st_size - 65536)) & ~511u);
+            const uint64_t t0 = svcGetSystemTick();
+            ::lseek(fd, at, SEEK_SET);
+            if (::read(fd, buf.data(), size) != (ssize_t)size)
+                status("sd bench: short read at %ld", (long)at);
+            ticks += svcGetSystemTick() - t0;
+        }
+        const double ms = ticks / (SYSCLOCK_ARM11 / 1000.0) / kReads;
+        status("sd bench: %5u B: %6.3f ms/read, %5.0f KiB/s", (unsigned)size, ms, size / 1024.0 / (ms / 1000.0));
+    }
+    ::close(fd);
+}
+#endif
+
 void wait_for_start()
 {
     std::printf("\nPress START to exit.\n");
@@ -737,6 +844,9 @@ int main()
         return 1;
     }
     status("Game.exe: %u bytes. Starting...", (unsigned)exe.size());
+#ifdef PROF_COUNTERS
+    sd_benchmark(game_dir + "/d2data.mpq");
+#endif
 
     {
         std::vector<uint8_t> script;
@@ -797,14 +907,28 @@ int main()
         // up, messages go to the log file only.
         // The sound engine's "[son]" diagnostics (WinVita writes them in
         // French) go to game.log only.
-        if (std::strncmp(s, "t=", 2) != 0 && std::strncmp(s, "[son]", 5) != 0 && !g_osk_shown)
+        // So do the per-interval profile lines ("prof...").
+        if (std::strncmp(s, "t=", 2) != 0 && std::strncmp(s, "[son]", 5) != 0 && std::strncmp(s, "prof", 4) != 0 &&
+            !g_osk_shown)
             std::printf("%.*s\n", 39, s);
     };
     opt.present = present;
     opt.poll_input = poll;
+    opt.io_start = start_io_thread;
+    opt.io_wait = [] { LightEvent_Wait(&g_io_event); };
+    opt.io_wake = [] { LightEvent_Signal(&g_io_event); };
+    opt.io_done = [] { LightEvent_Signal(&g_io_done_event); };
+    opt.io_idle_wait = [](uint32_t ms) { LightEvent_WaitTimeout(&g_io_done_event, (s64)ms * 1000000); };
 
     start_render_thread();
+#ifdef PROF_COUNTERS
+    start_sampler();
+#endif
     rt::RunResult r = rt::run_exe(std::move(exe), opt);
+    join_io_thread();
+#ifdef PROF_COUNTERS
+    stop_sampler();
+#endif
     stop_render_thread();
     if (!r.loaded)
         status("FATAL: %s", r.error.c_str());

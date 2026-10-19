@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Sun, 18 Oct 2026 18:32:33 +0300
+Subject: [PATCH] prof: 3DS clock, windowed sample reset, cache-sync counters
+
+PROF_COUNTERS builds on the 3DS: prof::now_ns() reads the ARM11 system
+tick (newlib's clock_gettime is not usable there), and
+prof::reset_samples() clears the EIP histograms so a host can report one
+profile per interval instead of a since-boot total.
+
+mman_ctr.c counts calls to dyn86_ctr_clear_cache and, on hardware, the
+ticks spent in Luma's whole-cache SVCs. Always on: the cost is paid per
+newly translated block. A steady stream in play would mean retranslation,
+with every one flushing the whole L1 and L2.
+---
+ src/dynarec86/shim/ctr/mman_ctr.c | 10 ++++++++++
+ src/runtime/prof.cpp              | 10 ++++++++++
+ src/runtime/prof.h                |  4 ++++
+ 3 files changed, 24 insertions(+)
+
+diff --git a/src/dynarec86/shim/ctr/mman_ctr.c b/src/dynarec86/shim/ctr/mman_ctr.c
+index 807a60e..494b374 100644
+--- a/src/dynarec86/shim/ctr/mman_ctr.c
++++ b/src/dynarec86/shim/ctr/mman_ctr.c
+@@ -247,9 +247,18 @@ static void svc_invalidate_entire_icache(void)
+     __asm__ volatile("svc 0x94" ::: "r0", "memory");
+ }
+ 
++/* Cache maintenance counters (always on: one increment and two tick reads
++ * per newly translated block). A steady stream of these in play means the
++ * guest keeps getting retranslated, and on hardware every one flushes the
++ * whole L1 and L2. */
++uint32_t dyn86_ctr_cache_syncs = 0;
++uint64_t dyn86_ctr_cache_sync_ticks = 0;
++
+ void dyn86_ctr_clear_cache(void* beg, void* end)
+ {
++    dyn86_ctr_cache_syncs++;
+     if (!is_emulator()) {
++        const u64 t0 = svcGetSystemTick();
+         /* New 3DS (Luma3DS): the range variants fault in the kernel on code
+          * pages made RWX with MEMOP_PROT (data abort at the block's first
+          * address, DFSR 0x804: instruction-cache maintenance fault; Luma dump
+@@ -257,6 +266,7 @@ void dyn86_ctr_clear_cache(void* beg, void* end)
+          * is paid once per newly translated block, not per executed one. */
+         svc_flush_entire_dcache();
+         svc_invalidate_entire_icache();
++        dyn86_ctr_cache_sync_ticks += svcGetSystemTick() - t0;
+         return;
+     }
+     /* Azahar: implements 0x54 and 0x93 but not 0x92 (finding 4). */
+diff --git a/src/runtime/prof.cpp b/src/runtime/prof.cpp
+index 287c4b4..ff1d336 100644
+--- a/src/runtime/prof.cpp
++++ b/src/runtime/prof.cpp
+@@ -11,6 +11,8 @@
+ 
+ #ifdef __vita__
+ #include <psp2/kernel/processmgr.h>
++#elif defined(__3DS__)
++#include <3ds.h>
+ #else
+ #include <time.h>
+ #endif
+@@ -20,6 +22,10 @@ namespace d2rt { namespace prof {
+ uint64_t now_ns() {
+ #ifdef __vita__
+     return (uint64_t)sceKernelGetProcessTimeWide() * 1000ull;   // µs -> ns
++#elif defined(__3DS__)
++    // newlib's clock_gettime is not a usable clock on the 3DS (host_clock.cpp).
++    const uint64_t t = svcGetSystemTick();
++    return (t / SYSCLOCK_ARM11) * 1000000000ull + (t % SYSCLOCK_ARM11) * 1000000000ull / SYSCLOCK_ARM11;
+ #else
+     struct timespec ts;
+     clock_gettime(CLOCK_MONOTONIC, &ts);
+@@ -59,6 +65,10 @@ void note_thread(uint32_t tid, uint32_t entry) { TidProf& t = g_tid[tid]; if (!t
+ void threads(void (*cb)(uint32_t, uint32_t, uint64_t, uint64_t, void*), void* u) {
+     for (auto& p : g_tid) cb(p.first, p.second.entry, p.second.samples, p.second.blocks, u);
+ }
++void reset_samples() {
++    g_hist.clear(); g_samples = 0;
++    for (auto& p : g_tid) { p.second.hist.clear(); p.second.samples = 0; p.second.blocks = 0; }
++}
+ void top_eips_tid(uint32_t tid, int n, void (*cb)(uint32_t, uint64_t, void*), void* u) {
+     auto it = g_tid.find(tid); if (it == g_tid.end()) return;
+     std::vector<std::pair<uint64_t, uint32_t>> v; v.reserve(it->second.hist.size());
+diff --git a/src/runtime/prof.h b/src/runtime/prof.h
+index b1a8f2c..3e1e6cf 100644
+--- a/src/runtime/prof.h
++++ b/src/runtime/prof.h
+@@ -45,6 +45,9 @@ void   note_thread(uint32_t tid, uint32_t entry);
+ void   threads(void (*cb)(uint32_t tid, uint32_t entry, uint64_t samples, uint64_t blocks, void* u), void* u);
+ // cb(eip, hits): the n most frequent exact EIPs for the thread (n<0: all).
+ void   top_eips_tid(uint32_t tid, int n, void (*cb)(uint32_t eip, uint64_t hits, void* u), void* u);
++// Clears the EIP histograms and per-thread samples/blocks (thread entries
++// stay): windowed profiles, one per reporting interval.
++void   reset_samples();
+ 
+ #else
+ inline uint64_t now_ns() { return 0; }
+@@ -56,6 +59,7 @@ inline void add_blocks_tid(uint32_t, uint32_t) {}
+ inline void note_thread(uint32_t, uint32_t) {}
+ inline void threads(void (*)(uint32_t, uint32_t, uint64_t, uint64_t, void*), void*) {}
+ inline void top_eips_tid(uint32_t, int, void (*)(uint32_t, uint64_t, void*), void*) {}
++inline void reset_samples() {}
+ #endif
+ 
+ }} // namespace d2rt::prof

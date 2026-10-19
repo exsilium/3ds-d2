@@ -128,7 +128,13 @@ The app plays sound through WinVita's DirectSound emulation (ds_emul) and the 3D
 
 The CPU-bound Linux lane is the way to compare the work per frame between builds without the console: qemu on a fast host otherwise always keeps the game at its 25 fps cap.
 
-Checking a native routine: `M4_FRAMEHASH` on the virtual clock, `M4_NATIVE=0` against `M4_NATIVE=late`. The late mode installs the hooks on arrival in the game world. Routines that also run in the menus (the DC6 sprites) otherwise shift the moment the game is created: the scheduler preempts by instruction count and virtual time advances per switch, so the map seed and the whole world come out different, though correctly drawn. `D2_NATIVE_MASK` enables a subset of the hooks for bisecting, and `M4_DUMPFRAME=<n>` saves one frame's raw pixels.
+Checking a native routine: `M4_FRAMEHASH` on the virtual clock, `M4_NATIVE=0` against `M4_NATIVE=late`. The late mode installs the hooks on arrival in the game world. Routines that also run in the menus (the DC6 sprites) otherwise shift the moment the game is created: the scheduler preempts by instruction count and virtual time advances per switch, so the map seed and the whole world come out different, though correctly drawn. `D2_NATIVE_MASK` enables a subset of the hooks for bisecting, and `M4_DUMPFRAME=<n>` saves one frame's raw pixels and palette.
+
+Two more settings matter for these checks:
+- **`WX86_FAKETSC=1` once the script gives input in the game world** (walking, for example). Without it, `RDTSC` reads the host's clock. Then anything that changes the host's timing, even an extra hash, moves where the input lands, and the runs diverge for reasons unrelated to the change being checked.
+- **`M4_HASHMEM=<va>:<bytes>`** hashes a guest memory range with every frame, for native code whose result the pixels may not show. The light grid is `0x7b0e68:0x4800`.
+
+Example: the native light grid (`LightGrid`, mask bit 8), with the town walk script, `WX86_FAKETSC=1` and `M4_HASHMEM=0x7b0e68:0x4800`. Masks `0xff` and `0x1ff` give the same 2,372 frames, pixels and grid alike, over 185 distinct grid states.
 
 ## Blood Moor: VirtualAlloc ran out (2026-10-18)
 

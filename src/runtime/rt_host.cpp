@@ -122,7 +122,7 @@ uint32_t native_entry(const char *name, uint32_t stack_args, std::function<uint3
 }
 
 bool hook_function(Cpu &c, uint32_t va, const uint8_t *expect, uint32_t n, uint32_t stack_args,
-                   std::function<uint32_t(Cpu &)> fn, const char *name)
+                   std::function<uint32_t(Cpu &)> fn, const char *name, bool in_line)
 {
     if (n < 5)
         return false;
@@ -139,7 +139,9 @@ bool hook_function(Cpu &c, uint32_t va, const uint8_t *expect, uint32_t n, uint3
     std::memcpy(jmp + 1, &rel, 4);
     c.write(va, jmp, 5);
     c.invalidate_code(va, 5);
-    logf("native %s at %08x", name, va);
+    if (in_line)
+        c.set_inline_shim(trap);
+    logf("native %s at %08x%s", name, va, in_line ? " (in line)" : "");
     return true;
 }
 
@@ -581,6 +583,21 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
     img->release_image();   // the guest copy is mapped and linked: the host copy is dead weight
     if (g_opt.install_native)
         g_opt.install_native(*cpu);
+    // The game's clock reads, served in line from translated code (WinVita's
+    // lock-free in-line intrinsic): no trap, no exit from the dynarec loop.
+    // On the console a GetTickCount trap cost more than its body: ~10% of a
+    // town frame went to them. Same value as the shims (now_ms). Armed
+    // before the game runs: a slot already translated can't be rewritten.
+    static const char *const kClockImports[][2] = {{"KERNEL32.dll", "GetTickCount"}, {"WINMM.dll", "timeGetTime"}};
+    for (const auto &imp : kClockImports) {
+        const uint32_t slot = br->shim_trap_existing(imp[0], imp[1]);
+        if (slot && cpu->set_intrinsic_nogil(slot, [](Cpu::IntrinFrame &f, uint32_t) {
+                f.eax = (uint32_t)now_ms();
+                f.pop = 0;
+                return true;
+            }))
+            logf("%s: served in line", imp[1]);
+    }
     res.unresolved_imports = br->unresolved_count();
     res.loaded = true;
     logf("loaded %s at %08x entry %08x, %u unresolved import(s)", g_opt.exe_name.c_str(), g_exe_base,

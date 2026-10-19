@@ -221,8 +221,12 @@ std::string module_name_of(uint32_t base);
 // shim's trap over the function's first bytes. The guest stack and registers
 // arrive exactly as the original would see them (ecx/edx included); callee-
 // saved registers are untouched by a shim. Returns false if the bytes differ.
+// `in_line`: the shim is served from inside the translated code, without
+// leaving the dynarec loop (WinVita's in-line shim path), which saves most
+// of a call's fixed cost. Only for native code that never calls back into
+// guest code (guest_call) and never blocks.
 bool hook_function(d2rt::Cpu &c, uint32_t va, const uint8_t *expect, uint32_t n, uint32_t stack_args,
-                   std::function<uint32_t(d2rt::Cpu &)> fn, const char *name);
+                   std::function<uint32_t(d2rt::Cpu &)> fn, const char *name, bool in_line = false);
 // Native code the guest can call (or a guest function pointer can hold):
 // registers `fn` as a shim taking `stack_args` dwords, popped on return,
 // and returns its guest address (0 on failure). hook_function is this plus

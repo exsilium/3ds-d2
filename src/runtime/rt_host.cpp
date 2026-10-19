@@ -30,6 +30,8 @@ extern "C" {
 size_t d2rt_box86_dynarec_kb(void);
 size_t d2rt_box86_custommalloc_kb(void);
 size_t d2rt_box86_jmptbl_kb(void);
+int dyn86_intrin_report(char *out, unsigned cap);   // translation-time intrinsics: calls and served
+extern int dyn86_intrin_n;
 // The console's cache maintenance per translated block (mman_ctr.c). Weak:
 // the Linux lanes have no such counters.
 extern uint32_t dyn86_ctr_cache_syncs __attribute__((weak));
@@ -230,6 +232,11 @@ void prof_report(uint64_t ms)
          (unsigned long long)(now.ms - g_mark.ms), now.frames - g_mark.frames,
          (unsigned long long)(now.idle_ms - g_mark.idle_ms), (unsigned long long)(now.switches - g_mark.switches),
          now.syncs - g_mark.syncs, (unsigned long long)((now.sync_ticks - g_mark.sync_ticks) / 268u));   // 268 MHz tick
+    if (dyn86_intrin_n) {
+        char line[256];
+        if (dyn86_intrin_report(line, sizeof line) > 0)
+            logf("prof %s", line);
+    }
     const FileStats &f = now.files, &f0 = g_mark.files;
     logf("prof files: %llu reads (%llu async), %llu hits, %llu fills, %llu direct, %llu seeks; disk %llu reads %llu KiB in "
          "%llu ms; cache %llu KiB",

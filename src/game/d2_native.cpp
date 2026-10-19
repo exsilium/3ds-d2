@@ -31,6 +31,9 @@ extern "C" {
 void dyn86_mi_arm(int mode, uintptr_t cpy_va, uintptr_t set_va);
 void dyn86_mi_set_span(uint32_t span);
 }
+// And its translation-time intrinsics: a direct native call where a block
+// starts at a registered address, no trap, no bridge.
+#include "dyn86_intrin.h"
 
 namespace game {
 namespace {
@@ -1187,21 +1190,19 @@ uint32_t dcc_bits(uint32_t stream, uint32_t n)
 // the cell. Otherwise the entry's distinct leading colours give 0, 1 or 2
 // bits a pixel: 0 fills the cell with the first colour, else each pixel's
 // code picks one of *entry's four; then *entry moves on by 4.
-uint32_t dcc_cell(Cpu &c)
+void dcc_cell_do(uint32_t pentry, uint32_t eq, uint32_t cell, uint32_t pix, uint32_t prev)
 {
-    const uint32_t pentry = c.reg(R_ECX), eq = c.reg(R_EDX), cell = c.reg(R_ESI);
-    const uint32_t pix = c.arg(0), prev = c.arg(1);
     const uint32_t width = U32(cell + 0xc), stride = U32(cell + 8);
     const int32_t height = I32(cell + 0x10);
     if (eq && U32(prev) && dcc_bits(eq, 1)) {
         if (width == U32(prev + 0xc) && (uint32_t)height == U32(prev + 0x10)) {
             const uint32_t src = U32(prev + 4), dst = U32(cell + 4);
             if (src == dst)
-                return 0;
+                return;
             // Room for any height and width: rows overlap when a cell is
             // wider than 5, as they do in the original's 0x1c-byte buffer.
             if (height > 64 || width > 64)
-                return 0;
+                return;
             uint8_t tmp[5 * 64 + 64];
             const uint32_t src_stride = U32(prev + 8);
             for (int32_t r = 0; r < height; r++)
@@ -1213,7 +1214,7 @@ uint32_t dcc_cell(Cpu &c)
             for (int32_t r = 0; r < height; r++)
                 std::memset(H(dst + stride * (uint32_t)r), 0, width);
         }
-        return 0;
+        return;
     }
     const uint8_t *e = H(U32(cell));
     uint32_t bits = 0;
@@ -1235,7 +1236,20 @@ uint32_t dcc_cell(Cpu &c)
     }
     const uint32_t next = U32(pentry) + 4;
     std::memcpy(H(pentry), &next, 4);
-    return 0;
+}
+
+// Called by the translated code itself (dyn86_intrin_add below): a cell is
+// a few dozen pixels and an area load decodes hundreds of thousands, so the
+// trap and the bridge's in-line path both cost about as much as the work.
+Cpu *g_cpu = nullptr;
+dyn86_intrin_t *g_dcc_intrin = nullptr;   // its table entry: the helper keeps the counts
+
+int dcc_cell_intrin(void *, uint32_t esp)
+{
+    g_dcc_intrin->calls++;
+    g_dcc_intrin->served++;
+    dcc_cell_do(g_cpu->reg(R_ECX), g_cpu->reg(R_EDX), g_cpu->reg(R_ESI), U32(esp + 4), U32(esp + 8));
+    return 1;
 }
 
 }  // namespace
@@ -1298,8 +1312,22 @@ int install_d2_native(Cpu &c)
     HOOK(c, 0x00524c60, k524c60, sizeof k524c60, 3, lang_lookup, "LangLookup", true);
     for (int i = 0; i <= 32; i++)
         g_dcc_mask[i] = U32(kDccMasks + 4 * i);
+    // DccCell: a translation-time intrinsic, not a hook. ecx, edx and esi
+    // are its register arguments (stored for it), ret 8; it changes no guest
+    // register the caller reads. Its only entry is the call at 0x60cbbe, and
+    // nothing jumps into its body (checked by disassembly), so every entry
+    // starts a block at its first byte, as the mechanism requires.
     static const uint8_t k60b7b0[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x30, 0xa1, 0xe0, 0x9d, 0x74, 0x00};
-    HOOK(c, 0x0060b7b0, k60b7b0, sizeof k60b7b0, 2, dcc_cell, "DccCell", true);
+    uint8_t cell_have[sizeof k60b7b0];
+    g_cpu = &c;
+    if ((mask & bit) && c.read(0x0060b7b0, cell_have, sizeof cell_have) && !std::memcmp(cell_have, k60b7b0, sizeof cell_have) &&
+        dyn86_intrin_add(0x0060b7b0, dcc_cell_intrin, 8, DYN86_IR_CX | DYN86_IR_DX | DYN86_IR_SI, 0, "DccCell")) {
+        g_dcc_intrin = &dyn86_intrin_tbl[dyn86_intrin_n - 1];
+        dyn86_intrin_on = 1;
+        rt::logf("native DccCell at 0060b7b0 (translation-time intrinsic)");
+        n++;
+    }
+    bit <<= 1;
     // The C runtime's memcpy (0x6829c0, memmove semantics) and memset
     // (0x681ef0), ~4% of the main thread while an area loads: served by the
     // dynarec at their call (WinVita mode 3: copies under 64 bytes in line,

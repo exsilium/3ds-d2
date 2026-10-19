@@ -26,6 +26,12 @@
 
 using namespace d2rt;
 
+// WinVita's translation-time memcpy / memset service (dyn86_memintrin.h).
+extern "C" {
+void dyn86_mi_arm(int mode, uintptr_t cpy_va, uintptr_t set_va);
+void dyn86_mi_set_span(uint32_t span);
+}
+
 namespace game {
 namespace {
 
@@ -1137,6 +1143,101 @@ uint32_t lang_lookup(Cpu &c)
     return index;
 }
 
+// ---- DCC animations ------------------------------------------------------------------
+//
+// D2CMP's DCC decoder turns the game's animation files into frames as
+// monsters and players are loaded. Its cell decoder was ~11% of the main
+// thread while an area loads: per pixel, a bit-reader call and a lookup.
+
+constexpr uint32_t kDccMasks = 0x006e6030;   // [n] = (1 << n) - 1, n = 0..32
+uint32_t g_dcc_mask[33];
+
+// 60b200(edi=bits, edx=stream): the next `bits` bits, from the low end of
+// 32-bit words. Stream: +4 the current word, +0xc the bit position in it.
+uint32_t dcc_bits(uint32_t stream, uint32_t n)
+{
+    if (!n)
+        return 0;
+    uint32_t pos = U32(stream + 0xc), word = U32(stream + 4);
+    const int32_t avail = 32 - (int32_t)pos;
+    uint32_t v;
+    if ((int32_t)n <= avail) {
+        v = (U32(word) >> pos) & g_dcc_mask[n];
+        pos += n;
+        if (pos == 32) {
+            word += 4;
+            pos = 0;
+        }
+    } else {
+        v = (U32(word) >> pos) & g_dcc_mask[avail];
+        word += 4;
+        pos = n - (uint32_t)avail;
+        v |= (U32(word) & g_dcc_mask[pos]) << avail;
+    }
+    std::memcpy(H(stream + 4), &word, 4);
+    std::memcpy(H(stream + 0xc), &pos, 4);
+    return v;
+}
+
+// 60b7b0(ecx=&entry, edx=equal-cell stream or 0, esi=cell, [8]=pixel
+// stream, [c]=previous cell), ret 8: one cell. Cell: +0 its 4-colour entry,
+// +4 pixels, +8 stride, +0xc width, +0x10 height. With an equal-cell
+// stream and a previous cell, a set bit copies the previous cell (through a
+// 5-byte-a-row buffer, as the original) when the sizes match, else clears
+// the cell. Otherwise the entry's distinct leading colours give 0, 1 or 2
+// bits a pixel: 0 fills the cell with the first colour, else each pixel's
+// code picks one of *entry's four; then *entry moves on by 4.
+uint32_t dcc_cell(Cpu &c)
+{
+    const uint32_t pentry = c.reg(R_ECX), eq = c.reg(R_EDX), cell = c.reg(R_ESI);
+    const uint32_t pix = c.arg(0), prev = c.arg(1);
+    const uint32_t width = U32(cell + 0xc), stride = U32(cell + 8);
+    const int32_t height = I32(cell + 0x10);
+    if (eq && U32(prev) && dcc_bits(eq, 1)) {
+        if (width == U32(prev + 0xc) && (uint32_t)height == U32(prev + 0x10)) {
+            const uint32_t src = U32(prev + 4), dst = U32(cell + 4);
+            if (src == dst)
+                return 0;
+            // Room for any height and width: rows overlap when a cell is
+            // wider than 5, as they do in the original's 0x1c-byte buffer.
+            if (height > 64 || width > 64)
+                return 0;
+            uint8_t tmp[5 * 64 + 64];
+            const uint32_t src_stride = U32(prev + 8);
+            for (int32_t r = 0; r < height; r++)
+                std::memcpy(tmp + 5 * r, H(src + src_stride * (uint32_t)r), width);
+            for (int32_t r = 0; r < height; r++)
+                std::memcpy(H(dst + stride * (uint32_t)r), tmp + 5 * r, width);
+        } else {
+            const uint32_t dst = U32(cell + 4);
+            for (int32_t r = 0; r < height; r++)
+                std::memset(H(dst + stride * (uint32_t)r), 0, width);
+        }
+        return 0;
+    }
+    const uint8_t *e = H(U32(cell));
+    uint32_t bits = 0;
+    for (uint32_t i = 1; e[i] != e[i - 1];) {
+        bits++;
+        i = 1u << bits;
+        if (i + 1 > 4)
+            break;
+    }
+    uint32_t dst = U32(cell + 4);
+    const uint8_t *colors = H(U32(pentry));
+    if (!bits) {
+        for (int32_t r = 0; r < height; r++, dst += stride)
+            std::memset(H(dst), colors[0], width);
+    } else {
+        for (int32_t r = 0; r < height; r++, dst += stride)
+            for (int32_t x = 0; x < (int32_t)width; x++)
+                *H(dst + (uint32_t)x) = colors[dcc_bits(pix, bits)];
+    }
+    const uint32_t next = U32(pentry) + 4;
+    std::memcpy(H(pentry), &next, 4);
+    return 0;
+}
+
 }  // namespace
 
 int install_d2_native(Cpu &c)
@@ -1195,6 +1296,27 @@ int install_d2_native(Cpu &c)
     HOOK(c, 0x0041e000, k41e000, sizeof k41e000, 3, pk_decode, "PkExplode", true);
     static const uint8_t k524c60[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x08, 0x0f, 0xb7, 0x47, 0x02};
     HOOK(c, 0x00524c60, k524c60, sizeof k524c60, 3, lang_lookup, "LangLookup", true);
+    for (int i = 0; i <= 32; i++)
+        g_dcc_mask[i] = U32(kDccMasks + 4 * i);
+    static const uint8_t k60b7b0[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x30, 0xa1, 0xe0, 0x9d, 0x74, 0x00};
+    HOOK(c, 0x0060b7b0, k60b7b0, sizeof k60b7b0, 2, dcc_cell, "DccCell", true);
+    // The C runtime's memcpy (0x6829c0, memmove semantics) and memset
+    // (0x681ef0), ~4% of the main thread while an area loads: served by the
+    // dynarec at their call (WinVita mode 3: copies under 64 bytes in line,
+    // larger ones by a native helper), no trap. Every entry is a call to the
+    // first byte, and nothing jumps into either body (checked by
+    // disassembly). Armed before the game runs: the translator reads it.
+    static const uint8_t k6829c0[] = {0x55, 0x8b, 0xec, 0x57, 0x56, 0x8b, 0x75, 0x0c};
+    static const uint8_t k681ef0[] = {0x8b, 0x54, 0x24, 0x0c, 0x8b, 0x4c, 0x24, 0x04};
+    uint8_t have[8], have2[8];
+    if ((mask & bit) && c.read(0x006829c0, have, 8) && !std::memcmp(have, k6829c0, 8) &&
+        c.read(0x00681ef0, have2, 8) && !std::memcmp(have2, k681ef0, 8)) {
+        dyn86_mi_set_span(rt::layout().span);
+        dyn86_mi_arm(3, 0x006829c0, 0x00681ef0);
+        rt::logf("memcpy/memset: served by the dynarec (in line under 64 bytes)");
+        n++;
+    }
+    bit <<= 1;
 #undef HOOK
     return n;
 }

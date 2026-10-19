@@ -62,26 +62,25 @@ inline int32_t imax(int32_t a, int32_t b) { return a > b ? a : b; }
 inline int32_t imin(int32_t a, int32_t b) { return a < b ? a : b; }
 
 // 4f69b0 FloorIsoFlat(ecx=src 256-byte iso block, edx=dst, [8]=tbl), ret 4.
-uint32_t floor_iso_flat(Cpu &c)
+void iso_flat(const uint8_t *src, uint8_t *dst, const uint8_t *tbl)
 {
-    const uint8_t *src = H(c.reg(R_ECX));
-    uint8_t *dst = H(c.reg(R_EDX));
-    const uint8_t *tbl = H(c.arg(0));
     const int32_t pitch = I32(kPitch);
     for (int r = 0; r < 15; r++)
         remap(dst + (intptr_t)r * pitch + g_xoff[r], src + g_soff[r], tbl, g_width[r]);
+}
+
+uint32_t floor_iso_flat(Cpu &c)
+{
+    iso_flat(H(c.reg(R_ECX)), H(c.reg(R_EDX)), H(c.arg(0)));
     return 0;
 }
 
 // 4f6f60 RleFlat(ecx=src stream, edx=dst, [8]=tbl, [c]=rows), ret 8.
 // Pairs (skip, run); (0,0) ends a row. A run of 0 or over 32 draws nothing
 // but still advances (the original's 32-entry jump table).
-uint32_t rle_flat(Cpu &c)
+void rle_flat_draw(const uint8_t *src, uint8_t *rowp, const uint8_t *tbl, uint32_t rows)
 {
-    const uint8_t *src = H(c.reg(R_ECX));
-    uint8_t *rowp = H(c.reg(R_EDX)), *d = rowp;
-    const uint8_t *tbl = H(c.arg(0));
-    uint32_t rows = c.arg(1);
+    uint8_t *d = rowp;
     const int32_t pitch = I32(kPitch);
     while (rows != 0) {
         const uint8_t skip = src[0], run = src[1];
@@ -98,20 +97,20 @@ uint32_t rle_flat(Cpu &c)
         d += run;
         src += run;
     }
+}
+
+uint32_t rle_flat(Cpu &c)
+{
+    rle_flat_draw(H(c.reg(R_ECX)), H(c.reg(R_EDX)), H(c.arg(0)), c.arg(1));
     return 0;
 }
 
 // 4f7580 RleFlatClipped(ecx=x0, edx=y0, [8]=src, [c]=dst, [10]=tbl, [14]=rows), ret 0x10.
-uint32_t rle_flat_clipped(Cpu &c)
+void rle_flat_clipped_draw(int32_t x0, int32_t y, const uint8_t *src, uint8_t *rowp, const uint8_t *tbl, int32_t rows)
 {
-    const int32_t x0 = (int32_t)c.reg(R_ECX);
-    int32_t y = (int32_t)c.reg(R_EDX);
-    const uint8_t *src = H(c.arg(0));
-    uint8_t *rowp = H(c.arg(1)), *d = rowp;
-    const uint8_t *tbl = H(c.arg(2));
-    const int32_t rows = (int32_t)c.arg(3);
+    uint8_t *d = rowp;
     if (rows <= 0)
-        return 0;
+        return;
     const int32_t pitch = I32(kPitch);
     const int32_t clip_l = I32(kClipLeft), clip_r = I32(kClipRight);
     const int32_t clip_t = I32(kClipTop), clip_b = I32(kClipBottom);
@@ -127,7 +126,7 @@ uint32_t rle_flat_clipped(Cpu &c)
             continue;
         }
         if (y >= clip_b)   // checked on non-end-of-row pairs only, before the skip
-            return 0;
+            return;
         d += skip;
         if (y >= clip_t) {
             const int32_t x = x0 + (int32_t)(d - rowp);
@@ -140,6 +139,12 @@ uint32_t rle_flat_clipped(Cpu &c)
         d += run;
         src += run;
     } while (i < rows);
+}
+
+uint32_t rle_flat_clipped(Cpu &c)
+{
+    rle_flat_clipped_draw((int32_t)c.reg(R_ECX), (int32_t)c.reg(R_EDX), H(c.arg(0)), H(c.arg(1)), H(c.arg(2)),
+                          (int32_t)c.arg(3));
     return 0;
 }
 
@@ -509,6 +514,116 @@ uint32_t light_block(Cpu &c)
     return 0;
 }
 
+// ---- the floor tile ---------------------------------------------------------------
+//
+// A floor tile is a list of iso blocks. Drawn by 4f8b80 one block at a time
+// through a per-block wrapper and a blitter: on the console the native
+// blitters' entry and exit, once per block, cost about as much as their
+// pixels. Here the whole tile is one native call.
+
+constexpr uint32_t kShades = 0x007d2348;       // 32 shade tables of 256 bytes; light >> 3 picks one
+constexpr uint32_t kFlatLight = 0x007d2340;    // nonzero: one light per block from the light buffer
+constexpr uint32_t kNoGouraud = 0x0072da50;    // nonzero: never interpolate the light
+
+inline const uint8_t *shade(uint8_t light) { return H(kShades + ((uint32_t)(light >> 3) << 8)); }
+
+// 4f88b0's iso branch: a 15-row iso block clipped to the window, at screen
+// (x, y), drawn at dst.
+void iso_flat_clipped(const uint8_t *src, int32_t x, int32_t y, uint8_t *dst, const uint8_t *tbl)
+{
+    const int32_t pitch = I32(kPitch);
+    const int32_t r0 = imax(0, I32(kClipTop) - y);
+    const int32_t r1 = imin(15, I32(kClipBottom) - y);
+    uint8_t *rowp = dst + (intptr_t)pitch * r0;
+    for (int32_t r = r0; r < r1; r++, rowp += pitch) {
+        const int32_t sx = g_xoff[r] + x;
+        const int32_t l = imax(0, I32(kClipLeft) - sx);
+        const int32_t n = imin(imax(0, I32(kClipRight) - sx), g_width[r]) - l;
+        if (n > 0)
+            for (int32_t i = 0; i < n; i++)
+                rowp[g_xoff[r] + l + i] = tbl[src[g_soff[r] + l + i]];
+    }
+}
+
+// 4f8b80(ecx=tile, edx=x, [8]=y, [c]=light buffer), ret 8. Per block (20
+// bytes from [tile+0x54], [tile+0x50] of them): offset (short x, short y) at
+// +0, flags at +8 (1: drawn, 4: RLE), light cell (+6, +7), pixels at
+// [+0x10]. Flat light (the light buffer's cell, or interpolation off, or the
+// four neighbours within 10 of each other) goes to the native blitters;
+// interpolated light keeps the game's own 4f8850 / 4f89f0.
+uint32_t floor_tile(Cpu &c)
+{
+    const uint32_t tile = c.reg(R_ECX);
+    const int32_t x = (int32_t)c.reg(R_EDX), y = (int32_t)c.arg(0);
+    const uint32_t lightbuf = c.arg(1);
+    const int32_t count = I32(tile + 0x50);
+    const uint32_t pitch = U32(kPitch);
+    const uint32_t rowbase = pitch * (uint32_t)y + U32(kFbBase) + (uint32_t)x;
+    for (int32_t i = 0; i < count; i++) {
+        const uint32_t e = U32(tile + 0x54) + 20 * (uint32_t)i;
+        int16_t ex, ey;
+        std::memcpy(&ex, H(e), 2);
+        std::memcpy(&ey, H(e + 2), 2);
+        const uint32_t dst = (uint32_t)ey * pitch + (uint32_t)ex + rowbase;
+        const uint8_t flags = *H(e + 8);
+        if (!(flags & 1))
+            continue;
+        const int32_t sx = ex + x, sy = y + ey;
+        if (sy < I32(0x007d2330) || sy >= I32(0x007d2338) || sx < I32(0x007c9788) || sx >= I32(0x007c9798))
+            continue;
+        const uint32_t cell = (uint32_t)*H(e + 6) + 8u * *H(e + 7);
+        bool flat = true;
+        uint8_t light;
+        uint32_t corners[4];
+        if (I32(kFlatLight)) {
+            light = *H(lightbuf + 12 * (cell + 9));
+        } else {
+            const uint8_t *b = H(lightbuf + 12 * cell);
+            const int32_t v6c = b[0x6c], v78 = b[0x78], vcc = b[0xcc], vd8 = b[0xd8];
+            light = (uint8_t)v6c;
+            const int32_t d = std::abs(v78 - v6c) + std::abs(vcc - v6c) + std::abs(vd8 - v78);
+            if (!I32(kNoGouraud) && d >= 10) {
+                flat = false;
+                corners[0] = (uint32_t)((vcc + b[0xc0] + v6c + b[0x60]) >> 2);
+                corners[1] = (uint32_t)((b[0x18] + v78 + b[0x0c] + v6c) >> 2);
+                corners[2] = (uint32_t)((b[0xe4] + vcc + b[0x84] + v78) >> 2);
+                corners[3] = (uint32_t)((b[0x138] + vd8 + b[0x12c] + vcc) >> 2);
+            }
+        }
+        const bool inside = sy >= I32(0x007c9780) && sy < I32(0x007c979c) && sx >= I32(0x007c97a4) &&
+                            sx < I32(0x007d2320);
+        const uint32_t src = U32(e + 0x10);
+        if (flat) {
+            const uint8_t *tbl = shade(light);
+            if (inside) {          // 4f8810
+                if (flags & 4)
+                    rle_flat_draw(H(src), H(dst), tbl, 15);
+                else
+                    iso_flat(H(src), H(dst), tbl);
+            } else {               // 4f88b0
+                if (flags & 4)
+                    rle_flat_clipped_draw(sx, sy, H(src), H(dst), tbl, 15);
+                else
+                    iso_flat_clipped(H(src), sx, sy, H(dst), tbl);
+            }
+        } else {
+            // The original passes its four corners by address: here they go
+            // below the stack pointer, under guest_call's own frame.
+            const uint32_t buf = c.reg(R_ESP) - 0x20;
+            std::memcpy(H(buf), corners, sizeof corners);
+            c.set_reg(R_ECX, e);
+            if (inside) {
+                c.set_reg(R_EDX, dst);
+                rt::guest_call(c, 0x004f8850, {buf});
+            } else {
+                c.set_reg(R_EDX, (uint32_t)sx);
+                rt::guest_call(c, 0x004f89f0, {(uint32_t)sy, dst, buf});
+            }
+        }
+    }
+    return 0;
+}
+
 }  // namespace
 
 int install_d2_native(Cpu &c)
@@ -551,6 +666,8 @@ int install_d2_native(Cpu &c)
     HOOK(c, 0x004756d0, k4756d0, sizeof k4756d0, 0, light_grid, "LightGrid");
     static const uint8_t k4ddef0[] = {0x55, 0x8b, 0xec, 0x51, 0x83, 0x7d, 0x10, 0x00, 0x53};
     HOOK(c, 0x004ddef0, k4ddef0, sizeof k4ddef0, 3, light_block, "LightBlock");
+    static const uint8_t k4f8b80[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x48, 0x53, 0x8b, 0x1d};
+    HOOK(c, 0x004f8b80, k4f8b80, sizeof k4f8b80, 2, floor_tile, "FloorTile");
 #undef HOOK
     return n;
 }

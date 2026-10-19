@@ -725,6 +725,273 @@ uint32_t adpcm_decode(Cpu &c)
     return dst - dst0;
 }
 
+// ---- sound: MPQ Huffman --------------------------------------------------------------
+//
+// The second stage of the compressed WAVs: Storm's adaptive Huffman (FGK)
+// decoder, about a third of the loader thread's own time in Blood Moor once
+// ADPCM was native. The tree logic follows StormLib's huff.cpp (Ladislav
+// Zezula, MIT licence), which reproduces Storm's; the weight tables are the
+// game's own (0x6cf3a0, 0x102 bytes apart, identical to StormLib's). The
+// output of a decoder is fixed by the stream, so it matches the original's
+// byte for byte; only the way the tree is held in memory differs.
+
+constexpr uint32_t kHuffWeights = 0x006cf3a0;
+
+struct HuffItem {
+    HuffItem *next, *prev;   // the weight-sorted list: next = lower weight
+    uint32_t value, weight;
+    HuffItem *parent, *child_lo;
+};
+
+class HuffTree {
+public:
+    // 41f9e0(ecx=dst, edx=&dst bytes, [8]=src), ret 0xc: decodes until the
+    // end code or a full buffer and stores the bytes written in *edx.
+    uint32_t decompress(uint8_t *out, uint32_t out_len, uint32_t src)
+    {
+        bits_ = U32(src);   // the game's stream: a first dword, then 16-bit words
+        count_ = 32;
+        in_ = src + 4;
+        if (!out_len)
+            return 0;
+        const uint32_t type = get8();
+        build(type);
+        const bool sparse = type == 0;
+        uint32_t n = 0;
+        for (;;) {
+            uint32_t v = decode();
+            if (v == 0x101) {
+                v = get8();
+                insert_new(head_.prev->value, v);
+                if (!sparse)
+                    inc_weights(by_byte_[v]);
+            }
+            if (v == 0x100)
+                return n;
+            out[n++] = (uint8_t)v;
+            if (n == out_len)
+                return n;
+            if (sparse)
+                inc_weights(by_byte_[v]);
+        }
+    }
+
+private:
+    // ---- input: bits from the low end, refilled 16 bits at a time
+    void need(uint32_t k)
+    {
+        if (count_ < k) {
+            uint16_t w;
+            std::memcpy(&w, H(in_), 2);
+            bits_ |= (uint32_t)w << count_;
+            count_ += 16;
+            in_ += 2;
+        }
+    }
+    uint32_t get8()
+    {
+        need(8);
+        const uint32_t v = bits_ & 0xff;
+        bits_ >>= 8;
+        count_ -= 8;
+        return v;
+    }
+    uint32_t get1()
+    {
+        need(1);
+        const uint32_t v = bits_ & 1;
+        bits_ >>= 1;
+        count_ -= 1;
+        return v;
+    }
+    uint32_t peek7()
+    {
+        need(7);
+        return bits_ & 0x7f;
+    }
+    void skip(uint32_t k)
+    {
+        need(k);
+        bits_ >>= k;
+        count_ -= k;
+    }
+
+    // ---- the weight-sorted list
+    static void unlink(HuffItem *i)
+    {
+        if (i->next) {
+            i->prev->next = i->next;
+            i->next->prev = i->prev;
+            i->next = i->prev = nullptr;
+        }
+    }
+    static void link_after(HuffItem *at, HuffItem *i)   // StormLib's LinkTwoItems
+    {
+        i->next = at->next;
+        i->prev = at->next->prev;
+        at->next->prev = i;
+        at->next = i;
+    }
+    HuffItem *higher_or_equal(HuffItem *i, uint32_t weight)
+    {
+        if (i)
+            for (; i != &head_; i = i->prev)
+                if (i->weight >= weight)
+                    return i;
+        return &head_;
+    }
+    HuffItem *create(uint32_t value, uint32_t weight, bool before)
+    {
+        if (used_ >= kItems)
+            return nullptr;
+        HuffItem *i = &items_[used_++];
+        i->next = i->prev = nullptr;
+        link_after(before ? head_.prev : &head_, i);
+        i->value = value;
+        i->weight = weight;
+        i->parent = i->child_lo = nullptr;
+        return i;
+    }
+    uint32_t fixup(HuffItem *i, uint32_t max_weight)
+    {
+        if (i->weight < max_weight) {
+            HuffItem *h = higher_or_equal(head_.prev, i->weight);
+            unlink(i);
+            link_after(h, i);
+            return max_weight;
+        }
+        return i->weight;
+    }
+    void build(uint32_t type)
+    {
+        head_.next = head_.prev = &head_;
+        used_ = 0;
+        min_valid_ = 1;
+        std::memset(by_byte_, 0, sizeof by_byte_);
+        std::memset(links_, 0, sizeof links_);
+        const uint8_t *w = H(kHuffWeights + 0x102 * type);
+        uint32_t max_weight = 0;
+        for (uint32_t i = 0; i < 0x100; i++)
+            if (w[i]) {
+                by_byte_[i] = create(i, w[i], false);
+                max_weight = fixup(by_byte_[i], max_weight);
+            }
+        by_byte_[0x100] = create(0x100, 1, true);
+        by_byte_[0x101] = create(0x101, 1, true);
+        for (HuffItem *lo = head_.prev; lo != &head_;) {
+            HuffItem *hi = lo->prev;
+            if (hi == &head_)
+                break;
+            HuffItem *p = create(0, hi->weight + lo->weight, false);
+            if (!p)
+                break;
+            lo->parent = hi->parent = p;
+            p->child_lo = lo;
+            max_weight = fixup(p, max_weight);
+            lo = hi->prev;
+        }
+        min_valid_ = 1;
+    }
+    void inc_weights(HuffItem *i)
+    {
+        for (; i; i = i->parent) {
+            i->weight++;
+            HuffItem *higher = higher_or_equal(i->prev, i->weight);
+            HuffItem *hi = higher->next;
+            if (hi != i) {
+                unlink(hi);
+                link_after(i, hi);
+                unlink(i);
+                link_after(higher, i);
+                HuffItem *lo = hi->parent->child_lo;
+                if (i->parent->child_lo == i)
+                    i->parent->child_lo = hi;
+                if (lo == hi)
+                    hi->parent->child_lo = i;
+                HuffItem *p = i->parent;
+                i->parent = hi->parent;
+                hi->parent = p;
+                min_valid_++;
+            }
+        }
+    }
+    void insert_new(uint32_t v1, uint32_t v2)
+    {
+        HuffItem *last = head_.prev;
+        HuffItem *hi = create(v1, last->weight, true);
+        if (!hi)
+            return;
+        hi->parent = last;
+        by_byte_[v1] = hi;
+        HuffItem *lo = create(v2, 0, true);
+        if (!lo)
+            return;
+        lo->parent = last;
+        last->child_lo = lo;
+        by_byte_[v2] = lo;
+        inc_weights(lo);
+    }
+
+    // ---- decoding, with the 7-bit quick links (an optimization: they
+    // never change what is decoded)
+    struct Link {
+        uint32_t valid, bits;
+        HuffItem *item;
+        uint32_t value;
+    };
+    uint32_t decode()
+    {
+        const uint32_t ix = peek7();
+        HuffItem *item;
+        HuffItem *at7 = nullptr;
+        uint32_t depth = 0;
+        if (links_[ix].valid > min_valid_) {
+            if (links_[ix].bits <= 7) {
+                skip(links_[ix].bits);
+                return links_[ix].value;
+            }
+            item = links_[ix].item;
+            skip(7);
+        } else {
+            item = head_.next;
+        }
+        while (item->child_lo) {
+            item = get1() ? item->child_lo->prev : item->child_lo;
+            if (++depth == 7)
+                at7 = item;
+        }
+        if (links_[ix].valid < min_valid_) {
+            if (depth > 7) {
+                links_[ix] = {min_valid_, depth, at7, 0};
+            } else {
+                for (uint32_t k = depth ? ix & (0xffffffffu >> (32 - depth)) : 0; k < 128; k += 1u << depth)
+                    links_[k] = {min_valid_, depth, nullptr, item->value};
+            }
+        }
+        return item->value;
+    }
+
+    static constexpr uint32_t kItems = 515;
+    HuffItem items_[kItems];
+    uint32_t used_ = 0;
+    HuffItem head_{};
+    HuffItem *by_byte_[0x102];
+    Link links_[128];
+    uint32_t min_valid_ = 1;
+    uint32_t bits_ = 0, count_ = 0, in_ = 0;
+};
+
+HuffTree g_huff;   // guest threads all run on the host's one game thread
+
+uint32_t huffman_decode(Cpu &c)
+{
+    const uint32_t plen = c.reg(R_EDX);
+    const uint32_t len = U32(plen);
+    const uint32_t n = g_huff.decompress(H(c.reg(R_ECX)), len, c.arg(0));
+    std::memcpy(H(plen), &n, 4);
+    return 0;
+}
+
 }  // namespace
 
 int install_d2_native(Cpu &c)
@@ -777,6 +1044,8 @@ int install_d2_native(Cpu &c)
         g_adpcm_adj[i] = I32(kAdpcmIndexAdj + 4 * i);
     static const uint8_t k41dce0[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x1c, 0x53, 0x56, 0x8b, 0x75, 0x0c};
     HOOK(c, 0x0041dce0, k41dce0, sizeof k41dce0, 3, adpcm_decode, "AdpcmDecode", true);
+    static const uint8_t k41f9e0[] = {0x55, 0x8b, 0xec, 0xb8, 0x80, 0x3a, 0x00, 0x00, 0xe8};
+    HOOK(c, 0x0041f9e0, k41f9e0, sizeof k41f9e0, 3, huffman_decode, "HuffmanDecode", true);
 #undef HOOK
     return n;
 }

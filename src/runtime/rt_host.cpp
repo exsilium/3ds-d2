@@ -10,6 +10,7 @@
 #include "runtime/guest_thread.h"
 #include "runtime/guest_thread_ctx.h"
 #include "runtime/host_clock.h"
+#include "runtime/prof.h"
 #include "runtime/sched_cooperative.h"
 #include "runtime/win32_shims_advapi32.h"
 #include "runtime/win32_shims_gdi32.h"
@@ -29,14 +30,24 @@ extern "C" {
 size_t d2rt_box86_dynarec_kb(void);
 size_t d2rt_box86_custommalloc_kb(void);
 size_t d2rt_box86_jmptbl_kb(void);
+int dyn86_intrin_report(char *out, unsigned cap);   // translation-time intrinsics: calls and served
+extern int dyn86_intrin_n;
+// The console's cache maintenance per translated block (mman_ctr.c). Weak:
+// the Linux lanes have no such counters.
+extern uint32_t dyn86_ctr_cache_syncs __attribute__((weak));
+extern uint64_t dyn86_ctr_cache_sync_ticks __attribute__((weak));
 }
 
+#include <algorithm>
+#include <atomic>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <malloc.h>
 #include <memory>
 #include <set>
+#include <vector>
 
 using namespace d2rt;
 
@@ -46,6 +57,7 @@ namespace {
 RunOptions g_opt;
 Bridge *g_br = nullptr;
 CooperativeScheduler *g_sched = nullptr;
+std::atomic<Cpu *> g_tick_cpu{nullptr};   // the CPU while the scheduler runs (profile_tick)
 uint32_t g_exe_base = 0;
 bool g_exited = false;
 bool g_timed_out = false;
@@ -112,7 +124,7 @@ uint32_t native_entry(const char *name, uint32_t stack_args, std::function<uint3
 }
 
 bool hook_function(Cpu &c, uint32_t va, const uint8_t *expect, uint32_t n, uint32_t stack_args,
-                   std::function<uint32_t(Cpu &)> fn, const char *name)
+                   std::function<uint32_t(Cpu &)> fn, const char *name, bool in_line)
 {
     if (n < 5)
         return false;
@@ -129,7 +141,9 @@ bool hook_function(Cpu &c, uint32_t va, const uint8_t *expect, uint32_t n, uint3
     std::memcpy(jmp + 1, &rel, 4);
     c.write(va, jmp, 5);
     c.invalidate_code(va, 5);
-    logf("native %s at %08x", name, va);
+    if (in_line)
+        c.set_inline_shim(trap);
+    logf("native %s at %08x%s", name, va, in_line ? " (in line)" : "");
     return true;
 }
 
@@ -178,17 +192,140 @@ uint32_t guest_call(Cpu &c, uint32_t va, std::initializer_list<uint32_t> args)
 }
 
 namespace {
+// What the last heartbeat interval cost. Always: scheduler idle time and the
+// console's cache maintenance. With PROF_COUNTERS (package-cia --prof): the
+// split between translated code and shims, the busiest shims, and an EIP
+// profile per guest thread (one sample per preempted slice), after which the
+// samples are reset so every interval is a profile of its own.
+struct ProfMark {
+    uint64_t ms, idle_ms, switches, sync_ticks;
+    uint32_t syncs, frames;
+    FileStats files;
+    uint64_t run_ns = 0, trap_ns = 0, trap_calls = 0, waits = 0, waits_now = 0, cs = 0, cs_contended = 0, ticks = 0;
+} g_mark{};
+
+#ifdef PROF_COUNTERS
+struct ThreadProf { uint32_t tid, entry; uint64_t samples, blocks, run_ns = 0, trap_ns = 0, slices = 0; };
+
+void log_eips(const char *head, const std::vector<std::pair<uint32_t, uint64_t>> &v)
+{
+    char line[400];
+    size_t off = std::snprintf(line, sizeof line, "%s", head);
+    for (const auto &e : v) {
+        const int w = std::snprintf(line + off, sizeof line - off, " %08x:%llu", (unsigned)e.first,
+                                    (unsigned long long)e.second);
+        if (w <= 0 || off + w >= sizeof line)
+            break;
+        off += w;
+    }
+    logf("%s", line);
+}
+#endif
+
+void prof_report(uint64_t ms)
+{
+    const uint32_t syncs = &dyn86_ctr_cache_syncs ? dyn86_ctr_cache_syncs : 0;
+    const uint64_t ticks = &dyn86_ctr_cache_sync_ticks ? dyn86_ctr_cache_sync_ticks : 0;
+    ProfMark now{ms, g_sched ? g_sched->idle_ms_ : 0, g_sched ? g_sched->switches() : 0, ticks, syncs, g_stats.frames,
+                 file_stats()};
+    logf("prof: %llu ms, frames %u, idle %llu ms, switches %llu, cache syncs %u (%llu us)",
+         (unsigned long long)(now.ms - g_mark.ms), now.frames - g_mark.frames,
+         (unsigned long long)(now.idle_ms - g_mark.idle_ms), (unsigned long long)(now.switches - g_mark.switches),
+         now.syncs - g_mark.syncs, (unsigned long long)((now.sync_ticks - g_mark.sync_ticks) / 268u));   // 268 MHz tick
+    if (dyn86_intrin_n) {
+        char line[256];
+        if (dyn86_intrin_report(line, sizeof line) > 0)
+            logf("prof %s", line);
+    }
+    const FileStats &f = now.files, &f0 = g_mark.files;
+    logf("prof files: %llu reads (%llu async), %llu hits, %llu fills, %llu direct, %llu seeks; disk %llu reads %llu KiB in "
+         "%llu ms; cache %llu KiB",
+         (unsigned long long)(f.calls - f0.calls), (unsigned long long)(f.async - f0.async),
+         (unsigned long long)(f.hits - f0.hits),
+         (unsigned long long)(f.fills - f0.fills), (unsigned long long)(f.direct - f0.direct),
+         (unsigned long long)(f.seeks - f0.seeks), (unsigned long long)(f.disk_reads - f0.disk_reads),
+         (unsigned long long)((f.disk_bytes - f0.disk_bytes) >> 10), (unsigned long long)((f.disk_us - f0.disk_us) / 1000),
+         (unsigned long long)(f.cache_bytes >> 10));
+#ifdef PROF_COUNTERS
+    now.run_ns = prof::run_ns;
+    now.trap_ns = prof::trap_ns;
+    now.trap_calls = prof::trap_calls;
+    now.waits = prof::wait_calls;
+    now.waits_now = prof::wait_immediate;
+    now.cs = prof::cs_enter;
+    now.cs_contended = prof::cs_contended;
+    now.ticks = prof::ticks();
+    logf("prof: run %llu ms (shims %llu ms in %llu calls), waits %llu (%llu immediate), cs %llu (%llu contended), "
+         "samples %llu",
+         (unsigned long long)((now.run_ns - g_mark.run_ns) / 1000000), (unsigned long long)((now.trap_ns - g_mark.trap_ns) / 1000000),
+         (unsigned long long)(now.trap_calls - g_mark.trap_calls), (unsigned long long)(now.waits - g_mark.waits),
+         (unsigned long long)(now.waits_now - g_mark.waits_now), (unsigned long long)(now.cs - g_mark.cs),
+         (unsigned long long)(now.cs_contended - g_mark.cs_contended), (unsigned long long)prof::eip_samples());
+    if (now.ticks != g_mark.ticks)   // time-based sampling: ticks not sampled landed outside guest slices
+        logf("prof: %llu timer ticks, %llu in guest slices", (unsigned long long)(now.ticks - g_mark.ticks),
+             (unsigned long long)prof::eip_samples());
+    char shims[400];
+    if (g_br && g_br->prof_window(shims, sizeof shims, 12))
+        logf("prof shims:%s", shims);
+
+    std::vector<ThreadProf> threads;
+    prof::threads([](uint32_t tid, uint32_t entry, uint64_t samples, uint64_t blocks, void *u) {
+        static_cast<std::vector<ThreadProf> *>(u)->push_back({tid, entry, samples, blocks});
+    }, &threads);
+    // Time per thread: unlike the samples, it also covers threads that always
+    // yield before their quantum expires.
+    prof::thread_times([](uint32_t tid, uint64_t run, uint64_t trap, uint64_t slices, void *u) {
+        for (ThreadProf &t : *static_cast<std::vector<ThreadProf> *>(u))
+            if (t.tid == tid) {
+                t.run_ns = run;
+                t.trap_ns = trap;
+                t.slices = slices;
+            }
+    }, &threads);
+    using Eips = std::vector<std::pair<uint32_t, uint64_t>>;
+    const auto collect = [](uint32_t eip, uint64_t hits, void *u) { static_cast<Eips *>(u)->push_back({eip, hits}); };
+    for (const ThreadProf &t : threads) {
+        if (!t.samples && !t.blocks && !t.slices)
+            continue;
+        logf("prof thread %u (entry %08x): run %llu ms (shims %llu ms) in %llu slices, %llu samples, %llu blocks",
+             t.tid, t.entry, (unsigned long long)(t.run_ns / 1000000), (unsigned long long)(t.trap_ns / 1000000),
+             (unsigned long long)t.slices, (unsigned long long)t.samples, (unsigned long long)t.blocks);
+        Eips v;
+        // Time samples spread over many EIPs: the busy threads get a longer list.
+        prof::top_eips_tid(t.tid, t.samples > 1000 ? 120 : 40, collect, &v);
+        for (size_t i = 0; i < v.size(); i += 20) {
+            char head[32];
+            std::snprintf(head, sizeof head, "prof eip t%u", t.tid);
+            log_eips(head, Eips(v.begin() + i, v.begin() + std::min(v.size(), i + 20)));
+        }
+    }
+    Eips buckets;   // 64-byte buckets, all threads: hot loops spread over several EIPs
+    prof::top_eips(40, collect, &buckets);
+    for (size_t i = 0; i < buckets.size(); i += 20)
+        log_eips("prof bucket", Eips(buckets.begin() + i, buckets.begin() + std::min(buckets.size(), i + 20)));
+    prof::reset_samples();
+#endif
+    g_mark = now;
+}
+
 void check_time_limit(uint64_t ms)
 {
     if (g_opt.heartbeat_ms && ms >= g_next_beat) {
         g_next_beat = ms + g_opt.heartbeat_ms;
-        logf("t=%llus peeks=%u files=%u read=%lluKiB frames=%u heap=%u/%uKiB va=%u/%uKiB free=%uKiB jit=%u meta=%u jmptbl=%uKiB",
+        prof_report(ms);
+#ifdef __GLIBC__
+        const size_t host_used = mallinfo2().uordblks;
+#else
+        const size_t host_used = mallinfo().uordblks;
+#endif
+        logf("t=%llus peeks=%u files=%u read=%lluKiB frames=%u heap=%u/%uKiB va=%u/%uKiB free=%uKiB jit=%u meta=%u jmptbl=%uKiB "
+             "host=%uKiB",
              (unsigned long long)(ms / 1000), g_stats.peeks, g_stats.files_opened,
              (unsigned long long)(g_stats.bytes_read >> 10), g_stats.frames, g_heap.used_bytes() >> 10,
              g_heap.peak() >> 10, g_va.used_bytes() >> 10, g_va.peak() >> 10,
              (unsigned)((g_pool_size ? g_pool_size - g_heap.cur() - g_va.cur() : g_va.largest_free()) >> 10),
              (unsigned)d2rt_box86_dynarec_kb(),
-             (unsigned)d2rt_box86_custommalloc_kb(), (unsigned)d2rt_box86_jmptbl_kb());
+             (unsigned)d2rt_box86_custommalloc_kb(), (unsigned)d2rt_box86_jmptbl_kb(), (unsigned)(host_used >> 10));
     }
     if (g_opt.max_ms && ms >= g_opt.max_ms && !g_timed_out && g_sched) {
         g_timed_out = true;
@@ -215,6 +352,16 @@ void tail_call(Cpu &c, uint32_t va, uint32_t shim_argc, std::initializer_list<ui
     }
     c.set_reg(R_ESP, entry - (4 + 4 * shim_argc));   // the bridge's epilogue adds that back
     g_br->redirect_next(va);
+}
+
+void profile_tick()
+{
+#ifdef PROF_COUNTERS
+    if (Cpu *c = g_tick_cpu.load(std::memory_order_acquire)) {
+        prof::tick();
+        c->nudge_thread_budget(nullptr);   // the cooperative scheduler's one emu: no registry walk
+    }
+#endif
 }
 
 uint64_t now_ms()
@@ -444,6 +591,36 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
     img->release_image();   // the guest copy is mapped and linked: the host copy is dead weight
     if (g_opt.install_native)
         g_opt.install_native(*cpu);
+    // The game's clock reads, served in line from translated code (WinVita's
+    // lock-free in-line intrinsic): no trap, no exit from the dynarec loop.
+    // On the console a GetTickCount trap cost more than its body: ~10% of a
+    // town frame went to them. Same value as the shims (now_ms). Armed
+    // before the game runs: a slot already translated can't be rewritten.
+    static const char *const kClockImports[][2] = {{"KERNEL32.dll", "GetTickCount"}, {"WINMM.dll", "timeGetTime"}};
+    for (const auto &imp : kClockImports) {
+        const uint32_t slot = br->shim_trap_existing(imp[0], imp[1]);
+        if (slot && cpu->set_intrinsic_nogil(slot, [](Cpu::IntrinFrame &f, uint32_t) {
+                f.eax = (uint32_t)now_ms();
+                f.pop = 0;
+                return true;
+            }))
+            logf("%s: served in line", imp[1]);
+    }
+    // The hottest other imports go through the bridge without leaving the
+    // dynarec loop (WinVita's in-line shim path): same shim, no trap. Under
+    // the cooperative scheduler a shim that must wait yields, and the in-line
+    // path turns a yield into a clean stop, as a trap would. Per call this
+    // saved about half of what these cost at their call sites.
+    static const char *const kInLineImports[][2] = {{"KERNEL32.dll", "EnterCriticalSection"},
+                                                    {"KERNEL32.dll", "LeaveCriticalSection"},
+                                                    {"KERNEL32.dll", "QueryPerformanceCounter"},
+                                                    {"USER32.dll", "wsprintfA"},
+                                                    {"GDI32.dll", "StretchBlt"}};
+    for (const auto &imp : kInLineImports)
+        if (const uint32_t slot = br->shim_trap_existing(imp[0], imp[1])) {
+            cpu->set_inline_shim(slot);
+            logf("%s: in line", imp[1]);
+        }
     res.unresolved_imports = br->unresolved_count();
     res.loaded = true;
     logf("loaded %s at %08x entry %08x, %u unresolved import(s)", g_opt.exe_name.c_str(), g_exe_base,
@@ -459,7 +636,11 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
     sched.set_time_sink([](uint64_t ms) { check_time_limit(ms); });
     wx86_set_scheduler(&sched);
     sched.set_main(img->entry_va(), L.main_stack + 0x200000 - 0x100, L.main_tib);
+    g_tick_cpu.store(cpu, std::memory_order_release);
+    start_async_io();
     sched.run();
+    stop_async_io();
+    g_tick_cpu.store(nullptr, std::memory_order_release);
     wx86_set_scheduler(nullptr);
     g_sched = nullptr;
     if (g_opt.audio)

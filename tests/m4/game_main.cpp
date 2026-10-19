@@ -31,11 +31,16 @@
 #include "png.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <utility>
 #include <vector>
@@ -261,7 +266,23 @@ int main(int argc, char **argv)
             }
             for (int i = 0; i < 256; i++)
                 h = (h ^ f.palette[i]) * 16777619u;
-            std::fprintf(framehash, "%u %08x %ux%u\n", n, h, f.width, f.height);
+            // M4_HASHMEM=<va>:<bytes>: a guest memory range hashed with each
+            // frame, for native code whose result the pixels may not show
+            // (the light grid, 0x7b0e68:0x4800).
+            static const char *hm = std::getenv("M4_HASHMEM");
+            if (hm) {
+                char *end = nullptr;
+                const uint32_t va = (uint32_t)std::strtoul(hm, &end, 0);
+                const uint32_t len = end && *end == ':' ? (uint32_t)std::strtoul(end + 1, nullptr, 0) : 0;
+                std::vector<uint8_t> mem(len);
+                uint32_t mh = 2166136261u;
+                if (len && rt::guest_read(va, mem.data(), len))
+                    for (uint8_t b : mem)
+                        mh = (mh ^ b) * 16777619u;
+                std::fprintf(framehash, "%u %08x %ux%u mem %08x\n", n, h, f.width, f.height, mh);
+            } else {
+                std::fprintf(framehash, "%u %08x %ux%u\n", n, h, f.width, f.height);
+            }
             // M4_DUMPFRAME=<n>: that frame's raw indices, for comparing two runs.
             static const char *dump = std::getenv("M4_DUMPFRAME");
             if (dump && n == (unsigned)std::atoi(dump)) {
@@ -336,7 +357,62 @@ int main(int argc, char **argv)
         controls.set_context(gs.in_game, gs.panel_open);
         controls.update(pad, now);
     };
+    // M4_ASYNCIO=1 (real clock only): asynchronous file reads with a worker
+    // thread, as on the console. Not deterministic; off by default.
+    static std::mutex io_mutex;
+    static std::condition_variable io_cv;
+    static bool io_signaled = false;
+    static std::thread io_thread;
+    if (std::getenv("M4_ASYNCIO") && !std::getenv("M4_VIRTUAL_CLOCK")) {
+        opt.io_start = [](void (*worker)()) {
+            io_thread = std::thread(worker);
+            return true;
+        };
+        opt.io_wait = [] {
+            std::unique_lock<std::mutex> lock(io_mutex);
+            io_cv.wait(lock, [] { return io_signaled; });
+            io_signaled = false;
+        };
+        opt.io_wake = [] {
+            {
+                std::lock_guard<std::mutex> lock(io_mutex);
+                io_signaled = true;
+            }
+            io_cv.notify_one();
+        };
+        static std::mutex done_mutex;
+        static std::condition_variable done_cv;
+        static bool done = false;
+        opt.io_done = [] {
+            {
+                std::lock_guard<std::mutex> lock(done_mutex);
+                done = true;
+            }
+            done_cv.notify_one();
+        };
+        opt.io_idle_wait = [](uint32_t ms) {
+            std::unique_lock<std::mutex> lock(done_mutex);
+            done_cv.wait_for(lock, std::chrono::milliseconds(ms), [] { return done; });
+            done = false;
+        };
+    }
+#ifdef PROF_COUNTERS
+    // M4_PROF: the time-based profile sampler, as on the console (2 ms).
+    static std::atomic<bool> sampler_stop{false};
+    std::thread sampler([] {
+        while (!sampler_stop.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            rt::profile_tick();
+        }
+    });
+#endif
     rt::RunResult r = rt::run_exe(std::move(exe), opt);
+    if (io_thread.joinable())
+        io_thread.join();
+#ifdef PROF_COUNTERS
+    sampler_stop = true;
+    sampler.join();
+#endif
     dyn86_hotprof_dump(stderr, 60);
     save("last.png");
     if (!r.loaded) {

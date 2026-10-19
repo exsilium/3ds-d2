@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Mon, 19 Oct 2026 10:13:43 +0300
+Subject: [PATCH] prof: time-based sampling driven by a host timer
+
+EIP samples taken at quantum expiry weigh guest instructions, not time:
+on the console, native lighting code that drew ~37% of the samples saved
+only ~10% of the frame. prof::tick() lets a host timer thread drive the
+sampling instead: the host calls it at a fixed period and pokes the
+running emu's budget, and the scheduler samples a slice once per tick
+that landed in it. Each sample then stands for one period of time.
+Without ticks, sampling stays at quantum expiry as before.
+---
+ src/runtime/prof.cpp              |  5 +++++
+ src/runtime/prof.h                | 11 +++++++++++
+ src/runtime/sched_cooperative.cpp | 12 +++++++++++-
+ 3 files changed, 27 insertions(+), 1 deletion(-)
+
+diff --git a/src/runtime/prof.cpp b/src/runtime/prof.cpp
+index 15451a3..1425c82 100644
+--- a/src/runtime/prof.cpp
++++ b/src/runtime/prof.cpp
+@@ -5,6 +5,7 @@
+ 
+ #ifdef PROF_COUNTERS
+ #include <algorithm>
++#include <atomic>
+ #include <map>
+ #include <unordered_map>
+ #include <vector>
+@@ -39,6 +40,10 @@ uint64_t trap_calls = 0;
+ uint64_t wait_calls = 0, wait_immediate = 0;
+ uint64_t cs_enter = 0, cs_contended = 0;
+ 
++static std::atomic<uint64_t> g_ticks{0};
++void tick() { g_ticks.fetch_add(1, std::memory_order_relaxed); }
++uint64_t ticks() { return g_ticks.load(std::memory_order_relaxed); }
++
+ static std::unordered_map<uint32_t, uint64_t> g_hist;   // eip>>6 -> hits
+ static uint64_t g_samples = 0;
+ 
+diff --git a/src/runtime/prof.h b/src/runtime/prof.h
+index dd06e64..cd38137 100644
+--- a/src/runtime/prof.h
++++ b/src/runtime/prof.h
+@@ -51,6 +51,15 @@ void   top_eips_tid(uint32_t tid, int n, void (*cb)(uint32_t eip, uint64_t hits,
+ void   add_slice_tid(uint32_t tid, uint64_t run_ns, uint64_t trap_ns);
+ // cb(tid, run_ns, trap_ns, slices) for each thread seen, in increasing tid order.
+ void   thread_times(void (*cb)(uint32_t tid, uint64_t run_ns, uint64_t trap_ns, uint64_t slices, void* u), void* u);
++// TIME-BASED SAMPLING: a host timer thread calls tick() at a fixed period
++// and pokes the running guest thread's budget, so its slice ends at the next
++// block entry. The scheduler samples a slice in which a tick landed, so each
++// sample stands for one period of time, not one quantum of instructions
++// (which over-weighted long runs of cheap instructions). Without ticks the
++// scheduler keeps sampling at quantum expiry. tick() is safe from any
++// thread; ticks() counts them all, including those landing outside a slice.
++void     tick();
++uint64_t ticks();
+ // Clears the EIP histograms and per-thread samples, blocks and times
+ // (thread entries stay): windowed profiles, one per reporting interval.
+ void   reset_samples();
+@@ -67,6 +76,8 @@ inline void threads(void (*)(uint32_t, uint32_t, uint64_t, uint64_t, void*), voi
+ inline void top_eips_tid(uint32_t, int, void (*)(uint32_t, uint64_t, void*), void*) {}
+ inline void add_slice_tid(uint32_t, uint64_t, uint64_t) {}
+ inline void thread_times(void (*)(uint32_t, uint64_t, uint64_t, uint64_t, void*), void*) {}
++inline void tick() {}
++inline uint64_t ticks() { return 0; }
+ inline void reset_samples() {}
+ #endif
+ 
+diff --git a/src/runtime/sched_cooperative.cpp b/src/runtime/sched_cooperative.cpp
+index 2c7fff0..02309b8 100644
+--- a/src/runtime/sched_cooperative.cpp
++++ b/src/runtime/sched_cooperative.cpp
+@@ -285,6 +285,7 @@ void CooperativeScheduler::run_slice(GuestThread* t) {
+ #ifdef PROF_COUNTERS
+     uint64_t prof_t0 = prof::now_ns();
+     const uint64_t prof_trap0 = prof::trap_ns;
++    const uint64_t prof_tick0 = prof::ticks();
+     uint32_t prof_b0 = 0; cpu_->thread_emu_blocks(nullptr, &prof_b0);   // blocks per thread (exact)
+ #endif
+     // D2_JITPROFILE guest-run timer. Deliberately here — ONE pair of clock
+@@ -304,7 +305,16 @@ void CooperativeScheduler::run_slice(GuestThread* t) {
+ #ifdef PROF_COUNTERS
+     // Hot-block sampling: one EIP sample per PREEMPTED slice (quantum expiry is
+     // effectively a random cut in guest execution — unbiased, zero per-insn cost).
+-    if (preempted_) { prof::sample_eip(cpu_->reg(R_EIP)); prof::sample_eip_tid(cpu_->reg(R_EIP), t->id); }
++    // With a timer (prof::tick), sample the slices ticks landed in, once per
++    // tick: one sample per period of time (a slice that outlived several, in
++    // a loop inside one block, carries them all). Without a timer, one
++    // sample per preempted slice.
++    {
++        const uint64_t n = prof_tick0 ? prof::ticks() - prof_tick0 : preempted_ ? 1 : 0;
++        for (uint64_t i = 0; i < n && i < 64; ++i) {
++            prof::sample_eip(cpu_->reg(R_EIP)); prof::sample_eip_tid(cpu_->reg(R_EIP), t->id);
++        }
++    }
+     { uint32_t prof_b1 = 0; cpu_->thread_emu_blocks(nullptr, &prof_b1);
+       prof::add_blocks_tid(t->id, prof_b1 - prof_b0); prof::note_thread(t->id, t->entry); }
+ #endif

@@ -31,11 +31,14 @@
 #include "png.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <utility>
 #include <vector>
@@ -352,7 +355,21 @@ int main(int argc, char **argv)
         controls.set_context(gs.in_game, gs.panel_open);
         controls.update(pad, now);
     };
+#ifdef PROF_COUNTERS
+    // M4_PROF: the time-based profile sampler, as on the console (2 ms).
+    static std::atomic<bool> sampler_stop{false};
+    std::thread sampler([] {
+        while (!sampler_stop.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            rt::profile_tick();
+        }
+    });
+#endif
     rt::RunResult r = rt::run_exe(std::move(exe), opt);
+#ifdef PROF_COUNTERS
+    sampler_stop = true;
+    sampler.join();
+#endif
     dyn86_hotprof_dump(stderr, 60);
     save("last.png");
     if (!r.loaded) {

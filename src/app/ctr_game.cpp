@@ -466,6 +466,40 @@ void start_render_thread()
                                                    : "game thread (no second core)");
 }
 
+#ifdef PROF_COUNTERS
+// The time-based profile sampler (rt::profile_tick): every 2 ms, from core 2
+// at a priority above the drawing and the mixer, so its period holds while
+// core 0 runs the game.
+Thread g_sampler = nullptr;
+volatile bool g_sampler_stop = false;
+
+void sampler_main(void *)
+{
+    while (!g_sampler_stop) {
+        svcSleepThread(2000000);
+        rt::profile_tick();
+    }
+}
+
+void start_sampler()
+{
+    s32 prio = 0x30;
+    svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+    g_sampler = threadCreate(sampler_main, nullptr, 4 * 1024, prio - 3, g_render_core >= 0 ? g_render_core : 2, false);
+    status("profile sampler: %s", g_sampler ? "every 2 ms" : "not started (instruction-quantum samples)");
+}
+
+void stop_sampler()
+{
+    if (!g_sampler)
+        return;
+    g_sampler_stop = true;
+    threadJoin(g_sampler, U64_MAX);
+    threadFree(g_sampler);
+    g_sampler = nullptr;
+}
+#endif
+
 void stop_render_thread()
 {
     if (!g_render_thread)
@@ -852,7 +886,13 @@ int main()
     opt.poll_input = poll;
 
     start_render_thread();
+#ifdef PROF_COUNTERS
+    start_sampler();
+#endif
     rt::RunResult r = rt::run_exe(std::move(exe), opt);
+#ifdef PROF_COUNTERS
+    stop_sampler();
+#endif
     stop_render_thread();
     if (!r.loaded)
         status("FATAL: %s", r.error.c_str());

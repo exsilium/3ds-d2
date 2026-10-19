@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 using namespace d2rt;
 
@@ -1024,10 +1025,67 @@ uint32_t lang_hash(uint32_t key, uint32_t size)
     return h % size;
 }
 
+// A host-side index of one string table: for each used node, its key's FNV
+// hash, in an open-addressed array of node numbers (2 bytes a slot). Built
+// on a table's first lookup; rebuilt if the table's address or shape
+// changes (the game loads its string tables once).
+struct LangIndex {
+    uint32_t table = 0, size = 0, probes = 0, keys = 0, nodes = 0;
+    std::vector<uint16_t> slots;   // node numbers; 0xffff = empty
+    uint32_t mask = 0;
+};
+LangIndex g_lang_index[4];
+
+inline uint32_t fnv(const uint8_t *s)
+{
+    uint32_t h = 2166136261u;
+    for (; *s; s++)
+        h = (h ^ *s) * 16777619u;
+    return h;
+}
+
+LangIndex &lang_index(uint32_t table, uint32_t size, uint32_t probes, uint32_t keys, uint32_t nodes)
+{
+    LangIndex *slot = &g_lang_index[0];
+    for (LangIndex &x : g_lang_index) {
+        if (x.table == table && x.size == size && x.probes == probes && x.keys == keys && x.nodes == nodes)
+            return x;
+        if (!x.table || x.table == table)
+            slot = &x;
+    }
+    LangIndex &x = *slot;
+    x.table = table;
+    x.size = size;
+    x.probes = probes;
+    x.keys = keys;
+    x.nodes = nodes;
+    uint32_t cap = 1;
+    while (cap < 2 * size)
+        cap <<= 1;
+    x.mask = cap - 1;
+    x.slots.assign(cap, 0xffff);
+    for (uint32_t j = 0; j < size && j < 0xffff; j++) {
+        const uint32_t node = nodes + 17 * j;
+        if (*H(node) != 1)
+            continue;
+        for (uint32_t k = fnv(H(U32(node + 7) + table)) & x.mask;; k = (k + 1) & x.mask)
+            if (x.slots[k] == 0xffff) {
+                x.slots[k] = (uint16_t)j;
+                break;
+            }
+    }
+    return x;
+}
+
 // 524c60(edi=table, [8]=string pointers, [c]=key, [10]=&string), ret 0xc:
 // the string's index (ax), 0xffff if the key isn't there. Nodes of 17 bytes
 // after the header's index array: a used flag (1), the index (+1), the key's
-// offset from the table (+7). At most [table+0xd] probes, from the hash on.
+// offset from the table (+7). The original walks at most [table+0xd] nodes
+// from the key's hash bucket, comparing keys, and takes the first match. Its
+// probe limit is close to the table's size, so a missing key (most keys miss
+// the patch and expansion tables) walked nearly every node. The answer is the
+// same from the index: of the nodes holding the key, the one fewest steps
+// from its bucket, if within the limit.
 // (A found key whose string pointer is null is a fatal error in the game;
 // here it returns as found, with that null.)
 uint32_t lang_lookup(Cpu &c)
@@ -1037,21 +1095,46 @@ uint32_t lang_lookup(Cpu &c)
     std::memcpy(&keys, H(table + 2), 2);
     const uint32_t nodes = table + 2u * keys + 0x15;
     const uint32_t size = U32(table + 4), probes = U32(table + 0xd);
-    uint32_t i = lang_hash(key, size);
-    for (uint32_t n = 0; n < probes;) {
-        const uint32_t node = nodes + 17 * i;
-        n++;
-        if (*H(node) == 1 && std::strcmp(reinterpret_cast<const char *>(H(U32(node + 7) + table)),
-                                         reinterpret_cast<const char *>(H(key))) == 0) {
-            const uint32_t str = U32(strings + 4 * i);
-            std::memcpy(H(out), &str, 4);
-            uint16_t index;
-            std::memcpy(&index, H(node + 1), 2);
-            return (i & 0xffff0000u) | index;
+    const uint32_t start = lang_hash(key, size);
+    if (size > 0xffff) {   // beyond 16-bit node numbers: the original walk
+        uint32_t i = start;
+        for (uint32_t n = 0; n < probes; n++) {
+            const uint32_t node = nodes + 17 * i;
+            if (*H(node) == 1 && !std::strcmp(reinterpret_cast<const char *>(H(U32(node + 7) + table)),
+                                               reinterpret_cast<const char *>(H(key)))) {
+                const uint32_t str = U32(strings + 4 * i);
+                std::memcpy(H(out), &str, 4);
+                uint16_t index;
+                std::memcpy(&index, H(node + 1), 2);
+                return (i & 0xffff0000u) | index;
+            }
+            i = (uint32_t)((int32_t)(i + 1) % (int32_t)size);
         }
-        i = (uint32_t)((int32_t)(i + 1) % (int32_t)size);
+        return (i & 0xffff0000u) | 0xffffu;
     }
-    return (i & 0xffff0000u) | 0xffffu;
+    if (!probes)
+        return 0xffff;
+    const LangIndex &x = lang_index(table, size, probes, keys, nodes);
+    const uint8_t *k = H(key);
+    uint32_t best = 0xffffffffu, best_dist = 0xffffffffu;
+    for (uint32_t s = fnv(k) & x.mask; x.slots[s] != 0xffff; s = (s + 1) & x.mask) {
+        const uint32_t j = x.slots[s];
+        const uint32_t node = nodes + 17 * j;
+        if (std::strcmp(reinterpret_cast<const char *>(H(U32(node + 7) + table)), reinterpret_cast<const char *>(k)))
+            continue;
+        const uint32_t dist = (j + size - start) % size;
+        if (dist < best_dist) {
+            best_dist = dist;
+            best = j;
+        }
+    }
+    if (best_dist >= probes)
+        return 0xffff;
+    const uint32_t str = U32(strings + 4 * best);
+    std::memcpy(H(out), &str, 4);
+    uint16_t index;
+    std::memcpy(&index, H(nodes + 17 * best + 1), 2);
+    return index;
 }
 
 }  // namespace

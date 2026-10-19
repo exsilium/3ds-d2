@@ -4,7 +4,7 @@ Diablo II: Lord of Destruction 1.14d on the New 3DS.
 
 3ds-d2 runs the unmodified Windows `Game.exe` of Diablo II 1.14d on a New 3DS. The x86 code runs through an ARMv6 port of the Box86 dynamic recompiler (from the WinVita engine). The Windows APIs the game calls come from 3ds-d2's own runtime. The hottest drawing routines run as native ARM code. The game itself is not included: you need your own copy of Diablo II and Lord of Destruction, patched to 1.14d.
 
-**Status:** early, version 0.1.0. On a real New 3DS the game runs from the main menu through character creation into the Rogue Encampment and the Blood Moor, with sound, and plays the cinematics ([docs/cinematics.md](docs/cinematics.md)). The frame rate is still below the game's own 25 fps in busy areas.
+**Status:** early, version 0.2.0. On a real New 3DS the game runs from the main menu through character creation into the Rogue Encampment and the Blood Moor, with sound, and plays the cinematics ([docs/cinematics.md](docs/cinematics.md)). The frame rate is still below the game's own 25 fps in busy areas.
 
 <p align="center">
   <img src="docs/evidence/3ds-d2.jpeg" width="480" alt="Diablo II running on a New 3DS: the game on the top screen, the diagnostics panel on the bottom screen">
@@ -134,7 +134,7 @@ Everything builds inside Docker containers with a pinned toolchain (devkitARM, l
 
    ```
    cia: 3ds-d2-<build-id>.cia
-   version: 0.1.0
+   version: 0.2.0
    sha256: ...
    ```
 

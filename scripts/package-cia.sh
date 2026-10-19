@@ -46,7 +46,7 @@ esac
 
 work=build/cia
 out=dist/cia
-version=0.1.0   # the title version FBI and the HOME menu show (major.minor.micro)
+version=0.2.0   # the title version FBI and the HOME menu show (major.minor.micro)
 mkdir -p "$out"
 python3 -I packaging/cia/make_art.py "$work"
 bannertool makebanner -i "$work/banner.png" -a "$work/banner.wav" -o "$work/banner.bnr" >/dev/null

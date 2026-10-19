@@ -380,6 +380,21 @@ int main(int argc, char **argv)
             }
             io_cv.notify_one();
         };
+        static std::mutex done_mutex;
+        static std::condition_variable done_cv;
+        static bool done = false;
+        opt.io_done = [] {
+            {
+                std::lock_guard<std::mutex> lock(done_mutex);
+                done = true;
+            }
+            done_cv.notify_one();
+        };
+        opt.io_idle_wait = [](uint32_t ms) {
+            std::unique_lock<std::mutex> lock(done_mutex);
+            done_cv.wait_for(lock, std::chrono::milliseconds(ms), [] { return done; });
+            done = false;
+        };
     }
 #ifdef PROF_COUNTERS
     // M4_PROF: the time-based profile sampler, as on the console (2 ms).

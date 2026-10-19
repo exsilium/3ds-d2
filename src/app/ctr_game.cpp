@@ -504,6 +504,7 @@ void stop_sampler()
 // the second core, above the drawing, so a finished SD read reaches the
 // waiting guest thread at once. It sleeps on an event between requests.
 LightEvent g_io_event;
+LightEvent g_io_done_event;   // a read completed: wakes an idle scheduler (RunOptions::io_done)
 Thread g_io_thread = nullptr;
 void (*g_io_worker)() = nullptr;
 
@@ -513,6 +514,7 @@ bool start_io_thread(void (*worker)())
 {
     g_io_worker = worker;
     LightEvent_Init(&g_io_event, RESET_ONESHOT);
+    LightEvent_Init(&g_io_done_event, RESET_ONESHOT);
     s32 prio = 0x30;
     svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
     g_io_thread = threadCreate(io_main, nullptr, 16 * 1024, prio - 1, g_render_core >= 0 ? g_render_core : 2, false);
@@ -915,6 +917,8 @@ int main()
     opt.io_start = start_io_thread;
     opt.io_wait = [] { LightEvent_Wait(&g_io_event); };
     opt.io_wake = [] { LightEvent_Signal(&g_io_event); };
+    opt.io_done = [] { LightEvent_Signal(&g_io_done_event); };
+    opt.io_idle_wait = [](uint32_t ms) { LightEvent_WaitTimeout(&g_io_done_event, (s64)ms * 1000000); };
 
     start_render_thread();
 #ifdef PROF_COUNTERS

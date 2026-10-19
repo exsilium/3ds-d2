@@ -104,6 +104,12 @@ struct RunOptions {
     // Unset: reads stay synchronous (the deterministic Linux lanes).
     std::function<bool(void (*worker)())> io_start;
     std::function<void()> io_wait, io_wake;
+    // Optional, with io_start: io_done() is called by the worker after each
+    // completed read, and io_idle_wait(ms) waits for it at most `ms`. The
+    // scheduler, with every guest thread waiting on reads, then wakes as soon
+    // as one completes instead of polling every millisecond.
+    std::function<void()> io_done;
+    std::function<void(uint32_t)> io_idle_wait;
     // Where cinematics play their sound (null: they play silent).
     VideoAudio *video_audio = nullptr;
 };

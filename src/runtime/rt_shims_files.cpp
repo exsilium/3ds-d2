@@ -27,8 +27,12 @@
 #include "runtime/cpu.h"
 #include "runtime/guest_region.h"
 #include "runtime/guest_sync.h"
+#include "runtime/guest_thread_ctx.h"
 #include "runtime/host_clock.h"
+#include "runtime/sched_cooperative.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -301,7 +305,45 @@ public:
                 g_file_stats.cache_bytes -= kBlock;
     }
 
+    // Threads: one thread fills blocks (read(): the game's own thread, or the
+    // I/O worker when reads are asynchronous); try_read() may run on another
+    // at the same time. The lock covers the block table and try_read's copy,
+    // never a disk read: a block being filled is unlisted (base ~0) until its
+    // bytes are in.
+    std::atomic<int> inflight{0};   // asynchronous requests on this file not yet done
+
+    // Copies n bytes at `pos` to dst if every byte is already cached (or
+    // past EOF); false, with nothing done, otherwise.
+    bool try_read(uint64_t pos, uint8_t *dst, uint32_t n, uint32_t &got)
+    {
+        got = 0;
+        if (pos >= size_)
+            return true;
+        if (n > size_ - pos)
+            n = (uint32_t)(size_ - pos);
+        if (n >= kBlock)
+            return false;
+        Guard g(lock_);
+        for (uint64_t at = pos - pos % kBlock; at < pos + n; at += kBlock)
+            if (!find(at))
+                return false;
+        while (got < n) {
+            const uint64_t at = pos + got;
+            Block *b = find(at - at % kBlock);
+            const uint32_t off = (uint32_t)(at - b->base);
+            if (off >= b->len)
+                break;
+            const uint32_t take = b->len - off < n - got ? b->len - off : n - got;
+            std::memcpy(dst + got, b->data.get() + off, take);
+            b->used = ++clock_;
+            g_file_stats.hits++;
+            got += take;
+        }
+        return true;
+    }
+
     // Copies up to n bytes at `pos` to dst; returns how many (fewer at EOF).
+    // Fills blocks from the file as needed: the filling thread only.
     uint32_t read(uint64_t pos, uint8_t *dst, uint32_t n)
     {
         if (pos >= size_)
@@ -335,8 +377,29 @@ private:
         std::unique_ptr<uint8_t[]> data;
     };
 
+    struct Guard {
+        std::atomic_flag &f;
+        explicit Guard(std::atomic_flag &flag) : f(flag)
+        {
+            while (f.test_and_set(std::memory_order_acquire)) {
+            }
+        }
+        ~Guard() { f.clear(std::memory_order_release); }
+    };
+
+    Block *find(uint64_t base)
+    {
+        for (Block &b : blocks_)
+            if (b.base == base && b.data)
+                return &b;
+        return nullptr;
+    }
+
+    // The block at `base`, read from the file if it isn't cached. Only the
+    // filling thread changes blocks, so a block it returns stays valid.
     const Block *block_at(uint64_t base)
     {
+        Guard g(lock_);
         Block *victim = &blocks_[0], *oldest = nullptr;   // least recently used: any, and with memory
         for (Block &b : blocks_) {
             if (b.base == base && b.data) {
@@ -358,8 +421,12 @@ private:
             g_file_stats.cache_bytes += kBlock;
         }
         const uint64_t left = size_ - base;
-        victim->base = ~0ull;
-        victim->len = disk_read(base, victim->data.get(), left < kBlock ? (uint32_t)left : kBlock);
+        victim->base = ~0ull;   // unlisted while it is filled
+        lock_.clear(std::memory_order_release);
+        const uint32_t len = disk_read(base, victim->data.get(), left < kBlock ? (uint32_t)left : kBlock);
+        while (lock_.test_and_set(std::memory_order_acquire)) {
+        }
+        victim->len = len;
         victim->base = base;
         victim->used = ++clock_;
         g_file_stats.fills++;
@@ -387,6 +454,7 @@ private:
     uint64_t size_;
     uint32_t clock_ = 0;
     Block blocks_[kBlocks];
+    std::atomic_flag lock_ = ATOMIC_FLAG_INIT;
 };
 
 struct RtFile : Waitable {
@@ -397,6 +465,10 @@ struct RtFile : Waitable {
     std::string host;
     ~RtFile() override
     {
+        // Asynchronous reads still in flight write into this file's cache.
+        while (cache && cache->inflight.load(std::memory_order_acquire) > 0)
+            if (options().sleep_ms)
+                options().sleep_ms(1);
         if (fp)
             std::fclose(fp);
         if (fd >= 0)
@@ -406,6 +478,79 @@ struct RtFile : Waitable {
     bool ready(GuestThread *) override { return true; }
     const char *kind() const override { return "file"; }
 };
+
+// ---- asynchronous reads (RunOptions::io_start) --------------------------------------
+//
+// A ReadFile that misses the cache goes to one host worker thread: the guest
+// thread waits on the request, the scheduler runs the other guest threads,
+// and the reader wakes with ReadFile's TRUE once the bytes are in its buffer.
+// Requests come from the game's thread (one producer) and the worker serves
+// them in order (one consumer). While a file has requests in flight, only the
+// worker fills its cache; the game's thread then only copies cached bytes
+// (ReadCache::try_read).
+struct IoRequest : Waitable {
+    ReadCache *cache = nullptr;
+    uint64_t pos = 0;
+    uint8_t *dst = nullptr;
+    uint32_t n = 0;
+    std::atomic<int> state{0};   // 0 free, 1 queued, 2 done; the waiter's acquire frees it
+    bool try_acquire(GuestThread *) override
+    {
+        int done = 2;
+        return state.compare_exchange_strong(done, 0, std::memory_order_acq_rel);
+    }
+    bool ready(GuestThread *) override { return state.load(std::memory_order_acquire) == 2; }
+    uint32_t result() const override { return 1; }   // ReadFile's TRUE
+    const char *kind() const override { return "fileio"; }
+};
+
+constexpr uint32_t kIoMax = 16;   // requests in flight; past that, reads wait their turn synchronously
+IoRequest g_io[kIoMax];
+IoRequest *g_io_ring[kIoMax];
+std::atomic<uint32_t> g_io_head{0}, g_io_tail{0};
+std::atomic<bool> g_io_quit{false};
+bool g_io_on = false;
+
+void io_worker_main()
+{
+    for (;;) {
+        const uint32_t t = g_io_tail.load(std::memory_order_relaxed);
+        if (t == g_io_head.load(std::memory_order_acquire)) {
+            if (g_io_quit.load(std::memory_order_acquire))
+                return;
+            options().io_wait();
+            continue;
+        }
+        IoRequest *r = g_io_ring[t % kIoMax];
+        r->cache->read(r->pos, r->dst, r->n);
+        r->cache->inflight.fetch_sub(1, std::memory_order_acq_rel);
+        g_io_tail.store(t + 1, std::memory_order_release);
+        r->state.store(2, std::memory_order_release);   // before the count: the scheduler polls while it is nonzero
+        wx86_host_pending(-1);
+    }
+}
+
+// Queues a read; null when every request is in flight.
+IoRequest *io_submit(ReadCache *cache, uint64_t pos, uint8_t *dst, uint32_t n)
+{
+    for (IoRequest &r : g_io) {
+        if (r.state.load(std::memory_order_acquire) != 0)
+            continue;
+        r.cache = cache;
+        r.pos = pos;
+        r.dst = dst;
+        r.n = n;
+        r.state.store(1, std::memory_order_relaxed);
+        cache->inflight.fetch_add(1, std::memory_order_acq_rel);
+        wx86_host_pending(1);
+        const uint32_t h = g_io_head.load(std::memory_order_relaxed);
+        g_io_ring[h % kIoMax] = &r;
+        g_io_head.store(h + 1, std::memory_order_release);
+        options().io_wake();
+        return &r;
+    }
+    return nullptr;
+}
 
 struct FindEntry {
     std::string name;
@@ -889,6 +1034,23 @@ uint32_t module_file_name(Cpu &c, uint32_t module, uint32_t buf, uint32_t size)
 
 const FileStats &file_stats() { return g_file_stats; }
 
+void start_async_io()
+{
+    g_io_quit = false;
+    g_io_on = options().real_clock && options().io_start && options().io_wait && options().io_wake &&
+              options().io_start(io_worker_main);
+    logf("file reads: %s", g_io_on ? "asynchronous (I/O worker)" : "synchronous");
+}
+
+void stop_async_io()
+{
+    if (!g_io_on)
+        return;
+    g_io_quit = true;
+    options().io_wake();   // the worker drains the queue, then returns
+    g_io_on = false;
+}
+
 bool host_path(const std::string &guest, bool write, std::string &host)
 {
     const std::string rel = normalize(guest);
@@ -936,9 +1098,38 @@ void install_files(Bridge &br)
         if (!f) { set_last_error(c, ERROR_INVALID_HANDLE); return 0; }
         uint32_t got;
         g_file_stats.calls++;
-        if (f->cache) {
-            if (ov)   // OVERLAPPED: the offset is in the structure; completes synchronously
+        if (f->cache && !ov && n && g_io_on) {
+            // Asynchronous: what is cached is copied now; a miss goes to the
+            // worker and this guest thread waits for it. The file can't
+            // change size, so the count and the new position are known now.
+            uint8_t *dst = static_cast<uint8_t *>(c.hostptr(buf, n));
+            if (dst && !f->cache->try_read(f->pos, dst, n, got)) {
+                got = f->pos < f->size ? (uint32_t)std::min<uint64_t>(n, f->size - f->pos) : 0;
+                if (IoRequest *r = io_submit(f->cache.get(), f->pos, dst, n)) {
+                    f->pos += got;
+                    stats().bytes_read += got;
+                    g_file_stats.async++;
+                    if (pread)
+                        c.write_u32(pread, got);
+                    return wx86_sched()->wait(r, 0xFFFFFFFFu);   // EAX = TRUE when it wakes
+                }
+                dst = nullptr;   // every request busy: read below, once this file has none in flight
+            }
+            if (dst) {
+                f->pos += got;
+            } else {
+                while (f->cache->inflight.load(std::memory_order_acquire) > 0)
+                    if (options().sleep_ms)
+                        options().sleep_ms(1);
+                got = cached_read(c, *f, buf, n);
+            }
+        } else if (f->cache) {
+            if (ov) {   // OVERLAPPED: the offset is in the structure; completes synchronously
+                while (f->cache->inflight.load(std::memory_order_acquire) > 0)
+                    if (options().sleep_ms)
+                        options().sleep_ms(1);
                 f->pos = c.read_u32(ov + 8);
+            }
             got = cached_read(c, *f, buf, n);
         } else {
             if (ov)

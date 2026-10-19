@@ -500,6 +500,34 @@ void stop_sampler()
 }
 #endif
 
+// Asynchronous file reads (RunOptions::io_start): the runtime's I/O worker on
+// the second core, above the drawing, so a finished SD read reaches the
+// waiting guest thread at once. It sleeps on an event between requests.
+LightEvent g_io_event;
+Thread g_io_thread = nullptr;
+void (*g_io_worker)() = nullptr;
+
+void io_main(void *) { g_io_worker(); }
+
+bool start_io_thread(void (*worker)())
+{
+    g_io_worker = worker;
+    LightEvent_Init(&g_io_event, RESET_ONESHOT);
+    s32 prio = 0x30;
+    svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+    g_io_thread = threadCreate(io_main, nullptr, 16 * 1024, prio - 1, g_render_core >= 0 ? g_render_core : 2, false);
+    return g_io_thread != nullptr;
+}
+
+void join_io_thread()
+{
+    if (!g_io_thread)
+        return;
+    threadJoin(g_io_thread, U64_MAX);   // the runtime has told it to stop
+    threadFree(g_io_thread);
+    g_io_thread = nullptr;
+}
+
 void stop_render_thread()
 {
     if (!g_render_thread)
@@ -884,12 +912,16 @@ int main()
     };
     opt.present = present;
     opt.poll_input = poll;
+    opt.io_start = start_io_thread;
+    opt.io_wait = [] { LightEvent_Wait(&g_io_event); };
+    opt.io_wake = [] { LightEvent_Signal(&g_io_event); };
 
     start_render_thread();
 #ifdef PROF_COUNTERS
     start_sampler();
 #endif
     rt::RunResult r = rt::run_exe(std::move(exe), opt);
+    join_io_thread();
 #ifdef PROF_COUNTERS
     stop_sampler();
 #endif

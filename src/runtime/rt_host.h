@@ -96,6 +96,14 @@ struct RunOptions {
     std::function<void(d2rt::Cpu &)> install_native;
     bool audio = false;
     int audio_rate = 22050;
+    // Asynchronous file reads (real_clock only): io_start runs `worker` on a
+    // new host thread, ideally on another core, and returns false if it
+    // can't; the worker blocks in io_wait() until io_wake(). A guest thread
+    // whose ReadFile misses the cache then waits for the worker while the
+    // other guest threads run, instead of stalling them all on the storage.
+    // Unset: reads stay synchronous (the deterministic Linux lanes).
+    std::function<bool(void (*worker)())> io_start;
+    std::function<void()> io_wait, io_wake;
     // Where cinematics play their sound (null: they play silent).
     VideoAudio *video_audio = nullptr;
 };
@@ -131,8 +139,13 @@ struct FileStats {
     uint64_t seeks = 0;       // SetFilePointer on cached files (no file system access)
     uint64_t disk_reads = 0, disk_bytes = 0, disk_us = 0;   // file system reads by the cache
     uint64_t cache_bytes = 0; // block memory held now (freed with its handle)
+    uint64_t async = 0;       // reads handed to the I/O worker, the guest thread waiting
 };
 const FileStats &file_stats();
+// The asynchronous reads' worker (RunOptions::io_start): started and stopped
+// by run_exe.
+void start_async_io();
+void stop_async_io();
 
 // Time-based profile sampling (PROF_COUNTERS builds; a no-op otherwise): a
 // host timer thread calls this at a fixed period, on another core. It ends

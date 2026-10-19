@@ -87,6 +87,20 @@ const char *const kRefusedDlls[] = {
     "d2lang.dll",   "d2sound.dll", "d2net.dll",   "d2mcpclient.dll", "d2cmp.dll", "d2launch.dll",    "d2multi.dll",
     "bnclient.dll", "d2gdi.dll",   "d2ddraw.dll", "d2direct3d.dll",  "d2glide.dll",
 };
+// Optional debug-helper DLLs the game probes for at startup; their
+// absence is expected, so a miss is not logged.
+const char *const kQuietProbeDlls[] = {
+    "dbghelp.dll",
+    "imagehlp.dll",
+};
+
+bool is_quiet_probe(const std::string &key)
+{
+    for (const char *n : kQuietProbeDlls)
+        if (key == n)
+            return true;
+    return false;
+}
 
 // "C:\Dir\Foo" -> "foo.dll"
 std::string module_key(const std::string &path)
@@ -163,7 +177,8 @@ uint32_t load_library(Cpu &c, const std::string &name)
     // A PE DLL in the game directory: map it, bind its imports, run DllMain.
     std::vector<uint8_t> bytes;
     if (!read_guest_file(name, bytes) && !read_guest_file(key, bytes)) {
-        logf("LoadLibrary %s: not found", name.c_str());
+        if (!is_quiet_probe(key))
+            logf("LoadLibrary %s: not found", name.c_str());
         set_last_error(c, ERROR_MOD_NOT_FOUND);
         return 0;
     }

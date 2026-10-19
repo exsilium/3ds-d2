@@ -1252,6 +1252,168 @@ int dcc_cell_intrin(void *, uint32_t esp)
     return 1;
 }
 
+// 60b2b0(ecx=iterator, eax=frame set): the next DCC cell, in 4x4 steps
+// over each frame's box, frames with an empty box skipped; 0 at the end.
+// The iterator is the caller's 0x3c-byte frame block, so it stays in guest
+// memory, field for field (+0x20 the cell number, +0x34 / +0x38 its size).
+inline void put32(uint32_t va, uint32_t v) { std::memcpy(H(va), &v, 4); }
+
+uint32_t dcc_next(uint32_t it, uint32_t set)
+{
+    const auto f = [it](uint32_t o) { return I32(it + o); };
+    const auto put = [it](uint32_t o, int32_t v) { put32(it + o, (uint32_t)v); };
+    int32_t w = f(0x34);
+    put(0x24, f(0x24) + w);
+    int32_t x = f(0x24), width = f(4);
+    if (x < width) {
+        put(0x30, f(0x30) + w);
+        put(0x20, f(0x20) + 1);
+        put(0x34, x + 5 < width ? 4 : width - x);
+        return 1;
+    }
+    put(0x28, f(0x28) + f(0x38));
+    int32_t y = f(0x28);
+    const int32_t height = f(8);
+    if (y < height) {
+        const int32_t nx = -(f(0xc) % 4);
+        put(0x24, 0);
+        put(0x34, nx + 5 < width ? nx + 4 : width);
+        put(0x2c, f(0x2c) + f(0x18) * f(0x38));
+        put(0x30, f(0x2c));
+        put(0x1c, f(0x1c) + I32(set + 0x28));
+        put(0x20, f(0x1c));
+        y = f(0x28);
+        put(0x38, y + 5 < height ? 4 : height - y);
+        return 1;
+    }
+    put(0, f(0) + 1);
+    int32_t n = f(0);
+    uint32_t frame = (uint32_t)n * 0x2c + U32(set + 4);
+    for (; n < I32(set + 0x1c); n++, put(0, n), frame += 0x2c)
+        if (U32(frame + 4) && U32(frame + 8)) {
+            put(4, I32(frame + 4));
+            put(8, I32(frame + 8));
+            put(0xc, I32(frame + 0xc) - I32(set + 8));
+            const int32_t top = I32(frame + 0x28) ? 0 : I32(frame + 8);
+            const int32_t by = I32(frame + 0x10) - I32(set + 0xc) - top;
+            put(0x10, by);
+            put(0x14, I32(frame + 0x20));
+            put(0x18, I32(frame + 0x24));
+            const int32_t bx = f(0xc);
+            const int32_t cell = bx / 4 + (by / 4) * I32(set + 0x28);
+            put(0x1c, cell);
+            put(0x20, cell);
+            put(0x24, 0);
+            put(0x28, 0);
+            put(0x2c, 0);
+            put(0x30, 0);
+            const int32_t ax = -(bx % 4), ay = -(by % 4);
+            put(0x34, ax + 5 < f(4) ? ax + 4 : f(4));
+            put(0x38, ay + 5 < f(8) ? ay + 4 : f(8));
+            return 1;
+        }
+    return 0;
+}
+
+uint32_t g_dcc_bit[4];   // 0x6ce268: 1 << n
+
+// 60b9a0([8]=frame set, [c]=cell slots (20 bytes, +0 the cell's last
+// entry), [10]=equal-cell stream or 0, [14]=pixel-mask stream, [18]=
+// encoding-type stream or 0, [1c]=raw-pixel stream, [20]=pixel-code stream,
+// [24]=&{entries, bytes}, [28]=&code bits used), ret 0x24: DCC's pixel
+// buffer, one 4-colour entry per changed cell. Per cell: an equal-cell bit
+// keeps the last entry; else a 4-bit mask (0xf for a cell's first entry)
+// says which colours are new, each 8 raw bits or the last colour plus 4-bit
+// steps (more while a step is 0xf); a colour equal to the last ends the
+// entry, the decoded ones moved up over the gaps and the rest cleared; the
+// colours not in the mask come from the cell's previous entry.
+uint32_t dcc_pixel_buffer(Cpu &c)
+{
+    const uint32_t set = c.arg(0), slots = c.arg(1), eq = c.arg(2), mask_s = c.arg(3), enc = c.arg(4);
+    const uint32_t raw = c.arg(5), code = c.arg(6), pbe = c.arg(7), used = c.arg(8);
+    const uint32_t start = ((U32(code + 4) - U32(code)) >> 2 << 5) + U32(code + 0xc);
+    uint32_t cur = U32(pbe);
+    if (U32(set + 0x1c)) {
+        uint32_t it = c.reg(R_ESP) - 0x100;   // the original's 0x3c-byte iterator, below the stack
+        std::memset(H(it), 0, 0x3c);
+        put32(it, 0xffffffffu);
+        for (uint32_t more = dcc_next(it, set); more; more = dcc_next(it, set)) {
+            const uint32_t slot = slots + 20 * U32(it + 0x20);
+            const uint32_t prev = U32(slot);
+            uint32_t m = 0xf;
+            if (prev) {
+                if (eq && dcc_bits(eq, 1))
+                    continue;   // equal cell: the last entry stands
+                m = dcc_bits(mask_s, 4);
+            }
+            const bool is_raw = m && enc && dcc_bits(enc, 1);
+            const uint32_t bits = m | 0xfffffff0u;
+            const auto has = [bits](int32_t i) { return (bits & g_dcc_bit[i & 3]) != 0 || i >= 4; };
+            uint8_t *e = H(cur);
+            const uint8_t *pe = H(prev);   // with prev 0 every colour is in the mask
+            uint8_t last = 0;
+            int32_t i = 4;
+            bool ended = false;
+            while (i != 0) {
+                i--;
+                if (!(bits & g_dcc_bit[i])) {
+                    e[i] = pe[i];
+                    continue;
+                }
+                uint8_t col;
+                if (is_raw) {
+                    col = (uint8_t)dcc_bits(raw, 8);
+                } else {
+                    col = last;
+                    uint32_t step;
+                    do {
+                        step = dcc_bits(code, 4);
+                        col = (uint8_t)(col + step);
+                    } while (step == 0xf);
+                }
+                e[i] = col;
+                if (col == last) {
+                    ended = true;
+                    break;
+                }
+                last = col;
+            }
+            if (ended) {
+                int32_t src = i, dst = -1;
+                for (;;) {
+                    do
+                        src++;
+                    while (!has(src));
+                    if (src >= 4)
+                        break;
+                    do
+                        dst++;
+                    while (!has(dst));
+                    e[dst] = e[src];
+                }
+                for (;;) {
+                    do
+                        dst++;
+                    while (!has(dst));
+                    if (dst >= 4)
+                        break;
+                    e[dst] = 0;
+                }
+                while (i != 0) {
+                    i--;
+                    if (!(bits & g_dcc_bit[i]))
+                        e[i] = pe[i];
+                }
+            }
+            put32(slot, cur);
+            cur += 4;
+        }
+    }
+    put32(used, ((U32(code + 4) - U32(code)) >> 2 << 5) - start + U32(code + 0xc));
+    put32(pbe + 4, cur - U32(pbe));
+    return 0;
+}
+
 }  // namespace
 
 int install_d2_native(Cpu &c)
@@ -1320,6 +1482,8 @@ int install_d2_native(Cpu &c)
     static const uint8_t k60b7b0[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x30, 0xa1, 0xe0, 0x9d, 0x74, 0x00};
     uint8_t cell_have[sizeof k60b7b0];
     g_cpu = &c;
+    for (int i = 0; i < 4; i++)
+        g_dcc_bit[i] = U32(0x006ce268 + 4 * i);
     if ((mask & bit) && c.read(0x0060b7b0, cell_have, sizeof cell_have) && !std::memcmp(cell_have, k60b7b0, sizeof cell_have) &&
         dyn86_intrin_add(0x0060b7b0, dcc_cell_intrin, 8, DYN86_IR_CX | DYN86_IR_DX | DYN86_IR_SI, 0, "DccCell")) {
         g_dcc_intrin = &dyn86_intrin_tbl[dyn86_intrin_n - 1];
@@ -1328,6 +1492,8 @@ int install_d2_native(Cpu &c)
         n++;
     }
     bit <<= 1;
+    static const uint8_t k60b9a0[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x68, 0x8b, 0x45, 0x24};
+    HOOK(c, 0x0060b9a0, k60b9a0, sizeof k60b9a0, 9, dcc_pixel_buffer, "DccPixelBuffer", true);
     // The C runtime's memcpy (0x6829c0, memmove semantics) and memset
     // (0x681ef0), ~4% of the main thread while an area loads: served by the
     // dynarec at their call (WinVita mode 3: copies under 64 bytes in line,

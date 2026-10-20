@@ -3,6 +3,7 @@
 
 #include "game/automap.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -130,6 +131,27 @@ BottomView::Kind SecondScreen::shown_kind() const
     case BottomTab::Info: return BottomView::kInfo;
     }
     return BottomView::kInfo;
+}
+
+// The map draws the ground as a checkerboard of single dots. Every one-pixel
+// step of the map, across or down, puts them on the other squares, and at
+// 1:1 the whole ground then shimmers; showing them always on the same
+// squares keeps it still (the map then moves in steps of two). Whether the
+// dots in the window at (left, top) are on odd squares (x + y odd): counted
+// over every other row, a dot being a pixel with nothing on either side or
+// above or below. (At half size each 2x2 block holds both kinds of square.)
+static int map_dots_odd(const AutomapImage &am, int left, int top)
+{
+    int n[2] = {0, 0};
+    const int x0 = std::max(left, 1), x1 = std::min(left + SecondScreen::kWidth, (int)am.width - 1);
+    const int y0 = std::max(top, 1), y1 = std::min(top + SecondScreen::kAreaH, (int)am.height - 1);
+    for (int y = y0; y < y1; y += 2) {
+        const uint8_t *r = am.pixels + (ptrdiff_t)y * am.stride;
+        for (int x = x0; x < x1; x++)
+            if (r[x] && !r[x - 1] && !r[x + 1] && !r[x - am.stride] && !r[x + am.stride])
+                n[(x + y) & 1]++;
+    }
+    return n[1] > n[0] ? 1 : 0;
 }
 
 bool SecondScreen::wants_automap() const { return gs_.in_game && shown_kind() == BottomView::kMap; }
@@ -367,7 +389,10 @@ bool SecondScreen::stage(BottomView &v, uint64_t now_ms)
                 mx -= (int)am.width / 4;
             v.map.assign((size_t)kW * kAreaH, 0);
             const int s = map_scale_;
-            const int left = mx - kW * s / 2, top = my - kAreaH * s / 2;
+            int left = mx - kW * s / 2;
+            const int top = my - kAreaH * s / 2;
+            if (s == 1 && map_dots_odd(am, left, top) != ((left + top) & 1))
+                left++;   // keep the ground's dots on the screen's even squares
             for (int y = 0; y < kAreaH; y++) {
                 uint8_t *out = &v.map[(size_t)y * kW];
                 for (int x = 0; x < kW; x++) {

@@ -1,16 +1,18 @@
 // See automap.h.
 //
-// The off-screen map, by difference: just before the map is drawn, the frame
-// (the world and the UI drawn so far) is copied aside; the game then draws
-// the map into its frame as usual, and every pixel that changed is the map's.
-// The frame gets its copy back, so the top screen shows no map unless the
-// player asked for one (Tab). One guest buffer holds the copy, then the map.
+// The off-screen map, on black: just before the map is drawn, the frame (the
+// world and the UI drawn so far) is copied aside and cleared to index 0; the
+// game then draws the map into its frame as usual, onto nothing, and every
+// pixel that is not 0 is the map's. The frame gets its copy back, so the top
+// screen shows no map unless the player asked for one (Tab). One guest
+// buffer holds the copy, then the map.
 // (The sprite and line drawers do not take their target from the tile
 // renderer's frame base, 0x7d5448: pointing that elsewhere left the map in
-// the frame. The difference needs nothing from the renderer.)
+// the frame. Clearing needs nothing from the renderer.)
 //
-// A map pixel identical to the frame pixel under it reads as no map: a dot
-// missing now and then, never a wrong one.
+// On black rather than over the world: the map is drawn blended with what is
+// under it, so over the world its colours changed with the world and pixels
+// matching it were lost, a shimmer that moved as the player did.
 #include "game/automap.h"
 
 #include "runtime/cpu.h"
@@ -78,20 +80,27 @@ uint32_t pass_decide(Cpu &)
 uint32_t capture_begin(Cpu &)
 {
     uint8_t *copy = g_base + g_buf;
-    for (uint32_t y = 0; y < g_fh; y++)
-        std::memcpy(copy + (size_t)y * g_fw, g_frame + (ptrdiff_t)y * g_fstride, g_fw);
+    for (uint32_t y = 0; y < g_fh; y++) {
+        uint8_t *f = g_frame + (ptrdiff_t)y * g_fstride;
+        std::memcpy(copy + (size_t)y * g_fw, f, g_fw);
+        std::memset(f, 0, g_fw);
+    }
     return 0;
 }
 
 uint32_t capture_end(Cpu &)
 {
     uint8_t *copy = g_base + g_buf;
+    // Row by row, frame and copy trade places in whole-row copies (a byte
+    // loop took about twice as long in Azahar).
+    static uint8_t row[2048];
     for (uint32_t y = 0; y < g_fh; y++) {
         uint8_t *f = g_frame + (ptrdiff_t)y * g_fstride, *c = copy + (size_t)y * g_fw;
-        for (uint32_t x = 0; x < g_fw; x++) {
-            const uint8_t drawn = f[x], before = c[x];
-            f[x] = before;
-            c[x] = drawn != before ? drawn : 0;
+        for (uint32_t x = 0; x < g_fw; x += sizeof row) {
+            const uint32_t n = g_fw - x < sizeof row ? g_fw - x : (uint32_t)sizeof row;
+            std::memcpy(row, f + x, n);
+            std::memcpy(f + x, c + x, n);
+            std::memcpy(c + x, row, n);
         }
     }
     g_seq++;

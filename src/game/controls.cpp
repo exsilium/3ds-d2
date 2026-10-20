@@ -118,11 +118,25 @@ void Controls::update(const Pad &pad, uint64_t now_ms)
     if ((released & kSelect) && !select_used_)
         zoom_toggle_ = true;
 
+    // ---- Select + D-pad: the bottom screen's tabs (not the belt) ----
+    const bool select_layer = (held & kSelect) && !r_layer;
+    if (select_layer) {
+        static const struct { uint32_t button; Bottom request; } kSelectPad[] = {
+            {kRight, Bottom::kNextTab}, {kLeft, Bottom::kPrevTab}, {kUp, Bottom::kMap}, {kDown, Bottom::kMapSize}};
+        for (const auto &s : kSelectPad)
+            if (pressed & s.button) {
+                bottom_ = s.request;
+                select_used_ = true;   // no zoom toggle when Select is let go
+            }
+    }
+
     // ---- bound buttons: the layer chosen at press time is the one released ----
     bool a_left = false, b_right = false;
     for (size_t i = 0; i < sizeof kBindings / sizeof kBindings[0]; i++) {
         const Binding &b = kBindings[i];
-        if (pressed & b.button) {
+        if ((pressed & b.button) && select_layer && (b.button & (kUp | kDown | kLeft | kRight))) {
+            bound_[i] = 0;   // taken by the Select layer above
+        } else if (pressed & b.button) {
             bound_[i] = r_layer ? b.with_r : b.normal;
             if (bound_[i] != kMouseLeft && bound_[i] != kMouseRight)
                 key(bound_[i], true);

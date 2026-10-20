@@ -91,6 +91,14 @@ public:
     static constexpr int kMapBtnY = kHeight - 16, kMapBtnH = 16;
     static constexpr int kScaleBtnX = 264, kScaleBtnW = 56, kMsBtnX = 176, kMsBtnW = 84;
     bool take_settings_changed() { bool r = settings_changed_; settings_changed_ = false; return r; }
+    // The buttons' shortcuts (Select + D-pad): the next or previous tab
+    // along the bar (PANEL too while a panel is open), MAP, and MAP's size
+    // (showing MAP). Not while the keyboard is open.
+    void step_tab(int dir);
+    void show_map();
+    void switch_map_size();
+    // Controls::take_bottom_request's answer, applied.
+    void request(Controls::Bottom r);
 
     // Each poll, before Controls::update, with the touch already given to
     // the keyboard if it is open: takes the touches it acts on out of `pad`

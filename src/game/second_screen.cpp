@@ -293,6 +293,8 @@ void SecondScreen::tab_tapped(int x, Pad &pad)
 
 void SecondScreen::update(Pad &pad, const GameState &gs, int cursor_x, int cursor_y, uint64_t now_ms)
 {
+    if (gs.in_game != gs_.in_game)
+        dirty_ = true;   // into or out of a game: the map or its note again
     gs_ = gs;
     cx_ = cursor_x;
     cy_ = cursor_y;

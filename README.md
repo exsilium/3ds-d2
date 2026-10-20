@@ -101,6 +101,7 @@ Start 3ds-d2 from the HOME menu. The game appears on the top screen. The bottom 
 | R + D-pad | Skill hotkeys F1–F4 |
 | R + Start | Enter (confirm) |
 | R + Select | On-screen keyboard |
+| L + R + Select | Screenshot into the Camera album |
 
 When the game asks for text, such as a character name, a keyboard opens on the bottom screen. Tap the keys. B deletes, Y is shift, Start confirms, Select closes it. R + Select opens the keyboard at any time. [docs/controls.md](docs/controls.md) has the full mapping.
 

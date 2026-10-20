@@ -100,8 +100,9 @@ Start 3ds-d2 from the HOME menu. The game appears on the top screen. The bottom 
 | R + A / B / X / Y | Character screen / skill tree / automap / quests |
 | R + D-pad | Skill hotkeys F1–F4 |
 | R + Start | Enter (confirm) |
+| R + Select | On-screen keyboard |
 
-When the game asks for text, such as a character name, a keyboard opens on the bottom screen. Tap the keys. B deletes, Y is shift, Start confirms, Select closes it. Select + Start opens the keyboard at any time. [docs/controls.md](docs/controls.md) has the full mapping.
+When the game asks for text, such as a character name, a keyboard opens on the bottom screen. Tap the keys. B deletes, Y is shift, Start confirms, Select closes it. R + Select opens the keyboard at any time. [docs/controls.md](docs/controls.md) has the full mapping.
 
 If the app shows "Game.exe not found", check the folder name and that `Game.exe` is inside `/3ds/3ds-d2/game/`.
 

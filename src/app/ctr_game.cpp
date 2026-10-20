@@ -352,21 +352,30 @@ void status(const char *fmt, ...)
 }
 
 // A fatal message from the CPU backend (it exits right after): show it and
-// wait for START, instead of dropping silently back to the HOME menu.
-extern "C" void d2_ctr_progress_hook(const char *msg)
+// The bottom screen back to the text console, over whatever the second
+// screen drew (a fatal message, the game's end): single-buffered again, the
+// consoles on the buffer shown, cleared.
+void console_again()
 {
-    if (std::strncmp(msg, "FATAL", 5) != 0)
-        return;
-    g_ss_active = false;   // the console again, over whatever the second screen drew
+    g_ss_active = false;
     if (g_bottom_double) {
-        // Single again, the consoles on the buffer shown.
         gfxSetDoubleBuffering(GFX_BOTTOM, false);
         g_bottom_double = false;
         u16 *fb = (u16 *)gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, nullptr, nullptr);
         g_stats_con.frameBuffer = g_log_con.frameBuffer = fb;
     }
+    consoleSelect(&g_stats_con);
+    consoleClear();
     consoleSelect(&g_log_con);
     consoleClear();
+}
+
+// wait for START, instead of dropping silently back to the HOME menu.
+extern "C" void d2_ctr_progress_hook(const char *msg)
+{
+    if (std::strncmp(msg, "FATAL", 5) != 0)
+        return;
+    console_again();
     std::printf("\x1b[31m%s\x1b[0m\n", msg);
     logline(msg);
     std::printf("Logs: sdmc:/3ds/3ds-d2/logs/. START: exit\n");
@@ -1034,6 +1043,8 @@ void wait_for_start()
         hidScanInput();
         if (hidKeysDown() & KEY_START)
             break;
+        gfxFlushBuffers();   // the console's text, out of the CPU cache
+        gfxScreenSwapBuffers(GFX_BOTTOM, false);
         gspWaitForVBlank();
     }
 }
@@ -1174,6 +1185,7 @@ int main()
 #endif
     aptUnhook(&g_apt_cookie);
     stop_render_thread();
+    console_again();   // the game's end shows on the console, as before the second screen
     if (!r.loaded)
         status("FATAL: %s", r.error.c_str());
     else

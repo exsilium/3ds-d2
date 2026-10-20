@@ -181,6 +181,7 @@ PrintConsole g_stats_con, g_log_con;
 game::SecondScreen g_ss;
 game::Osk g_osk;
 bool g_ss_active = false;    // the second screen owns the bottom framebuffer
+bool g_bottom_double = false; // render thread: the bottom screen is double-buffered (second screen)
 extern "C" const uint8_t default_font_bin[];   // libctru's console font: 8x8, 1 bpp, bit 7 leftmost
 int g_render_core = -1;                 // the core drawing frames (-1: the game's thread)
 volatile uint32_t g_frames_skipped = 0; // frames not shown: the previous one was still drawing
@@ -357,6 +358,13 @@ extern "C" void d2_ctr_progress_hook(const char *msg)
     if (std::strncmp(msg, "FATAL", 5) != 0)
         return;
     g_ss_active = false;   // the console again, over whatever the second screen drew
+    if (g_bottom_double) {
+        // Single again, the consoles on the buffer shown.
+        gfxSetDoubleBuffering(GFX_BOTTOM, false);
+        g_bottom_double = false;
+        u16 *fb = (u16 *)gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, nullptr, nullptr);
+        g_stats_con.frameBuffer = g_log_con.frameBuffer = fb;
+    }
     consoleSelect(&g_log_con);
     consoleClear();
     std::printf("\x1b[31m%s\x1b[0m\n", msg);
@@ -533,6 +541,15 @@ void save_staged_shot()
     __atomic_store_n(&g_shot_done, true, __ATOMIC_RELEASE);
 }
 
+// The top screen, and the bottom one when it was drawn: once double-buffered,
+// swapping the bottom without a draw would show the older of its two buffers.
+void swap_screens(bool bottom_drawn)
+{
+    gfxScreenSwapBuffers(GFX_TOP, true);
+    if (bottom_drawn || !g_bottom_double)
+        gfxScreenSwapBuffers(GFX_BOTTOM, false);
+}
+
 void draw_staged()
 {
     const Staged &st = g_staged;
@@ -544,7 +561,7 @@ void draw_staged()
         const uint32_t strides[3] = {st.width, cw, cw};
         draw_yuv(top, planes, strides, st.width, st.height, st.display_height);
         gfxFlushBuffers();
-        gfxSwapBuffers();
+        swap_screens(false);
         return;
     }
     for (int i = 0; i < 256; i++) {
@@ -562,14 +579,21 @@ void draw_staged()
         draw_window(top, f, st.cursor_x, st.cursor_y);
     else
         draw_stretched(top, f);
-    if (st.bottom_draw) {
-        // The bottom framebuffer is single-buffered (the consoles'): drawn in place.
+    const bool bottom_drawn = st.bottom_draw && st.bottom.kind != game::BottomView::kNone;
+    if (bottom_drawn) {
+        // Double-buffered from the second screen's first draw: drawn in the
+        // buffer not shown, so the screen never shows one half redrawn.
+        // Every draw covers the whole screen.
+        if (!g_bottom_double) {
+            gfxSetDoubleBuffering(GFX_BOTTOM, true);
+            g_bottom_double = true;
+        }
         uint16_t *bottom = (uint16_t *)gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, nullptr, nullptr);
         game::draw_bottom(bottom, st.bottom, st.pixels.data(), (int)st.width, (int)st.height, g_pal565,
                           default_font_bin);
     }
     gfxFlushBuffers();
-    gfxSwapBuffers();
+    swap_screens(bottom_drawn);
 }
 
 void render_main(void *)

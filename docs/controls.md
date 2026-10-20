@@ -58,7 +58,7 @@ PANEL appears when a panel opens and is shown by itself. Choosing another tab hi
 
 **Pointing** (ZOOM and PANEL): the cursor goes to the touched spot and follows the finger. A short tap is a left click there; it picks up or drops an item, buys, or walks. Holding still for half a second is a right click; it drinks or uses an item, or casts. Dragging near the edge of the area scrolls it.
 
-The panels are found from the UI table at `0x7A27C0` (see [Telling menus from the game world](#telling-menus-from-the-game-world)): inventory and skill tree on the right; character sheet, shop, socketing, quest log, waypoints, party, trade, stash, cube and mercenary on the left; NPC dialogue and the game menu in the centre.
+The panels are found from the UI table at `0x7A27C0` (see [Telling menus from the game world](#telling-menus-from-the-game-world)): inventory and skill tree on the right; character sheet, shop, socketing, quest log, waypoints, party, trade, stash, cube and mercenary on the left; NPC dialogue in the centre. The game menu (Start) is not offered: it is readable on the top screen as it is.
 
 **The automap** (`src/game/automap.cpp`): Game.exe's UI pass draws the map with `0x45AD60` when `ui[0x0A]` (Tab) is set. That call site (`0x456F93`) now calls a small stub of guest code, placed in the zero slack after `.text` (`0x6CB5B0`). While MAP is shown, every third UI pass also draws the map for the bottom screen: the frame is copied aside, the game draws the map into it, and each pixel that changed is kept as map. The frame then gets its copy back, so the top screen is unaffected. The stub calls the game's functions as ordinary guest code because the map's first draw in a level waits for the game's other threads, which a native `guest_call` cannot do.
 

@@ -58,8 +58,9 @@ constexpr uint64_t kLeftPanels = bit(0x02)     // character sheet
                                | bit(0x24);    // mercenary
 constexpr uint64_t kRightPanels = bit(0x01)    // inventory
                                 | bit(0x04);   // skill tree
-constexpr uint64_t kCentrePanels = bit(0x08)   // NPC dialogue menu
-                                 | bit(0x09);  // game menu (Escape)
+// The game menu (Escape, 0x09) is left out: it fills the top screen,
+// readable as it is.
+constexpr uint64_t kCentrePanels = bit(0x08);  // NPC dialogue menu
 
 inline uint16_t rgb(uint32_t r, uint32_t g, uint32_t b)
 {

@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Exile <exile@chamber.ee>
+Date: Tue, 20 Oct 2026 08:28:57 +0300
+Subject: [PATCH] dyn86, scheduler: fault-report helpers
+
+dyn86_block_of_native() maps a host code address to the guest block
+translated there; CooperativeScheduler::threads() lists every guest
+thread with its stack and TIB. For fault reports: a host data abort
+inside the JIT pool says nothing about the guest until the translated
+block is mapped back to its x86 address. Both are read-only and take
+no lock, so an exception handler can call them. Refs exsilium/3ds-d2#5.
+---
+ src/dynarec86/dyn86.c           | 13 +++++++++++++
+ src/dynarec86/dyn86.h           |  6 ++++++
+ src/runtime/sched_cooperative.h |  3 +++
+ 3 files changed, 22 insertions(+)
+
+diff --git a/src/dynarec86/dyn86.c b/src/dynarec86/dyn86.c
+index 20b5331..ae44544 100644
+--- a/src/dynarec86/dyn86.c
++++ b/src/dynarec86/dyn86.c
+@@ -260,3 +260,16 @@ uint32_t dyn86_unal_stat(int k) {
+     switch (k) { case 0: return dyn86_unal_total; case 1: return dyn86_unal_cnt;
+                  case 2: return dyn86_unal_last;  default: return dyn86_unal_site; }
+ }
++
++/* See dyn86.h. */
++#include "dynablock_private.h"
++dynablock_t* FindDynablockFromNativeAddress(void* p);
++int dyn86_block_of_native(uintptr_t pc, uint32_t* x86_addr, uint32_t* x86_size)
++{
++    dynablock_t* db = FindDynablockFromNativeAddress((void*)pc);
++    if (!db)
++        return 0;
++    if (x86_addr) *x86_addr = (uint32_t)(uintptr_t)db->x86_addr;
++    if (x86_size) *x86_size = (uint32_t)db->x86_size;
++    return 1;
++}
+diff --git a/src/dynarec86/dyn86.h b/src/dynarec86/dyn86.h
+index 26f5e8f..d14c401 100644
+--- a/src/dynarec86/dyn86.h
++++ b/src/dynarec86/dyn86.h
+@@ -53,6 +53,12 @@ void dyn86_dump_xfer(void);
+  * STMs the register file. Called by rt_boot's Crash.txt hook at a Fog Halt. */
+ void dyn86_dump_eipring(void);
+ 
++/* Fault reports: the guest block whose translation contains host address
++ * `pc` — its first x86 address and size in guest bytes. 0 when `pc` is not
++ * in translated code. Read-only walk of the JIT allocator's block marks, no
++ * lock: callable from an exception handler. */
++int dyn86_block_of_native(uintptr_t pc, uint32_t* x86_addr, uint32_t* x86_size);
++
+ /* One-time platform-layer init. Call ONCE, right after
+  * init_custommem_helper() and before any translation. */
+ void dyn86_init(void);
+diff --git a/src/runtime/sched_cooperative.h b/src/runtime/sched_cooperative.h
+index b754d69..22615ee 100644
+--- a/src/runtime/sched_cooperative.h
++++ b/src/runtime/sched_cooperative.h
+@@ -206,6 +206,9 @@ public:
+     // TIB would reach `va`, is refused (CreateThread fails) instead of
+     // overlapping live memory. 0 = unbounded (the default).
+     void set_tib_ceiling(uint32_t va) { tib_ceiling_ = va; }
++    // Every guest thread, finished ones included (fault reports). Read-only;
++    // the scheduler's thread, or a fault handler that interrupted it.
++    const std::vector<std::unique_ptr<GuestThread>>& threads() const { return threads_; }
+ 
+ private:
+     GuestThread* pick_ready();     // round-robin; also wakes satisfiable Blocked

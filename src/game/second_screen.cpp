@@ -135,6 +135,51 @@ BottomView::Kind SecondScreen::shown_kind() const
 
 bool SecondScreen::wants_automap() const { return gs_.in_game && shown_kind() == BottomView::kMap; }
 
+void SecondScreen::step_tab(int dir)
+{
+    if (shown_kind() == BottomView::kKeyboard)
+        return;
+    const int n = panel_sides_ ? 5 : 4;
+    const BottomTab to = (BottomTab)(((int)shown_tab() + dir + n) % n);
+    if (to == BottomTab::Panel) {
+        panel_dismissed_ = false;
+    } else {
+        panel_dismissed_ = panel_sides_ != 0;
+        set_tab(to);
+    }
+    dirty_ = true;
+}
+
+void SecondScreen::show_map()
+{
+    if (shown_kind() == BottomView::kKeyboard)
+        return;
+    panel_dismissed_ = panel_sides_ != 0;
+    set_tab(BottomTab::Map);
+    dirty_ = true;
+}
+
+void SecondScreen::request(Controls::Bottom r)
+{
+    switch (r) {
+    case Controls::Bottom::kNextTab: step_tab(1); break;
+    case Controls::Bottom::kPrevTab: step_tab(-1); break;
+    case Controls::Bottom::kMap: show_map(); break;
+    case Controls::Bottom::kMapSize: switch_map_size(); break;
+    case Controls::Bottom::kNone: break;
+    }
+}
+
+void SecondScreen::switch_map_size()
+{
+    if (shown_kind() == BottomView::kKeyboard)
+        return;
+    if (shown_tab() != BottomTab::Map)
+        show_map();
+    set_map_scale(map_scale_ == 1 ? 2 : 1);
+    settings_changed_ = true;
+}
+
 void SecondScreen::set_map_ms(uint32_t ms)
 {
     // The nearest of the choices.

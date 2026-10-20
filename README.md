@@ -102,6 +102,8 @@ Start 3ds-d2 from the HOME menu. The game appears on the top screen. The bottom 
 | R + Start | Enter (confirm) |
 | R + Select | On-screen keyboard |
 | L + R + Select | Screenshot into the Camera album |
+| Select + D-pad left / right | Previous / next bottom-screen tab |
+| Select + D-pad up / down | Bottom screen: MAP / switch the map's size |
 
 When the game asks for text, such as a character name, a keyboard opens on the bottom screen. Tap the keys. B deletes, Y is shift, Start confirms, Select closes it. R + Select opens the keyboard at any time. [docs/controls.md](docs/controls.md) has the full mapping.
 

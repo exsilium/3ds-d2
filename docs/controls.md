@@ -27,7 +27,7 @@ The mapping lives in `src/game/controls.cpp`. It follows the ideas D2Vita proved
 | D-pad | Belt potions 1–4 (up, right, down, left) |
 | ZL / ZR (New 3DS) | Weapon swap (W) / automap (Tab) |
 | Start | Escape: game menu, closes panels |
-| Select | Top screen: whole frame ↔ 1:1 zoom |
+| Select | Top screen: whole frame ↔ 1:1 zoom (on release, when no D-pad button was pressed with it) |
 
 **R is a layer key.** While R is held:
 
@@ -41,6 +41,14 @@ The mapping lives in `src/game/controls.cpp`. It follows the ideas D2Vita proved
 | Start | Enter: confirm, e.g. OK after typing a character name |
 | Select | On-screen keyboard (it also opens by itself when the game focuses a text field) |
 | L + Select | Screenshot into the Camera album (see below) |
+
+**Select is a layer key for the bottom screen.** While Select is held (without R), the D-pad does not use the belt:
+
+| Select + | Action |
+| --- | --- |
+| D-pad right / left | Next / previous tab along the bar (PANEL included while a panel is open), wrapping around |
+| D-pad up | MAP |
+| D-pad down | Switches the map's size (x1 ↔ x1/2), showing MAP |
 
 ## Bottom screen
 

@@ -70,6 +70,10 @@ public:
     bool take_zoom_toggle() { bool r = zoom_toggle_; zoom_toggle_ = false; return r; }
     bool take_keyboard_request() { bool r = keyboard_; keyboard_ = false; return r; }
     bool take_screenshot_request() { bool r = screenshot_; screenshot_ = false; return r; }
+    // Select + D-pad, for the bottom screen: next or previous tab, MAP, or
+    // the map's size. kNone when there is none.
+    enum class Bottom : uint8_t { kNone, kNextTab, kPrevTab, kMap, kMapSize };
+    Bottom take_bottom_request() { Bottom r = bottom_; bottom_ = Bottom::kNone; return r; }
 
 private:
     void move_cursor(int x, int y);
@@ -83,7 +87,7 @@ private:
     bool walking_ = false;
     bool walk_press_pending_ = false;   // cursor moved first; press on the next poll
     bool walk_left_ = false;      // walking holds the left button (A and taps are other sources)
-    bool select_used_ = false;    // Select was pressed with R: no zoom toggle on release
+    bool select_used_ = false;    // Select was used with R or the D-pad: no zoom toggle on release
     uint8_t start_vk_ = 0;
     uint8_t bound_[16] = {};      // the key each binding pressed (chosen by the R layer at press time)
     // Touch.
@@ -95,6 +99,7 @@ private:
     float cstick_acc_x_ = 0, cstick_acc_y_ = 0, circle_acc_x_ = 0, circle_acc_y_ = 0;
     bool in_game_ = false, panel_open_ = false;
     bool zoom_toggle_ = false, keyboard_ = false, screenshot_ = false;
+    Bottom bottom_ = Bottom::kNone;
     uint8_t keys_[256] = {};      // which virtual keys this layer holds down
     uint8_t pad_keys_[4] = {};    // Pad::keys at the previous poll
 };

@@ -917,6 +917,7 @@ void poll()
     g_controls.update(pad, rt::now_ms());
     if (g_controls.take_zoom_toggle())
         g_zoom = !g_zoom;
+    g_ss.request(g_controls.take_bottom_request());   // Select + D-pad
     if (g_controls.take_keyboard_request())   // R+Select
         g_osk.open();
     if (g_controls.take_screenshot_request())   // L+R+Select

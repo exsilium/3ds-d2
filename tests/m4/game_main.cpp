@@ -396,6 +396,7 @@ int main(int argc, char **argv)
         second_screen.update(pad, gs, controls.cursor_x(), controls.cursor_y(), now);
         controls.set_context(gs.in_game, gs.panel_open);
         controls.update(pad, now);
+        second_screen.request(controls.take_bottom_request());
     };
     // M4_ASYNCIO=1 (real clock only): asynchronous file reads with a worker
     // thread, as on the console. Not deterministic; off by default.

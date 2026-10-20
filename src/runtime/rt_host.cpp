@@ -627,6 +627,17 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
          img->entry_va(), res.unresolved_imports);
 
     CooperativeScheduler sched(cpu, br.get(), L.worker_stacks, L.worker_stack, L.worker_tibs);
+    // The worker TEBs grow up from worker_tibs: stop them at the next region
+    // of the layout (the heap, on the 3DS) instead of letting the 17th
+    // thread's TEB land in it. Issue #5.
+    {
+        uint32_t ceiling = L.span;
+        for (const uint32_t b : {L.dll_base, L.heap_base, L.va_base, L.scratch_base, L.peb, L.main_tib,
+                                 L.worker_stacks, L.main_stack, L.trap_base})
+            if (b > L.worker_tibs && b < ceiling)
+                ceiling = b;
+        sched.set_tib_ceiling(ceiling);
+    }
     g_sched = &sched;
     if (opt.real_clock && opt.sleep_ms)
         sched.set_real_clock([] { return wx86_now_ms() - g_t0_ms; }, opt.sleep_ms);

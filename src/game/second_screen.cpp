@@ -133,25 +133,35 @@ BottomView::Kind SecondScreen::shown_kind() const
     return BottomView::kInfo;
 }
 
-// The map draws the ground as a checkerboard of single dots. Every one-pixel
-// step of the map, across or down, puts them on the other squares, and at
-// 1:1 the whole ground then shimmers; showing them always on the same
-// squares keeps it still (the map then moves in steps of two). Whether the
-// dots in the window at (left, top) are on odd squares (x + y odd): counted
-// over every other row, a dot being a pixel with nothing on either side or
-// above or below. (At half size each 2x2 block holds both kinds of square.)
-static int map_dots_odd(const AutomapImage &am, int left, int top)
+// The map draws the ground as single dots on every other pixel of every
+// other row, black between. At 1:1 every step of the map turns each of those
+// pixels on or off, which reads as a dark flash over the whole ground. Each
+// such dot (nothing on its sides, above or below) also colours the black
+// pixels around it, diagonals included: the ground shows solid, as at half
+// size, while lines and the names' letters keep their edges. `out` is the
+// kW x kAreaH crop at (left, top), already filled from the map.
+static void map_fill_dots(const AutomapImage &am, int left, int top, uint8_t *out)
 {
-    int n[2] = {0, 0};
-    const int x0 = std::max(left, 1), x1 = std::min(left + SecondScreen::kWidth, (int)am.width - 1);
-    const int y0 = std::max(top, 1), y1 = std::min(top + SecondScreen::kAreaH, (int)am.height - 1);
-    for (int y = y0; y < y1; y += 2) {
-        const uint8_t *r = am.pixels + (ptrdiff_t)y * am.stride;
-        for (int x = x0; x < x1; x++)
-            if (r[x] && !r[x - 1] && !r[x + 1] && !r[x - am.stride] && !r[x + am.stride])
-                n[(x + y) & 1]++;
+    constexpr int kW = SecondScreen::kWidth, kH = SecondScreen::kAreaH;
+    const ptrdiff_t st = am.stride;
+    const int x0 = std::max(left - 1, 1), x1 = std::min(left + kW + 1, (int)am.width - 1);
+    const int y0 = std::max(top - 1, 1), y1 = std::min(top + kH + 1, (int)am.height - 1);
+    for (int y = y0; y < y1; y++) {
+        const uint8_t *r = am.pixels + (ptrdiff_t)y * st;
+        for (int x = x0; x < x1; x++) {
+            const uint8_t p = r[x];
+            if (!p || r[x - 1] || r[x + 1] || r[x - st] || r[x + st])
+                continue;
+            for (int oy = y - top - 1; oy <= y - top + 1; oy++) {
+                if (oy < 0 || oy >= kH)
+                    continue;
+                uint8_t *o = out + (size_t)oy * kW;
+                for (int ox = x - left - 1; ox <= x - left + 1; ox++)
+                    if (ox >= 0 && ox < kW && !o[ox])
+                        o[ox] = p;
+            }
+        }
     }
-    return n[1] > n[0] ? 1 : 0;
 }
 
 bool SecondScreen::wants_automap() const { return gs_.in_game && shown_kind() == BottomView::kMap; }
@@ -178,6 +188,7 @@ void SecondScreen::panel_geometry()
     if (sides != panel_sides_) {
         panel_sides_ = sides;
         dirty_ = true;
+        automap_refresh();   // the map moves over when a side panel opens
     }
     if (sides & 4)
         side_ = 2;
@@ -389,30 +400,33 @@ bool SecondScreen::stage(BottomView &v, uint64_t now_ms)
                 mx -= (int)am.width / 4;
             v.map.assign((size_t)kW * kAreaH, 0);
             const int s = map_scale_;
-            int left = mx - kW * s / 2;
-            const int top = my - kAreaH * s / 2;
-            if (s == 1 && map_dots_odd(am, left, top) != ((left + top) & 1))
-                left++;   // keep the ground's dots on the screen's even squares
+            const int left = mx - kW * s / 2, top = my - kAreaH * s / 2;
+            const int w = (int)am.width, h = (int)am.height;
             for (int y = 0; y < kAreaH; y++) {
                 uint8_t *out = &v.map[(size_t)y * kW];
-                for (int x = 0; x < kW; x++) {
-                    // Half size: the first non-empty pixel of each 2x2 block,
-                    // so one-pixel lines survive.
-                    uint8_t p = 0;
-                    for (int j = 0; j < s && !p; j++) {
-                        const int sy = top + y * s + j;
-                        if (sy < 0 || sy >= (int)am.height)
-                            continue;
-                        const uint8_t *row = am.pixels + (ptrdiff_t)sy * am.stride;
-                        for (int i = 0; i < s && !p; i++) {
-                            const int sx = left + x * s + i;
-                            if (sx >= 0 && sx < (int)am.width)
-                                p = row[sx];
-                        }
-                    }
+                const int sy = top + y * s;
+                const uint8_t *r0 = sy >= 0 && sy < h ? am.pixels + (ptrdiff_t)sy * am.stride : nullptr;
+                if (s == 1) {
+                    const int xs = std::max(0, -left), xe = std::min(kW, w - left);
+                    if (r0 && xs < xe)
+                        std::memcpy(out + xs, r0 + left + xs, (size_t)(xe - xs));
+                    continue;
+                }
+                // Half size: the first non-empty pixel of each 2x2 block, so
+                // one-pixel lines survive. (Blocks over the image's edge stay
+                // empty.)
+                const uint8_t *r1 = sy + 1 >= 0 && sy + 1 < h ? am.pixels + (ptrdiff_t)(sy + 1) * am.stride : nullptr;
+                const int xs = std::max(0, (-left + 1) / 2), xe = std::min(kW, (w - left) / 2);
+                for (int x = xs; x < xe; x++) {
+                    const int sx = left + 2 * x;
+                    uint8_t p = r0 ? (r0[sx] ? r0[sx] : r0[sx + 1]) : 0;
+                    if (!p && r1)
+                        p = r1[sx] ? r1[sx] : r1[sx + 1];
                     out[x] = p;
                 }
             }
+            if (s == 1)
+                map_fill_dots(am, left, top, v.map.data());
             last_map_seq_ = am.seq;
             last_scale_ = map_scale_;
             redraw = true;

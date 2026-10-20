@@ -44,6 +44,7 @@ const Pad &Autoplay::step(uint64_t now_ms, Controls &controls, bool &shot, const
             if (retry_tap_ && now_ms >= next_retry_ms_ && !pad_.touching) {
                 controls.warp_cursor(retry_x_, retry_y_);
                 pad_.touching = true;
+                pad_.touchpad = true;
                 pad_.touch_x = 160;
                 pad_.touch_y = 120;
                 touch_until_ = now_ms + 100;
@@ -77,9 +78,18 @@ const Pad &Autoplay::step(uint64_t now_ms, Controls &controls, bool &shot, const
         if (v == "tap" && std::sscanf(ev, "%*llu %*s %d %d", &x, &y) == 2) {
             controls.warp_cursor(x, y);
             pad_.touching = true;
+            pad_.touchpad = true;
             pad_.touch_x = 160;
             pad_.touch_y = 120;
             touch_until_ = now_ms + 100;
+        } else if (v == "touch" && std::sscanf(ev, "%*llu %*s %d %d", &x, &y) == 2) {
+            int ms = 100;
+            std::sscanf(ev, "%*llu %*s %*d %*d %d", &ms);
+            pad_.touching = true;
+            pad_.touchpad = false;
+            pad_.touch_x = x;
+            pad_.touch_y = y;
+            touch_until_ = now_ms + (uint64_t)ms;
         } else if (v == "circle" && std::sscanf(ev, "%*llu %*s %d %d", &x, &y) == 2) {
             pad_.circle_x = x;
             pad_.circle_y = y;

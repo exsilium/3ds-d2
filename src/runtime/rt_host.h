@@ -222,6 +222,12 @@ void sleep_guest(uint32_t ms);
 // The guest's clock: the scheduler's (virtual or real), so GetTickCount, QPC,
 // Sleep and timed waits always agree.
 uint64_t now_ms();
+// Closes the host side of every file the game has open (after the I/O
+// worker's queued reads), and opens them again where they were: for the
+// platform to let go of its storage while the app is suspended (the HOME
+// menu). Call from the game's thread while no guest code runs, in pairs.
+void suspend_files();
+void resume_files();
 uint64_t now_us();
 void logf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 

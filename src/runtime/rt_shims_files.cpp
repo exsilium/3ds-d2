@@ -299,6 +299,7 @@ public:
     static constexpr uint64_t kCap = 1u << 20;
 
     ReadCache(int fd, uint64_t size) : fd_(fd), size_(size) {}
+    void set_fd(int fd) { fd_ = fd; }   // the file reopened (resume_files)
     ~ReadCache()
     {
         for (const Block &b : blocks_)
@@ -497,14 +498,23 @@ private:
     std::atomic_flag lock_ = ATOMIC_FLAG_INIT;
 };
 
+struct RtFile;
+std::vector<RtFile *> g_files;   // every open file (suspend_files); the game's thread alone
+
 struct RtFile : Waitable {
     FILE *fp = nullptr;              // files the guest may write: stdio
     int fd = -1;                     // read-only game files: a descriptor under `cache`
     uint64_t pos = 0, size = 0;      // ...whose position is kept here and size fixed at open
     std::unique_ptr<ReadCache> cache;
     std::string host;
+    const char *mode = "rb";         // fp's fopen mode
+    // Closed by suspend_files: fp's position to come back to.
+    bool suspended = false;
+    long fp_pos = 0;
+    RtFile() { g_files.push_back(this); }
     ~RtFile() override
     {
+        g_files.erase(std::find(g_files.begin(), g_files.end(), this));
         // Asynchronous reads still in flight write into this file's cache.
         while (cache && cache->inflight.load(std::memory_order_acquire) > 0)
             if (options().sleep_ms)
@@ -601,6 +611,61 @@ void io_pause()
     if (options().sleep_ms)
         options().sleep_ms(1);
 }
+
+}  // namespace
+
+// See rt_host.h. The I/O worker drains its queue first: only the game's
+// thread queues reads, and it is the one here.
+void suspend_files()
+{
+    while (g_io_tail.load(std::memory_order_acquire) != g_io_head.load(std::memory_order_acquire))
+        if (options().sleep_ms)
+            options().sleep_ms(1);
+    int n = 0;
+    for (RtFile *f : g_files) {
+        if (f->suspended)
+            continue;
+        if (f->fd >= 0) {
+            ::close(f->fd);
+            f->fd = -1;
+        }
+        if (f->fp) {
+            std::fflush(f->fp);
+            f->fp_pos = std::ftell(f->fp);
+            std::fclose(f->fp);
+            f->fp = nullptr;
+        }
+        f->suspended = true;
+        n++;
+    }
+    logf("files: %d closed for the suspend", n);
+}
+
+void resume_files()
+{
+    int n = 0, failed = 0;
+    for (RtFile *f : g_files) {
+        if (!f->suspended)
+            continue;
+        f->suspended = false;
+        if (f->cache) {
+            f->fd = ::open(f->host.c_str(), O_RDONLY);
+            f->cache->set_fd(f->fd);   // -1 if it failed: its reads then return nothing
+            failed += f->fd < 0;
+        } else {
+            // Reopened for update, never truncated again ("w+b" made it at open).
+            const bool write = std::strchr(f->mode, 'w') || std::strchr(f->mode, '+');
+            f->fp = std::fopen(f->host.c_str(), write ? "r+b" : "rb");
+            if (f->fp)
+                std::fseek(f->fp, f->fp_pos, SEEK_SET);
+            failed += !f->fp;
+        }
+        n++;
+    }
+    logf("files: %d reopened after the suspend%s", n, failed ? ", some failed" : "");
+}
+
+namespace {
 
 struct FindEntry {
     std::string name;
@@ -983,6 +1048,7 @@ uint32_t create_file(Cpu &c, const std::string &guest, uint32_t access, uint32_t
     }
     auto *f = new RtFile();
     f->host = host;
+    f->mode = mode;
     // Read-only and in the game install: the cached path (see the top).
     const std::string &data = data_root();
     if (std::strcmp(mode, "rb") == 0 && split_roots() && host.compare(0, data.size(), data) == 0) {

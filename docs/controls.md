@@ -28,7 +28,6 @@ The mapping lives in `src/game/controls.cpp`. It follows the ideas D2Vita proved
 | ZL / ZR (New 3DS) | Weapon swap (W) / automap (Tab) |
 | Start | Escape: game menu, closes panels |
 | Select | Top screen: whole frame ↔ 1:1 zoom |
-| Select + Start | On-screen keyboard (it also opens by itself when the game focuses a text field) |
 
 **R is a layer key.** While R is held:
 
@@ -40,7 +39,7 @@ The mapping lives in `src/game/controls.cpp`. It follows the ideas D2Vita proved
 | Y | Quests (Q) |
 | D-pad | Skill hotkeys F1–F4 |
 | Start | Enter: confirm, e.g. OK after typing a character name |
-| Select | Close all panels (Space) |
+| Select | On-screen keyboard (it also opens by itself when the game focuses a text field) |
 
 ## Cinematics
 
@@ -66,7 +65,7 @@ On the Linux lane, `M4_SCRIPT` drives the same `game::Controls` with scripted pa
 
 ## On-screen keyboard
 
-When the game focuses a text field, such as the hero name box, a keyboard replaces the message log on the bottom screen. Select+Start opens it at any time. `src/game/osk.cpp` holds the layout and behaviour.
+When the game focuses a text field, such as the hero name box, a keyboard replaces the message log on the bottom screen. R + Select opens it at any time. `src/game/osk.cpp` holds the layout and behaviour.
 
 - **Typing:** tap the keys, or click them with the mouse in Azahar. Characters go to the game as `WM_CHAR`.
 - **Keys:** `<-` deletes, `Shift` capitalises the next letter, `OK` sends Enter and closes, `Close` just closes.

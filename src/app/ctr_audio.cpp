@@ -70,10 +70,17 @@ public:
             return;
         if (frames > grain_)
             frames = grain_;
-        // The DSP's pace: wait for the next buffer to come back.
+        // The DSP's pace: wait for the next buffer to come back. Not once
+        // the app is closing: "Close" from the HOME menu leaves the DSP
+        // asleep since the suspend (ndsp gets a cancel, not a wakeup), so no
+        // buffer comes back, this thread never returns to ds_emul's stop
+        // flag and the process never exits ("Closing software..." forever).
         ndspWaveBuf &b = bufs_[next_];
-        while (b.status != NDSP_WBUF_DONE && b.status != NDSP_WBUF_FREE)
+        while (b.status != NDSP_WBUF_DONE && b.status != NDSP_WBUF_FREE) {
+            if (aptShouldClose())
+                return;
             svcSleepThread(2 * 1000 * 1000);
+        }
         std::memcpy(b.data_pcm16, interleaved, (size_t)frames * 2 * sizeof(int16_t));
         b.nsamples = (u32)frames;
         DSP_FlushDataCache(b.data_pcm16, (u32)frames * 2 * sizeof(int16_t));
@@ -256,7 +263,13 @@ bool thread_stop(void)
 {
     if (!g_thread)
         return true;
-    threadJoin(g_thread, U64_MAX);   // ds_emul has cleared its run flag before calling this
+    // ds_emul has cleared its run flag before calling this; the body leaves
+    // within one grain. Bounded, as on the Vita: false keeps the sink open
+    // and the thread alive rather than hanging the exit.
+    if (threadJoin(g_thread, 2000ull * 1000 * 1000) != 0) {   // a timeout (09401BFE) is not R_FAILED
+        rt::logf("sound: mixer thread did not stop within 2 s");
+        return false;
+    }
     threadFree(g_thread);
     g_thread = nullptr;
     return true;

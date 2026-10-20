@@ -11,7 +11,8 @@
 // switches. The bottom screen is a diagnostics panel (frame rate, frame time,
 // guest and host memory, the latest runtime messages) and the touchpad; when
 // the game focuses a text field, an on-screen keyboard replaces the messages.
-// Controls: src/game/controls.h.
+// Controls: src/game/controls.h. L+R+Select saves the frame into the
+// console's Camera album (ctr_screenshot.cpp).
 //
 // The frame is drawn by the CPU straight into the RGB565 framebuffer: a
 // palette lookup per sample, no texture upload, no GPU state. Cinematics
@@ -135,6 +136,17 @@ namespace audio {
 rt::VideoAudio *video_sink();   // ctr_audio.cpp
 }  // namespace audio
 }  // namespace d2rt
+
+namespace shot {
+struct Source {
+    const uint8_t *pixels;
+    uint32_t width, height;
+    const uint32_t *palette;
+    bool yuv;
+    uint32_t display_height;
+};
+bool save(const Source &src, std::string &msg);   // ctr_screenshot.cpp
+}  // namespace shot
 
 namespace {
 
@@ -457,11 +469,44 @@ struct Staged {
     int cursor_x, cursor_y;
     bool yuv = false;
     uint32_t display_height = 0;
+    bool shot = false;   // also save this frame to the Camera album
 };
 Staged g_staged;
 LightEvent g_render_go;
 volatile bool g_render_busy = false, g_render_quit = false;
 Thread g_render_thread = nullptr;
+
+// Screenshots (L+R+Select): the request rides on the next staged frame, and
+// the thread that draws it saves it after drawing, so the picture is the one
+// on screen. Encoding and writing take a moment, while the screen holds that
+// frame (frames arriving meanwhile are skipped, as for any slow draw). The
+// result is shown by the game's thread (poll): the console is not thread-safe.
+bool g_shot_request = false;
+volatile bool g_shot_done = false;
+std::string g_shot_msg;
+
+// The request for the frame being staged. It waits while the last result is
+// still unread (the drawing thread would overwrite g_shot_msg).
+bool take_shot_request()
+{
+    return !__atomic_load_n(&g_shot_done, __ATOMIC_ACQUIRE) && std::exchange(g_shot_request, false);
+}
+
+void save_staged_shot()
+{
+    Staged &st = g_staged;
+    if (!st.shot)
+        return;
+    st.shot = false;
+    const uint64_t t0 = host_us();
+    const shot::Source src{st.pixels.data(), st.width, st.height, st.palette, st.yuv, st.display_height};
+    std::string msg;
+    const bool ok = shot::save(src, msg);
+    char ms[24];
+    std::snprintf(ms, sizeof ms, ", %u ms", (unsigned)((host_us() - t0) / 1000));
+    g_shot_msg = (ok ? "screenshot: " : "screenshot failed: ") + msg + (ok ? ms : "");
+    __atomic_store_n(&g_shot_done, true, __ATOMIC_RELEASE);
+}
 
 void draw_staged()
 {
@@ -505,6 +550,7 @@ void render_main(void *)
         const uint64_t t0 = host_us();
         draw_staged();
         g_timing.draw_us += host_us() - t0;
+        save_staged_shot();
         __atomic_store_n(&g_render_busy, false, __ATOMIC_RELEASE);
     }
 }
@@ -624,6 +670,7 @@ void present(const rt::Frame &f)
         st.width = f.width;
         st.height = f.height;
         st.display_height = f.display_height;
+        st.shot = take_shot_request();
         st.pixels.resize((size_t)f.width * f.height + 2 * (size_t)cw * ch);
         uint8_t *o = st.pixels.data();
         for (int p = 0; p < 3; p++) {
@@ -637,6 +684,7 @@ void present(const rt::Frame &f)
         } else {
             draw_staged();
             g_timing.draw_us += host_us() - t0;
+            save_staged_shot();
         }
     } else {
         Staged &st = g_staged;
@@ -650,12 +698,14 @@ void present(const rt::Frame &f)
         st.zoom = g_zoom;
         st.cursor_x = g_controls.cursor_x();
         st.cursor_y = g_controls.cursor_y();
+        st.shot = take_shot_request();
         if (g_render_thread) {
             __atomic_store_n(&g_render_busy, true, __ATOMIC_RELEASE);
             LightEvent_Signal(&g_render_go);
         } else {
             draw_staged();
             g_timing.draw_us += host_us() - t0;
+            save_staged_shot();
         }
     }
     update_stats();
@@ -789,6 +839,7 @@ void poll()
         } else if (g_autoplay.active()) {
             bool shot = false;
             pad = g_autoplay.step(rt::now_ms(), g_controls, shot, gs);
+            g_shot_request |= shot;
         }
     }
     // A newly focused text field (the hero name box, a game name) opens the keyboard.
@@ -824,6 +875,15 @@ void poll()
         g_zoom = !g_zoom;
     if (g_controls.take_keyboard_request())   // R+Select
         g_osk.open();
+    if (g_controls.take_screenshot_request())   // L+R+Select
+        g_shot_request = true;
+    if (__atomic_load_n(&g_shot_done, __ATOMIC_ACQUIRE)) {
+        __atomic_store_n(&g_shot_done, false, __ATOMIC_RELAXED);
+        if (g_osk_shown)
+            logline(g_shot_msg.c_str());
+        else
+            status("%s", g_shot_msg.c_str());
+    }
     if (g_osk.dirty() || g_osk.is_open() != g_osk_shown)
         draw_osk();
 }

@@ -40,6 +40,18 @@ The mapping lives in `src/game/controls.cpp`. It follows the ideas D2Vita proved
 | D-pad | Skill hotkeys F1–F4 |
 | Start | Enter: confirm, e.g. OK after typing a character name |
 | Select | On-screen keyboard (it also opens by itself when the game focuses a text field) |
+| L + Select | Screenshot into the Camera album (see below) |
+
+## Screenshots
+
+**L + R + Select** saves what the game is showing into the console's Camera album, the way L + R does in Animal Crossing: New Leaf. Hold L and R, then press Select. `src/app/ctr_screenshot.cpp` writes the file.
+
+- **Where:** `sdmc:/DCIM/<NNN>NIN03/HNI_<NNNN>.JPG`, the folder and names the camera uses. The number is one past the highest in the newest folder. A folder holding 100 pictures moves on to the next one.
+- **What:** the game's own frame, not the 400×240 screen. In game that is 640×480, the camera's own photo size. Larger frames, such as the 800×600 menus, are scaled to fit 640×480. Cinematics keep their aspect ratio. The zoom setting makes no difference.
+- **File:** a baseline JPEG with an EXIF block, holding the date and a 160×120 thumbnail.
+- **While saving:** the top screen holds the frame for a moment. The bottom screen then shows the path, or why saving failed.
+
+Rosalina's screenshot (Luma3DS menu) still works too. It saves both screens as BMPs in `/luma/screenshots/`.
 
 ## Cinematics
 

@@ -15,6 +15,7 @@
 //   R            layer: R+A character (C), R+B skill tree (T), R+X automap (Tab),
 //                R+Y quests (Q), R+D-pad skill hotkeys F1-F4, R+Start Enter,
 //                R+Select on-screen keyboard (opens by itself on a text field)
+//   L+R+Select   screenshot into the Camera album
 //   D-pad        belt potions 1-4
 //   ZL / ZR      weapon swap (W) / automap (Tab)            (New 3DS)
 //   Start        Escape (game menu)
@@ -58,6 +59,7 @@ public:
     // One-shot requests for the platform layer, cleared when read.
     bool take_zoom_toggle() { bool r = zoom_toggle_; zoom_toggle_ = false; return r; }
     bool take_keyboard_request() { bool r = keyboard_; keyboard_ = false; return r; }
+    bool take_screenshot_request() { bool r = screenshot_; screenshot_ = false; return r; }
 
 private:
     void move_cursor(int x, int y);
@@ -82,7 +84,7 @@ private:
     uint64_t tap_hold_until_ms_ = 0;
     float cstick_acc_x_ = 0, cstick_acc_y_ = 0, circle_acc_x_ = 0, circle_acc_y_ = 0;
     bool in_game_ = false, panel_open_ = false;
-    bool zoom_toggle_ = false, keyboard_ = false;
+    bool zoom_toggle_ = false, keyboard_ = false, screenshot_ = false;
     uint8_t keys_[256] = {};      // which virtual keys this layer holds down
 };
 

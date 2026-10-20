@@ -20,6 +20,7 @@
 
 #include "runtime/guest_region.h"
 
+#include <algorithm>
 #include <cstring>
 
 using namespace d2rt;
@@ -39,8 +40,7 @@ uint8_t *g_base = nullptr;   // host = guest + base (WinVita's single arena)
 inline uint32_t U32(uint32_t va) { uint32_t v; std::memcpy(&v, g_base + va, 4); return v; }
 
 bool g_want = false;
-int g_every = 3;
-uint32_t g_pass = 0;
+uint32_t g_move_ms = 500;
 // The game's frame, as the last present showed it (host pointer into guest memory).
 uint8_t *g_frame = nullptr;
 uint32_t g_fw = 0, g_fh = 0;
@@ -52,7 +52,7 @@ bool g_force = false;                 // capture at the next pass
 uint32_t g_last_x = 0, g_last_y = 0;
 uint64_t g_last_ms = 0;
 constexpr uint32_t kPlayerUnit = 0x007a6a70;   // the player's unit, or 0
-constexpr uint64_t kStillMs = 1000;            // standing still: a capture a second
+constexpr uint64_t kStillMs = 2000;            // standing still: a capture every two seconds
 
 bool ensure_buffer()
 {
@@ -77,10 +77,11 @@ bool ensure_buffer()
 //
 // Returns bit 0: draw the game's own map (Tab); bit 1: capture.
 //
-// Captures come every `every`-th pass while the player moves. Standing still
-// (attacking in place too) the map changes little, only the markers of
-// others moving: then one a second, which saves most of the cost (the
-// game's map took about 16 ms a draw in Azahar).
+// The game's map is slow to draw (about 16 ms a draw in Azahar, a frame's
+// worth of slack), so captures are rationed by time: while the player moves,
+// one every g_move_ms; standing still (attacking in place too) the map
+// changes little, only the markers of others moving, so one every
+// kStillMs.
 bool capture_due()
 {
     if (!g_want)
@@ -90,9 +91,8 @@ bool capture_due()
     const uint32_t x = path ? U32(path) : 0, y = path ? U32(path + 4) : 0;
     const uint64_t now = rt::now_ms();
     if (!(g_seq == 0 || g_force)) {
-        if (++g_pass % (uint32_t)g_every != 0)
-            return false;
-        if (x == g_last_x && y == g_last_y && now - g_last_ms < kStillMs)
+        const bool still = x == g_last_x && y == g_last_y;
+        if (now - g_last_ms < (still ? std::max<uint64_t>(kStillMs, g_move_ms) : g_move_ms))
             return false;
     }
     if (!ensure_buffer())
@@ -225,12 +225,12 @@ void automap_frame(const uint8_t *pixels, uint32_t width, uint32_t height, int32
     g_seq = 0;   // a capture of another size is no longer the map
 }
 
-void set_automap_capture(bool on, int every)
+void set_automap_capture(bool on, uint32_t move_ms)
 {
     if (on && !g_want)
         g_force = true;   // shown again: the last capture may be old
     g_want = on;
-    g_every = every > 0 ? every : 1;
+    g_move_ms = move_ms;
 }
 
 void automap_refresh() { g_force = true; }

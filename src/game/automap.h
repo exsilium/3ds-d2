@@ -27,11 +27,11 @@ bool install_automap_capture(d2rt::Cpu &c);
 // draws into. Call on every present; the capture needs one first.
 void automap_frame(const uint8_t *pixels, uint32_t width, uint32_t height, int32_t stride);
 
-// Whether the platform wants the off-screen map, and how often: every
-// `every`-th UI pass draws it while the player moves, once a second while
-// the player stands still (the game's own map on the top screen is not
-// affected). Game thread.
-void set_automap_capture(bool on, int every = 3);
+// Whether the platform wants the off-screen map, and how often: at most one
+// draw every `move_ms` while the player moves, every two seconds (or
+// `move_ms` if longer) while the player stands still. The game's own map on
+// the top screen is not affected. Game thread.
+void set_automap_capture(bool on, uint32_t move_ms = 500);
 // Capture at the next UI pass (the map moved without the player: a panel
 // opened or closed). Game thread.
 void automap_refresh();

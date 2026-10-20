@@ -40,6 +40,16 @@ struct Pad {
     int cstick_x = 0, cstick_y = 0;   // -156..156, y up
     bool touching = false;
     int touch_x = 0, touch_y = 0;     // touch-screen pixels (320x240)
+    // A scripted tap (autoplay "tap"): the touchpad's, whatever the bottom
+    // screen shows.
+    bool touchpad = false;
+    // From the bottom screen (second_screen.h), which takes the touches it
+    // acts on out of `touching`: a spot the cursor goes to, in game pixels,
+    // with the mouse buttons held there; and keys its buttons hold down.
+    bool pointing = false;
+    int point_x = 0, point_y = 0;
+    bool point_left = false, point_right = false;
+    uint8_t keys[4] = {};             // virtual keys, 0 = none
 };
 
 class Controls {
@@ -86,6 +96,7 @@ private:
     bool in_game_ = false, panel_open_ = false;
     bool zoom_toggle_ = false, keyboard_ = false, screenshot_ = false;
     uint8_t keys_[256] = {};      // which virtual keys this layer holds down
+    uint8_t pad_keys_[4] = {};    // Pad::keys at the previous poll
 };
 
 }  // namespace game

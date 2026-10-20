@@ -138,6 +138,23 @@ void Controls::update(const Pad &pad, uint64_t now_ms)
         }
     }
 
+    // ---- keys held by the bottom screen's buttons ----
+    for (uint8_t old : pad_keys_) {
+        bool still = false;
+        for (uint8_t k : pad.keys)
+            still |= k == old;
+        if (old && !still)
+            key(old, false);
+    }
+    for (int i = 0; i < 4; i++) {
+        key(pad.keys[i], true);
+        pad_keys_[i] = pad.keys[i];
+    }
+
+    // ---- the bottom screen pointing straight at the game ----
+    if (pad.pointing)
+        move_cursor(pad.point_x, pad.point_y);
+
     // ---- C-stick: relative cursor, quadratic response ----
     stick_cursor(pad.cstick_x, pad.cstick_y, kCstickSpeed, cstick_acc_x_, cstick_acc_y_);
 
@@ -213,8 +230,8 @@ void Controls::update(const Pad &pad, uint64_t now_ms)
     }
 
     // ---- the mouse buttons, from all their sources ----
-    rt::input_button(false, a_left || walk_left_ || tap_left);
-    rt::input_button(true, b_right);
+    rt::input_button(false, a_left || walk_left_ || tap_left || pad.point_left);
+    rt::input_button(true, b_right || pad.point_right);
     prev_ = held;
 }
 

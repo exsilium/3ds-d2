@@ -2,6 +2,7 @@
 // the 3DS app's sdmc:/3ds/3ds-d2/autoplay.txt). Events are separated by ';'
 // or newlines; each starts with a guest time in milliseconds:
 //   <ms> tap <x> <y>       put the cursor on game pixel x,y and tap the touchpad (100 ms)
+//   <ms> touch <x> <y> [ms] touch the bottom screen at x,y (its pixels) for ms (100)
 //   <ms> press <button>    hold a button: A B X Y L R ZL ZR START SELECT UP DOWN LEFT RIGHT
 //   <ms> release <button>
 //   <ms> circle <x> <y>    circle pad position (-156..156, y up)

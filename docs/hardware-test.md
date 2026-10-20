@@ -39,7 +39,7 @@ The HOME menu shows a "3ds-d2" icon. Title ID `000400000D2D3D00`.
 
 ## What to look at
 
-The bottom screen is the diagnostics panel. Please note:
+The diagnostics are on the bottom screen's INFO tab (tap INFO in the tab bar; [controls.md](controls.md#bottom-screen) explains the other tabs). Please note:
 
 1. **fps** on the main menu and in the Rogue Encampment while walking. For comparison, Azahar measured 25 in menus and ~9 in town.
 2. **draw ms/frame**: the CPU cost of scaling the frame to the top screen.

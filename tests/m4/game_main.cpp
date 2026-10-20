@@ -332,7 +332,7 @@ int main(int argc, char **argv)
         const uint64_t now = rt::now_ms();
         second_screen.set_frame((int)f.width, (int)f.height);
         second_screen.stage(bottom_view, now);
-        game::set_automap_capture(second_screen.wants_automap());
+        game::set_automap_capture(second_screen.wants_automap(), second_screen.map_ms(), second_screen.map_scale());
         if (shot_now) {
             shot_now = false;
             char name[32];

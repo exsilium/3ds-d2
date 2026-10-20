@@ -133,38 +133,30 @@ BottomView::Kind SecondScreen::shown_kind() const
     return BottomView::kInfo;
 }
 
-// The map draws the ground as single dots on every other pixel of every
-// other row, black between. At 1:1 every step of the map turns each of those
-// pixels on or off, which reads as a dark flash over the whole ground. Each
-// such dot (nothing on its sides, above or below) also colours the black
-// pixels around it, diagonals included: the ground shows solid, as at half
-// size, while lines and the names' letters keep their edges. `out` is the
-// kW x kAreaH crop at (left, top), already filled from the map.
-static void map_fill_dots(const AutomapImage &am, int left, int top, uint8_t *out)
+bool SecondScreen::wants_automap() const { return gs_.in_game && shown_kind() == BottomView::kMap; }
+
+void SecondScreen::set_map_ms(uint32_t ms)
 {
-    constexpr int kW = SecondScreen::kWidth, kH = SecondScreen::kAreaH;
-    const ptrdiff_t st = am.stride;
-    const int x0 = std::max(left - 1, 1), x1 = std::min(left + kW + 1, (int)am.width - 1);
-    const int y0 = std::max(top - 1, 1), y1 = std::min(top + kH + 1, (int)am.height - 1);
-    for (int y = y0; y < y1; y++) {
-        const uint8_t *r = am.pixels + (ptrdiff_t)y * st;
-        for (int x = x0; x < x1; x++) {
-            const uint8_t p = r[x];
-            if (!p || r[x - 1] || r[x + 1] || r[x - st] || r[x + st])
-                continue;
-            for (int oy = y - top - 1; oy <= y - top + 1; oy++) {
-                if (oy < 0 || oy >= kH)
-                    continue;
-                uint8_t *o = out + (size_t)oy * kW;
-                for (int ox = x - left - 1; ox <= x - left + 1; ox++)
-                    if (ox >= 0 && ox < kW && !o[ox])
-                        o[ox] = p;
-            }
-        }
-    }
+    // The nearest of the choices.
+    uint32_t best = kMapMs[0];
+    for (uint32_t c : kMapMs)
+        if ((c > ms ? c - ms : ms - c) < (best > ms ? best - ms : ms - best))
+            best = c;
+    map_ms_ = best;
+    dirty_ = true;
 }
 
-bool SecondScreen::wants_automap() const { return gs_.in_game && shown_kind() == BottomView::kMap; }
+// MAP's button under (x, y): 0 size, 1 refresh, -1 none.
+static int map_button(int x, int y)
+{
+    if (y < SecondScreen::kMapBtnY)
+        return -1;
+    if (x >= SecondScreen::kScaleBtnX && x < SecondScreen::kScaleBtnX + SecondScreen::kScaleBtnW)
+        return 0;
+    if (x >= SecondScreen::kMsBtnX && x < SecondScreen::kMsBtnX + SecondScreen::kMsBtnW)
+        return 1;
+    return -1;
+}
 
 // Which halves hold a panel, and which one to show.
 void SecondScreen::panel_geometry()
@@ -188,7 +180,6 @@ void SecondScreen::panel_geometry()
     if (sides != panel_sides_) {
         panel_sides_ = sides;
         dirty_ = true;
-        automap_refresh();   // the map moves over when a side panel opens
     }
     if (sides & 4)
         side_ = 2;
@@ -290,6 +281,9 @@ void SecondScreen::update(Pad &pad, const GameState &gs, int cursor_x, int curso
                 dirty_ = true;
             } else if (kind == BottomView::kViewport && gs_.in_game) {
                 grip_ = Grip::Point;
+            } else if (kind == BottomView::kMap && map_button(pad.touch_x, pad.touch_y) >= 0) {
+                grip_ = Grip::MapButton;
+                key_ = map_button(pad.touch_x, pad.touch_y);
             } else {
                 grip_ = Grip::Pad;
             }
@@ -332,6 +326,18 @@ void SecondScreen::update(Pad &pad, const GameState &gs, int cursor_x, int curso
         }
         if (up && grip_ == Grip::Key)
             dirty_ = true;
+        if (up && grip_ == Grip::MapButton && moved_ <= kTapSlop) {
+            // A tap: the size switches; the refresh steps through its choices.
+            if (key_ == 0) {
+                set_map_scale(map_scale_ == 1 ? 2 : 1);
+            } else {
+                size_t i = 0;
+                while (i < sizeof kMapMs / sizeof kMapMs[0] && kMapMs[i] != map_ms_)
+                    i++;
+                set_map_ms(kMapMs[(i + 1) % (sizeof kMapMs / sizeof kMapMs[0])]);
+            }
+            settings_changed_ = true;
+        }
         if (up)
             grip_ = Grip::None;
     }
@@ -350,7 +356,7 @@ void SecondScreen::update(Pad &pad, const GameState &gs, int cursor_x, int curso
         pad.keys[nk++] = kKeys[key_].vk;
     if (alt_latched_ && gs_.in_game && kind != BottomView::kKeyboard)
         pad.keys[nk++] = VK_MENU;
-    if (grip_ == Grip::Bar || grip_ == Grip::Key || grip_ == Grip::Point)
+    if (grip_ == Grip::Bar || grip_ == Grip::Key || grip_ == Grip::Point || grip_ == Grip::MapButton)
         pad.touching = false;
     if (grip_ != Grip::Point)
         follow_cursor();
@@ -386,53 +392,25 @@ bool SecondScreen::stage(BottomView &v, uint64_t now_ms)
     switch (kind) {
     case BottomView::kMap: {
         v.map_scale = map_scale_;
-        AutomapImage am;
+        v.map_ms = map_ms_;
+        const uint64_t state = gs_.in_game ? automap_state(map_scale_) : 0;
         if (!gs_.in_game) {
             v.map.clear();
             v.note = "The map shows here in the game.";
-        } else if (automap_image(am) && (am.seq != last_map_seq_ || redraw || map_scale_ != last_scale_)) {
-            // The player is drawn at (w/2 - 16, h/2 - 8) of the frame, a
-            // quarter of the width over when a panel covers one half.
-            int mx = (int)am.width / 2 - 16, my = (int)am.height / 2 - 8;
-            if ((panel_sides_ & 3) == 1)
-                mx += (int)am.width / 4;
-            else if ((panel_sides_ & 3) == 2)
-                mx -= (int)am.width / 4;
+        } else if (state && (state != last_map_state_ || redraw || map_scale_ != last_scale_ || v.map.empty())) {
+            // The player moved a pixel (at this size), new units, or the
+            // screen was taken away: the map again, around the player.
             v.map.assign((size_t)kW * kAreaH, 0);
-            const int s = map_scale_;
-            const int left = mx - kW * s / 2, top = my - kAreaH * s / 2;
-            const int w = (int)am.width, h = (int)am.height;
-            for (int y = 0; y < kAreaH; y++) {
-                uint8_t *out = &v.map[(size_t)y * kW];
-                const int sy = top + y * s;
-                const uint8_t *r0 = sy >= 0 && sy < h ? am.pixels + (ptrdiff_t)sy * am.stride : nullptr;
-                if (s == 1) {
-                    const int xs = std::max(0, -left), xe = std::min(kW, w - left);
-                    if (r0 && xs < xe)
-                        std::memcpy(out + xs, r0 + left + xs, (size_t)(xe - xs));
-                    continue;
-                }
-                // Half size: the first non-empty pixel of each 2x2 block, so
-                // one-pixel lines survive. (Blocks over the image's edge stay
-                // empty.)
-                const uint8_t *r1 = sy + 1 >= 0 && sy + 1 < h ? am.pixels + (ptrdiff_t)(sy + 1) * am.stride : nullptr;
-                const int xs = std::max(0, (-left + 1) / 2), xe = std::min(kW, (w - left) / 2);
-                for (int x = xs; x < xe; x++) {
-                    const int sx = left + 2 * x;
-                    uint8_t p = r0 ? (r0[sx] ? r0[sx] : r0[sx + 1]) : 0;
-                    if (!p && r1)
-                        p = r1[sx] ? r1[sx] : r1[sx + 1];
-                    out[x] = p;
-                }
+            if (automap_draw(v.map.data(), kW, kAreaH, map_scale_)) {
+                last_map_state_ = state;
+                last_scale_ = map_scale_;
+                redraw = true;
+            } else {
+                v.map.clear();
             }
-            if (s == 1)
-                map_fill_dots(am, left, top, v.map.data());
-            last_map_seq_ = am.seq;
-            last_scale_ = map_scale_;
-            redraw = true;
-        } else if (v.map.empty()) {
-            v.note = "Drawing the map...";
         }
+        if (gs_.in_game && v.map.empty())
+            v.note = "Drawing the map...";
         break;
     }
     case BottomView::kKeys: {
@@ -582,7 +560,24 @@ void draw_bottom(uint16_t *fb, const BottomView &v, const uint8_t *frame, int fw
             for (int y = 0; y < kAreaH; y++, src += kW)
                 *col-- = *src ? pal565[*src] : kBg;
         }
-        cv.text(kW - 8 * 5 - 2, SecondScreen::kHeight - 10, v.map_scale == 1 ? "x1" : "x1/2", kHint);
+        {
+            // The buttons: size and the units' refresh.
+            char ms[16];
+            if (v.map_ms < 1000)
+                std::snprintf(ms, sizeof ms, "mark .%us", (unsigned)(v.map_ms % 100 ? v.map_ms / 10 : v.map_ms / 100));
+            else
+                std::snprintf(ms, sizeof ms, "mark %us", (unsigned)(v.map_ms / 1000));
+            const int y = SecondScreen::kMapBtnY, h = SecondScreen::kMapBtnH;
+            const struct { int x, w; const char *label; } kButtons[] = {
+                {SecondScreen::kMsBtnX, SecondScreen::kMsBtnW, ms},
+                {SecondScreen::kScaleBtnX, SecondScreen::kScaleBtnW, v.map_scale == 1 ? "x1" : "x1/2"},
+            };
+            for (const auto &b : kButtons) {
+                cv.fill(b.x + 1, y + 1, b.w - 2, h - 2, kBarBg);
+                cv.fill(b.x + 1, y, b.w - 2, 1, kHint);
+                cv.centred(b.x, y + 4, b.w, b.label, kBarText);
+            }
+        }
         break;
     case BottomView::kKeys:
         cv.fill(0, kBarH, kW, kAreaH, kBg);

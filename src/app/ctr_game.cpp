@@ -182,9 +182,6 @@ game::SecondScreen g_ss;
 game::Osk g_osk;
 bool g_ss_active = false;    // the second screen owns the bottom framebuffer
 bool g_bottom_double = false; // render thread: the bottom screen is double-buffered (second screen)
-// The bottom map's update interval while the player moves, in ms (mapms= in
-// settings.txt, edited by hand): 100 (smooth, costly) to 5000.
-uint32_t g_map_ms = 500;
 extern "C" const uint8_t default_font_bin[];   // libctru's console font: 8x8, 1 bpp, bit 7 leftmost
 int g_render_core = -1;                 // the core drawing frames (-1: the game's thread)
 volatile uint32_t g_frames_skipped = 0; // frames not shown: the previous one was still drawing
@@ -718,7 +715,7 @@ void present(const rt::Frame &f)
         g_controls.set_frame((int)f.width, (int)f.height);
         g_ss.set_frame((int)f.width, (int)f.height);
         game::automap_frame(f.pixels, f.width, f.height, f.stride);
-        game::set_automap_capture(g_ss.wants_automap(), g_map_ms);
+        game::set_automap_capture(g_ss.wants_automap(), g_ss.map_ms(), g_ss.map_scale());
     }
     g_timing.frames++;
     g_timing.total_frames++;
@@ -799,10 +796,8 @@ void load_settings()
             g_ss.set_tab(tab);
         else if (std::sscanf(line, "mapscale=%31s", value) == 1)
             g_ss.set_map_scale(std::atoi(value));
-        else if (std::sscanf(line, "mapms=%31s", value) == 1) {
-            const int ms = std::atoi(value);
-            g_map_ms = ms < 100 ? 100 : ms > 5000 ? 5000 : (uint32_t)ms;
-        }
+        else if (std::sscanf(line, "mapms=%31s", value) == 1)
+            g_ss.set_map_ms((uint32_t)std::atoi(value));
     }
     std::fclose(f);
     g_ss.take_settings_changed();
@@ -812,7 +807,7 @@ void save_settings()
 {
     if (FILE *f = std::fopen(kSettings, "w")) {
         std::fprintf(f, "bottom=%s\nmapscale=%d\nmapms=%u\n", game::bottom_tab_name(g_ss.tab()), g_ss.map_scale(),
-                     (unsigned)g_map_ms);
+                     (unsigned)g_ss.map_ms());
         std::fclose(f);
     }
 }

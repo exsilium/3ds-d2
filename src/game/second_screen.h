@@ -1,7 +1,9 @@
 // The bottom screen during play (second_screen.cpp): a row of tabs over a
 // 320x222 area that shows one of
-//   MAP    the automap, drawn off-screen (automap.h), centred on the player;
-//          tapping MAP again switches 1:1 <-> half size
+//   MAP    the automap (automap.h), centred on the player and following
+//          them smoothly; tapping MAP again switches 1:1 <-> half size, as
+//          does the size button under the map; the other button there sets
+//          how often the crosses and names of others are refreshed
 //   KEYS   touch buttons for the game's hotkeys (skills F1-F8, panels, run,
 //          weapon swap, show items, chat, close all)
 //   ZOOM   the frame at 1:1 around the cursor, readable text; touch points
@@ -58,6 +60,7 @@ struct BottomView {
     // until the first capture.
     std::vector<uint8_t> map;
     int map_scale = 1;
+    uint32_t map_ms = 500;            // the units' refresh (the button under the map)
     // kKeys: bit i lit = button i shown pressed (or latched).
     uint32_t keys_lit = 0;
     // kInfo, and the upper part of kKeyboard.
@@ -79,6 +82,14 @@ public:
     void set_tab(BottomTab t);
     int map_scale() const { return map_scale_; }
     void set_map_scale(int s) { map_scale_ = s == 2 ? 2 : 1; dirty_ = true; }
+    // How often the map's units are refreshed while the player moves (ms):
+    // one of kMapMs.
+    uint32_t map_ms() const { return map_ms_; }
+    void set_map_ms(uint32_t ms);
+    static constexpr uint32_t kMapMs[] = {250, 500, 1000, 2000, 5000};
+    // MAP's buttons, in the strip under the map: size and refresh.
+    static constexpr int kMapBtnY = kHeight - 16, kMapBtnH = 16;
+    static constexpr int kScaleBtnX = 264, kScaleBtnW = 56, kMsBtnX = 176, kMsBtnW = 84;
     bool take_settings_changed() { bool r = settings_changed_; settings_changed_ = false; return r; }
 
     // Each poll, before Controls::update, with the touch already given to
@@ -113,6 +124,7 @@ private:
 
     BottomTab tab_ = BottomTab::Map;
     int map_scale_ = 1;
+    uint32_t map_ms_ = 500;
     bool settings_changed_ = false;
     const Osk *osk_ = nullptr;
 
@@ -129,7 +141,7 @@ private:
     int vx_ = 0, vy_ = 0, scroll_h_ = 0;
 
     // Touch.
-    enum class Grip : uint8_t { None, Bar, Pad, Key, Point };
+    enum class Grip : uint8_t { None, Bar, Pad, Key, Point, MapButton };
     Grip grip_ = Grip::None;
     int key_ = -1;                    // KEYS: the button held
     int tx0_ = 0, ty0_ = 0, moved_ = 0;
@@ -152,7 +164,8 @@ private:
     BottomView::Kind last_kind_ = BottomView::kNone;
     BottomTab last_tab_ = BottomTab::Map;
     bool last_panel_tab_ = false;
-    uint32_t last_keys_ = 0, last_map_seq_ = 0, last_log_head_ = 0;
+    uint32_t last_keys_ = 0, last_log_head_ = 0;
+    uint64_t last_map_state_ = 0;
     int last_vx_ = -1, last_vy_ = -1, last_scale_ = 0;
     uint32_t presents_ = 0;
 };

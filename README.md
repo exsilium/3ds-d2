@@ -81,7 +81,7 @@ The CIA holds only the app, about 2 MB. A new version is a quick reinstall over 
 
 ### 4. Play
 
-Start 3ds-d2 from the HOME menu. The game appears on the top screen. The bottom screen has tabs: the automap (MAP), touch buttons for the hotkeys (KEYS), a 1:1 view around the cursor (ZOOM), and frame rate and memory use (INFO). When a panel opens, such as the inventory or the stash, the bottom screen shows it at full size, and you can tap items directly. On MAP and INFO the bottom screen works as a touchpad.
+Start 3ds-d2 from the HOME menu. The game appears on the top screen. The bottom screen has tabs: the automap (MAP), touch buttons for the hotkeys (KEYS), a 1:1 view around the cursor (ZOOM), and frame rate and memory use (INFO). When a panel opens, such as the inventory or the stash, the bottom screen shows it at full size, and you can tap items directly. On MAP and INFO the bottom screen works as a touchpad; the buttons under the map set its size and how often the markers of others refresh.
 
 | Input | Action |
 | --- | --- |

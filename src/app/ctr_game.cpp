@@ -723,12 +723,36 @@ void draw_osk()
     g_osk.clear_dirty();
 }
 
+// HOME button and sleep (issue #6): libctru acts on them inside aptMainLoop,
+// on this thread. RunOptions::service calls this every 50 ms even while the
+// game pumps no messages (loading a level), not only from the pump (poll);
+// before, a press during a load waited for the load to end. False: the HOME
+// menu's "close", or the system shutting down.
+bool apt_service()
+{
+    if (aptMainLoop())
+        return true;
+    rt::request_exit(0);
+    return false;
+}
+
+// Leaving for the HOME menu or sleep: libctru then hands the screens over
+// (capture, GPU right). A frame the drawing thread is still presenting would
+// land in the middle of that; wait for it. No new one starts meanwhile: only
+// this thread (present) starts them, and it is the one in aptMainLoop.
+aptHookCookie g_apt_cookie;
+void apt_hook(APT_HookType type, void *)
+{
+    if (type != APTHOOK_ONSUSPEND && type != APTHOOK_ONSLEEP)
+        return;
+    while (__atomic_load_n(&g_render_busy, __ATOMIC_ACQUIRE))
+        svcSleepThread(1000000);
+}
+
 void poll()
 {
-    if (!aptMainLoop()) {   // HOME menu "close", or the system shutting down
-        rt::request_exit(0);
+    if (!apt_service())
         return;
-    }
     hidScanInput();
     const u32 k = hidKeysHeld();
     game::Pad pad;
@@ -979,6 +1003,7 @@ int main()
     };
     opt.present = present;
     opt.poll_input = poll;
+    opt.service = [] { apt_service(); };
     opt.io_start = start_io_thread;
     opt.io_wait = [] { LightEvent_Wait(&g_io_event); };
     opt.io_wake = [] { LightEvent_Signal(&g_io_event); };
@@ -986,6 +1011,7 @@ int main()
     opt.io_idle_wait = [](uint32_t ms) { LightEvent_WaitTimeout(&g_io_done_event, (s64)ms * 1000000); };
 
     start_render_thread();
+    aptHook(&g_apt_cookie, apt_hook, nullptr);
 #ifdef PROF_COUNTERS
     start_sampler();
 #endif
@@ -994,6 +1020,7 @@ int main()
 #ifdef PROF_COUNTERS
     stop_sampler();
 #endif
+    aptUnhook(&g_apt_cookie);
     stop_render_thread();
     if (!r.loaded)
         status("FATAL: %s", r.error.c_str());

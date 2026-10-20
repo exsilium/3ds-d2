@@ -102,7 +102,9 @@ void Controls::update(const Pad &pad, uint64_t now_ms)
     // ---- Select / Start: zoom, keyboard, Escape, Enter ----
     if (pressed & kSelect) {
         select_used_ = r_layer;
-        if (r_layer)
+        if (r_layer && (held & kL))
+            screenshot_ = true;   // L+R+Select: screenshot to the Camera album
+        else if (r_layer)
             keyboard_ = true;   // R+Select: on-screen keyboard
     }
     if (pressed & kStart) {

@@ -75,7 +75,7 @@ M3OBJ := $(CPUOBJ) $(addprefix $(OUT)/rt/,$(RTFULL:.cpp=.o)) $(addprefix $(OUT)/
 GAMESRC := $(notdir $(wildcard $(ROOT)/src/game/*.cpp))
 BINKSRC := $(notdir $(wildcard $(ROOT)/src/game/bink/*.cpp))
 GAMEOBJ := $(CPUOBJ) $(addprefix $(OUT)/rt/,$(RTFULL:.cpp=.o)) $(addprefix $(OUT)/m3/,$(M3SRC:.cpp=.o)) \
-           $(addprefix $(OUT)/game/,$(GAMESRC:.cpp=.o)) $(addprefix $(OUT)/game/bink/,$(BINKSRC:.cpp=.o)) $(OUT)/game/ctr_game.o $(OUT)/game/ctr_audio.o $(OUT)/runner/ctr_stubs.o
+           $(addprefix $(OUT)/game/,$(GAMESRC:.cpp=.o)) $(addprefix $(OUT)/game/bink/,$(BINKSRC:.cpp=.o)) $(OUT)/game/ctr_game.o $(OUT)/game/ctr_audio.o $(OUT)/game/ctr_screenshot.o $(OUT)/runner/ctr_stubs.o
 
 .PHONY: all clean
 all: $(OUT)/cpu-lane.3dsx $(OUT)/m3.3dsx $(OUT)/3ds-d2-game.3dsx $(OUT)/3ds-d2-game-cia.elf
@@ -128,13 +128,17 @@ $(OUT)/game/ctr_game.o: $(ROOT)/src/app/ctr_game.cpp $(wildcard $(ROOT)/src/game
 # extended memory mode and its RomFS (scripts/package-cia.sh packs it).
 $(OUT)/game/ctr_audio.o: $(ROOT)/src/app/ctr_audio.cpp $(wildcard $(ROOT)/src/runtime/rt_*.h)
 	@mkdir -p $(@D); $(CXX) $(CXXFLAGS) -O2 -I$(ROOT)/src -c $< -o $@
+# Screenshots into the Camera album: libjpeg-turbo from the pinned image's portlibs.
+PORTLIBS := $(DEVKITPRO)/portlibs/3ds
+$(OUT)/game/ctr_screenshot.o: $(ROOT)/src/app/ctr_screenshot.cpp
+	@mkdir -p $(@D); $(CXX) $(CXXFLAGS) -O2 -I$(PORTLIBS)/include -c $< -o $@
 $(OUT)/game/ctr_game_cia.o: $(ROOT)/src/app/ctr_game.cpp $(wildcard $(ROOT)/src/game/*.h) $(wildcard $(ROOT)/src/runtime/rt_*.h)
 	@mkdir -p $(@D); $(CXX) $(CXXFLAGS) -O2 -DD2_CIA -I$(ROOT)/src -c $< -o $@
 $(OUT)/3ds-d2-game-cia.elf: $(filter-out $(OUT)/game/ctr_game.o,$(GAMEOBJ)) $(OUT)/game/ctr_game_cia.o
-	$(CXX) $(LDFLAGS) $^ -lctru -lm -o $@
+	$(CXX) $(LDFLAGS) $^ -L$(PORTLIBS)/lib -ljpeg -lctru -lm -o $@
 
 $(OUT)/3ds-d2-game.elf: $(GAMEOBJ)
-	$(CXX) $(LDFLAGS) $^ -lctru -lm -o $@
+	$(CXX) $(LDFLAGS) $^ -L$(PORTLIBS)/lib -ljpeg -lctru -lm -o $@
 $(OUT)/3ds-d2-game.smdh:
 	@mkdir -p $(@D); smdhtool --create "3ds-d2" "Diablo II LoD 1.14d on the n3DS" "3ds-d2" $(CTRULIB)/default_icon.png $@
 $(OUT)/3ds-d2-game.3dsx: $(OUT)/3ds-d2-game.elf $(OUT)/3ds-d2-game.smdh

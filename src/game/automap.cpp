@@ -47,6 +47,12 @@ uint32_t g_fw = 0, g_fh = 0;
 int32_t g_fstride = 0;
 uint32_t g_buf = 0, g_buf_size = 0;   // the copy, then the map (guest), g_fw x g_fh
 uint32_t g_seq = 0;
+bool g_force = false;                 // capture at the next pass
+// Where the player stood at the last capture, and when (ms).
+uint32_t g_last_x = 0, g_last_y = 0;
+uint64_t g_last_ms = 0;
+constexpr uint32_t kPlayerUnit = 0x007a6a70;   // the player's unit, or 0
+constexpr uint64_t kStillMs = 1000;            // standing still: a capture a second
 
 bool ensure_buffer()
 {
@@ -70,10 +76,38 @@ bool ensure_buffer()
 // decide, copy and compare.
 //
 // Returns bit 0: draw the game's own map (Tab); bit 1: capture.
+//
+// Captures come every `every`-th pass while the player moves. Standing still
+// (attacking in place too) the map changes little, only the markers of
+// others moving: then one a second, which saves most of the cost (the
+// game's map took about 16 ms a draw in Azahar).
+bool capture_due()
+{
+    if (!g_want)
+        return false;
+    const uint32_t player = U32(kPlayerUnit), path = player ? U32(player + 0x2c) : 0;
+    // The path's position: subtiles, 16.16 fixed point.
+    const uint32_t x = path ? U32(path) : 0, y = path ? U32(path + 4) : 0;
+    const uint64_t now = rt::now_ms();
+    if (!(g_seq == 0 || g_force)) {
+        if (++g_pass % (uint32_t)g_every != 0)
+            return false;
+        if (x == g_last_x && y == g_last_y && now - g_last_ms < kStillMs)
+            return false;
+    }
+    if (!ensure_buffer())
+        return false;
+    g_force = false;
+    g_last_x = x;
+    g_last_y = y;
+    g_last_ms = now;
+    return true;
+}
+
 uint32_t pass_decide(Cpu &)
 {
     const bool top = U32(kAutomapOn) != 0;
-    const bool capture = g_want && (g_seq == 0 || ++g_pass % (uint32_t)g_every == 0) && ensure_buffer();
+    const bool capture = capture_due();
     return (top ? 1u : 0u) | (capture ? 2u : 0u);
 }
 
@@ -193,9 +227,13 @@ void automap_frame(const uint8_t *pixels, uint32_t width, uint32_t height, int32
 
 void set_automap_capture(bool on, int every)
 {
+    if (on && !g_want)
+        g_force = true;   // shown again: the last capture may be old
     g_want = on;
     g_every = every > 0 ? every : 1;
 }
+
+void automap_refresh() { g_force = true; }
 
 bool automap_image(AutomapImage &out)
 {

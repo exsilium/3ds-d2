@@ -9,7 +9,7 @@ namespace game {
 namespace {
 
 constexpr uint8_t VK_TAB = 0x09, VK_RETURN = 0x0D, VK_SHIFT = 0x10, VK_MENU = 0x12, VK_ESCAPE = 0x1B,
-                  VK_SPACE = 0x20, VK_F1 = 0x70;
+                  VK_F1 = 0x70;
 constexpr uint8_t kMouseLeft = 0xFE, kMouseRight = 0xFF;   // bindings that are mouse buttons, not keys
 
 constexpr float kStickMax = 156.0f;
@@ -99,37 +99,22 @@ void Controls::update(const Pad &pad, uint64_t now_ms)
     const uint32_t held = pad.held, pressed = held & ~prev_, released = prev_ & ~held;
     const bool r_layer = (held & kR) != 0;
 
-    // ---- Select / Start: zoom, keyboard, Escape, Enter, Space ----
+    // ---- Select / Start: zoom, keyboard, Escape, Enter ----
     if (pressed & kSelect) {
-        select_used_ = false;
-        if (r_layer) {
-            select_vk_ = VK_SPACE;   // close all panels
-            key(VK_SPACE, true);
-            select_used_ = true;
-        }
+        select_used_ = r_layer;
+        if (r_layer)
+            keyboard_ = true;   // R+Select: on-screen keyboard
     }
     if (pressed & kStart) {
-        if (held & kSelect) {
-            keyboard_ = true;
-            select_used_ = true;
-            start_vk_ = 0;
-        } else {
-            start_vk_ = r_layer ? VK_RETURN : VK_ESCAPE;
-            key(start_vk_, true);
-        }
+        start_vk_ = r_layer ? VK_RETURN : VK_ESCAPE;
+        key(start_vk_, true);
     }
     if (released & kStart) {
         key(start_vk_, false);
         start_vk_ = 0;
     }
-    if (released & kSelect) {
-        if (select_vk_) {
-            key(select_vk_, false);
-            select_vk_ = 0;
-        } else if (!select_used_) {
-            zoom_toggle_ = true;
-        }
-    }
+    if ((released & kSelect) && !select_used_)
+        zoom_toggle_ = true;
 
     // ---- bound buttons: the layer chosen at press time is the one released ----
     bool a_left = false, b_right = false;

@@ -14,12 +14,11 @@
 //   L            stand still (Shift, held)
 //   R            layer: R+A character (C), R+B skill tree (T), R+X automap (Tab),
 //                R+Y quests (Q), R+D-pad skill hotkeys F1-F4, R+Start Enter,
-//                R+Select close panels (Space)
+//                R+Select on-screen keyboard (opens by itself on a text field)
 //   D-pad        belt potions 1-4
 //   ZL / ZR      weapon swap (W) / automap (Tab)            (New 3DS)
 //   Start        Escape (game menu)
 //   Select       top screen: whole frame <-> 1:1 zoom around the cursor
-//   Select+Start on-screen keyboard (opens by itself on a text field)
 #ifndef D2_GAME_CONTROLS_H
 #define D2_GAME_CONTROLS_H
 
@@ -72,8 +71,8 @@ private:
     bool walking_ = false;
     bool walk_press_pending_ = false;   // cursor moved first; press on the next poll
     bool walk_left_ = false;      // walking holds the left button (A and taps are other sources)
-    bool select_used_ = false;    // Select took part in a combination: no zoom toggle on release
-    uint8_t start_vk_ = 0, select_vk_ = 0;
+    bool select_used_ = false;    // Select was pressed with R: no zoom toggle on release
+    uint8_t start_vk_ = 0;
     uint8_t bound_[16] = {};      // the key each binding pressed (chosen by the R layer at press time)
     // Touch.
     bool touch_prev_ = false;

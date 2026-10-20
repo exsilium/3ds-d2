@@ -822,7 +822,7 @@ void poll()
     g_controls.update(pad, rt::now_ms());
     if (g_controls.take_zoom_toggle())
         g_zoom = !g_zoom;
-    if (g_controls.take_keyboard_request())   // Select+Start
+    if (g_controls.take_keyboard_request())   // R+Select
         g_osk.open();
     if (g_osk.dirty() || g_osk.is_open() != g_osk_shown)
         draw_osk();

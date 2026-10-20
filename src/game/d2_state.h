@@ -23,9 +23,10 @@ struct GameState {
     bool in_game = false;     // a game is running (player unit exists)
     bool panel_open = false;  // a panel covers the world (the cursor is for it)
     uint32_t edit_focus = 0;  // the focused edit box (character name, chat...), 0 if none
+    uint64_t ui = 0;          // in game: bit i set = UI table entry i is non-zero (i < 0x28)
 };
 
-// Cheap: a check byte and up to 38 dwords. Call once per input poll.
+// Cheap: a check byte and up to 42 dwords. Call once per input poll.
 GameState read_game_state();
 
 }  // namespace game

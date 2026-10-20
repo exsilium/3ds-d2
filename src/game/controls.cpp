@@ -118,11 +118,25 @@ void Controls::update(const Pad &pad, uint64_t now_ms)
     if ((released & kSelect) && !select_used_)
         zoom_toggle_ = true;
 
+    // ---- Select + D-pad: the bottom screen's tabs (not the belt) ----
+    const bool select_layer = (held & kSelect) && !r_layer;
+    if (select_layer) {
+        static const struct { uint32_t button; Bottom request; } kSelectPad[] = {
+            {kRight, Bottom::kNextTab}, {kLeft, Bottom::kPrevTab}, {kUp, Bottom::kMap}, {kDown, Bottom::kMapSize}};
+        for (const auto &s : kSelectPad)
+            if (pressed & s.button) {
+                bottom_ = s.request;
+                select_used_ = true;   // no zoom toggle when Select is let go
+            }
+    }
+
     // ---- bound buttons: the layer chosen at press time is the one released ----
     bool a_left = false, b_right = false;
     for (size_t i = 0; i < sizeof kBindings / sizeof kBindings[0]; i++) {
         const Binding &b = kBindings[i];
-        if (pressed & b.button) {
+        if ((pressed & b.button) && select_layer && (b.button & (kUp | kDown | kLeft | kRight))) {
+            bound_[i] = 0;   // taken by the Select layer above
+        } else if (pressed & b.button) {
             bound_[i] = r_layer ? b.with_r : b.normal;
             if (bound_[i] != kMouseLeft && bound_[i] != kMouseRight)
                 key(bound_[i], true);
@@ -137,6 +151,23 @@ void Controls::update(const Pad &pad, uint64_t now_ms)
             bound_[i] = 0;
         }
     }
+
+    // ---- keys held by the bottom screen's buttons ----
+    for (uint8_t old : pad_keys_) {
+        bool still = false;
+        for (uint8_t k : pad.keys)
+            still |= k == old;
+        if (old && !still)
+            key(old, false);
+    }
+    for (int i = 0; i < 4; i++) {
+        key(pad.keys[i], true);
+        pad_keys_[i] = pad.keys[i];
+    }
+
+    // ---- the bottom screen pointing straight at the game ----
+    if (pad.pointing)
+        move_cursor(pad.point_x, pad.point_y);
 
     // ---- C-stick: relative cursor, quadratic response ----
     stick_cursor(pad.cstick_x, pad.cstick_y, kCstickSpeed, cstick_acc_x_, cstick_acc_y_);
@@ -213,8 +244,8 @@ void Controls::update(const Pad &pad, uint64_t now_ms)
     }
 
     // ---- the mouse buttons, from all their sources ----
-    rt::input_button(false, a_left || walk_left_ || tap_left);
-    rt::input_button(true, b_right);
+    rt::input_button(false, a_left || walk_left_ || tap_left || pad.point_left);
+    rt::input_button(true, b_right || pad.point_right);
     prev_ = held;
 }
 

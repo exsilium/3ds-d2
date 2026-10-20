@@ -8,9 +8,11 @@
 // Display: the game draws an 800x600 8-bit frame. The top screen shows all of
 // it stretched over the full 400x240 (2:1 across, 2.5:1 down, filtered), or a
 // 1:1 400x240 window that follows the cursor, for reading text; Select
-// switches. The bottom screen is a diagnostics panel (frame rate, frame time,
-// guest and host memory, the latest runtime messages) and the touchpad; when
-// the game focuses a text field, an on-screen keyboard replaces the messages.
+// switches. The bottom screen (game::SecondScreen) has tabs: the automap,
+// touch buttons for the hotkeys, a 1:1 view around the cursor, diagnostics
+// (frame rate, memory, the runtime's messages), and an open panel at 1:1 to
+// touch directly; it is also the touchpad. When the game focuses a text
+// field, an on-screen keyboard takes it over.
 // Controls: src/game/controls.h. L+R+Select saves the frame into the
 // console's Camera album (ctr_screenshot.cpp).
 //
@@ -19,11 +21,13 @@
 // (src/game/cinematics.cpp) arrive as YUV and are drawn the same way, scaled
 // to fit the screen with their aspect ratio; their sound is ctr_audio.cpp's.
 #include "game/autoplay.h"
+#include "game/automap.h"
 #include "game/cinematics.h"
 #include "game/controls.h"
 #include "game/d2_native.h"
 #include "game/d2_state.h"
 #include "game/osk.h"
+#include "game/second_screen.h"
 #include "runtime/rt_host.h"
 
 #include <3ds.h>
@@ -155,6 +159,7 @@ const char kGameDir[] = "sdmc:/3ds/3ds-d2/game";
 const char kRomfsGameDir[] = "romfs:/game";   // the CIA carries the game files in its RomFS
 const char kSaveDir[] = "sdmc:/3ds/3ds-d2/save";
 const char kLogDir[] = "sdmc:/3ds/3ds-d2/logs";
+const char kSettings[] = "sdmc:/3ds/3ds-d2/settings.txt";   // the bottom screen's tab and map size
 
 FILE *g_log = nullptr;
 game::Controls g_controls;
@@ -165,12 +170,19 @@ uint16_t g_pal565[256];
 // 2x2 filter then costs four table loads and three adds per output pixel.
 uint32_t g_pal_wide[256];
 
-// ---- bottom screen: diagnostics panel ----------------------------------------------
+// ---- bottom screen -------------------------------------------------------------------
 //
-// Two console windows on the bottom framebuffer: statistics (rows 0-10,
-// rewritten once a second) and the runtime's messages (rows 12-29, scrolling).
+// Until the game shows its first frame: two console windows, statistics
+// (rows 0-10) and the startup messages (rows 12-29). From then on the bottom
+// screen is game::SecondScreen's (second_screen.h), drawn in pixels with
+// each frame; the statistics and messages become its INFO tab.
 
 PrintConsole g_stats_con, g_log_con;
+game::SecondScreen g_ss;
+game::Osk g_osk;
+bool g_ss_active = false;    // the second screen owns the bottom framebuffer
+bool g_bottom_double = false; // render thread: the bottom screen is double-buffered (second screen)
+extern "C" const uint8_t default_font_bin[];   // libctru's console font: 8x8, 1 bpp, bit 7 leftmost
 int g_render_core = -1;                 // the core drawing frames (-1: the game's thread)
 volatile uint32_t g_frames_skipped = 0; // frames not shown: the previous one was still drawing
 game::Autoplay g_autoplay;
@@ -187,16 +199,15 @@ struct Timing {
 
 uint64_t host_us() { return svcGetSystemTick() / (SYSCLOCK_ARM11 / 1000000); }
 
+inline uint16_t rgb565(uint32_t r, uint32_t g, uint32_t b) { return (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)); }
+
 void show_stats(float fps, float draw_ms, float worst_ms)
 {
-    consoleSelect(&g_stats_con);
     const rt::MemoryReport m = rt::memory_report();
     const struct mallinfo mi = mallinfo();
     const uint64_t t = rt::now_ms() / 1000;
     const rt::Stats &st = rt::stats();
-    // Each line is padded to 39 columns: a 40th character would wrap the
-    // 40-column window and scroll the panel.
-    char line[12][48];
+    char line[11][48];
 #ifdef PROF_COUNTERS
     const char *build = "  PROF";   // the profiling build (package-cia --prof)
 #else
@@ -214,18 +225,22 @@ void show_stats(float fps, float draw_ms, float worst_ms)
     std::snprintf(line[5], 48, "host heap  %6u/%6u KiB", (unsigned)(mi.uordblks >> 10), (unsigned)(__ctru_heap_size >> 10));
     std::snprintf(line[6], 48, "linear free %5u KiB", (unsigned)(linearSpaceFree() >> 10));
     std::snprintf(line[7], 48, "app free    %5u KiB", (unsigned)(osGetMemRegionFree(MEMREGION_APPLICATION) >> 10));
-    if (dyn86_jit_allocfail)   // translated code no longer fits: the game will stall
-        std::snprintf(line[8], 48, "\x1b[31mJIT MEMORY FULL\x1b[0m code %u jmptbl %u", m.jit_code_kb, m.jmptbl_kb);
+    const bool jit_full = dyn86_jit_allocfail != 0;   // translated code no longer fits: the game will stall
+    if (jit_full)
+        std::snprintf(line[8], 48, "JIT MEMORY FULL code %u jmptbl %u", m.jit_code_kb, m.jmptbl_kb);
     else
         std::snprintf(line[8], 48, " jit code %5u meta %5u jmptbl %5u", m.jit_code_kb, m.jit_meta_kb, m.jmptbl_kb);
     std::snprintf(line[9], 48, "files %3u  read %5u MiB", st.files_opened, (unsigned)(st.bytes_read >> 20));
-    std::snprintf(line[10], 48, "view: %s%s", g_zoom ? "1:1 zoom (Select)" : "whole frame (Select: zoom)",
+    std::snprintf(line[10], 48, "top: %s%s", g_zoom ? "1:1 zoom (Select)" : "whole frame (Select: zoom)",
                   g_autoplay_on ? "  AUTO" : "");
-    std::snprintf(line[11], 48, "%s", "----------------------------------------");
-    std::printf("\x1b[1;1H");
-    for (int i = 0; i < 12; i++)
-        std::printf(i == 0 ? "\x1b[33m%-39.39s\x1b[0m\n" : i == 11 ? "%-39.39s" : "%-39.39s\n", line[i]);
-    consoleSelect(&g_log_con);
+    std::vector<game::BottomView::Line> lines;
+    for (int i = 0; i < 11; i++) {
+        line[i][40] = 0;   // 40 columns
+        const uint16_t c = i == 0 ? rgb565(255, 220, 90) : (i == 8 && jit_full) ? rgb565(255, 60, 60) : rgb565(255, 255, 255);
+        lines.push_back({line[i], c});
+    }
+    lines.push_back({"----------------------------------------", rgb565(130, 120, 100)});
+    g_ss.set_stats(std::move(lines));
 }
 
 void update_stats()
@@ -316,6 +331,15 @@ void on_cpu_exception(ERRF_ExceptionInfo *e, CpuRegisters *regs)
     resume_regs(frame, regs->cpsr, regs->lr);
 }
 
+// A message for the screen: the startup console, or the INFO tab.
+void screen_message(const char *s)
+{
+    if (g_ss_active)
+        g_ss.log(s);
+    else
+        std::printf("%.*s\n", 39, s);   // the log window
+}
+
 void status(const char *fmt, ...)
 {
     char buf[256];
@@ -323,17 +347,35 @@ void status(const char *fmt, ...)
     va_start(ap, fmt);
     std::vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
-    std::printf("%s\n", buf);   // the log window
+    screen_message(buf);
     logline(buf);
 }
 
 // A fatal message from the CPU backend (it exits right after): show it and
+// The bottom screen back to the text console, over whatever the second
+// screen drew (a fatal message, the game's end): single-buffered again, the
+// consoles on the buffer shown, cleared.
+void console_again()
+{
+    g_ss_active = false;
+    if (g_bottom_double) {
+        gfxSetDoubleBuffering(GFX_BOTTOM, false);
+        g_bottom_double = false;
+        u16 *fb = (u16 *)gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, nullptr, nullptr);
+        g_stats_con.frameBuffer = g_log_con.frameBuffer = fb;
+    }
+    consoleSelect(&g_stats_con);
+    consoleClear();
+    consoleSelect(&g_log_con);
+    consoleClear();
+}
+
 // wait for START, instead of dropping silently back to the HOME menu.
 extern "C" void d2_ctr_progress_hook(const char *msg)
 {
     if (std::strncmp(msg, "FATAL", 5) != 0)
         return;
-    consoleSelect(&g_log_con);
+    console_again();
     std::printf("\x1b[31m%s\x1b[0m\n", msg);
     logline(msg);
     std::printf("Logs: sdmc:/3ds/3ds-d2/logs/. START: exit\n");
@@ -347,8 +389,6 @@ extern "C" void d2_ctr_progress_hook(const char *msg)
 }
 
 // ---- top screen ----------------------------------------------------------------------
-
-inline uint16_t rgb565(uint32_t r, uint32_t g, uint32_t b) { return (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)); }
 
 // The framebuffer is column-major (the LCD is mounted rotated): pixel (x, y)
 // of the 400x240 top screen is at [x * 240 + (239 - y)].
@@ -470,6 +510,8 @@ struct Staged {
     bool yuv = false;
     uint32_t display_height = 0;
     bool shot = false;   // also save this frame to the Camera album
+    game::BottomView bottom;   // the second screen, drawn after the top when bottom_draw
+    bool bottom_draw = false;
 };
 Staged g_staged;
 LightEvent g_render_go;
@@ -508,6 +550,15 @@ void save_staged_shot()
     __atomic_store_n(&g_shot_done, true, __ATOMIC_RELEASE);
 }
 
+// The top screen, and the bottom one when it was drawn: once double-buffered,
+// swapping the bottom without a draw would show the older of its two buffers.
+void swap_screens(bool bottom_drawn)
+{
+    gfxScreenSwapBuffers(GFX_TOP, true);
+    if (bottom_drawn || !g_bottom_double)
+        gfxScreenSwapBuffers(GFX_BOTTOM, false);
+}
+
 void draw_staged()
 {
     const Staged &st = g_staged;
@@ -519,7 +570,7 @@ void draw_staged()
         const uint32_t strides[3] = {st.width, cw, cw};
         draw_yuv(top, planes, strides, st.width, st.height, st.display_height);
         gfxFlushBuffers();
-        gfxSwapBuffers();
+        swap_screens(false);
         return;
     }
     for (int i = 0; i < 256; i++) {
@@ -537,8 +588,21 @@ void draw_staged()
         draw_window(top, f, st.cursor_x, st.cursor_y);
     else
         draw_stretched(top, f);
+    const bool bottom_drawn = st.bottom_draw && st.bottom.kind != game::BottomView::kNone;
+    if (bottom_drawn) {
+        // Double-buffered from the second screen's first draw: drawn in the
+        // buffer not shown, so the screen never shows one half redrawn.
+        // Every draw covers the whole screen.
+        if (!g_bottom_double) {
+            gfxSetDoubleBuffering(GFX_BOTTOM, true);
+            g_bottom_double = true;
+        }
+        uint16_t *bottom = (uint16_t *)gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, nullptr, nullptr);
+        game::draw_bottom(bottom, st.bottom, st.pixels.data(), (int)st.width, (int)st.height, g_pal565,
+                          default_font_bin);
+    }
     gfxFlushBuffers();
-    gfxSwapBuffers();
+    swap_screens(bottom_drawn);
 }
 
 void render_main(void *)
@@ -656,8 +720,12 @@ void present(const rt::Frame &f)
     if (g_timing.last_present_us && t0 - g_timing.last_present_us > g_timing.worst_gap_us)
         g_timing.worst_gap_us = t0 - g_timing.last_present_us;
     g_timing.last_present_us = t0;
-    if (!f.yuv[0])   // a cinematic's size is not the game's: the cursor keeps the game's frame
+    if (!f.yuv[0]) {   // a cinematic's size is not the game's: the cursor keeps the game's frame
         g_controls.set_frame((int)f.width, (int)f.height);
+        g_ss.set_frame((int)f.width, (int)f.height);
+        game::automap_frame(f.pixels, f.width, f.height, f.stride);
+        game::set_automap_capture(g_ss.wants_automap(), g_ss.map_ms(), g_ss.map_scale());
+    }
     g_timing.frames++;
     g_timing.total_frames++;
 
@@ -699,6 +767,13 @@ void present(const rt::Frame &f)
         st.cursor_x = g_controls.cursor_x();
         st.cursor_y = g_controls.cursor_y();
         st.shot = take_shot_request();
+        if (!g_ss_active) {
+            g_ss_active = true;   // the game's first frame: the bottom screen is the second screen's from now on
+            status("bottom screen: %s tab (tap the tabs to change)", game::bottom_tab_name(g_ss.tab()));
+        }
+        st.bottom_draw = g_ss.stage(st.bottom, rt::now_ms());
+        if (st.bottom.kind == game::BottomView::kKeyboard)
+            g_osk.clear_dirty();
         if (g_render_thread) {
             __atomic_store_n(&g_render_busy, true, __ATOMIC_RELEASE);
             LightEvent_Signal(&g_render_go);
@@ -711,66 +786,39 @@ void present(const rt::Frame &f)
     update_stats();
 }
 
-// ---- on-screen keyboard (bottom screen, over the log window) ----------------------
+// ---- on-screen keyboard (drawn by the second screen) ------------------------------
 
-game::Osk g_osk;
-bool g_osk_shown = false;            // what the log window shows now: the keyboard or the log
 bool g_wait_release = false;         // after the keyboard closes: ignore buttons until all are up
 uint32_t g_last_focus = 0;           // the last focused edit box seen (auto-open on a new one)
-// The keyboard is drawn in pixels straight into the bottom screen's
-// framebuffer (single-buffered, the one the consoles print into), in the
-// 320x140 area under the stats panel, which ends at text row 11 (y 95).
-// Pixels, not console text: keys and labels then line up with the touch
-// areas exactly, and labels sit in the middle of their 22-pixel keys.
-// (Console windows do not land where consoleSetWindow says: the log
-// window, set at row 13, prints from row 12, which put the text-grid
-// keyboard a row above its touch areas.)
-constexpr int kOskY = 100;
-extern "C" const uint8_t default_font_bin[];   // libctru's console font: 8x8, 1 bpp, bit 7 leftmost
 
-inline void osk_px(uint16_t *fb, int x, int y, uint16_t c)
+// ---- settings: the bottom screen's tab and map size -------------------------------------
+
+void load_settings()
 {
-    if (x >= 0 && x < 320 && y >= 0 && y < 240)
-        fb[x * 240 + (239 - y)] = c;   // the framebuffer is column-major, bottom to top
+    FILE *f = std::fopen(kSettings, "r");
+    if (!f)
+        return;
+    char line[64], value[32];
+    while (std::fgets(line, sizeof line, f)) {
+        game::BottomTab tab;
+        if (std::sscanf(line, "bottom=%31s", value) == 1 && game::bottom_tab_from_name(value, tab))
+            g_ss.set_tab(tab);
+        else if (std::sscanf(line, "mapscale=%31s", value) == 1)
+            g_ss.set_map_scale(std::atoi(value));
+        else if (std::sscanf(line, "mapms=%31s", value) == 1)
+            g_ss.set_map_ms((uint32_t)std::atoi(value));
+    }
+    std::fclose(f);
+    g_ss.take_settings_changed();
 }
 
-void osk_fill(uint16_t *fb, int x, int y, int w, int h, uint16_t c)
+void save_settings()
 {
-    for (int i = 0; i < w; i++)
-        for (int j = 0; j < h; j++)
-            osk_px(fb, x + i, y + j, c);
-}
-
-void osk_text(uint16_t *fb, int x, int y, const std::string &s, uint16_t c)
-{
-    for (size_t i = 0; i < s.size(); i++) {
-        const uint8_t *g = default_font_bin + (uint8_t)s[i] * 8;
-        for (int r = 0; r < 8; r++)
-            for (int b = 0; b < 8; b++)
-                if (g[r] & (0x80 >> b))
-                    osk_px(fb, x + (int)i * 8 + b, y + r, c);
+    if (FILE *f = std::fopen(kSettings, "w")) {
+        std::fprintf(f, "bottom=%s\nmapscale=%d\nmapms=%u\n", game::bottom_tab_name(g_ss.tab()), g_ss.map_scale(),
+                     (unsigned)g_ss.map_ms());
+        std::fclose(f);
     }
-}
-
-void draw_osk()
-{
-    uint16_t *fb = g_log_con.frameBuffer;
-    if (!g_osk.is_open()) {
-        consoleSelect(&g_log_con);
-        std::printf("\x1b[2J");
-    }
-    osk_fill(fb, 0, kOskY, game::Osk::kWidth, game::Osk::kHeight, 0);
-    if (g_osk.is_open()) {
-        const uint16_t key = rgb565(200, 200, 200), down = rgb565(80, 80, 80);
-        osk_text(fb, 0, kOskY + 2, g_osk.title(), rgb565(255, 255, 255));
-        for (const game::Osk::KeyView &k : g_osk.keys()) {
-            osk_fill(fb, k.x, kOskY + k.y, k.w, k.h, k.pressed ? down : key);
-            osk_text(fb, k.x + (k.w - 8 * (int)k.label.size()) / 2, kOskY + k.y + (k.h - 8) / 2, k.label,
-                     k.pressed ? rgb565(255, 255, 255) : 0);
-        }
-    }
-    g_osk_shown = g_osk.is_open();
-    g_osk.clear_dirty();
 }
 
 // HOME button and sleep (issue #6): libctru acts on them inside aptMainLoop,
@@ -778,25 +826,76 @@ void draw_osk()
 // game pumps no messages (loading a level), not only from the pump (poll);
 // before, a press during a load waited for the load to end. False: the HOME
 // menu's "close", or the system shutting down.
+u32 g_apt_thread = 0;   // the thread in aptMainLoop (the game's)
+bool g_storage_closed = false;
+void open_storage();
+
 bool apt_service()
 {
+    svcGetThreadId(&g_apt_thread, CUR_THREAD_HANDLE);
     if (aptMainLoop())
         return true;
+    if (g_storage_closed)
+        open_storage();   // closed from the HOME menu: the game may still write on its way out
     rt::request_exit(0);
     return false;
+}
+
+// The app's storage while the HOME menu has the system (issue #6: the HOME
+// menu stopped itself when it could not open its own extdata while 3ds-d2
+// ran; why is not known, so the app keeps nothing open meanwhile): the
+// game's files, the log, the RomFS and the SD card's archive are closed on
+// the way out and opened again on the way back.
+bool g_romfs = false;          // the CIA's RomFS is mounted
+std::string g_log_path;
+
+void close_storage()
+{
+    rt::suspend_files();
+    if (FILE *f = g_log) {
+        g_log = nullptr;
+        std::fclose(f);
+    }
+    if (g_romfs)
+        romfsExit();
+    archiveUnmount("sdmc");
+    g_storage_closed = true;
+}
+
+void open_storage()
+{
+    g_storage_closed = false;
+    archiveMountSdmc();
+    if (g_romfs)
+        g_romfs = R_SUCCEEDED(romfsInit());
+    if (!g_log_path.empty())
+        g_log = std::fopen(g_log_path.c_str(), "a");
+    rt::resume_files();
 }
 
 // Leaving for the HOME menu or sleep: libctru then hands the screens over
 // (capture, GPU right). A frame the drawing thread is still presenting would
 // land in the middle of that; wait for it. No new one starts meanwhile: only
 // this thread (present) starts them, and it is the one in aptMainLoop.
+// For the HOME menu, then, the storage is closed until the return. Only on
+// the game's thread inside aptMainLoop, where no guest code runs (a sleep
+// may be announced on libctru's own APT thread while the game runs on).
 aptHookCookie g_apt_cookie;
 void apt_hook(APT_HookType type, void *)
 {
+    u32 thread = 0;
+    svcGetThreadId(&thread, CUR_THREAD_HANDLE);
+    const bool game_thread = thread == g_apt_thread;
+    if (type == APTHOOK_ONRESTORE || type == APTHOOK_ONWAKEUP)
+        g_ss.invalidate();   // the HOME menu or sleep drew over the bottom screen
+    if (type == APTHOOK_ONRESTORE && g_storage_closed && game_thread)
+        open_storage();
     if (type != APTHOOK_ONSUSPEND && type != APTHOOK_ONSLEEP)
         return;
     while (__atomic_load_n(&g_render_busy, __ATOMIC_ACQUIRE))
         svcSleepThread(1000000);
+    if (type == APTHOOK_ONSUSPEND && game_thread && !g_storage_closed)
+        close_storage();
 }
 
 void poll()
@@ -859,7 +958,7 @@ void poll()
         // an idle pad, which also releases anything that was held.
         g_osk.buttons(pressed);
         if (touch_down)
-            g_osk.tap(pad.touch_x, pad.touch_y - kOskY);
+            g_osk.tap(pad.touch_x, pad.touch_y - game::SecondScreen::kOskY);
         if (!g_osk.is_open())
             g_wait_release = true;   // the button that closed it must not reach the game
         pad = game::Pad();
@@ -869,23 +968,22 @@ void poll()
         else
             g_wait_release = false;
     }
+    g_ss.update(pad, gs, g_controls.cursor_x(), g_controls.cursor_y(), rt::now_ms());
+    if (g_ss.take_settings_changed())
+        save_settings();
     g_controls.set_context(gs.in_game, gs.panel_open);
     g_controls.update(pad, rt::now_ms());
     if (g_controls.take_zoom_toggle())
         g_zoom = !g_zoom;
+    g_ss.request(g_controls.take_bottom_request());   // Select + D-pad
     if (g_controls.take_keyboard_request())   // R+Select
         g_osk.open();
     if (g_controls.take_screenshot_request())   // L+R+Select
         g_shot_request = true;
     if (__atomic_load_n(&g_shot_done, __ATOMIC_ACQUIRE)) {
         __atomic_store_n(&g_shot_done, false, __ATOMIC_RELAXED);
-        if (g_osk_shown)
-            logline(g_shot_msg.c_str());
-        else
-            status("%s", g_shot_msg.c_str());
+        status("%s", g_shot_msg.c_str());
     }
-    if (g_osk.dirty() || g_osk.is_open() != g_osk_shown)
-        draw_osk();
 }
 
 bool read_file(const std::string &path, std::vector<uint8_t> &out)
@@ -945,6 +1043,8 @@ void wait_for_start()
         hidScanInput();
         if (hidKeysDown() & KEY_START)
             break;
+        gfxFlushBuffers();   // the console's text, out of the CPU cache
+        gfxScreenSwapBuffers(GFX_BOTTOM, false);
         gspWaitForVBlank();
     }
 }
@@ -960,11 +1060,13 @@ int main()
     consoleSetWindow(&g_stats_con, 0, 0, 40, 12);
     consoleSetWindow(&g_log_con, 0, 13, 40, 17);
     consoleSelect(&g_log_con);
+    g_ss.set_keyboard(&g_osk);
     mkdir("sdmc:/3ds", 0777);
     mkdir(kRoot, 0777);
     mkdir(kSaveDir, 0777);
     mkdir(kLogDir, 0777);
-    g_log = std::fopen((std::string(kLogDir) + "/game.log").c_str(), "w");
+    g_log_path = std::string(kLogDir) + "/game.log";
+    g_log = std::fopen(g_log_path.c_str(), "w");
     std::freopen((std::string(kLogDir) + "/stderr.txt").c_str(), "w", stderr);
     // The main thread's handler is the default for the others; the guest runs here.
     threadOnException(on_cpu_exception, g_exc_stack + sizeof g_exc_stack, WRITE_DATA_TO_HANDLER_STACK);
@@ -981,7 +1083,8 @@ int main()
     // Game files: the CIA's RomFS if it has them, else the SD card.
     std::string game_dir = kGameDir;
     std::vector<uint8_t> exe;
-    if (R_SUCCEEDED(romfsInit()) && read_file(std::string(kRomfsGameDir) + "/Game.exe", exe))
+    g_romfs = R_SUCCEEDED(romfsInit());
+    if (g_romfs && read_file(std::string(kRomfsGameDir) + "/Game.exe", exe))
         game_dir = kRomfsGameDir;
     status("app memory %u KiB, game files: %s",
            (unsigned)(osGetMemRegionSize(MEMREGION_APPLICATION) >> 10), game_dir.c_str());
@@ -997,6 +1100,7 @@ int main()
     sd_benchmark(game_dir + "/d2data.mpq");
 #endif
 
+    load_settings();
     {
         std::vector<uint8_t> script;
         if (read_file(std::string(kRoot) + "/autoplay.txt", script)) {
@@ -1046,20 +1150,19 @@ int main()
     opt.install_native = [](d2rt::Cpu &c) {
         game::install_d2_native(c);
         game::install_cinematics(c);
+        game::install_automap_capture(c);   // the bottom screen's MAP tab
     };
     opt.video_audio = d2rt::audio::video_sink();
     opt.log = [](const char *s) {
         char line[600];
         std::snprintf(line, sizeof line, "[rt] %s", s);
         logline(line);
-        // Heartbeats: the panel shows those numbers. While the keyboard is
-        // up, messages go to the log file only.
+        // Heartbeats: the panel shows those numbers.
         // The sound engine's "[son]" diagnostics (WinVita writes them in
         // French) go to game.log only.
         // So do the per-interval profile lines ("prof...").
-        if (std::strncmp(s, "t=", 2) != 0 && std::strncmp(s, "[son]", 5) != 0 && std::strncmp(s, "prof", 4) != 0 &&
-            !g_osk_shown)
-            std::printf("%.*s\n", 39, s);
+        if (std::strncmp(s, "t=", 2) != 0 && std::strncmp(s, "[son]", 5) != 0 && std::strncmp(s, "prof", 4) != 0)
+            screen_message(s);
     };
     opt.present = present;
     opt.poll_input = poll;
@@ -1082,6 +1185,7 @@ int main()
 #endif
     aptUnhook(&g_apt_cookie);
     stop_render_thread();
+    console_again();   // the game's end shows on the console, as before the second screen
     if (!r.loaded)
         status("FATAL: %s", r.error.c_str());
     else

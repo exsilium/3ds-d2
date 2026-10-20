@@ -23,11 +23,14 @@
 //   "20000 tap 400 307;26000 tap 400 290;32000 text Tester;34000 press R;..."
 
 #include "game/autoplay.h"
+#include "game/automap.h"
 #include "game/cinematics.h"
 #include "game/controls.h"
 #include "game/d2_native.h"
 #include "game/d2_state.h"
+#include "game/second_screen.h"
 #include "runtime/rt_host.h"
+#include "ctru_font.h"
 #include "png.h"
 
 #include <algorithm>
@@ -51,6 +54,11 @@ void dyn86_hotprof_dump(FILE *f, int top);
 }
 
 static bool shot_now = false;   // M4_SCRIPT "shot": save the next frame
+
+// The 3DS app's bottom screen (game::SecondScreen), driven by the scripted
+// pad; each "shot" also saves it, as the console would show it, as b<ms>.png.
+static game::SecondScreen second_screen;
+static game::BottomView bottom_view;
 
 // The cinematics' sound on the lane: a consumer that plays in real time on
 // the guest clock (so the player paces itself as on the console), with
@@ -149,6 +157,7 @@ int main(int argc, char **argv)
             game::install_d2_native(c);
         if (video)
             game::install_cinematics(c);
+        game::install_automap_capture(c);
     };
     static LaneVideoAudio video_audio;
     opt.video_audio = &video_audio;
@@ -178,7 +187,10 @@ int main(int argc, char **argv)
         return 2;
     }
     opt.out = [](const char *s, size_t n) { std::fwrite(s, 1, n, stdout); std::fflush(stdout); };
-    opt.log = [](const char *s) { std::fprintf(stderr, "[rt] %s\n", s); };
+    opt.log = [](const char *s) {
+        std::fprintf(stderr, "[rt] %s\n", s);
+        second_screen.log(s);
+    };
     if (!std::getenv("M4_VIRTUAL_CLOCK")) {
         opt.real_clock = true;
         opt.sleep_ms = [](uint32_t ms) { usleep(ms * 1000); };
@@ -256,6 +268,7 @@ int main(int argc, char **argv)
             return;
         }
         last_yuv = false;
+        game::automap_frame(f.pixels, f.width, f.height, f.stride);
         if (framehash) {
             static unsigned n = 0;
             uint32_t h = 2166136261u;
@@ -317,11 +330,31 @@ int main(int argc, char **argv)
             std::memcpy(&last_idx[(size_t)y * f.width], f.pixels + (ptrdiff_t)y * f.stride, f.width);
         std::memcpy(last_pal, f.palette, sizeof last_pal);
         const uint64_t now = rt::now_ms();
+        second_screen.set_frame((int)f.width, (int)f.height);
+        second_screen.stage(bottom_view, now);
+        game::set_automap_capture(second_screen.wants_automap(), second_screen.map_ms(), second_screen.map_scale());
         if (shot_now) {
             shot_now = false;
             char name[32];
             std::snprintf(name, sizeof name, "s%06llu.png", (unsigned long long)now);
             save(name);
+            // The bottom screen as the console would show it now.
+            static uint16_t fb[320 * 240];
+            uint16_t pal[256];
+            for (int i = 0; i < 256; i++) {
+                const uint32_t p = f.palette[i];
+                pal[i] = (uint16_t)((((p >> 16) & 0xFF) >> 3 << 11) | (((p >> 8) & 0xFF) >> 2 << 5) | ((p & 0xFF) >> 3));
+            }
+            game::draw_bottom(fb, bottom_view, last_idx.data(), (int)f.width, (int)f.height, pal, kCtruFont);
+            std::vector<uint8_t> rgb(320 * 240 * 3);
+            for (int y = 0; y < 240; y++)
+                for (int x = 0; x < 320; x++) {
+                    const uint16_t c = fb[x * 240 + 239 - y];
+                    uint8_t *o = &rgb[(y * 320 + x) * 3];
+                    o[0] = (uint8_t)((c >> 11) << 3), o[1] = (uint8_t)(((c >> 5) & 63) << 2), o[2] = (uint8_t)((c & 31) << 3);
+                }
+            std::snprintf(name, sizeof name, "b%06llu.png", (unsigned long long)now);
+            png::write_rgb(shots + "/" + name, rgb.data(), 320, 240);
         }
         if (now >= next_shot) {
             char name[32];
@@ -330,6 +363,12 @@ int main(int argc, char **argv)
             next_shot = next_shot < 15000 ? 15000 : next_shot < 30000 ? 30000 : next_shot + 30000;
         }
     };
+    // M4_BOTTOM=map|keys|zoom|info: the bottom screen's tab at the start.
+    if (const char *t = std::getenv("M4_BOTTOM")) {
+        game::BottomTab tab;
+        if (game::bottom_tab_from_name(t, tab))
+            second_screen.set_tab(tab);
+    }
     static game::Autoplay autoplay;
     if (const char *sc = std::getenv("M4_SCRIPT"))
         autoplay.load(sc);
@@ -351,11 +390,13 @@ int main(int argc, char **argv)
             reset_done = true;
             std::fprintf(stderr, "[rt] hotprof: counting from here (in game)\n");
         }
-        const game::Pad &pad = autoplay.step(now, controls, shot, gs);
+        game::Pad pad = autoplay.step(now, controls, shot, gs);
         if (shot)
             shot_now = true;
+        second_screen.update(pad, gs, controls.cursor_x(), controls.cursor_y(), now);
         controls.set_context(gs.in_game, gs.panel_open);
         controls.update(pad, now);
+        second_screen.request(controls.take_bottom_request());
     };
     // M4_ASYNCIO=1 (real clock only): asynchronous file reads with a worker
     // thread, as on the console. Not deterministic; off by default.

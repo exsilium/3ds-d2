@@ -65,6 +65,11 @@ bool g_timed_out = false;
 Stats g_stats;
 uint64_t g_next_beat = 0;
 uint32_t g_exit_code = 0;
+// RunOptions::service: only on the thread that runs the guest (now_ms is also
+// read by host threads), and not from inside itself.
+thread_local bool t_runs_guest = false;
+bool g_in_service = false;
+uint64_t g_last_service_ms = 0;   // real clock (wx86_now_ms)
 wx86::GuestRegion g_heap, g_va;
 // When the layout puts the heap and VirtualAlloc ranges side by side (all of
 // them do), both are faces of one pool: the heap grows up from its base, VA
@@ -438,6 +443,15 @@ void prof_report(uint64_t ms)
 
 void check_time_limit(uint64_t ms)
 {
+    if (g_opt.service && t_runs_guest && !g_in_service) {
+        const uint64_t real = wx86_now_ms();
+        if (real - g_last_service_ms >= 50) {
+            g_in_service = true;
+            g_opt.service();
+            g_in_service = false;
+            g_last_service_ms = wx86_now_ms();
+        }
+    }
     if (g_opt.heartbeat_ms && ms >= g_next_beat) {
         g_next_beat = ms + g_opt.heartbeat_ms;
         prof_report(ms);
@@ -599,6 +613,11 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
     g_stats = Stats();
     g_next_beat = g_opt.heartbeat_ms;
     g_t0_ms = wx86_now_ms();
+    g_last_service_ms = g_t0_ms;
+    struct RunsGuest {
+        RunsGuest() { t_runs_guest = true; }
+        ~RunsGuest() { t_runs_guest = false; }
+    } runs_guest;
 
     // Single-arena layout (rt_layout.h): the bridge reads its bases from the
     // environment at construction; the backend allocates the arena from WX86_ARENA.

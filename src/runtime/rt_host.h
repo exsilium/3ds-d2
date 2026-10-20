@@ -81,6 +81,11 @@ struct RunOptions {
     uint32_t max_ms = 0;                           // stop the guest after this much guest time (0: no limit)
     std::function<void(const Frame &)> present;   // each frame the game shows
     std::function<void()> poll_input;              // sample the controls (from the message pump, every >= 16 ms)
+    // The platform's own housekeeping, on the thread that runs the guest, at
+    // least every 50 ms of real time even while the game pumps no messages
+    // (a level load): the console's HOME button and sleep (issue #6). It may
+    // block (the app suspended) and may call request_exit.
+    std::function<void()> service;
     uint32_t trap_report = 0;                      // at exit, print the N most-called imports (stdout)
     uint32_t heartbeat_ms = 0;                     // log progress counters every N ms of guest time
     // Registry DWORDs seeded under the game's settings key when absent (the

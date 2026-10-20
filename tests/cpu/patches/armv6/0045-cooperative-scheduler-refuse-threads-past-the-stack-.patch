@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Exile <exile@chamber.ee>
+Date: Tue, 20 Oct 2026 08:26:16 +0300
+Subject: [PATCH] cooperative scheduler: refuse threads past the stack and TIB
+ regions
+
+Fresh worker stacks only warned when they reached the TIB region, and
+TIBs grew without a bound. On the 3DS layouts the 10th fresh stack
+overlaps the TIBs and the first 64 KiB of the guest heap, and the 17th
+TIB is the heap's first page: the thread's stack and TEB writes (SEH
+frames, LastError, TLS) then corrupt live heap blocks silently.
+
+CreateThread now fails, with a [sched] REFUSED line, when a fresh stack
+would reach the TIB region or a fresh TIB the ceiling the host sets
+with set_tib_ceiling() (0 = unbounded, as before). Refs
+exsilium/3ds-d2#5.
+---
+ src/runtime/sched_cooperative.cpp | 22 ++++++++++++++++------
+ src/runtime/sched_cooperative.h   |  9 ++++++++-
+ 2 files changed, 24 insertions(+), 7 deletions(-)
+
+diff --git a/src/runtime/sched_cooperative.cpp b/src/runtime/sched_cooperative.cpp
+index 36fa142..8267e7b 100644
+--- a/src/runtime/sched_cooperative.cpp
++++ b/src/runtime/sched_cooperative.cpp
+@@ -90,14 +90,24 @@ GuestThread* CooperativeScheduler::create_thread(uint32_t entry, uint32_t param,
+             cpu_->write(sbase + o, z.data(), (ssize - o) > (uint32_t)z.size() ? (uint32_t)z.size() : (ssize - o));
+         if (tib) cpu_->write(tib, z.data(), 0x1000);
+     } else {
+-        sbase = stack_next_; stack_next_ += ssize + 0x10000;
+-        if (tib_region_ && stack_next_ > tib_region_ && !stack_overrun_warned_) {
+-            stack_overrun_warned_ = true;
+-            std::fprintf(stderr, "[sched] WARNING worker stacks (%u threads) reached the TIB region 0x%08x — long-session overrun risk\n",
+-                         next_id_, tib_region_);
+-            char m[128]; std::snprintf(m, sizeof m, "SCHED: %u threads, worker stacks reached TIB 0x%08x (overrun risk)", next_id_, tib_region_);
++        // A fresh stack must end below the TIBs, and a fresh TIB below the
++        // ceiling (the heap, on the 3DS layouts): past either, the thread's
++        // stack or TEB writes (SEH frames, LastError, TLS) would land in
++        // memory another owner uses — silent corruption, the class of fault
++        // behind issue #5. Refuse the thread instead, loudly.
++        const bool stack_over = tib_region_ && stack_next_ + ssize > tib_region_;
++        const bool tib_over = tib_ceiling_ && tib_next_ + 0x1000 > tib_ceiling_;
++        if (stack_over || tib_over) {
++            std::fprintf(stderr, "[sched] REFUSED thread %u (entry 0x%08x, stack 0x%x): %s full "
++                         "(stacks next 0x%08x, TIB region 0x%08x, TIBs next 0x%08x, ceiling 0x%08x)\n",
++                         t->id, entry, ssize, stack_over ? "worker stack region" : "TIB region",
++                         stack_next_, tib_region_, tib_next_, tib_ceiling_);
++            char m[128]; std::snprintf(m, sizeof m, "SCHED: thread %u refused, %s full", t->id,
++                                       stack_over ? "stack region" : "TIB region");
+             wx86_vita_progress_c(m);
++            return nullptr;
+         }
++        sbase = stack_next_; stack_next_ += ssize + 0x10000;
+         cpu_->map(sbase, ssize, nullptr, P_RW);
+     }
+     t->stack_base = sbase; t->stack_top = sbase + ssize;
+diff --git a/src/runtime/sched_cooperative.h b/src/runtime/sched_cooperative.h
+index cf57523..b754d69 100644
+--- a/src/runtime/sched_cooperative.h
++++ b/src/runtime/sched_cooperative.h
+@@ -202,6 +202,10 @@ public:
+     // to isolate whether a bug is triggered by WAIT_TIMEOUT deliveries.
+     void set_real_expire(bool on) { real_expire_ = on; }
+     void set_defer_towake(bool on) { defer_towake_ = on; }   // see D2_TOWAKE_DEFER above
++    // A thread whose fresh stack would reach the TIB region, or whose fresh
++    // TIB would reach `va`, is refused (CreateThread fails) instead of
++    // overlapping live memory. 0 = unbounded (the default).
++    void set_tib_ceiling(uint32_t va) { tib_ceiling_ = va; }
+ 
+ private:
+     GuestThread* pick_ready();     // round-robin; also wakes satisfiable Blocked
+@@ -227,6 +231,9 @@ private:
+     Cpu* cpu_; Bridge* br_;
+     uint32_t stack_region_, stack_each_, stack_next_;
+     uint32_t tib_region_, tib_next_;
++    // First address above the TIB region that belongs to something else (the
++    // guest heap on the 3DS layouts); 0 = unbounded. See set_tib_ceiling.
++    uint32_t tib_ceiling_ = 0;
+     std::vector<std::unique_ptr<GuestThread>> threads_;
+     // Stable flat view for cross-thread readers (the Vita watchdog).
+     static constexpr uint32_t kFlatMax = 128;
+@@ -242,7 +249,7 @@ private:
+     uint32_t quantum_ = 300000;   // instructions per slice before preemption
+     bool preempted_ = false;
+     bool hook_installed_ = false;
+-    bool stack_overrun_warned_ = false;   // one-shot worker-stack overrun warning
++    bool stack_overrun_warned_ = false;   // unused since stacks past the TIBs are refused (create_thread)
+     uint32_t virt_tick_us_ = 0, virt_us_acc_ = 0;                // set_virtual_tick_us
+     uint64_t virt_ms_ = 0;                                // virtual clock for timed waits
+     std::function<void(uint64_t)> time_sink_;             // fires when virt_ms_ advances

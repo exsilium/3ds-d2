@@ -178,6 +178,14 @@ MemoryReport memory_report();
 // range is outside the guest span or the runtime is not running.
 bool guest_read(uint32_t va, void *out, uint32_t n);
 
+// A host CPU exception's guest picture, for the console's exception handler:
+// the guest block and registers when the fault is in translated code, who
+// owns the fault address and each register's target, every guest thread,
+// memory use and a call-stack hint. `r` = host r0-r15, `far` = the fault
+// address. Writes through `line`; reads guest memory directly, takes no
+// lock and allocates once (the module list).
+void crash_report(const uint32_t r[16], uint32_t far, void (*line)(const char *));
+
 // `exe` is taken by value (move it in): its bytes are freed as soon as the
 // image is loaded, and the loader's own host copy once it is linked.
 RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt);

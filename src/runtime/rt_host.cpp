@@ -32,6 +32,7 @@ size_t d2rt_box86_custommalloc_kb(void);
 size_t d2rt_box86_jmptbl_kb(void);
 int dyn86_intrin_report(char *out, unsigned cap);   // translation-time intrinsics: calls and served
 extern int dyn86_intrin_n;
+int dyn86_block_of_native(uintptr_t pc, uint32_t *x86_addr, uint32_t *x86_size);   // fault reports
 // The console's cache maintenance per translated block (mman_ctr.c). Weak:
 // the Linux lanes have no such counters.
 extern uint32_t dyn86_ctr_cache_syncs __attribute__((weak));
@@ -110,6 +111,133 @@ bool guest_read(uint32_t va, void *out, uint32_t n)
     if (!g_br || !g_opt.layout || (uint64_t)va + n > g_opt.layout->span || va < 0x10000)
         return false;
     return g_br->cpu()->read(va, out, n);
+}
+
+// ---- host fault report (issue #5) ---------------------------------------------------
+
+namespace {
+
+// What owns guest address `va`: a heap or VirtualAlloc block, a module, or a
+// guest thread's stack. Into `buf`; "-" when nothing does.
+using Modules = std::vector<std::pair<uint32_t, uint32_t>>;
+
+const char *owner_of(uint32_t va, const Modules &mods, char *buf, size_t cap)
+{
+    if (const uint32_t b = g_heap.block_of(va)) {
+        std::snprintf(buf, cap, "heap block %08x+%x of %x", b, va - b, g_heap.size_of(b));
+        return buf;
+    }
+    if (const uint32_t b = g_va.block_of(va)) {
+        std::snprintf(buf, cap, "VirtualAlloc block %08x+%x of %x", b, va - b, g_va.size_of(b));
+        return buf;
+    }
+    for (const auto &m : mods)
+        if (va >= m.first && va - m.first < m.second) {
+            std::snprintf(buf, cap, "module %08x+%x", m.first, va - m.first);
+            return buf;
+        }
+    if (g_sched)
+        for (const auto &t : g_sched->threads())
+            if (t->stack_top && va >= t->stack_base && va < t->stack_top) {
+                std::snprintf(buf, cap, "stack of thread %u", t->id);
+                return buf;
+            }
+    std::snprintf(buf, cap, "-");
+    return buf;
+}
+
+}  // namespace
+
+void crash_report(const uint32_t r[16], uint32_t far, void (*line)(const char *))
+{
+    char s[256], o[96];
+    if (!g_br || !g_opt.layout) {
+        line("crash: no guest running");
+        return;
+    }
+    const Layout &L = *g_opt.layout;
+    Cpu *cpu = g_br->cpu();
+    const Modules mods = g_br->loaded_modules();   // once: the only allocation here
+    const uintptr_t membase = (uintptr_t)cpu->hostptr(L.heap_base, 1) - L.heap_base;
+    // Guest address of a host address, or ~0 outside the arena.
+    const auto guest = [&](uintptr_t host) -> uint32_t {
+        return host >= membase && host - membase < L.span ? (uint32_t)(host - membase) : 0xFFFFFFFFu;
+    };
+    const auto mapped = [&](uint32_t va, uint32_t n) { return va >= 0x10000 && (uint64_t)va + n <= L.span; };
+    const auto word = [&](uint32_t va) {
+        uint32_t v;
+        std::memcpy(&v, (const void *)(membase + va), 4);
+        return v;
+    };
+
+    uint32_t bx = 0, bsize = 0;
+    const bool jit = dyn86_block_of_native(r[15], &bx, &bsize) != 0;
+    if (jit) {
+        // Box86's ARM mapping: r4-r11 = EAX ECX EDX EBX ESP EBP ESI EDI, r14 = the
+        // last EIP the block stored (its start, or the target of a call).
+        std::snprintf(s, sizeof s, "crash: in translated guest code, block %08x (%u x86 bytes), xEIP %08x", bx, bsize,
+                      r[14]);
+        line(s);
+        std::snprintf(s, sizeof s, "crash: EAX %08x ECX %08x EDX %08x EBX %08x ESP %08x EBP %08x ESI %08x EDI %08x",
+                      r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11]);
+        line(s);
+    } else {
+        line("crash: not in translated code (host code: symbolize pc and lr against the ELF)");
+    }
+    const uint32_t gfar = guest(far);
+    if (gfar != 0xFFFFFFFFu) {
+        std::snprintf(s, sizeof s, "crash: fault address = guest %08x (%s)", gfar, owner_of(gfar, mods, o, sizeof o));
+        line(s);
+    }
+    if (g_sched)
+        if (GuestThread *t = g_sched->current()) {
+            std::snprintf(s, sizeof s, "crash: guest thread %u, entry %08x, stack %08x-%08x, TEB %08x", t->id, t->entry,
+                          t->stack_base, t->stack_top, t->tib);
+            line(s);
+        }
+
+    // Each guest register that points into guest memory: who owns it, and the
+    // 16 bytes there (a corrupted object shows up next to its neighbours).
+    static const char *const kNames[8] = {"EAX", "ECX", "EDX", "EBX", "ESP", "EBP", "ESI", "EDI"};
+    for (int i = 0; jit && i < 8; i++) {
+        const uint32_t v = r[4 + i];
+        if (!mapped(v, 16))
+            continue;
+        std::snprintf(s, sizeof s, "crash: %s -> %s: %08x %08x %08x %08x", kNames[i], owner_of(v, mods, o, sizeof o),
+                      word(v), word(v + 4), word(v + 8), word(v + 12));
+        line(s);
+    }
+
+    // Memory pressure, and every guest thread with its stack and TEB (a stack
+    // or TEB past its region overlaps the heap: see the scheduler's REFUSED).
+    std::snprintf(s, sizeof s, "crash: heap %u KiB (peak %u), VirtualAlloc %u KiB (peak %u), pool largest free %u KiB",
+                  g_heap.cur() >> 10, g_heap.peak() >> 10, g_va.cur() >> 10, g_va.peak() >> 10,
+                  g_va.largest_free() >> 10);
+    line(s);
+    if (g_sched)
+        for (const auto &t : g_sched->threads()) {
+            std::snprintf(s, sizeof s, "crash: thread %u entry %08x state %d stack %08x-%08x TEB %08x", t->id, t->entry,
+                          (int)t->state, t->stack_base, t->stack_top, t->tib);
+            line(s);
+        }
+
+    // Guest call-stack hint: words on the guest stack that point into a module.
+    if (jit && mapped(r[8], 4)) {
+        uint32_t top = r[8] + 0x200;
+        if (g_sched)
+            if (GuestThread *t = g_sched->current())
+                if (t->stack_top && r[8] >= t->stack_base && r[8] < t->stack_top)
+                    top = std::min(top, t->stack_top);
+        for (uint32_t a = r[8]; a + 4 <= top && mapped(a, 4); a += 4) {
+            const uint32_t v = word(a);
+            for (const auto &m : mods)
+                if (v >= m.first && v - m.first < m.second) {
+                    std::snprintf(s, sizeof s, "crash: [esp+%03x] %08x", a - r[8], v);
+                    line(s);
+                    break;
+                }
+        }
+    }
 }
 
 uint32_t native_entry(const char *name, uint32_t stack_args, std::function<uint32_t(Cpu &)> fn)
@@ -627,6 +755,17 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
          img->entry_va(), res.unresolved_imports);
 
     CooperativeScheduler sched(cpu, br.get(), L.worker_stacks, L.worker_stack, L.worker_tibs);
+    // The worker TEBs grow up from worker_tibs: stop them at the next region
+    // of the layout (the heap, on the 3DS) instead of letting the 17th
+    // thread's TEB land in it. Issue #5.
+    {
+        uint32_t ceiling = L.span;
+        for (const uint32_t b : {L.dll_base, L.heap_base, L.va_base, L.scratch_base, L.peb, L.main_tib,
+                                 L.worker_stacks, L.main_stack, L.trap_base})
+            if (b > L.worker_tibs && b < ceiling)
+                ceiling = b;
+        sched.set_tib_ceiling(ceiling);
+    }
     g_sched = &sched;
     if (opt.real_clock && opt.sleep_ms)
         sched.set_real_clock([] { return wx86_now_ms() - g_t0_ms; }, opt.sleep_ms);

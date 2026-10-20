@@ -63,6 +63,7 @@ Logs are on the SD card in `3ds/3ds-d2/logs/`: `game.log` for the runtime, and `
   ```
 
   It prints the registers and the source line of the PC, the LR and every stack word that points into the app.
+- **The guest side of the same crash.** Before Luma3DS takes over, the app's own exception handler writes `crash:` lines to `logs/game.log`. When the fault is in translated code, these give the guest block and its x86 registers, what owns the fault address and each register's target (heap or VirtualAlloc block, module, thread stack), with the 16 bytes there, every guest thread with its stack and TEB, memory use, and return addresses on the guest stack. Attach `game.log` together with the dump. A `[sched] REFUSED thread` line in `stderr.txt` means the game asked for more threads than the worker stack or TEB regions hold. Before this check, such a thread silently overlapped the heap.
 
 - **Startup report.** The first log lines show how the startup went, both on the bottom screen and in `3ds/3ds-d2/logs/game.log`. For example:
 

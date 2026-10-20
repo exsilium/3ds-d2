@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Exile <exile@chamber.ee>
+Date: Tue, 20 Oct 2026 08:26:16 +0300
+Subject: [PATCH] VirtualFree: MEM_RELEASE drops the block's pages from the
+ decommitted set
+
+Pages decommitted and then released stayed in the set. A later
+reservation over them (or, with the shared heap/VirtualAlloc pool, a
+block that the heap face hands out) would have live data zeroed by the
+next commit that touches them. Refs exsilium/3ds-d2#5.
+---
+ src/runtime/win32_shims_memory.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/runtime/win32_shims_memory.cpp b/src/runtime/win32_shims_memory.cpp
+index b4dd490..36868b5 100644
+--- a/src/runtime/win32_shims_memory.cpp
++++ b/src/runtime/win32_shims_memory.cpp
+@@ -103,6 +103,10 @@ void win32_shims_memory_install(Bridge& br, const Wx86MemoryPlan& plan){
+     K("VirtualFree",3,[](Cpu&c){ uint32_t a=c.arg(0),sz=c.arg(1),ft=c.arg(2);
+         if(ft&0x8000u){ uint32_t blk=g_plan.va->block_of(a)?g_plan.va->block_of(a):a;  // MEM_RELEASE
+             uint32_t bs=g_plan.va->size_of(blk);
++            // The released pages are no longer "decommitted": they leave the
++            // set, or a later reservation over them (or, with a shared pool,
++            // a heap block) would have live data zeroed by its next commit.
++            if(bs) g_decommitted.erase(g_decommitted.lower_bound(blk), g_decommitted.lower_bound(blk+bs));
+             if(g_plan.va->free(blk)) note(WX86_MEM_VA_RELEASE,&c,blk,bs,ft);
+             else { uint32_t ra=c.read_u32(c.reg(R_ESP));         // a LOST free = arena leak
+                 note(WX86_MEM_VA_RELEASE_MISS,&c,a,bs,ft,0,ra); }

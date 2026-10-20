@@ -817,27 +817,76 @@ void save_settings()
 // game pumps no messages (loading a level), not only from the pump (poll);
 // before, a press during a load waited for the load to end. False: the HOME
 // menu's "close", or the system shutting down.
+u32 g_apt_thread = 0;   // the thread in aptMainLoop (the game's)
+bool g_storage_closed = false;
+void open_storage();
+
 bool apt_service()
 {
+    svcGetThreadId(&g_apt_thread, CUR_THREAD_HANDLE);
     if (aptMainLoop())
         return true;
+    if (g_storage_closed)
+        open_storage();   // closed from the HOME menu: the game may still write on its way out
     rt::request_exit(0);
     return false;
+}
+
+// The app's storage while the HOME menu has the system (issue #6: the HOME
+// menu stopped itself when it could not open its own extdata while 3ds-d2
+// ran; why is not known, so the app keeps nothing open meanwhile): the
+// game's files, the log, the RomFS and the SD card's archive are closed on
+// the way out and opened again on the way back.
+bool g_romfs = false;          // the CIA's RomFS is mounted
+std::string g_log_path;
+
+void close_storage()
+{
+    rt::suspend_files();
+    if (FILE *f = g_log) {
+        g_log = nullptr;
+        std::fclose(f);
+    }
+    if (g_romfs)
+        romfsExit();
+    archiveUnmount("sdmc");
+    g_storage_closed = true;
+}
+
+void open_storage()
+{
+    g_storage_closed = false;
+    archiveMountSdmc();
+    if (g_romfs)
+        g_romfs = R_SUCCEEDED(romfsInit());
+    if (!g_log_path.empty())
+        g_log = std::fopen(g_log_path.c_str(), "a");
+    rt::resume_files();
 }
 
 // Leaving for the HOME menu or sleep: libctru then hands the screens over
 // (capture, GPU right). A frame the drawing thread is still presenting would
 // land in the middle of that; wait for it. No new one starts meanwhile: only
 // this thread (present) starts them, and it is the one in aptMainLoop.
+// For the HOME menu, then, the storage is closed until the return. Only on
+// the game's thread inside aptMainLoop, where no guest code runs (a sleep
+// may be announced on libctru's own APT thread while the game runs on).
 aptHookCookie g_apt_cookie;
 void apt_hook(APT_HookType type, void *)
 {
+    u32 thread = 0;
+    svcGetThreadId(&thread, CUR_THREAD_HANDLE);
+    const bool game_thread = thread == g_apt_thread;
     if (type == APTHOOK_ONRESTORE || type == APTHOOK_ONWAKEUP)
         g_ss.invalidate();   // the HOME menu or sleep drew over the bottom screen
+    if (type == APTHOOK_ONRESTORE && g_storage_closed && game_thread)
+        open_storage();
     if (type != APTHOOK_ONSUSPEND && type != APTHOOK_ONSLEEP)
         return;
     while (__atomic_load_n(&g_render_busy, __ATOMIC_ACQUIRE))
         svcSleepThread(1000000);
+    if (type == APTHOOK_ONSUSPEND && game_thread && !g_storage_closed)
+        close_storage();
 }
 
 void poll()
@@ -1005,7 +1054,8 @@ int main()
     mkdir(kRoot, 0777);
     mkdir(kSaveDir, 0777);
     mkdir(kLogDir, 0777);
-    g_log = std::fopen((std::string(kLogDir) + "/game.log").c_str(), "w");
+    g_log_path = std::string(kLogDir) + "/game.log";
+    g_log = std::fopen(g_log_path.c_str(), "w");
     std::freopen((std::string(kLogDir) + "/stderr.txt").c_str(), "w", stderr);
     // The main thread's handler is the default for the others; the guest runs here.
     threadOnException(on_cpu_exception, g_exc_stack + sizeof g_exc_stack, WRITE_DATA_TO_HANDLER_STACK);
@@ -1022,7 +1072,8 @@ int main()
     // Game files: the CIA's RomFS if it has them, else the SD card.
     std::string game_dir = kGameDir;
     std::vector<uint8_t> exe;
-    if (R_SUCCEEDED(romfsInit()) && read_file(std::string(kRomfsGameDir) + "/Game.exe", exe))
+    g_romfs = R_SUCCEEDED(romfsInit());
+    if (g_romfs && read_file(std::string(kRomfsGameDir) + "/Game.exe", exe))
         game_dir = kRomfsGameDir;
     status("app memory %u KiB, game files: %s",
            (unsigned)(osGetMemRegionSize(MEMREGION_APPLICATION) >> 10), game_dir.c_str());

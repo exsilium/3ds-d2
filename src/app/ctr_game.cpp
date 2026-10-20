@@ -241,6 +241,69 @@ void logline(const char *s)
     }
 }
 
+// ---- CPU exceptions (issue #5) --------------------------------------------------------
+//
+// A guest memory fault in translated code ends the app with a Luma3DS dump of
+// host registers only: the guest thread, block and registers have to be
+// worked out from the ELF and Game.exe by hand, and what the faulting
+// registers pointed at is lost. This handler writes that guest picture to
+// game.log (rt::crash_report), then hands the fault back: it removes itself
+// and re-runs the faulting instruction, so Luma3DS still shows its screen
+// and saves its usual dump of the same fault.
+
+alignas(8) uint8_t g_exc_stack[0x8000];
+
+// Resumes at frame[13] with r0-r12 = frame[0..12], sp = frame + 14, the
+// condition flags of `cpsr` and lr = `lr` (user mode cannot set the rest).
+__attribute__((naked, noreturn)) void resume_regs(uint32_t *frame, uint32_t cpsr, uint32_t lr)
+{
+    asm volatile("msr cpsr_f, r1\n\t"
+                 "mov lr, r2\n\t"
+                 "mov sp, r0\n\t"
+                 "ldmia sp!, {r0-r12, pc}\n\t");
+}
+
+void on_cpu_exception(ERRF_ExceptionInfo *e, CpuRegisters *regs)
+{
+    // Once only: a second exception (in this report, or the re-run fault on a
+    // thread that falls back to the main thread's handler) ends the app.
+    static volatile int entered = 0;
+    if (entered++)
+        svcBreak(USERBREAK_PANIC);
+    static const char *const kType[] = {"prefetch abort", "data abort", "undefined instruction", "VFP exception"};
+    char s[200];
+    std::snprintf(s, sizeof s, "crash: %s at pc %08lx, fsr %08lx, far %08lx, lr %08lx, sp %08lx, cpsr %08lx",
+                  e->type <= ERRF_EXCEPTION_VFP ? kType[e->type] : "exception", (unsigned long)regs->pc,
+                  (unsigned long)e->fsr, (unsigned long)e->far, (unsigned long)regs->lr, (unsigned long)regs->sp,
+                  (unsigned long)regs->cpsr);
+    logline(s);
+    std::snprintf(s, sizeof s, "crash: r0-r12 %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx",
+                  (unsigned long)regs->r[0], (unsigned long)regs->r[1], (unsigned long)regs->r[2],
+                  (unsigned long)regs->r[3], (unsigned long)regs->r[4], (unsigned long)regs->r[5],
+                  (unsigned long)regs->r[6], (unsigned long)regs->r[7], (unsigned long)regs->r[8],
+                  (unsigned long)regs->r[9], (unsigned long)regs->r[10], (unsigned long)regs->r[11],
+                  (unsigned long)regs->r[12]);
+    logline(s);
+    uint32_t r[16];
+    for (int i = 0; i < 13; i++)
+        r[i] = regs->r[i];
+    r[13] = regs->sp;
+    r[14] = regs->lr;
+    r[15] = regs->pc;
+    rt::crash_report(r, e->far, logline);
+    logline("crash: handing the fault to Luma3DS (luma/dumps/arm11)");
+
+    // From here the fault is fatal again: no handler, the same instruction.
+    threadOnException(nullptr, nullptr, nullptr);
+    if (e->type == ERRF_EXCEPTION_VFP)
+        __builtin_trap();
+    uint32_t *frame = reinterpret_cast<uint32_t *>(regs->sp - 14 * 4);
+    for (int i = 0; i < 13; i++)
+        frame[i] = regs->r[i];
+    frame[13] = regs->pc | ((regs->cpsr & 0x20) ? 1u : 0u);   // Thumb state: interworking load
+    resume_regs(frame, regs->cpsr, regs->lr);
+}
+
 void status(const char *fmt, ...)
 {
     char buf[256];
@@ -819,6 +882,8 @@ int main()
     mkdir(kLogDir, 0777);
     g_log = std::fopen((std::string(kLogDir) + "/game.log").c_str(), "w");
     std::freopen((std::string(kLogDir) + "/stderr.txt").c_str(), "w", stderr);
+    // The main thread's handler is the default for the others; the guest runs here.
+    threadOnException(on_cpu_exception, g_exc_stack + sizeof g_exc_stack, WRITE_DATA_TO_HANDLER_STACK);
     status("3ds-d2: Diablo II on the 3DS");
     status("heap %u KiB at %08lx, linear %u KiB, app memory %u KiB", (unsigned)(__ctru_heap_size >> 10),
            (unsigned long)__ctru_heap, (unsigned)(__ctru_linear_heap_size >> 10),

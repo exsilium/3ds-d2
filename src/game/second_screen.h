@@ -2,8 +2,10 @@
 // 320x222 area that shows one of
 //   MAP    the automap (automap.h), centred on the player and following
 //          them smoothly; tapping MAP again switches 1:1 <-> half size, as
-//          does the size button under the map; the other button there sets
-//          how often the crosses and names of others are refreshed
+//          does the size button under the map; the next one sets how often
+//          the crosses and names of others are refreshed; the corner one (?)
+//          shows HELP instead: the controls, with MAP in the corner to go
+//          back (before the game too)
 //   KEYS   touch buttons for the game's hotkeys (skills F1-F8, panels, run,
 //          weapon swap, show items, chat, close all)
 //   ZOOM   the frame at 1:1 around the cursor, readable text; touch points
@@ -45,7 +47,7 @@ bool bottom_tab_from_name(const char *s, BottomTab &t);
 
 // Everything the bottom screen draws, taken on the game thread.
 struct BottomView {
-    enum Kind : uint8_t { kNone, kMap, kKeys, kViewport, kInfo, kKeyboard };
+    enum Kind : uint8_t { kNone, kMap, kHelp, kKeys, kViewport, kInfo, kKeyboard };
     struct Line {
         std::string text;
         uint16_t color;   // RGB565
@@ -87,13 +89,18 @@ public:
     uint32_t map_ms() const { return map_ms_; }
     void set_map_ms(uint32_t ms);
     static constexpr uint32_t kMapMs[] = {250, 500, 1000, 2000, 5000};
-    // MAP's buttons, in the strip under the map: size and refresh.
+    // Whether the MAP tab shows the controls (HELP) instead of the map.
+    bool map_help() const { return help_; }
+    void set_map_help(bool on);
+    // MAP's buttons, in the strip under the map: refresh, size, and in the
+    // corner HELP (? / MAP).
     static constexpr int kMapBtnY = kHeight - 16, kMapBtnH = 16;
-    static constexpr int kScaleBtnX = 264, kScaleBtnW = 56, kMsBtnX = 176, kMsBtnW = 84;
+    static constexpr int kMsBtnX = 136, kMsBtnW = 84, kScaleBtnX = 224, kScaleBtnW = 56;
+    static constexpr int kHelpBtnX = 284, kHelpBtnW = 36;
     bool take_settings_changed() { bool r = settings_changed_; settings_changed_ = false; return r; }
     // The buttons' shortcuts (Select + D-pad): the next or previous tab
     // along the bar (PANEL too while a panel is open), MAP, and MAP's size
-    // (showing MAP). Not while the keyboard is open.
+    // (both showing the map, not HELP). Not while the keyboard is open.
     void step_tab(int dir);
     void show_map();
     void switch_map_size();
@@ -109,7 +116,7 @@ public:
     // Draw everything again at the next stage (the screen was taken away:
     // HOME menu, sleep).
     void invalidate() { dirty_ = true; }
-    // Whether the automap capture is wanted (MAP shown in the game world).
+    // Whether the automap capture is wanted (the map shown in the game world).
     bool wants_automap() const;
 
     // The keyboard (osk.h), while it is open, replaces everything.
@@ -131,6 +138,7 @@ private:
     void follow_cursor();
 
     BottomTab tab_ = BottomTab::Map;
+    bool help_ = false;
     int map_scale_ = 1;
     uint32_t map_ms_ = 500;
     bool settings_changed_ = false;

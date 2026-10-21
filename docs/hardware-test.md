@@ -10,7 +10,7 @@ scripts/docker.sh package-cia --full ../3ds-d2-gamefiles/1.14d     # with every 
 
 The hardware build is `dist/cia/3ds-d2-<build-id>.cia`. It holds the app only and reads the game files from `sdmc:/3ds/3ds-d2/game/`, so a new build is a 2 MB install. The two bundled variants add `-slim` or `-full` to the name. A `.txt` next to each CIA lists its version, SHA-256 and the files inside. Every run checks the CIA's content, exheader and logo hashes with `ctrtool`, the same hashes the console's AM checks at the end of an install.
 
-The build ID is a hash of everything that goes into the CIA: `src/`, the build rules, the CPU backend's patch series and the packaging (`scripts/package-cia.sh`, `packaging/cia/`). The title version (`version=` in `scripts/package-cia.sh`, now 0.2.0) is what FBI and the HOME menu show.
+The build ID is a hash of everything that goes into the CIA: `src/`, the build rules, the CPU backend's patch series and the packaging (`scripts/package-cia.sh`, `packaging/cia/`). The title version (`version=` in `scripts/package-cia.sh`, now 0.3.0) is what FBI and the HOME menu show.
 
 The game files on the SD card, once: copy `Game.exe` and the MPQs of your 1.14d install to `sdmc:/3ds/3ds-d2/game/`. `scripts/docker.sh sdcard-folder [--full] <game-dir>` prepares that folder in `dist/sdcard/3ds/3ds-d2/game/` (hard links, nothing copied). Copy `dist/sdcard/3ds` onto the SD card root. Sound needs the real music and speech archives, so use `--full` there (or copy the install as is).
 

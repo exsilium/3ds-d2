@@ -33,7 +33,15 @@ Either way works:
 - **Network install** (no copy of the CIA on the SD card): start FBI → *Remote Install* → *Receive URLs over the network*, then send the file from the Mac with FBI's `servefiles.py`.
 - **From the SD card:** copy the `.cia` to the SD card, then FBI → *SD* → select it → *Install CIA*. You can delete the `.cia` afterwards.
 
-The HOME menu shows a "3ds-d2" icon. Title ID `000400000D2D3D00`.
+The HOME menu shows the Lord of Destruction icon, and the top screen shows the title screen's burning logo, with the opening of the title music, when the title is selected. They are taken from your Game.exe, d2data.mpq, d2exp.mpq and d2xmusic.mpq when the CIA is packaged with a game directory (`scripts/docker.sh package-cia <game-dir>`). Without one, a drawn "3ds-d2" icon and a silent banner are used. `D2_BANNER` on `scripts/docker.sh package-cia <game-dir>` picks the banner:
+- `animated` (the default): the burning logo as a 3D banner model, with "Expansion Set / Lord of Destruction" and "v1.14d" under it, without a background and always facing the viewer.
+- `stack`: the same model without its animation, for diagnosis.
+- `still`: a single-frame model with no animation.
+- `static`: the first frame as bannertool's own still banner, with no model of ours.
+
+Two more settings adjust the model. `D2_BANNER_FRAMES` sets how many of the 30 frames `animated` and `stack` use: 3 by default, which is also the most the HOME menu takes animated. `D2_BANNER_TURN=1` billboards only the planes' parent, the layout first tested on hardware, so the HOME menu turns the banner.
+
+The HOME menu caches banners. Uninstall the title before installing a CIA with a different banner. A banner model the HOME menu cannot handle freezes it as soon as the title is selected, and only a forced power-off recovers. Our first animated banners did this, although an emulator showed them. The model is now built the way a banner tested on hardware is (see [architecture.md](architecture.md#9b-the-game-cia-new-3ds-extended-memory)). Title ID `000400000D2D3D00`.
 
 **FBI error 0xD8E0806A** ("Cert signature or hash check failed", AM 106) at the end of an install means the CIA AM read does not match what was built. The chain and hashes are checked at packaging time, so the copy is the suspect. Compare `shasum -a 256` of the file on the SD card with the `.txt`, and copy it again if they differ.
 

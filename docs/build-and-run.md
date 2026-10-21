@@ -19,7 +19,7 @@ scripts/docker.sh test m4 <game-dir> [guest-ms] [cmdline]   # the real Game.exe 
 # build/cpu/ctr/m3.3dsx (built with the CPU-lane apps) runs the same fixture in Azahar;
 # output: sdmc:/3ds/3ds-d2/m3/out.txt
 AZAHAR=/path/to/azahar scripts/run-game-azahar.sh [--install <dir with Game.exe + MPQs>]   # the game in Azahar (docs/controls.md)
-scripts/docker.sh package-cia      # the hardware build -> dist/cia/3ds-d2-<build-id>.cia (docs/hardware-test.md)
+scripts/docker.sh package-cia [<game-dir>]   # the hardware build -> dist/cia/3ds-d2-<build-id>.cia; <game-dir>: the game's icon, banner and tune (docs/hardware-test.md)
 tests/bink/compare.sh <game-dir>   # the Bink decoder against FFmpeg on every cinematic (host: ffmpeg, python3, c++)
 scripts/docker.sh package          # release build -> dist/<build-id>/ + SHA256SUMS + manifest.json
 scripts/docker.sh repro            # two clean builds from different paths must match

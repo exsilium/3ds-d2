@@ -1,5 +1,7 @@
 image toolchain devkitpro/devkitarm@sha256:116afba8df8453961de2936ffab20dd441edf4d682856c1ec8b0e53d7ed0bbf5
+image ctrtools toolchain
 image hosttest debian@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
+image banner debian@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
 platform linux/arm64
 gcc 16.1.0
 dkp 3ds-box2d 2.4.1-1

@@ -363,11 +363,12 @@ int main(int argc, char **argv)
             next_shot = next_shot < 15000 ? 15000 : next_shot < 30000 ? 30000 : next_shot + 30000;
         }
     };
-    // M4_BOTTOM=map|keys|zoom|info: the bottom screen's tab at the start.
+    // M4_BOTTOM=map|help|keys|zoom|info: the bottom screen's tab at the start.
     if (const char *t = std::getenv("M4_BOTTOM")) {
         game::BottomTab tab;
         if (game::bottom_tab_from_name(t, tab))
             second_screen.set_tab(tab);
+        second_screen.set_map_help(std::strcmp(t, "help") == 0);
     }
     static game::Autoplay autoplay;
     if (const char *sc = std::getenv("M4_SCRIPT"))

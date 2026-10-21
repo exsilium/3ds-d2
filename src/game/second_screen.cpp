@@ -42,6 +42,35 @@ const KeyButton kKeys[SecondScreen::kKeyCount] = {
 };
 constexpr int kKeyCols = 4, kKeyW = kW / kKeyCols, kKeyH = 44;
 
+// HELP: the controls (docs/controls.md), a button and what it does. The
+// font is code page 437: 0x18-0x1B are the arrows up, down, right, left.
+struct HelpRow {
+    const char *keys, *action;
+};
+const HelpRow kHelp[] = {
+    {"Circle pad", "walk; cursor in menus"},
+    {"C-stick", "move the cursor"},
+    {"A / B", "left / right mouse button"},
+    {"X / Y", "inventory / items (held)"},
+    {"L", "stand still (held)"},
+    {"D-pad", "belt potions 1-4"},
+    {"ZL / ZR", "weapon swap / automap"},
+    {"Start", "game menu, close panels"},
+    {"Select", "top: whole frame / 1:1 zoom"},
+    {"R+A / R+B", "character / skill tree"},
+    {"R+X / R+Y", "automap / quests"},
+    {"R+D-pad", "skill hotkeys F1-F4"},
+    {"R+Start", "Enter (confirm)"},
+    {"R+Select", "on-screen keyboard"},
+    {"L+R+Select", "screenshot to Camera album"},
+    {"Sel+\x1b/\x1a", "previous / next tab"},
+    {"Sel+\x18/\x19", "map / map size"},
+    {"Touch", "touchpad on MAP and INFO"},
+    {"Tap/hold", "L/R click in ZOOM and PANEL"},
+    {"A,B,Start", "skip a cinematic"},
+};
+constexpr int kHelpRowH = 10;
+
 // Panels: the UI table entries (d2_state.h) by the half of the frame they
 // cover at 640x480. Entries not listed draw nothing over the world.
 // Inventory 0x01, quest log 0x0F and game menu 0x09 were seen on the lane;
@@ -124,7 +153,7 @@ BottomView::Kind SecondScreen::shown_kind() const
     if (osk_ && osk_->is_open())
         return BottomView::kKeyboard;
     switch (shown_tab()) {
-    case BottomTab::Map: return BottomView::kMap;
+    case BottomTab::Map: return help_ ? BottomView::kHelp : BottomView::kMap;
     case BottomTab::Keys: return BottomView::kKeys;
     case BottomTab::Zoom:
     case BottomTab::Panel: return BottomView::kViewport;
@@ -156,6 +185,15 @@ void SecondScreen::show_map()
         return;
     panel_dismissed_ = panel_sides_ != 0;
     set_tab(BottomTab::Map);
+    set_map_help(false);
+    dirty_ = true;
+}
+
+void SecondScreen::set_map_help(bool on)
+{
+    if (on != help_)
+        settings_changed_ = true;
+    help_ = on;
     dirty_ = true;
 }
 
@@ -174,7 +212,7 @@ void SecondScreen::switch_map_size()
 {
     if (shown_kind() == BottomView::kKeyboard)
         return;
-    if (shown_tab() != BottomTab::Map)
+    if (shown_tab() != BottomTab::Map || help_)
         show_map();
     set_map_scale(map_scale_ == 1 ? 2 : 1);
     settings_changed_ = true;
@@ -191,10 +229,15 @@ void SecondScreen::set_map_ms(uint32_t ms)
     dirty_ = true;
 }
 
-// MAP's button under (x, y): 0 size, 1 refresh, -1 none.
-static int map_button(int x, int y)
+// MAP's button under (x, y): 0 size, 1 refresh, 2 HELP, -1 none. Size and
+// refresh are there only over the map in the game.
+static int map_button(int x, int y, bool map)
 {
     if (y < SecondScreen::kMapBtnY)
+        return -1;
+    if (x >= SecondScreen::kHelpBtnX && x < SecondScreen::kHelpBtnX + SecondScreen::kHelpBtnW)
+        return 2;
+    if (!map)
         return -1;
     if (x >= SecondScreen::kScaleBtnX && x < SecondScreen::kScaleBtnX + SecondScreen::kScaleBtnW)
         return 0;
@@ -269,7 +312,9 @@ void SecondScreen::tab_tapped(int x, Pad &pad)
     const BottomTab hit = (BottomTab)i;
     if (hit == shown_tab()) {
         // The shown tab again: its second function.
-        if (hit == BottomTab::Map) {
+        if (hit == BottomTab::Map && help_) {
+            set_map_help(false);   // HELP: back to the map
+        } else if (hit == BottomTab::Map) {
             set_map_scale(map_scale_ == 1 ? 2 : 1);
             settings_changed_ = true;
         } else if (hit == BottomTab::Panel && panel_sides_ == 3) {
@@ -328,9 +373,10 @@ void SecondScreen::update(Pad &pad, const GameState &gs, int cursor_x, int curso
                 dirty_ = true;
             } else if (kind == BottomView::kViewport && gs_.in_game) {
                 grip_ = Grip::Point;
-            } else if (kind == BottomView::kMap && map_button(pad.touch_x, pad.touch_y) >= 0) {
+            } else if ((kind == BottomView::kMap || kind == BottomView::kHelp) &&
+                       map_button(pad.touch_x, pad.touch_y, kind == BottomView::kMap && gs_.in_game) >= 0) {
                 grip_ = Grip::MapButton;
-                key_ = map_button(pad.touch_x, pad.touch_y);
+                key_ = map_button(pad.touch_x, pad.touch_y, kind == BottomView::kMap && gs_.in_game);
             } else {
                 grip_ = Grip::Pad;
             }
@@ -374,8 +420,11 @@ void SecondScreen::update(Pad &pad, const GameState &gs, int cursor_x, int curso
         if (up && grip_ == Grip::Key)
             dirty_ = true;
         if (up && grip_ == Grip::MapButton && moved_ <= kTapSlop) {
-            // A tap: the size switches; the refresh steps through its choices.
-            if (key_ == 0) {
+            // A tap: the size switches; the refresh steps through its
+            // choices; the corner one switches between the map and HELP.
+            if (key_ == 2) {
+                set_map_help(!help_);
+            } else if (key_ == 0) {
                 set_map_scale(map_scale_ == 1 ? 2 : 1);
             } else {
                 size_t i = 0;
@@ -460,6 +509,8 @@ bool SecondScreen::stage(BottomView &v, uint64_t now_ms)
             v.note = "Drawing the map...";
         break;
     }
+    case BottomView::kHelp:
+        break;   // nothing changes: drawn when shown
     case BottomView::kKeys: {
         uint32_t lit = 0;
         if (grip_ == Grip::Key && key_ >= 0)
@@ -564,11 +615,21 @@ void draw_bar(const Canvas &cv, const BottomView &v)
         const int x = i * w;
         if (on)
             cv.fill(x + 1, 1, w - 2, kBarH - 3, kGold);
-        cv.centred(x, 5, w, kNames[i], on ? kBg : kBarText);
+        const char *name = i == 0 && v.kind == BottomView::kHelp ? "HELP" : kNames[i];
+        cv.centred(x, 5, w, name, on ? kBg : kBarText);
         if (i)
             cv.fill(x, 3, 1, kBarH - 7, kHint);
     }
     cv.fill(0, kBarH - 1, kW, 1, kHint);
+}
+
+// A button in the strip under the map.
+void draw_map_button(const Canvas &cv, int x, int w, const char *label)
+{
+    const int y = SecondScreen::kMapBtnY, h = SecondScreen::kMapBtnH;
+    cv.fill(x + 1, y + 1, w - 2, h - 2, kBarBg);
+    cv.fill(x + 1, y, w - 2, 1, kHint);
+    cv.centred(x, y + 4, w, label, kBarText);
 }
 
 }  // namespace
@@ -599,6 +660,7 @@ void draw_bottom(uint16_t *fb, const BottomView &v, const uint8_t *frame, int fw
         if (v.map.empty()) {
             cv.fill(0, kBarH, kW, kAreaH, kBg);
             cv.centred(0, kBarH + kAreaH / 2 - 4, kW, v.note.c_str(), kBarText);
+            draw_map_button(cv, SecondScreen::kHelpBtnX, SecondScreen::kHelpBtnW, "?");
             break;
         }
         for (int x = 0; x < kW; x++) {
@@ -614,18 +676,22 @@ void draw_bottom(uint16_t *fb, const BottomView &v, const uint8_t *frame, int fw
                 std::snprintf(ms, sizeof ms, "mark .%us", (unsigned)(v.map_ms % 100 ? v.map_ms / 10 : v.map_ms / 100));
             else
                 std::snprintf(ms, sizeof ms, "mark %us", (unsigned)(v.map_ms / 1000));
-            const int y = SecondScreen::kMapBtnY, h = SecondScreen::kMapBtnH;
-            const struct { int x, w; const char *label; } kButtons[] = {
-                {SecondScreen::kMsBtnX, SecondScreen::kMsBtnW, ms},
-                {SecondScreen::kScaleBtnX, SecondScreen::kScaleBtnW, v.map_scale == 1 ? "x1" : "x1/2"},
-            };
-            for (const auto &b : kButtons) {
-                cv.fill(b.x + 1, y + 1, b.w - 2, h - 2, kBarBg);
-                cv.fill(b.x + 1, y, b.w - 2, 1, kHint);
-                cv.centred(b.x, y + 4, b.w, b.label, kBarText);
-            }
+            draw_map_button(cv, SecondScreen::kMsBtnX, SecondScreen::kMsBtnW, ms);
+            draw_map_button(cv, SecondScreen::kScaleBtnX, SecondScreen::kScaleBtnW, v.map_scale == 1 ? "x1" : "x1/2");
+            draw_map_button(cv, SecondScreen::kHelpBtnX, SecondScreen::kHelpBtnW, "?");
         }
         break;
+    case BottomView::kHelp: {
+        cv.fill(0, kBarH, kW, kAreaH, kBg);
+        const int n = (int)(sizeof kHelp / sizeof kHelp[0]);
+        for (int i = 0; i < n; i++) {
+            const int y = kBarH + 4 + i * kHelpRowH;
+            cv.text(4, y, kHelp[i].keys, kGold);
+            cv.text(4 + 12 * 8, y, kHelp[i].action, rgb(230, 220, 200));
+        }
+        draw_map_button(cv, SecondScreen::kHelpBtnX, SecondScreen::kHelpBtnW, "MAP");
+        break;
+    }
     case BottomView::kKeys:
         cv.fill(0, kBarH, kW, kAreaH, kBg);
         for (int i = 0; i < SecondScreen::kKeyCount; i++) {

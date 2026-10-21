@@ -47,16 +47,17 @@ The mapping lives in `src/game/controls.cpp`. It follows the ideas D2Vita proved
 | Select + | Action |
 | --- | --- |
 | D-pad right / left | Next / previous tab along the bar (PANEL included while a panel is open), wrapping around |
-| D-pad up | MAP |
+| D-pad up | MAP (the map, also from HELP) |
 | D-pad down | Switches the map's size (x1 ↔ x1/2), showing MAP |
 
 ## Bottom screen
 
-`src/game/second_screen.cpp` draws the bottom screen and handles its touches. The tab bar is the top 18 pixels. Tap a tab to show it. Tap the tab that is already shown to use its second function. The chosen tab, the map size and the map's marker refresh are saved in `sdmc:/3ds/3ds-d2/settings.txt`.
+`src/game/second_screen.cpp` draws the bottom screen and handles its touches. The tab bar is the top 18 pixels. Tap a tab to show it. Tap the tab that is already shown to use its second function. The chosen tab, the map size, the map's marker refresh and whether MAP shows HELP are saved in `sdmc:/3ds/3ds-d2/settings.txt`.
 
 | Tab | Shows | Touch in the area |
 | --- | --- | --- |
-| MAP | The automap, centred on the player and scrolling with them, at 1:1 or half size. Two buttons under the map: the size (x1, x1/2; tapping MAP again also switches it) and how often the crosses and names of others are refreshed while you move (mark .25s, .5s, 1s, 2s, 5s). The game's own map on the top screen (Tab) is separate and stays off unless you turn it on. | Touchpad, except the two buttons |
+| MAP | The automap, centred on the player and scrolling with them, at 1:1 or half size. Three buttons under the map: how often the crosses and names of others are refreshed while you move (mark .25s, .5s, 1s, 2s, 5s), the size (x1, x1/2; tapping MAP again also switches it), and **?** in the corner. The game's own map on the top screen (Tab) is separate and stays off unless you turn it on. | Touchpad, except the buttons |
+| HELP | Shown in the MAP tab by **?**: the controls, one line per button or combination. The tab reads HELP and the corner button MAP; tapping either goes back to the map. **?** works before the game too, under "The map shows here in the game." On the first start (no `settings.txt` yet) the tab opens on HELP. | Touchpad, except the MAP button |
 | KEYS | 20 buttons: Skill 1–8 (F1–F8), Character, Inventory, Skills, Quests, Party, Merc, Map (Tab), Run/Walk, Swap (W), Items (Alt, latched: tap on, tap off), Chat (Enter), Close all (Space) | Presses the button: the key is held while you touch it |
 | ZOOM | The frame at 1:1 around the cursor: readable text and item details | Points at the game (below) |
 | INFO | The diagnostics: game time, fps, worst frame gap, draw time per frame, guest heap and VirtualAlloc use against their limits (with peaks), host heap, linear and application memory free, files and bytes read, then the latest runtime messages | Touchpad |
@@ -73,7 +74,7 @@ The panels are found from the UI table at `0x7A27C0` (see [Telling menus from th
 - **Tiles** (floors, walls, objects, extras): drawn by 3ds-d2 itself from the game's map data, every time the player moves a pixel, at the player's exact position, so the map scrolls smoothly. The level's map layer (`0x7A5164`) holds a binary tree of cells per kind, ordered by y; each cell names a frame of the map's DC6 cell file (`0x7A5168`) and a position in map pixels (world pixels / 10). The frames are decoded once and kept as runs of pixels. Drawn the way the game draws them (bottom-left corner at the cell's position plus the frame's offsets, opaque), they matched every pixel of a capture of the game's own map in the lane. The game draws the ground as single dots with black between; at 1:1 that turned each pixel on and off as the map moved, so the black around each lone dot takes its colour and the ground shows solid, as at half size. Drawing takes about 2 ms in Azahar, where the game's own map took about 16 ms, 15 of them for the tiles.
 - **Units** (the crosses and names of NPCs and other players, waypoint labels): captured from the game. Game.exe's UI pass draws the map with `0x45AD60` when `ui[0x0A]` (Tab) is set. That call site (`0x456F93`) now calls a small stub of guest code in the zero slack after `.text` (`0x6CB5B0`). When a capture is due, the stub runs only the game's map setup (`0x457520`) and units pass (`0x45AC90`, about 1 ms), with the map's offsets and unit bounds set so it draws around the player into a region at the frame's top-left corner, the size of the bottom map plus a margin. That part of the frame is copied aside and cleared to black first; every pixel drawn is kept, and the frame gets its copy back, so the top screen is unaffected. The player's own cross is left out (a filter in front of the per-unit function `0x45A860` skips the player while capturing) and drawn by 3ds-d2 at the centre, in the game's colour for it (`0x7A51B0`). Between captures the unit pixels move with the map. Captures come at the marker refresh set under the map while the player moves, every two seconds standing still (attacking in place included), and at once when MAP is shown, its size changes or the player nears the edge of the last capture. The stub calls the game's functions as ordinary guest code because the map's first draw in a level waits for the game's other threads, which a native `guest_call` cannot do.
 
-On the Linux lane, `M4_BOTTOM=map|keys|zoom|info` picks the starting tab. The script event `<ms> touch <x> <y> [ms]` touches the bottom screen, and each `shot` also saves the bottom screen as `b<ms>.png`.
+On the Linux lane, `M4_BOTTOM=map|help|keys|zoom|info` picks the starting tab. The script event `<ms> touch <x> <y> [ms]` touches the bottom screen, and each `shot` also saves the bottom screen as `b<ms>.png`.
 
 ## Screenshots
 

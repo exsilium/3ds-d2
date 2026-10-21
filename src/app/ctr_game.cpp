@@ -364,6 +364,9 @@ void console_again()
         u16 *fb = (u16 *)gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, nullptr, nullptr);
         g_stats_con.frameBuffer = g_log_con.frameBuffer = fb;
     }
+    // All of it: the consoles' clears left the bottom row of the second
+    // screen's last picture (MAP's corner button) showing.
+    std::memset(g_log_con.frameBuffer, 0, 320 * 240 * sizeof(u16));
     consoleSelect(&g_stats_con);
     consoleClear();
     consoleSelect(&g_log_con);
@@ -769,7 +772,8 @@ void present(const rt::Frame &f)
         st.shot = take_shot_request();
         if (!g_ss_active) {
             g_ss_active = true;   // the game's first frame: the bottom screen is the second screen's from now on
-            status("bottom screen: %s tab (tap the tabs to change)", game::bottom_tab_name(g_ss.tab()));
+            status("bottom screen: %s tab (tap the tabs to change)",
+               g_ss.tab() == game::BottomTab::Map && g_ss.map_help() ? "help" : game::bottom_tab_name(g_ss.tab()));
         }
         st.bottom_draw = g_ss.stage(st.bottom, rt::now_ms());
         if (st.bottom.kind == game::BottomView::kKeyboard)
@@ -796,8 +800,11 @@ uint32_t g_last_focus = 0;           // the last focused edit box seen (auto-ope
 void load_settings()
 {
     FILE *f = std::fopen(kSettings, "r");
-    if (!f)
+    if (!f) {
+        g_ss.set_map_help(true);   // the first start: the controls (HELP), until the corner button is tapped
+        g_ss.take_settings_changed();
         return;
+    }
     char line[64], value[32];
     while (std::fgets(line, sizeof line, f)) {
         game::BottomTab tab;
@@ -807,6 +814,8 @@ void load_settings()
             g_ss.set_map_scale(std::atoi(value));
         else if (std::sscanf(line, "mapms=%31s", value) == 1)
             g_ss.set_map_ms((uint32_t)std::atoi(value));
+        else if (std::sscanf(line, "maphelp=%31s", value) == 1)
+            g_ss.set_map_help(std::atoi(value) != 0);
     }
     std::fclose(f);
     g_ss.take_settings_changed();
@@ -815,8 +824,8 @@ void load_settings()
 void save_settings()
 {
     if (FILE *f = std::fopen(kSettings, "w")) {
-        std::fprintf(f, "bottom=%s\nmapscale=%d\nmapms=%u\n", game::bottom_tab_name(g_ss.tab()), g_ss.map_scale(),
-                     (unsigned)g_ss.map_ms());
+        std::fprintf(f, "bottom=%s\nmapscale=%d\nmapms=%u\nmaphelp=%d\n", game::bottom_tab_name(g_ss.tab()),
+                     g_ss.map_scale(), (unsigned)g_ss.map_ms(), g_ss.map_help() ? 1 : 0);
         std::fclose(f);
     }
 }

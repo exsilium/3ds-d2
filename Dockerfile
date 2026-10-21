@@ -60,3 +60,27 @@ RUN rm -f /etc/apt/sources.list.d/* \
       gcc-mingw-w64-i686 binutils-mingw-w64-i686 \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /work
+
+# --- HOME-menu banner lane ------------------------------------------------------
+# packaging/cia/game_art.py: the icon, banner model and tune from the user's
+# game files (bind-mounted at run time, never in this image). The banner model
+# is converted by pycgfx (skyfloogle/pycgfx; no licence file, so fetched here,
+# never copied into the repository) at the commit the hardware-tested ClouDS
+# Music FA banner was built with; its converter needs Python 3.12+, Pillow and
+# gltflib. Same Debian snapshot as hosttest; the Python packages pinned.
+FROM debian@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f AS banner
+ARG DEBIAN_SNAPSHOT=20261001T000000Z
+ARG PYCGFX_COMMIT=1f78850086f3a77c41e07162e842f97a5bf3c18a
+RUN rm -f /etc/apt/sources.list.d/* \
+ && echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT} trixie main" > /etc/apt/sources.list \
+ && apt-get -o Acquire::Check-Valid-Until=false update \
+ && apt-get install -y --no-install-recommends python3 python3-pil python3-pip git ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && pip install --break-system-packages --ignore-installed --no-cache-dir --no-deps \
+      gltflib==1.0.13 dataclasses-json==0.6.7 marshmallow==3.26.2 typing-inspect==0.9.0 \
+      mypy-extensions==1.1.0 typing-extensions==4.16.0 packaging==26.3 \
+ && git clone -q https://github.com/skyfloogle/pycgfx.git /opt/pycgfx \
+ && git -C /opt/pycgfx checkout -q "$PYCGFX_COMMIT" \
+ && rm -rf /opt/pycgfx/.git \
+ && python3 -c "import sys; sys.path.insert(0, '/opt/pycgfx'); import gltflib, PIL, main"
+WORKDIR /work

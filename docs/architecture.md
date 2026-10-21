@@ -377,6 +377,25 @@ Display and memory after the first Azahar session:
 
 `scripts/docker.sh package-cia <game-dir>` builds `dist/cia/*.cia`. It uses makerom and bannertool, built from pinned source in the `ctrtools` image. The CIA carries the user's game files in its RomFS, and its exheader asks for 124 MiB, 804 MHz and the L2 cache.
 
+Its HOME-menu art comes from the same files (`packaging/cia/game_art.py`). The icon is Game.exe's 32×32 Lord of Destruction icon (resource group 103), scaled to 48×48. The banner is a 3D banner model (CGFX) of the title screen's logo (`D2logoBlack*`/`D2logoFire*.DC6`, composited as the game draws them), built by `packaging/cia/banner_cgfx.py` in the `banner` image. A banner model the real HOME menu cannot handle freezes it, even when an emulator shows it, and our first hand-assembled models did. So the model follows the hardware-tested ClouDS Music FA banner (MIT, github.com/Epic0522/ClouDS-Music-FA) and the GBAtemp guide written from it:
+- a glTF scene converted by pycgfx's own converter, at the same commit;
+- each mesh bound to its node (`mesh_node_name`). The layout is `COMMON` → `name` → the flipbook's planes `frameNN` (the animated nodes) and `subtitle`. Every plane has Y-axis billboarding (mode 5), like the reference's screen-facing logo, so the HOME menu's turning of the model leaves it facing the viewer. Billboarding only `name` does not carry over to its children, so that logo turned. Animating mesh-less holder nodes above billboarded planes crashed the HOME menu: it read through a null pointer, probably looking up an animated node's mesh. Every animated node here carries its mesh, as in the reference;
+- animation only as ordinary Transform members (translation, rotation, scale, linear keys sampled at 30 fps), with no skinning;
+- matte, alpha-blended materials and RGBA4 textures;
+- the SMDH's `extendedbanner` flag and a 44.1 kHz stereo tune.
+
+The logo has no background. The lettering is opaque. The flames, which the game adds onto black, get the alpha of their brightest channel and the colour that gives the same result over black.
+
+The flipbook shows 3 of the 30 frames (0, 10 and 20) at 15 fps, as 256×128 cells of two RGBA4 atlases. The current frame's plane is in place and the others wait far above the view. A frame stays in place until the next one has arrived.
+
+Under the logo, a still plane carries "EXPANSION SET / Lord of Destruction" and "v1.14d". The two lines are cut out of the LoD main menu's background (`gameselectscreenEXP.dc6` in d2exp.mpq). The cut-out is keyed on brightness or on warmth (red minus blue), whichever is higher, so the gold lettering keeps its darker strokes while the grey scene drops out. The two lines get a dark halo so they read on a light background. The version is set in the main menu's font (`font24.DC6`), in the lines' gold made a little lighter and with a lighter halo, so it reads as a caption. The visible pixels of the whole banner are centred between the HOME menu's top bar and its bottom hints. The CGFX is 251 KB, under the HOME menu's 512 KiB limit.
+
+Two hardware limits were found by bisecting on a New 3DS. Every failure froze the HOME menu as the title was selected:
+- One material and texture per frame (15 of each) froze it. The same 15 planes sharing 2 atlas materials work when not animated.
+- Animated, 3 frame nodes work and 5 freeze. The reference animates 3. `banner_cgfx.py` refuses to build more than 3.
+
+The banner's tune is the first 2.95 s of `introedit.wav` (d2xmusic.mpq), resampled to 44.1 kHz, peak-normalised and faded out over the last half second. The HOME menu plays at most 3 s. It is decoded with `tools/mpq_extract.py`'s ports of the game's Huffman and ADPCM codecs, using the tables in Game.exe.
+
 The app's CIA flavour (`-DD2_CIA`) uses the extra memory as follows:
 
 | Region | Size |

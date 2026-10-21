@@ -10,8 +10,9 @@
 #   scripts/docker.sh test cpu [armv7|armv6]  the same fixtures through the Box86 backend
 #   scripts/docker.sh test m3            a PE32 through the Win32 runtime on the ARMv6 backend
 #   scripts/docker.sh package           release build -> dist/<build-id>/ with manifest
-#   scripts/docker.sh package-cia             the hardware build: dist/cia/3ds-d2-<build-id>.cia (~2 MB),
-#                                             reading the game files from sdmc:/3ds/3ds-d2/game/
+#   scripts/docker.sh package-cia [<game-dir>]   the hardware build: dist/cia/3ds-d2-<build-id>.cia (~2 MB),
+#                                             reading the game files from sdmc:/3ds/3ds-d2/game/; with
+#                                             <game-dir> (or D2_GAME_DIR) its icon, banner and tune are the game's
 #   scripts/docker.sh package-cia --slim <game-dir>   ... with your 1.14d files inside (no video/music/speech)
 #   scripts/docker.sh package-cia --full <game-dir>   ... with every MPQ inside
 #   scripts/docker.sh package-cia --prof [...]        the profiling build (game.log gets a profile every 10 s)
@@ -24,6 +25,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TOOLCHAIN_IMAGE=3ds-d2/toolchain:local
 HOSTTEST_IMAGE=3ds-d2/hosttest:local
 CTRTOOLS_IMAGE=3ds-d2/ctrtools:local
+BANNER_IMAGE=3ds-d2/banner:local
 
 die() { echo "docker.sh: $*" >&2; exit 1; }
 
@@ -97,13 +99,30 @@ package)
     do_build release
     run_in "$TOOLCHAIN_IMAGE" sh scripts/package.sh release
     ;;
-package-cia)   # [--prof] [--slim|--full <game-dir>]: the game app (+ the user's own 1.14d files) -> dist/cia/*.cia
+package-cia)   # [--prof] [<game-dir> | --slim|--full <game-dir>]: the game app (+ the user's own 1.14d files) -> dist/cia/*.cia
     prof=0; [ "${1:-}" = --prof ] && { prof=1; shift; }   # the profiling build: ...-prof.cia
     mode=sdcard
     case "${1:-}" in --slim) mode=slim; shift ;; --full) mode=full; shift ;; --sdcard) shift ;; esac
     stage="$ROOT/build/cia/romfs/game"
-    rm -rf "$ROOT/build/cia/romfs" && mkdir -p "$stage"
+    rm -rf "$ROOT/build/cia/romfs" "$ROOT/build/cia/art-src" "$ROOT/build/cia/game-art" && mkdir -p "$stage"
     RUN_EXTRA=(-e "D2_CIA_MODE=$mode" -e "D2_CIA_PROF=$prof")
+    [ -n "${D2_BANNER:-}" ] && RUN_EXTRA+=(-e "D2_BANNER=$D2_BANNER")
+    [ -n "${D2_BANNER_FRAMES:-}" ] && RUN_EXTRA+=(-e "D2_BANNER_FRAMES=$D2_BANNER_FRAMES")
+    [ -n "${D2_BANNER_TURN:-}" ] && RUN_EXTRA+=(-e "D2_BANNER_TURN=$D2_BANNER_TURN")
+    # The HOME-menu art (packaging/cia/game_art.py) comes from the user's
+    # Game.exe, d2data.mpq, d2exp.mpq and d2xmusic.mpq, mounted read-only outside the
+    # RomFS: the CIA holds the icon, banner and tune made from them. (For
+    # sdcard that is all that is used of the game directory.)
+    art="${1:-${D2_GAME_DIR:-}}"
+    if [ -n "$art" ]; then
+        [ -f "$art/Game.exe" ] || die "package-cia <game-dir>: no Game.exe in $art"
+        art="$(cd "$art" && pwd)"
+        for f in "$art"/*; do
+            case "$(basename "$f" | tr 'A-Z' 'a-z')" in
+            game.exe|d2data.mpq|d2exp.mpq|d2xmusic.mpq) RUN_EXTRA+=(-v "$f:/work/build/cia/art-src/$(basename "$f"):ro") ;;
+            esac
+        done
+    fi
     if [ "$mode" != sdcard ]; then
         [ -n "${1:-}" ] && [ -f "$1/Game.exe" ] || die "package-cia --$mode <game-dir with Game.exe and the MPQs>"
         game="$(cd "$1" && pwd)"
@@ -129,6 +148,11 @@ package-cia)   # [--prof] [--slim|--full <game-dir>]: the game app (+ the user's
         run_in "$TOOLCHAIN_IMAGE" make -s -j8 -C tests/cpu/ctr ../../../build/cpu/ctr/3ds-d2-game-cia.elf
     fi
     RUN_EXTRA=("${saved_extra[@]}")
+    if [ -n "$art" ]; then   # the icon, banner model and tune (packaging/cia/game_art.py)
+        ensure_image banner "$BANNER_IMAGE"
+        mkdir -p "$ROOT/build/cia/game-art"
+        run_in "$BANNER_IMAGE" python3 -I packaging/cia/game_art.py build/cia/art-src build/cia/game-art /opt/pycgfx
+    fi
     run_in "$CTRTOOLS_IMAGE" sh scripts/package-cia.sh
     ;;
 sdcard-folder)   # [--full] <game-dir>: dist/sdcard/3ds/3ds-d2/game/ to copy once to the SD card root

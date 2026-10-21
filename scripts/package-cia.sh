@@ -12,6 +12,13 @@
 # user's files there one by one (read-only: nothing is copied). The result
 # goes to dist/cia/ (git-ignored). Except for sdcard, it contains the user's
 # game files: it is for their own console, not for distribution.
+# The HOME-menu icon, banner model and tune are made from the user's Game.exe,
+# d2data.mpq and d2xmusic.mpq by packaging/cia/game_art.py, which docker.sh
+# runs first (in the banner image) into build/cia/game-art/. Without them,
+# make_art.py's drawn art and silence. D2_BANNER (read by game_art.py too):
+# animated (default), still (the model with one frame), static (the first
+# frame as bannertool's own still banner, no model of ours). A banner model
+# needs the SMDH's extendedbanner flag.
 set -eu
 cd /work
 # D2_CIA_PROF=1: the profiling build (built into build/cpu/ctr-prof).
@@ -48,9 +55,25 @@ work=build/cia
 out=dist/cia
 version=0.2.0   # the title version FBI and the HOME menu show (major.minor.micro)
 mkdir -p "$out"
-python3 -I packaging/cia/make_art.py "$work"
-bannertool makebanner -i "$work/banner.png" -a "$work/banner.wav" -o "$work/banner.bnr" >/dev/null
-bannertool makesmdh -s "3ds-d2" -l "Diablo II LoD 1.14d on the n3DS" -p "https://github.com/exsilium/3ds-d2" \
+python3 -I packaging/cia/make_art.py "$work"   # the drawn art, and a silent banner.wav
+smdh_flags=visible,allow3d,recordusage   # bannertool's default
+art_dir=build/cia/game-art
+if [ -f "$art_dir/banner.cgfx" ]; then
+    cp "$art_dir/icon.png" "$work/icon.png"
+    [ -f "$art_dir/banner.wav" ] && cp "$art_dir/banner.wav" "$work/banner.wav"
+    if [ "${D2_BANNER:-animated}" = static ]; then
+        bannertool makebanner -i "$art_dir/banner-preview.png" -a "$work/banner.wav" -o "$work/banner.bnr" >/dev/null
+    else
+        bannertool makebanner -ci "$art_dir/banner.cgfx" -a "$work/banner.wav" -o "$work/banner.bnr" >/dev/null
+        smdh_flags="$smdh_flags,extendedbanner"
+    fi
+    art="game (${D2_BANNER:-animated} banner)"
+else
+    echo "package-cia.sh: no game directory given: the drawn icon and banner"
+    bannertool makebanner -i "$work/banner.png" -a "$work/banner.wav" -o "$work/banner.bnr" >/dev/null
+    art=drawn
+fi
+bannertool makesmdh -s "3ds-d2" -l "Diablo II LoD 1.14d on the n3DS" -p "https://github.com/exsilium/3ds-d2" -f "$smdh_flags" \
     -i "$work/icon.png" -o "$work/icon.icn" >/dev/null
 
 id="$(sh scripts/build-id.sh 2>/dev/null || echo unversioned)"
@@ -77,6 +100,7 @@ cp "$elf" "${cia%.cia}.elf"   # the exact code of this CIA: decodes its crash du
     echo "cia: $(basename "$cia")"
     echo "version: $version"
     echo "mode: $mode"
+    echo "art: $art (SMDH flags $smdh_flags)"
     [ "$prof" = 1 ] && echo "build: profiling (PROF_COUNTERS)"
     echo "size: $(stat -c %s "$cia")"
     echo "sha256: $(sha256sum "$cia" | cut -d' ' -f1)"

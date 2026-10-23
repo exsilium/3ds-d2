@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Thu, 22 Oct 2026 14:13:54 +0300
+Subject: [PATCH] custommem: jump tables through weak d2rt_jmptbl_alloc/free
+ hooks
+
+The second-level jump tables (256 KiB each with JMPTABL_SHIFT 16) are the
+largest host allocation once Diablo II has run: 12 MiB. A port can now
+place them outside its malloc heap; the 3DS app puts some in linear
+memory, which its heap cannot use. Refs exsilium/3ds-d2#15.
+---
+ third_party/box86-dynarec/custommem.c | 15 ++++++++++++---
+ 1 file changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/third_party/box86-dynarec/custommem.c b/third_party/box86-dynarec/custommem.c
+index 25054db..16aeec9 100644
+--- a/third_party/box86-dynarec/custommem.c
++++ b/third_party/box86-dynarec/custommem.c
+@@ -45,6 +45,8 @@ static size_t jmptbl_allocated = 0, jmptbl_allocated1 = 0;
+ static int                 mmapsize = 0;
+ static uintptr_t           *box86_jmptbl[JMPTABL_SIZE];
+ static uintptr_t           box86_jmptbl_default[1<<JMPTABL_SHIFT];
++void* d2rt_jmptbl_alloc(size_t n);   /* defined next to create_jmptbl */
++void d2rt_jmptbl_free(void* p);
+ // lock addresses
+ KHASH_SET_INIT_INT(lockaddress)
+ static kh_lockaddress_t    *lockaddress = NULL;
+@@ -979,7 +981,7 @@ void cleanDBFromAddressRange(uintptr_t addr, size_t size, int destroy)
+             uintptr_t* tbl;
+             if(isJmpTableEmpty((tbl=box86_jmptbl[start_addr>>JMPTABL_SHIFT]))) {
+                 if(arm_lock_storeifref(&box86_jmptbl[start_addr>>JMPTABL_SHIFT], box86_jmptbl_default, tbl)==box86_jmptbl_default) {
+-                    box_free(tbl);
++                    d2rt_jmptbl_free(tbl);
+                     #ifdef TRACE_MEMSTAT
+                     jmptbl_allocated -= (1<<JMPTABL_SHIFT)*sizeof(uintptr_t);
+                     #endif
+@@ -990,10 +992,17 @@ void cleanDBFromAddressRange(uintptr_t addr, size_t size, int destroy)
+     }
+ }
+ 
++/* Where the second-level jump tables live (1<<JMPTABL_SHIFT entries each, by
++ * far the largest host allocation once a big guest has run). A port can
++ * place some outside its malloc heap: the 3DS app puts them in linear memory,
++ * which its heap cannot use. The defaults are box_malloc/box_free. */
++__attribute__((weak)) void* d2rt_jmptbl_alloc(size_t n) { return box_malloc(n); }
++__attribute__((weak)) void d2rt_jmptbl_free(void* p) { box_free(p); }
++
+ static uintptr_t *create_jmptbl(uintptr_t idx0, uintptr_t idx1)
+ {
+     if(box86_jmptbl[idx1] == box86_jmptbl_default) {
+-        uintptr_t* tbl = (uintptr_t*)box_malloc((1<<JMPTABL_SHIFT)*sizeof(uintptr_t));
++        uintptr_t* tbl = (uintptr_t*)d2rt_jmptbl_alloc((1<<JMPTABL_SHIFT)*sizeof(uintptr_t));
+         /* C13 (deep review): box_malloc was dereferenced unchecked — an OOM here
+          * wrote 64 Ki entries through NULL. Hand back the default table instead:
+          * the caller's store-if-ref then fails and the block is simply
+@@ -1002,7 +1011,7 @@ static uintptr_t *create_jmptbl(uintptr_t idx0, uintptr_t idx1)
+         for(int i=0; i<(1<<JMPTABL_SHIFT); ++i)
+             tbl[i] = (uintptr_t)arm_next;
+         if(arm_lock_storeifref(&box86_jmptbl[idx1], tbl, box86_jmptbl_default)!=tbl)
+-            box_free(tbl);
++            d2rt_jmptbl_free(tbl);
+ #ifdef TRACE_MEMSTAT
+         else {
+             jmptbl_allocated += (1<<JMPTABL_SHIFT)*sizeof(uintptr_t);

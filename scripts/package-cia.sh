@@ -53,7 +53,7 @@ esac
 
 work=build/cia
 out=dist/cia
-version=0.3.0   # the title version FBI and the HOME menu show (major.minor.micro)
+version=0.3.1   # the title version FBI and the HOME menu show (major.minor.micro)
 mkdir -p "$out"
 python3 -I packaging/cia/make_art.py "$work"   # the drawn art, and a silent banner.wav
 smdh_flags=visible,allow3d,recordusage   # bannertool's default

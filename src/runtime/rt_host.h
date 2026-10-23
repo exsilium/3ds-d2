@@ -88,6 +88,7 @@ struct RunOptions {
     std::function<void()> service;
     uint32_t trap_report = 0;                      // at exit, print the N most-called imports (stdout)
     uint32_t heartbeat_ms = 0;                     // log progress counters every N ms of guest time
+    std::function<void()> heartbeat;               // after each heartbeat's line: the app's own counters
     // Registry DWORDs seeded under the game's settings key when absent (the
     // game's own Options menu still changes and saves them): the 3DS app picks
     // cheaper video settings than a PC's defaults.
@@ -137,6 +138,7 @@ struct Stats {
     uint64_t bytes_read = 0;
     uint32_t dib_sections = 0;
     uint32_t frames = 0;         // blits of a DIB section to the window
+    uint32_t alloc_failures = 0; // guest heap or VirtualAlloc requests refused
 };
 Stats &stats();
 

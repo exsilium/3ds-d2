@@ -45,7 +45,9 @@ extern uint64_t dyn86_ctr_cache_sync_ticks __attribute__((weak));
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <malloc.h>
+#include <map>
 #include <memory>
 #include <set>
 #include <vector>
@@ -78,6 +80,57 @@ wx86::GuestRegion g_heap, g_va;
 // console), so fixed ranges ran out of VA with half the heap idle.
 wx86::GuestRegion g_pool;
 uint32_t g_pool_size = 0;   // 0: separate ranges
+
+// VirtualAlloc blocks by the guest code that allocated them (the return
+// address of its VirtualAlloc call), so an allocation failure can say who
+// holds the pool. The shim reports a request before it allocates, so each
+// new block takes the owner of the request before it (va_owner_sync).
+std::map<uint32_t, uint32_t> g_va_owner;
+uint32_t g_va_pending = 0;
+
+void va_owner_sync()
+{
+    const auto &used = g_va.used_map();
+    for (auto it = g_va_owner.begin(); it != g_va_owner.end();)
+        it = used.count(it->first) ? std::next(it) : g_va_owner.erase(it);
+    for (const auto &u : used)
+        if (g_va_owner.emplace(u.first, g_va_pending).second)
+            g_va_pending = 0;
+}
+
+void va_observer(const WxMemEvent &e)
+{
+    if (e.kind == WX86_MEM_VA_RESERVE || e.kind == WX86_MEM_VA_COMMIT_FRESH) {
+        va_owner_sync();
+        g_va_pending = e.cpu->read_u32(e.cpu->reg(R_ESP));
+    } else if (e.kind == WX86_MEM_VA_RELEASE) {
+        g_va_owner.erase(e.addr);
+    }
+}
+
+// One line: the largest owners of VirtualAlloc memory.
+void log_va_owners()
+{
+    va_owner_sync();
+    std::map<uint32_t, std::pair<uint32_t, uint32_t>> by;   // owner -> blocks, bytes
+    for (const auto &o : g_va_owner) {
+        auto &b = by[o.second];
+        b.first++;
+        b.second += g_va.size_of(o.first);
+    }
+    std::vector<std::pair<uint32_t, uint32_t>> order;   // bytes, owner
+    for (const auto &b : by)
+        order.emplace_back(b.second.second, b.first);
+    std::sort(order.rbegin(), order.rend());
+    std::string line = "VirtualAlloc by caller:";
+    for (size_t i = 0; i < order.size() && i < 8; i++) {
+        char item[48];
+        std::snprintf(item, sizeof item, " %08x %u KiB/%u", order[i].second, order[i].first >> 10,
+                      by[order[i].second].first);
+        line += item;
+    }
+    logf("%s", line.c_str());
+}
 
 // VirtualQuery support for WinVita's memory shims: report the arena regions.
 bool vquery(uint32_t addr, uint32_t &base, uint32_t &size, uint32_t &state, uint32_t &type, uint32_t &protect,
@@ -468,6 +521,8 @@ void check_time_limit(uint64_t ms)
              (unsigned)((g_pool_size ? g_pool_size - g_heap.cur() - g_va.cur() : g_va.largest_free()) >> 10),
              (unsigned)d2rt_box86_dynarec_kb(),
              (unsigned)d2rt_box86_custommalloc_kb(), (unsigned)d2rt_box86_jmptbl_kb(), (unsigned)(host_used >> 10));
+        if (g_opt.heartbeat)
+            g_opt.heartbeat();
     }
     if (g_opt.max_ms && ms >= g_opt.max_ms && !g_timed_out && g_sched) {
         g_timed_out = true;
@@ -668,10 +723,16 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
     // state, so an "Out of memory" from the game can be traced to its cause.
     wx86::region_set_fail_handler([](const wx86::RegionFail &f) {
         static unsigned n = 0;
+        g_stats.alloc_failures++;
         if (++n <= 16)
             logf("%s full: want %u KiB, live %u KiB, peak %u KiB, largest free %u KiB", f.name, f.want >> 10,
                  f.cur >> 10, f.peak >> 10, f.largest >> 10);
+        if (n <= 2)
+            log_va_owners();
     });
+    g_va_owner.clear();
+    g_va_pending = 0;
+    wx86_mem_set_observer(va_observer);
     if (L.heap_base + L.heap_size == L.va_base) {
         g_pool_size = L.heap_size + L.va_size;
         g_pool.init(L.heap_base, g_pool_size, 16, "pool");

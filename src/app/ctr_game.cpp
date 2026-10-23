@@ -24,6 +24,7 @@
 #include "game/automap.h"
 #include "game/cinematics.h"
 #include "game/controls.h"
+#include "game/d2_memory.h"
 #include "game/d2_native.h"
 #include "game/d2_state.h"
 #include "game/osk.h"
@@ -87,8 +88,41 @@ struct HeapSetup {
     u32 tries;         // allocation attempts until one succeeded
     Result last_rc;    // the last refusal
     Result linear_rc;
+    u32 jmptbl_linear; // linear memory set aside for jump tables
 };
 HeapSetup g_heap_setup;
+
+// Box86's second-level jump tables (256 KiB each, 12 MiB in play): the first
+// ones go to the linear memory set aside above, the rest to the heap.
+static u32 g_jmptbl_linear_used;
+void *d2rt_jmptbl_alloc(size_t n)
+{
+    if (g_jmptbl_linear_used + n <= g_heap_setup.jmptbl_linear) {
+        if (void *p = linearAlloc(n)) {
+            g_jmptbl_linear_used += n;
+            return p;
+        }
+    }
+    return malloc(n);
+}
+// The guest arena, reserved first thing in main (reserve_arena) and lent to
+// the backend when it maps it (mman_ctr.c): newlib's memalign needs the
+// arena's size + 16 MiB of contiguous heap, which the 95 MiB heap only has
+// before Game.exe and the rest of the startup take their share.
+static void *g_arena;
+static size_t g_arena_size;
+void *dyn86_ctr_arena_take(size_t len) { return g_arena && len <= g_arena_size ? g_arena : NULL; }
+int dyn86_ctr_arena_release(void *p) { return p && p == g_arena; }
+void d2rt_jmptbl_free(void *p)
+{
+    const u32 a = (u32)p;
+    if (a >= __ctru_linear_heap && a - __ctru_linear_heap < __ctru_linear_heap_size) {
+        g_jmptbl_linear_used -= linearGetSize(p);
+        linearFree(p);
+    } else {
+        free(p);
+    }
+}
 void __system_allocateHeaps(void)
 {
     HeapSetup &hs = g_heap_setup;
@@ -122,7 +156,21 @@ void __system_allocateHeaps(void)
         want -= 4u << 20;
     }
     __ctru_heap_size = want;
-    hs.linear_rc = svcControlMemory(&__ctru_linear_heap, 0x0, 0x0, __ctru_linear_heap_size, MEMOP_ALLOC_LINEAR, rw);
+    // The budget the heap window leaves (~2.9 MiB on the console) can only be
+    // linear memory: it goes to the linear heap for Box86's jump tables
+    // (d2rt_jmptbl_alloc below), so the guest arena can be that much larger
+    // (rt_layout.h). 256 KiB stays unclaimed.
+    const u32 avail = hs.budget < hs.region_free ? hs.budget : hs.region_free;
+    const u32 spare = avail > want + __ctru_linear_heap_size ? avail - want - __ctru_linear_heap_size : 0;
+    hs.jmptbl_linear = spare > (256u << 10) ? (spare - (256u << 10)) & ~0x3FFFFu : 0;
+    hs.linear_rc = svcControlMemory(&__ctru_linear_heap, 0x0, 0x0, __ctru_linear_heap_size + hs.jmptbl_linear,
+                                    MEMOP_ALLOC_LINEAR, rw);
+    if (R_SUCCEEDED(hs.linear_rc)) {
+        __ctru_linear_heap_size += hs.jmptbl_linear;
+    } else {
+        hs.jmptbl_linear = 0;
+        hs.linear_rc = svcControlMemory(&__ctru_linear_heap, 0x0, 0x0, __ctru_linear_heap_size, MEMOP_ALLOC_LINEAR, rw);
+    }
     if (R_FAILED(hs.linear_rc))
         svcBreak(USERBREAK_PANIC);   // no framebuffers: nothing can be shown
     mappableInit(OS_MAP_AREA_BEGIN, OS_MAP_AREA_END);
@@ -1060,8 +1108,36 @@ void wait_for_start()
 
 }  // namespace
 
+static d2rt::Cpu *g_guest_cpu = nullptr;   // the game's CPU, from install_native on
+
+#ifdef D2_CIA
+// The guest arena is carved out of the heap, 16 MiB-aligned, and the host
+// keeps the rest: the jump tables not in linear memory, the JIT's metadata
+// and the runtime (JIT code is in its pool). The largest layout that the
+// heap and the linear memory set aside for jump tables allow.
+static const rt::Layout *reserve_arena()
+{
+    const bool full = __ctru_heap_size >= (95u << 20);
+    const rt::Layout *const candidates[] = {
+        full && g_heap_setup.jmptbl_linear >= (2u << 20) ? &rt::kCtrGameLayoutN3 : nullptr,
+        full ? &rt::kCtrGameLayoutN3Heap : nullptr,   // the console's full heap
+        __ctru_heap_size >= (87u << 20) ? &rt::kCtrGameLayout : nullptr,
+    };
+    for (const rt::Layout *L : candidates) {
+        if (L && (g_arena = memalign(16u << 20, L->span))) {
+            g_arena_size = L->span;
+            return L;
+        }
+    }
+    return nullptr;
+}
+#endif
+
 int main()
 {
+#ifdef D2_CIA
+    const rt::Layout *const arena_layout = reserve_arena();   // before anything else takes heap
+#endif
     osSetSpeedupEnable(true);   // New 3DS: 804 MHz and the L2 cache
     gfxInit(GSP_RGB565_OES, GSP_RGB565_OES, false);
     consoleInit(GFX_BOTTOM, &g_stats_con);
@@ -1084,9 +1160,13 @@ int main()
            (unsigned long)__ctru_heap, (unsigned)(__ctru_linear_heap_size >> 10),
            (unsigned)(osGetMemRegionSize(MEMREGION_APPLICATION) >> 10));
 #ifdef D2_CIA
-    status("heap setup: budget %u KiB, region free %u KiB, %u tries, last refusal %08lx",
+    status("heap setup: budget %u KiB, region free %u KiB, %u tries, last refusal %08lx, jump tables %u KiB linear",
            (unsigned)(g_heap_setup.budget >> 10), (unsigned)(g_heap_setup.region_free >> 10),
-           (unsigned)g_heap_setup.tries, (unsigned long)g_heap_setup.last_rc);
+           (unsigned)g_heap_setup.tries, (unsigned long)g_heap_setup.last_rc,
+           (unsigned)(g_heap_setup.jmptbl_linear >> 10));
+    if (arena_layout)
+        status("arena: %s, %u KiB at %08lx", arena_layout->name, (unsigned)(g_arena_size >> 10),
+               (unsigned long)(uintptr_t)g_arena);
 #endif
 
     // Game files: the CIA's RomFS if it has them, else the SD card.
@@ -1121,19 +1201,13 @@ int main()
 
     rt::RunOptions opt;
 #ifdef D2_CIA
-    // The arena is carved out of the heap (16 MiB-aligned, so it needs its
-    // size + 16 MiB free at once) and the host keeps the rest: the jump
-    // tables, the JIT's metadata and the runtime (JIT code is in its pool).
-    if (__ctru_heap_size >= (95u << 20)) {
-        opt.layout = &rt::kCtrGameLayoutN3;   // the console's full heap
-    } else if (__ctru_heap_size >= (87u << 20)) {
-        opt.layout = &rt::kCtrGameLayout;
-    } else {
+    if (!arena_layout) {
         status("Only %u KiB of heap: the game needs at least 87 MiB.", (unsigned)(__ctru_heap_size >> 10));
         wait_for_start();
         gfxExit();
         return 1;
     }
+    opt.layout = arena_layout;
 #else
     opt.layout = &rt::kCtrGameLayout;
 #endif
@@ -1151,12 +1225,26 @@ int main()
     opt.real_clock = true;
     opt.sleep_ms = [](uint32_t ms) { svcSleepThread((s64)ms * 1000000); };
     opt.heartbeat_ms = 10000;
+    opt.heartbeat = [] {
+        game::govern_sprite_cache(*g_guest_cpu, rt::memory_report().free, game::kCtrPoolReserve,
+                                  game::kCtrSpriteCacheMin);
+        const game::SpriteCacheStats sc = game::sprite_cache_stats(*g_guest_cpu);
+        char line[96];
+        std::snprintf(line, sizeof line, "[rt] sprite cache %u/%u KiB, %u sprites", sc.used >> 10, sc.limit >> 10,
+                      sc.sprites);
+        logline(line);
+    };
     // Sound through ds_emul into the DSP (ctr_audio.cpp), mixed on another core.
     setenv("WX86_SON", "vita", 1);   // ds_emul's name for the console's realtime sink
     opt.audio = true;
     // Native floor, wall and sprite blitters in place of their translations,
     // and the native cinematics player.
+    // Memory (issue #15): a smaller sprite cache, the game's fatal exit
+    // ending the run at once, and the cache's fill after each heartbeat.
     opt.install_native = [](d2rt::Cpu &c) {
+        g_guest_cpu = &c;
+        game::set_sprite_cache_floor(c, game::kCtrSpriteCacheFloor);
+        game::install_fatal_exit(c);
         game::install_d2_native(c);
         game::install_cinematics(c);
         game::install_automap_capture(c);   // the bottom screen's MAP tab
@@ -1199,6 +1287,10 @@ int main()
         status("FATAL: %s", r.error.c_str());
     else
         status("Game ended: exited=%d code=%u %s", r.exited, r.exit_code, r.error.c_str());
+    if (rt::stats().alloc_failures)
+        status("Diablo II ran out of memory (%u requests refused, see game.log).", rt::stats().alloc_failures);
+    else if (game::fatal_exit_caller())
+        status("Diablo II stopped on an internal error at %08lx.", (unsigned long)game::fatal_exit_caller());
     if (g_log)
         std::fclose(g_log);
     wait_for_start();

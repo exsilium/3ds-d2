@@ -196,3 +196,40 @@ Build `cf0fa38a8f7a` on the console. Ten minutes in the Den, then a town portal 
 Memory the cache evicts stays in the game's pools, where its other data reuses it, so the cache's limit caps how far the pool system grows. The limit is read on every insertion: `0x5ffc40` asks `0x5ff3f0` for room, which is refused when used + size > `[+4]`, and evicts until it gets it. So `game::govern_sprite_cache` lowers it as the game runs. After each heartbeat (10 s) it sets the limit to the game's size minus whatever the pool's free space is short of a **10 MiB** reserve, never below **4 MiB** and never above what the game set. It notices when the game re-creates the cache: 8 MiB at the menus, 16 MiB in a game. For the session above it would have started lowering the limit at t≈130 s. By estimate, it settles near 5 MiB free with a ~11 MiB cache, where the run ended with 1.1 MiB free. On the lane, `M4_POOL_RESERVE_MB=50` forces the 4 MiB minimum: the cache went from 5,341 to 4,064 KiB as the character walked, and the town still draws correctly.
 
 Not reclaimable for now: `0x4117f0` (caller `0x41180c`) reserves 64 KiB no-access regions and commits pages as its small-block heap grows. Every reservation is backed in full in the single arena, about 3 MiB in the Den.
+
+## Act I's second quest: the pool system keeps its empty blocks (2026-10-23)
+
+Build `c66edeb50499` (v0.3.1) on the console. After 42 minutes, past the Cold Plains, the run ended cleanly: `heap full: want 386 KiB, live 9793 KiB, peak 11252 KiB, largest free 274 KiB`, then `game: fatal exit(-1), called from 004097be`. The request came from `0x409770`, which handles pool system allocations above its largest size class. It takes them from the heap with `malloc`. The pool still had 1.4 MiB free, but no single piece of it was big enough.
+
+| t (s) | VirtualAlloc | Sprite cache (used/limit) | Pool free |
+| --- | --- | --- | --- |
+| 720 | 37.2 MiB | (governor idle) | 19.7 MiB |
+| 900 | 50.2 MiB | 12.3 MiB limit | 6.3 MiB |
+| 1500 | 51.2 MiB | 9.3 MiB limit | 3.4 MiB |
+| 2522 | 54.4 MiB | 7.0/7.3 MiB | 1.3 MiB |
+
+`VirtualAlloc by caller: 00409687 44800 KiB/113 00412dcb 4672 KiB/14 0041180c 3200 KiB/39 00000000 2496 KiB/17 ...`. The governor brought the cache from 16 MiB down to 7 MiB, but VirtualAlloc never went down.
+
+In the pool system, each size class keeps a list of blocks. A block's header comes from `malloc` and its memory from VirtualAlloc. When the last unit in a block is freed, the block stays on the list. Only `0x409b80` takes empty blocks off and frees them, and it runs when a game is joined (`0x44b8a0`) or left (`0x45ca30`, through a state table). So memory the cache evicts goes back to the pool system's free units, never back to the shared pool.
+
+The game's own `0x409b80` can't simply be called during play. It takes the pool's lock (`0x74f104+4`) before each class's lock, while allocation (`0x40a0fe`, then `0x409370`) takes a class's lock before the pool's. With time-slice preemption, the two can deadlock.
+
+`game::install_pool_release` puts a stub in front of the pool system's allocation (`0x40a080`). Normally the stub costs one byte compare (its flag at `0x6cb6a0`). When the pool's free space is below the 10 MiB reserve, the heartbeat sets the flag. The next pool allocation then calls `PoolReleaseNext`. That native function goes ahead only if the pool's lock and every class's lock are free; native code runs without a thread switch. It then takes every empty block off its class's list and out of the sorted block array (`+0x7a0`/`+0x7a8`, adjusting the byte count at `+0x17a8`), as `0x409b80` and `0x409490` do. The stub hands each block to the game's own `VirtualFree` and `free`. Each release logs `pool release: <n> of <m> blocks empty, <x> KiB released; <y> KiB held, ~<z> KiB in use`. The last two numbers show how much of the pool system's memory is actually in use.
+
+On the lane (`M4_LAYOUT=ctr-n3 M4_POOL_RESERVE_MB=64`, so a release runs on every heartbeat), the menus gave back a 64 KiB and a 512 KiB block. In town the pool system held 6.9 MiB with ~5.2 MiB in use, and no block was empty. The run reached the town and played on to the time limit without errors. Whether this is enough for the console's 44 MiB depends on how many of its blocks become completely empty. The next console log will show it.
+
+### Blood Raven: the other pool systems (2026-10-23)
+
+Build `07b362a8b816` on the console. After 25 minutes, just after Blood Raven died and as the Rogue's spirit started talking, the run ended with `va full: want 512 KiB, live 56448 KiB, peak 57216 KiB, largest free 463 KiB`, then `fatal exit(-1), called from 00409653` (the pool system's own VirtualAlloc of a new block). `0x409687` held 45.9 MiB in 116 blocks. The release ran on every heartbeat from t=900 s on and never found a pool busy, but it only ever saw 47 to 54 blocks and 15 to 18 MiB held, with ~12.5 to 13 MiB in use. Only now and then did a block go empty (512 KiB at a time, 2 MiB once).
+
+The global pool is not the only one. The pool systems are an array of 8 entries of `0x17cc` bytes starting at `0x74f104`, each named at `+0x17ac`. `0x409dd0` hands out the next unused entry (the high-water mark is at `0x75af64`, freed entries are listed at `0x75af68`), and `0x409c80` destroys one: it frees each class's blocks and zeroes the entry. Neither takes the pool's or the classes' locks. On the lane, the game creates the `Client Pool System` at `0x7508d0` when it enters a game. In town it held 12.6 MiB (~8.5 MiB in use) against the global pool's 6.9 MiB, with a 4 MiB sprite cache. On the console, the ~28 MiB the release never saw was in this pool and any other the game had created.
+
+The release now walks every pool up to the high-water mark. It skips any entry whose class count is 0, which covers destroyed entries. It also skips the whole release while another guest thread is setting up or tearing down a pool: such a thread has `eip`, or a return address in its top 16 KiB of stack, inside `[0x409c80, 0x409ff0)`. Each release logs one line per pool (name, released, held, blocks, ~in use) and a total. On the lane (forced release on every heartbeat), both pools were released from without a skip, and the run played in town to the time limit.
+
+### Back in camp: blocks too large for the free space (2026-10-23)
+
+Build `fd92ad3da58a` on the console ran for 27 minutes. It ended back in the Rogue Encampment when the quest log was opened: `va full: want 512 KiB, live 54976 KiB, peak 55168 KiB, largest free 395 KiB`, then `fatal exit(-1), called from 00409653`. The pool had 2.7 MiB free, but in pieces. From t=400 s on, the free space stayed between 3 and 6 MiB. The release covered both pools without a skip, but it only freed 512 to 1024 KiB, five times in the whole run. At the end the Global Pool System held 17.8 MiB (~11.6 MiB in use) and the Client Pool System 25.9 MiB (~18.2 MiB in use). That is 43.7 MiB held for ~29.7 MiB in use: 14 MiB of free units spread across partly used blocks.
+
+`0x409dd0` sizes each class's blocks. Units under 256 bytes get 64 KiB blocks, units from 256 bytes up to 1 KiB get 256 units, and units of 1 KiB or more get `0x80000 / unit` units, in 512 KiB blocks (`mov eax, 0x80000` at `0x409fa8`). Every pool the game creates tops out at 256 KiB units (`0x409dd0`'s third argument is `0x40000` or `0x8000`). A 512 KiB block is a large piece to find in a fragmented pool, and it rarely goes completely empty.
+
+`game::set_pool_block_size` jumps from `0x409fa8` to a 16-byte stub at `0x6cb6b0`. The stub uses 128 KiB, or a single unit for the 256 KiB class, then continues at `0x409fad`. On the lane at the same point in town, the pools held 15.9 MiB (~14.5 MiB in use) instead of 19.6 MiB, and the shared pool had 35.5 MiB free instead of 31.8 MiB. Releases also happened in town (640 KiB once). The town rendered correctly.

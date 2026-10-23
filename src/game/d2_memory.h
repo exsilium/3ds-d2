@@ -48,6 +48,24 @@ bool install_fatal_exit(d2rt::Cpu &c);
 // Where the game called exit(-1) from (its return address), 0 if it did not.
 uint32_t fatal_exit_caller();
 
+// Lets the game's pool systems (the global one and those of the client's and
+// the server's game) give their empty blocks back to VirtualAlloc while a
+// game runs (the game only does so when one is joined or left): a stub in
+// front of their allocation (0x40a080) frees them, through the game's own
+// VirtualFree and free, on the first allocation after
+// request_pool_release, from each pool no other thread is inside then. Logs what each release finds. Returns false, changing nothing, on a
+// different Game.exe.
+bool install_pool_release(d2rt::Cpu &c);
+
+// Makes the pool systems' blocks for units of 1 KiB and more `bytes` long
+// (one unit where a unit is larger) instead of 512 KiB, so that a new block
+// still fits in a pool whose free space is in pieces, and blocks go empty,
+// to be released, more often. Install before the game creates its pools.
+// Returns false, changing nothing, on a different Game.exe.
+constexpr uint32_t kCtrPoolBlock = 128u << 10;
+bool set_pool_block_size(d2rt::Cpu &c, uint32_t bytes);
+void request_pool_release();
+
 }  // namespace game
 
 #endif

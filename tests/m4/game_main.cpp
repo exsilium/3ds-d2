@@ -163,6 +163,10 @@ int main(int argc, char **argv)
         if (sprite_floor)
             game::set_sprite_cache_floor(c, sprite_floor);
         game::install_fatal_exit(c);
+        if (ctr_layout) {
+            game::install_pool_release(c);
+            game::set_pool_block_size(c, game::kCtrPoolBlock);
+        }
         if (native_late)
             g_cpu = &c;
         if (native_now)
@@ -188,8 +192,12 @@ int main(int argc, char **argv)
         static const uint32_t reserve = std::getenv("M4_POOL_RESERVE_MB")
                                             ? (uint32_t)std::atoi(std::getenv("M4_POOL_RESERVE_MB")) << 20
                                             : game::kCtrPoolReserve;
-        if (ctr_layout)
-            game::govern_sprite_cache(*guest_cpu, rt::memory_report().free, reserve, game::kCtrSpriteCacheMin);
+        if (ctr_layout) {
+            const uint32_t pool_free = rt::memory_report().free;
+            if (pool_free < reserve)
+                game::request_pool_release();
+            game::govern_sprite_cache(*guest_cpu, pool_free, reserve, game::kCtrSpriteCacheMin);
+        }
         const game::SpriteCacheStats sc = game::sprite_cache_stats(*guest_cpu);
         std::fprintf(stderr, "[rt] sprite cache %u/%u KiB, %u sprites\n", sc.used >> 10, sc.limit >> 10, sc.sprites);
     };

@@ -1226,8 +1226,10 @@ int main()
     opt.sleep_ms = [](uint32_t ms) { svcSleepThread((s64)ms * 1000000); };
     opt.heartbeat_ms = 10000;
     opt.heartbeat = [] {
-        game::govern_sprite_cache(*g_guest_cpu, rt::memory_report().free, game::kCtrPoolReserve,
-                                  game::kCtrSpriteCacheMin);
+        const uint32_t pool_free = rt::memory_report().free;
+        if (pool_free < game::kCtrPoolReserve)
+            game::request_pool_release();
+        game::govern_sprite_cache(*g_guest_cpu, pool_free, game::kCtrPoolReserve, game::kCtrSpriteCacheMin);
         const game::SpriteCacheStats sc = game::sprite_cache_stats(*g_guest_cpu);
         char line[96];
         std::snprintf(line, sizeof line, "[rt] sprite cache %u/%u KiB, %u sprites", sc.used >> 10, sc.limit >> 10,
@@ -1240,11 +1242,15 @@ int main()
     // Native floor, wall and sprite blitters in place of their translations,
     // and the native cinematics player.
     // Memory (issue #15): a smaller sprite cache, the game's fatal exit
-    // ending the run at once, and the cache's fill after each heartbeat.
+    // ending the run at once, and the cache's fill after each heartbeat;
+    // the pool systems' empty blocks given back when the pool runs short,
+    // and their blocks 128 KiB instead of 512 KiB.
     opt.install_native = [](d2rt::Cpu &c) {
         g_guest_cpu = &c;
         game::set_sprite_cache_floor(c, game::kCtrSpriteCacheFloor);
         game::install_fatal_exit(c);
+        game::install_pool_release(c);
+        game::set_pool_block_size(c, game::kCtrPoolBlock);
         game::install_d2_native(c);
         game::install_cinematics(c);
         game::install_automap_capture(c);   // the bottom screen's MAP tab

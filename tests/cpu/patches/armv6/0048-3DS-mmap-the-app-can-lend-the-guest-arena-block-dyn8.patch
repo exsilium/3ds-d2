@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Thu, 22 Oct 2026 14:16:40 +0300
+Subject: [PATCH] 3DS mmap: the app can lend the guest arena block
+ (dyn86_ctr_arena_take)
+
+newlib's memalign asks for size + 16 MiB at once, so a 77 MiB arena
+would need 93 of the CIA's 95 MiB heap still contiguous when the backend
+maps it, after Game.exe (3.6 MB) is already read. The app reserves the
+block first thing and lends it through weak hooks: to cpu_box86's probe
+(alignment slack 0) and then to the arena itself. Refs exsilium/3ds-d2#15.
+---
+ src/dynarec86/shim/ctr/mman_ctr.c | 17 +++++++++++++++--
+ 1 file changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/src/dynarec86/shim/ctr/mman_ctr.c b/src/dynarec86/shim/ctr/mman_ctr.c
+index 494b374..aa9b406 100644
+--- a/src/dynarec86/shim/ctr/mman_ctr.c
++++ b/src/dynarec86/shim/ctr/mman_ctr.c
+@@ -170,6 +170,17 @@ static int in_jitpool(void* p)
+            (uint8_t*)p < dyn86_ctr_jitpool + dyn86_ctr_jitpool_size;
+ }
+ 
++/* An arena block the app reserved itself (16 MiB-aligned), lent for any
++ * request it can hold, or NULL (the default). newlib's memalign asks for
++ * len + 16 MiB at once (below), which an app whose arena is most of its heap
++ * only has before its startup takes a share: the game CIA reserves the block
++ * first thing. Lent, not given: cpu_box86 maps and unmaps a small probe
++ * first (its alignment slack is then 0) and then maps the arena itself, and
++ * gets the same block both times. dyn86_ctr_arena_release says whether an
++ * address is that block, which munmap then keeps for the app. */
++__attribute__((weak)) void* dyn86_ctr_arena_take(size_t len) { (void)len; return NULL; }
++__attribute__((weak)) int dyn86_ctr_arena_release(void* p) { (void)p; return 0; }
++
+ void* mmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset)
+ {
+     (void)fd; (void)offset;
+@@ -190,7 +201,9 @@ void* mmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset)
+             return p;
+     }
+     if ((flags & MAP_NORESERVE) && !(prot & PROT_EXEC)) {
+-        p = arena_alloc(len);
++        p = dyn86_ctr_arena_take(len);
++        if (!p)
++            p = arena_alloc(len);
+         if (p) {
+             memset(p, 0, len);
+             return p;
+@@ -222,7 +235,7 @@ int munmap(void* addr, size_t length)
+     (void)length;
+     if (in_jitpool(addr))
+         return 0;   /* pool chunks are never reused (Box86 keeps its code chunks anyway) */
+-    if (arena_free(addr))
++    if (dyn86_ctr_arena_release(addr) || arena_free(addr))
+         return 0;
+     // Executable chunks are never returned on hardware: their pages would go
+     // back to the heap still RWX. (Box86 keeps code chunks for the process

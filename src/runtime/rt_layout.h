@@ -57,41 +57,58 @@ constexpr Layout kGameLayout = {
 // Diablo II on the 3DS: 63 MiB, mapped by the backend at a 16 MiB-aligned
 // address above libctru's heap (mman_ctr.c). Azahar gives a .3dsx about 91 MiB
 // of application memory; the game app keeps 24 MiB of heap for the host (jump
-// tables 12 MiB and JIT code ~8 MiB in town) and 1 MiB of linear memory. Everything small (scratch, PEB/TEBs,
-// the main stack, the trap window) sits in the 4 MiB below the image, which a
-// single arena backs anyway. Sized from the peaks measured on this layout
-// with 64 MiB reported RAM (docs/memory-budget.md).
+// tables 12 MiB and JIT code ~8 MiB in town) and 1 MiB of linear memory.
+// Scratch, PEB, main TEB, the main stack and the trap window sit in the 4 MiB
+// below the image, which a single arena backs anyway. Above the image
+// (0x00400000-0x009ba000): 64 KiB for DLLs (none load for 1.14d), then the
+// worker stacks (256 KiB + a 64 KiB gap each: 7 threads; the game runs 4)
+// and their TEBs (16 pages), which the scheduler treats as the stacks'
+// ceiling, as the heap is theirs (it refuses threads past either). The heap
+// and VirtualAlloc share the rest as one pool (rt_host.cpp: the heap grows
+// up, VA down). Sized from the peaks measured with 64 MiB reported RAM
+// (docs/memory-budget.md).
 constexpr Layout kCtrGameLayout = {
     "ctr-game",
-    0x00a00000,               // DLLs (1 MiB; none expected for 1.14d), up to the worker stacks
-    0x00e00000, 0x01100000,   // 17 MiB heap (peak 16.2 MiB, at hero selection)
-    0x01f00000, 0x02000000,   // 32 MiB VirtualAlloc (peak 27.5 MiB in town)
+    0x009c0000,               // DLLs, up to the worker stacks
+    0x00c10000, 0x012f0000,   // heap (peak 16.2 MiB, at hero selection) ...
+    0x01f00000, 0x02000000,   // ... and VirtualAlloc (peak 27.5 MiB in town): a 51 MiB pool
     0x00010000, 0x00070000,   // scratch
     0x00080000, 0x00081000,   // PEB, main TEB
-    // Worker stacks grow upward from 0x00b00000 (256 KiB + a 64 KiB gap each,
-    // ~9 threads); their TEBs follow at 0x00df0000, which the scheduler
-    // treats as the stacks' ceiling and warns about if reached.
-    0x00b00000, 0x00040000, 0x00df0000,
+    0x009d0000, 0x00040000, 0x00c00000,   // worker stacks, default size, TEBs
     0x00100000, 0x00300000,   // main stack (2 MiB), trap window (1 MiB)
     0x03f00000,
 };
 
 // New 3DS hardware, CIA in extended memory mode: the kernel maps at most
 // ~95 MiB of heap (its heap window ends at 0x0E000000, docs/memory-budget.md),
-// and the arena is carved out of that heap. 75 MiB, of which heap and
-// VirtualAlloc share one 61 MiB pool (rt_host.cpp: the heap grows up, VA
-// down). The heap peaks at ~16 MiB while loading, then holds ~8 in play;
-// VirtualAlloc reached 44.5 MiB in Blood Moor, where a fixed 44 MiB range
-// ran out. The host keeps ~20 MiB: it used 14.4 in town on the console
-// (jump tables 12), with JIT code in its own .bss pool.
+// and the arena is carved out of that heap. Same map as kCtrGameLayout with a
+// larger pool. The heap peaks at ~16 MiB while loading, then holds ~8-9 in
+// play; VirtualAlloc climbs to ~52 MiB by the Den of Evil (issue #15).
+// 77 MiB, a 65 MiB pool, when the app could set ~2.5 MiB of jump tables
+// aside in linear memory (ctr_game.cpp): the host then still has ~3 MiB
+// spare of the ~18 MiB left to it (jump tables 12 MiB in play, JIT
+// metadata ~3; JIT code is in its own .bss pool).
+constexpr uint32_t kCtrN3PoolBase = 0x00c10000;
 constexpr Layout kCtrGameLayoutN3 = {
     "ctr-game-n3",
-    0x00a00000,
-    0x00e00000, 0x01100000,   // 17 MiB heap
-    0x01f00000, 0x02c00000,   // 44 MiB VirtualAlloc
+    0x009c0000,
+    kCtrN3PoolBase, 0x01f00000 - kCtrN3PoolBase,
+    0x01f00000, 0x02e00000,
     0x00010000, 0x00070000,
     0x00080000, 0x00081000,
-    0x00b00000, 0x00040000, 0x00df0000,
+    0x009d0000, 0x00040000, 0x00c00000,
+    0x00100000, 0x00300000,
+    0x04d00000,
+};
+// 75 MiB, a 63 MiB pool, when it could not (all jump tables in the heap).
+constexpr Layout kCtrGameLayoutN3Heap = {
+    "ctr-game-n3-heap",
+    0x009c0000,
+    kCtrN3PoolBase, 0x01f00000 - kCtrN3PoolBase,
+    0x01f00000, 0x02c00000,
+    0x00010000, 0x00070000,
+    0x00080000, 0x00081000,
+    0x009d0000, 0x00040000, 0x00c00000,
     0x00100000, 0x00300000,
     0x04b00000,
 };

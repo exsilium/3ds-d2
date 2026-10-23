@@ -401,12 +401,12 @@ The app's CIA flavour (`-DD2_CIA`) uses the extra memory as follows:
 | Region | Size |
 | --- | --- |
 | libctru heap | 95 MiB, the console's heap window (0x08000000-0x0E000000) |
-| Guest arena (`kCtrGameLayoutN3`), carved from that heap | 75 MiB: heap 17, VirtualAlloc 44 |
-| Host (rest of the heap) | ~20 MiB: jump tables, JIT metadata, runtime |
+| Guest arena (`kCtrGameLayoutN3`), carved from that heap | 77 MiB: heap and VirtualAlloc share a 65 MiB pool |
+| Host (rest of the heap) | ~18 MiB: jump tables, JIT metadata, runtime |
 | JIT code | 16 MiB static pool in `.bss`, outside the heap window |
-| Linear heap | 2 MiB |
+| Linear heap | 2 MiB, plus the ~2.5 MiB of budget the heap window leaves, for jump tables |
 
-The first design moved libctru's heap above an 80 MiB arena at 0x08000000. The console refuses heap at addresses of the app's choosing, and its heap window ends at 0x0E000000. So libctru's heap now takes the largest size the kernel grants (stepping down from 95 MiB), and the backend carves the arena out of it with a 16 MiB-aligned `memalign`. The hardware findings are in [hardware-test.md](hardware-test.md).
+The first design moved libctru's heap above an 80 MiB arena at 0x08000000. The console refuses heap at addresses of the app's choosing, and its heap window ends at 0x0E000000. So libctru's heap now takes the largest size the kernel grants (stepping down from 95 MiB), and the app reserves the arena out of it with a 16 MiB-aligned `memalign` first thing in `main`, which the backend then borrows (issue #15). The hardware findings are in [hardware-test.md](hardware-test.md).
 
 The first CIA run hung on the loading screen. GDB on Azahar's stub found a self-deadlock in Box86's `mutex_prot`:
 1. `protectDB` takes the lock and calls `rb_set`.

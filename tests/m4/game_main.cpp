@@ -26,6 +26,7 @@
 #include "game/automap.h"
 #include "game/cinematics.h"
 #include "game/controls.h"
+#include "game/d2_memory.h"
 #include "game/d2_native.h"
 #include "game/d2_state.h"
 #include "game/second_screen.h"
@@ -150,7 +151,18 @@ int main(int argc, char **argv)
     static const bool native_late = std::getenv("M4_NATIVE") && std::string(std::getenv("M4_NATIVE")) == "late";
     static const bool native_now = !native_late && (!std::getenv("M4_NATIVE") || std::string(std::getenv("M4_NATIVE")) != "0");
     static const bool video = std::getenv("M4_VIDEO") && std::string(std::getenv("M4_VIDEO")) != "0";
+    // The sprite cache's floor: the console app's with the 3DS layouts, the
+    // game's own otherwise; M4_SPRITE_MB=<MiB> sets it (24: the game's own).
+    static const bool ctr_layout = ctr;   // and its sprite cache governor (the heartbeat below)
+    static uint32_t sprite_floor = ctr ? game::kCtrSpriteCacheFloor : 0;
+    if (const char *mb = std::getenv("M4_SPRITE_MB"))
+        sprite_floor = (uint32_t)std::atoi(mb) << 20;
+    static d2rt::Cpu *guest_cpu = nullptr;
     opt.install_native = [](d2rt::Cpu &c) {
+        guest_cpu = &c;
+        if (sprite_floor)
+            game::set_sprite_cache_floor(c, sprite_floor);
+        game::install_fatal_exit(c);
         if (native_late)
             g_cpu = &c;
         if (native_now)
@@ -172,6 +184,15 @@ int main(int argc, char **argv)
     opt.cpuid_edx = rt::kCpuidNoSimd;
     opt.trap_report = 250;
     opt.heartbeat_ms = 10000;
+    opt.heartbeat = [] {   // as the console does it (M4_POOL_RESERVE_MB: another reserve)
+        static const uint32_t reserve = std::getenv("M4_POOL_RESERVE_MB")
+                                            ? (uint32_t)std::atoi(std::getenv("M4_POOL_RESERVE_MB")) << 20
+                                            : game::kCtrPoolReserve;
+        if (ctr_layout)
+            game::govern_sprite_cache(*guest_cpu, rt::memory_report().free, reserve, game::kCtrSpriteCacheMin);
+        const game::SpriteCacheStats sc = game::sprite_cache_stats(*guest_cpu);
+        std::fprintf(stderr, "[rt] sprite cache %u/%u KiB, %u sprites\n", sc.used >> 10, sc.limit >> 10, sc.sprites);
+    };
 
     std::vector<uint8_t> exe;
     opt.exe_name = "Game.exe";

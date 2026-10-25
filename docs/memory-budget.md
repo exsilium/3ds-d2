@@ -233,3 +233,26 @@ Build `fd92ad3da58a` on the console ran for 27 minutes. It ended back in the Rog
 `0x409dd0` sizes each class's blocks. Units under 256 bytes get 64 KiB blocks, units from 256 bytes up to 1 KiB get 256 units, and units of 1 KiB or more get `0x80000 / unit` units, in 512 KiB blocks (`mov eax, 0x80000` at `0x409fa8`). Every pool the game creates tops out at 256 KiB units (`0x409dd0`'s third argument is `0x40000` or `0x8000`). A 512 KiB block is a large piece to find in a fragmented pool, and it rarely goes completely empty.
 
 `game::set_pool_block_size` jumps from `0x409fa8` to a 16-byte stub at `0x6cb6b0`. The stub uses 128 KiB, or a single unit for the 256 KiB class, then continues at `0x409fad`. On the lane at the same point in town, the pools held 15.9 MiB (~14.5 MiB in use) instead of 19.6 MiB, and the shared pool had 35.5 MiB free instead of 31.8 MiB. Releases also happened in town (640 KiB once). The town rendered correctly.
+
+### The Dark Wood: two hours, then a heap block in pieces (2026-10-24)
+
+The pool release build (`90eb5b7`) on the console ran for 2 h 03 min into the Dark Wood, three times as long as any earlier run. It ended on entering a new area: `heap full: want 262 KiB, live 8248 KiB, peak 10168 KiB, largest free 208 KiB`, then `fatal exit(-1), called from 004097be` (`0x409770` again, a pool system request above its largest class going to `malloc`). The pool had 2.2 MiB free, in pieces of 208 KiB at most.
+
+| t (s) | VirtualAlloc | Pool free | Sprite cache limit | Pools held / ~in use |
+| --- | --- | --- | --- | --- |
+| 485 | 45.8 MiB | 11.1 MiB | 16.0 MiB | 36.2 / 34.1 MiB |
+| 1235 | 49.9 MiB | 6.7 MiB | 12.5 MiB | 38.5 / 35.7 MiB |
+| 3253 | 52.8 MiB | 3.4 MiB | 9.3 MiB | 39.8 / 35.6 MiB |
+| 6078 | 51.1 MiB | 4.6 MiB | 10.5 MiB | 39.3 / 34.5 MiB |
+| 7405 | 54.7 MiB | 2.2 MiB | 8.0 MiB | 41.6 / 33.6 MiB |
+
+`VirtualAlloc by caller: 00409687 44288 KiB/337 00412dcb 4672 KiB/14 0041180c 3904 KiB/39 00000000 2816 KiB/18 ...`. The release ran on almost every heartbeat for two hours and gave back 128 to 512 KiB now and then (2 to 3.4 MiB five times), so the pools stayed at 36 to 43 MiB held for 31 to 38 MiB in use. The run did not fail because the pool was full. It failed because the free space was in pieces: after two hours the heap's blocks (growing up) and VirtualAlloc's (growing down) are interleaved through the middle of the pool. Every heap failure on the console so far wanted a single block of 262 to 656 KiB while the pool still had 1 to 3 MiB free.
+
+The governor lowered the cache by one byte per byte the pool was short of its 10 MiB reserve. With the pool between 3 and 7 MiB free for most of the session, that held the cache at 8 to 13 MiB, never near its 4 MiB minimum.
+
+Two changes:
+
+- **A spare block.** `rt::RunOptions::pool_spare` keeps 1 MiB (`kCtrPoolSpare`) of the pool back in one piece, carved from its top before the game runs (patch 0049, `GuestRegion::set_spare`). A heap or VirtualAlloc request that fits nowhere else in the pool takes it from the spare, and frees go back to it. The pool's free figure (`free=` in the heartbeat, `rt::memory_report().free`) leaves it out. When the spare serves a request, the heartbeat logs `pool spare: <n> requests taken so far, <x> of 1024 KiB in use, pool largest free <y> KiB`, and the app treats the pool as having no free space: release, and the cache down to its minimum. The first two allocation failures also log the spare's state.
+- **A steeper governor.** The cache limit drops by twice the shortfall, so it reaches 4 MiB at 4 MiB free (at 1:1 it would need 0). With this session's 6 MiB free the cache would have been 8 MiB rather than 12. That leaves the pool systems ~4 MiB more of evicted units to reuse before they ask for new blocks.
+
+On the lane, `M4_POOL_SPARE_KB` sets another spare size (0: none).

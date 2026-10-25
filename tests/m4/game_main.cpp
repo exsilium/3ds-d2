@@ -136,8 +136,12 @@ int main(int argc, char **argv)
     const std::string lay = std::getenv("M4_LAYOUT") ? std::getenv("M4_LAYOUT") : "";
     const bool ctr = lay == "ctr" || lay == "ctr-n3";   // ctr-n3: the CIA's layout on a New 3DS
     opt.layout = lay == "ctr-n3" ? &rt::kCtrGameLayoutN3 : ctr ? &rt::kCtrGameLayout : &rt::kGameLayout;
-    if (ctr)
+    if (ctr) {
         opt.total_phys_mb = 64;
+        opt.pool_spare = game::kCtrPoolSpare;
+    }
+    if (const char *kb = std::getenv("M4_POOL_SPARE_KB"))   // another spare (0: none)
+        opt.pool_spare = (uint32_t)std::atoi(kb) << 10;
     if (const char *mb = std::getenv("M4_PHYS_MB"))   // override the RAM the game is told about
         opt.total_phys_mb = (uint32_t)std::atoi(mb);
     opt.virtual_tick_us = 250;   // used only under M4_VIRTUAL_CLOCK
@@ -193,7 +197,8 @@ int main(int argc, char **argv)
                                             ? (uint32_t)std::atoi(std::getenv("M4_POOL_RESERVE_MB")) << 20
                                             : game::kCtrPoolReserve;
         if (ctr_layout) {
-            const uint32_t pool_free = rt::memory_report().free;
+            const rt::MemoryReport m = rt::memory_report();
+            const uint32_t pool_free = m.spare_used ? 0 : m.free;
             if (pool_free < reserve)
                 game::request_pool_release();
             game::govern_sprite_cache(*guest_cpu, pool_free, reserve, game::kCtrSpriteCacheMin);

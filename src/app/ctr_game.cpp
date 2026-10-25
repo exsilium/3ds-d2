@@ -1217,6 +1217,7 @@ int main()
     opt.command_line = "game.exe -w";
     opt.cpuid_edx = rt::kCpuidNoSimd;
     opt.total_phys_mb = 64;   // the game's own 24 MiB sprite-cache floor
+    opt.pool_spare = game::kCtrPoolSpare;
     // Cheaper video defaults than a PC's (the game's Options menu still
     // changes them): 640x480 in game (36% fewer pixels to draw, and exactly
     // 2:1 down to the 240-line screen), low lighting, no blended shadows, no
@@ -1226,7 +1227,10 @@ int main()
     opt.sleep_ms = [](uint32_t ms) { svcSleepThread((s64)ms * 1000000); };
     opt.heartbeat_ms = 10000;
     opt.heartbeat = [] {
-        const uint32_t pool_free = rt::memory_report().free;
+        // A request served from the spare had no other piece of the pool
+        // left: the cache goes down to its minimum.
+        const rt::MemoryReport m = rt::memory_report();
+        const uint32_t pool_free = m.spare_used ? 0 : m.free;
         if (pool_free < game::kCtrPoolReserve)
             game::request_pool_release();
         game::govern_sprite_cache(*g_guest_cpu, pool_free, game::kCtrPoolReserve, game::kCtrSpriteCacheMin);

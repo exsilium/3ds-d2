@@ -276,7 +276,10 @@ uint32_t govern_sprite_cache(d2rt::Cpu &c, uint32_t pool_free, uint32_t reserve,
         return 0;   // no cache yet
     if (cur != g_written_limit)
         g_game_limit = cur;   // the game (re)created it
-    const uint32_t short_by = pool_free < reserve ? reserve - pool_free : 0;
+    // Twice the shortfall: at one for one, two hours in the Dark Wood held
+    // the pool at 3-7 MiB free with an 8-13 MiB cache, until a new area's
+    // heap block found no piece of the pool large enough.
+    const uint32_t short_by = pool_free < reserve ? 2 * (reserve - pool_free) : 0;
     uint32_t want = g_game_limit > short_by + min_limit ? g_game_limit - short_by : min_limit;
     want = want < g_game_limit ? want & ~0x3FFFFu : g_game_limit;   // 256 KiB steps
     if (want == cur)

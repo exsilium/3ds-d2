@@ -26,8 +26,8 @@ struct SpriteCacheStats {
 SpriteCacheStats sprite_cache_stats(d2rt::Cpu &c);
 
 // Holds the guest pool's free space near `reserve` by lowering the sprite
-// cache's limit by what the pool is short of it, down to `min_limit` and
-// never above the size the game gave the cache (it re-creates the cache
+// cache's limit by twice what the pool is short of it, down to `min_limit`
+// and never above the size the game gave the cache (it re-creates the cache
 // between the menus and a game). The cache evicts down to a lowered limit
 // as it takes new sprites, and the memory it lets go of stays in the game's
 // pool system for its other data, which then stops taking more of the
@@ -35,6 +35,10 @@ SpriteCacheStats sprite_cache_stats(d2rt::Cpu &c);
 // change; returns the limit in force.
 constexpr uint32_t kCtrPoolReserve = 10u << 20;
 constexpr uint32_t kCtrSpriteCacheMin = 4u << 20;
+// Of the pool, kept back in one piece for a request that fits nowhere else
+// (rt::RunOptions::pool_spare): the heap blocks the console was refused at
+// the end of long sessions were 262 to 656 KiB.
+constexpr uint32_t kCtrPoolSpare = 1u << 20;
 uint32_t govern_sprite_cache(d2rt::Cpu &c, uint32_t pool_free, uint32_t reserve, uint32_t min_limit);
 
 // Makes the game's fatal exit, exit(-1) after an internal error (an

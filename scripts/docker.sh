@@ -29,9 +29,30 @@ BANNER_IMAGE=3ds-d2/banner:local
 
 die() { echo "docker.sh: $*" >&2; exit 1; }
 
+# Git Bash (MSYS) on Windows: no argument rewriting (it turns -w /work and the
+# -v specs into Windows paths), and host paths as Docker Desktop takes them
+# (C:/...). Elsewhere a host path is passed as it is.
+case "$(uname -s)" in
+MINGW*|MSYS*|CYGWIN*)
+    export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
+    host_path() { cygpath -m "$1"; } ;;
+*)  host_path() { printf '%s\n' "$1"; } ;;
+esac
+
+# The containers read the tree as it is on disk: a CRLF checkout (Git for
+# Windows' core.autocrlf=true, in the submodule, which .gitattributes does not
+# reach) breaks the scripts and patches, and changes the build ID.
+for f in scripts/package-cia.sh third_party/winx86/build.sh; do
+    if [ -f "$ROOT/$f" ] && grep -q $'\r' "$ROOT/$f"; then
+        die "$f has CRLF line endings. Check the tree out with LF:
+    git config core.autocrlf false; git -C third_party/winx86 config core.autocrlf false
+then re-check out the affected files (git rm -r --cached . && git reset --hard, in each)"
+    fi
+done
+
 ensure_image() { # <target> <tag>
     if ! docker image inspect "$2" >/dev/null 2>&1; then
-        docker build --target "$1" -t "$2" "$ROOT"
+        docker build --target "$1" -t "$2" "$(host_path "$ROOT")"
     fi
 }
 
@@ -42,7 +63,7 @@ run_in() { # <image> <cmd...>
     local tty=(); [ -t 0 ] && [ -t 1 ] && tty=(-it)
     docker run --rm "${tty[@]}" --network none \
         -u "$(id -u):$(id -g)" -e HOME=/tmp \
-        -v "$ROOT:/work" ${RUN_EXTRA[@]+"${RUN_EXTRA[@]}"} -w /work "$image" "$@"
+        -v "$(host_path "$ROOT"):/work" ${RUN_EXTRA[@]+"${RUN_EXTRA[@]}"} -w /work "$image" "$@"
 }
 
 build_id() { run_in "$TOOLCHAIN_IMAGE" sh scripts/build-id.sh; }
@@ -60,8 +81,8 @@ do_build() { # <flavor>
 cmd="${1:-}"; shift || true
 case "$cmd" in
 image)
-    docker build --target toolchain -t "$TOOLCHAIN_IMAGE" "$ROOT"
-    docker build --target hosttest -t "$HOSTTEST_IMAGE" "$ROOT"
+    docker build --target toolchain -t "$TOOLCHAIN_IMAGE" "$(host_path "$ROOT")"
+    docker build --target hosttest -t "$HOSTTEST_IMAGE" "$(host_path "$ROOT")"
     ;;
 lock)
     ensure_image toolchain "$TOOLCHAIN_IMAGE"
@@ -89,7 +110,7 @@ test)
         [ -n "${2:-}" ] && [ -f "$2/Game.exe" ] || die "test m4 <game-dir with Game.exe> [guest-ms] [command line]"
         make_args=(-C tests/m4 run MS="${3:-20000}")
         [ -n "${4:-}" ] && make_args+=(CMD="$4")
-        RUN_EXTRA=(-v "$(cd "$2" && pwd):/game:ro")
+        RUN_EXTRA=(-v "$(host_path "$(cd "$2" && pwd)"):/game:ro")
         for v in M4_LAYOUT M4_VIRTUAL_CLOCK M4_SCRIPT M4_BOTTOM RT_MSGLOG M4_PHYS_MB M4_FAST M4_QEMU_FLAGS WX86_SON WX86_SONDUMP WX86_SONMAXS WX86_HOTPROF D2_NOLINK M4_FRAMEHASH M4_NATIVE D2_NATIVE_MASK M4_DUMPFRAME M4_VIDEO M4_VIDEO_WAV M4_PROF RT_FILETRACE M4_HASHMEM WX86_FAKETSC M4_ASYNCIO M4_SPRITE_MB M4_POOL_RESERVE_MB; do [ -n "${!v:-}" ] && RUN_EXTRA+=(-e "$v=${!v}"); done
         run_in "$HOSTTEST_IMAGE" make "${make_args[@]}" ;;
     *)    die "test host | test x86 [golden] | test cpu [armv7|armv6] | test m3 | test m4 <game-dir>" ;;
@@ -119,7 +140,7 @@ package-cia)   # [--prof] [<game-dir> | --slim|--full <game-dir>]: the game app 
         art="$(cd "$art" && pwd)"
         for f in "$art"/*; do
             case "$(basename "$f" | tr 'A-Z' 'a-z')" in
-            game.exe|d2data.mpq|d2exp.mpq|d2xmusic.mpq) RUN_EXTRA+=(-v "$f:/work/build/cia/art-src/$(basename "$f"):ro") ;;
+            game.exe|d2data.mpq|d2exp.mpq|d2xmusic.mpq) RUN_EXTRA+=(-v "$(host_path "$f"):/work/build/cia/art-src/$(basename "$f"):ro") ;;
             esac
         done
     fi
@@ -134,11 +155,12 @@ package-cia)   # [--prof] [<game-dir> | --slim|--full <game-dir>]: the game app 
             b="$(basename "$f")"
             [ -f "$f" ] || continue
             if [ "$mode" = full ] || echo "$b" | tr 'A-Z' 'a-z' | grep -Eq "$keep"; then
-                RUN_EXTRA+=(-v "$f:/work/build/cia/romfs/game/$b:ro")
+                RUN_EXTRA+=(-v "$(host_path "$f"):/work/build/cia/romfs/game/$b:ro")
             fi
         done
     fi
     ensure_image hosttest "$HOSTTEST_IMAGE"
+    ensure_image toolchain "$TOOLCHAIN_IMAGE"
     ensure_image ctrtools "$CTRTOOLS_IMAGE"
     saved_extra=("${RUN_EXTRA[@]}"); RUN_EXTRA=()
     run_in "$HOSTTEST_IMAGE" make -C tests/cpu VARIANT=armv6 lib >/dev/null     # the patched backend tree

@@ -54,7 +54,7 @@ The diagnostics are on the bottom screen's INFO tab (tap INFO in the tab bar; [c
 3. **host heap** and **jit code / jmptbl** in town. Azahar measured 22 MiB used, of 34 MiB in the CIA build.
 4. A red **JIT MEMORY FULL** line, if it ever appears.
 
-Logs are on the SD card in `3ds/3ds-d2/logs/`: `game.log` for the runtime, and `stderr.txt` for the CPU backend, including its arena line. Saves and settings are in `3ds/3ds-d2/save/`.
+Logs are on the SD card in `3ds/3ds-d2/logs/`: `game.log` for the runtime, and `stderr.txt` for the CPU backend, including its arena line. Saves and settings are in `3ds/3ds-d2/save/`. `python3 -I tools/session_report.py game.log` summarises a session from its heartbeats: the frame rate by game state, the slowest windows and what they were doing (sprite re-loads, new code, SD reads), and memory over time.
 
 ## Things that differ from Azahar, and may fail first
 

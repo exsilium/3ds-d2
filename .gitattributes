@@ -1,0 +1,5 @@
+# LF everywhere, whatever core.autocrlf says: the sources, scripts, patches
+# and Makefiles are read by the Linux build containers (and a CRLF checkout
+# would not build byte-identically to the others).
+* text=auto eol=lf
+*.jpeg binary

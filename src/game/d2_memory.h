@@ -26,8 +26,8 @@ struct SpriteCacheStats {
 SpriteCacheStats sprite_cache_stats(d2rt::Cpu &c);
 
 // Holds the guest pool's free space near `reserve` by lowering the sprite
-// cache's limit by what the pool is short of it, down to `min_limit` and
-// never above the size the game gave the cache (it re-creates the cache
+// cache's limit by twice what the pool is short of it, down to `min_limit`
+// and never above the size the game gave the cache (it re-creates the cache
 // between the menus and a game). The cache evicts down to a lowered limit
 // as it takes new sprites, and the memory it lets go of stays in the game's
 // pool system for its other data, which then stops taking more of the
@@ -35,6 +35,10 @@ SpriteCacheStats sprite_cache_stats(d2rt::Cpu &c);
 // change; returns the limit in force.
 constexpr uint32_t kCtrPoolReserve = 10u << 20;
 constexpr uint32_t kCtrSpriteCacheMin = 4u << 20;
+// Of the pool, kept back in one piece for a request that fits nowhere else
+// (rt::RunOptions::pool_spare): the heap blocks the console was refused at
+// the end of long sessions were 262 to 656 KiB.
+constexpr uint32_t kCtrPoolSpare = 1u << 20;
 uint32_t govern_sprite_cache(d2rt::Cpu &c, uint32_t pool_free, uint32_t reserve, uint32_t min_limit);
 
 // Makes the game's fatal exit, exit(-1) after an internal error (an
@@ -47,6 +51,24 @@ bool install_fatal_exit(d2rt::Cpu &c);
 
 // Where the game called exit(-1) from (its return address), 0 if it did not.
 uint32_t fatal_exit_caller();
+
+// Lets the game's pool systems (the global one and those of the client's and
+// the server's game) give their empty blocks back to VirtualAlloc while a
+// game runs (the game only does so when one is joined or left): a stub in
+// front of their allocation (0x40a080) frees them, through the game's own
+// VirtualFree and free, on the first allocation after
+// request_pool_release, from each pool no other thread is inside then. Logs what each release finds. Returns false, changing nothing, on a
+// different Game.exe.
+bool install_pool_release(d2rt::Cpu &c);
+
+// Makes the pool systems' blocks for units of 1 KiB and more `bytes` long
+// (one unit where a unit is larger) instead of 512 KiB, so that a new block
+// still fits in a pool whose free space is in pieces, and blocks go empty,
+// to be released, more often. Install before the game creates its pools.
+// Returns false, changing nothing, on a different Game.exe.
+constexpr uint32_t kCtrPoolBlock = 128u << 10;
+bool set_pool_block_size(d2rt::Cpu &c, uint32_t bytes);
+void request_pool_release();
 
 }  // namespace game
 

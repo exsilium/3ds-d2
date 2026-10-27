@@ -74,6 +74,10 @@ struct RunOptions {
     // Physical memory GlobalMemoryStatus reports (0: WinVita's 256 MiB). Diablo
     // II sizes its sprite cache from it; 64 gives the game's own 24 MiB floor.
     uint32_t total_phys_mb = 0;
+    // Bytes of the heap and VirtualAlloc pool (when the layout makes them
+    // one) kept back in one contiguous block, for a request that fits
+    // nowhere else once the pool's free space has gone to pieces (0: none).
+    uint32_t pool_spare = 0;
     // CPUID leaf-1 EDX reported to the guest; 0 keeps the backend's default
     // (FPU CMOV MMX FXSR SSE SSE2). The 3DS reports kCpuidNoSimd: the game
     // then takes its x87/integer paths instead of SSE code the ARM11 emulates.
@@ -174,6 +178,8 @@ struct MemoryReport {
     // The heap and VA ranges are one pool when adjacent (rt_host.cpp): what
     // is left of it, and its largest free block.
     uint32_t free, largest_free;
+    // RunOptions::pool_spare: bytes in use in it, and requests it has served.
+    uint32_t spare_used, spare_takes;
     // Host memory of the CPU backend (0 when the build does not count it):
     uint32_t jit_code_kb;    // translated ARM code
     uint32_t jit_meta_kb;    // block descriptors and the rest of its own allocator

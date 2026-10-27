@@ -80,6 +80,10 @@ wx86::GuestRegion g_heap, g_va;
 // console), so fixed ranges ran out of VA with half the heap idle.
 wx86::GuestRegion g_pool;
 uint32_t g_pool_size = 0;   // 0: separate ranges
+// RunOptions::pool_spare, kept back from the pool (GuestRegion::set_spare),
+// and the takes from it the heartbeat has logged.
+wx86::GuestRegion g_spare;
+uint32_t g_spare_size = 0, g_spare_logged = 0;
 
 // VirtualAlloc blocks by the guest code that allocated them (the return
 // address of its VirtualAlloc call), so an allocation failure can say who
@@ -337,8 +341,10 @@ MemoryReport memory_report()
 {
     const Layout &L = layout();
     const uint32_t heap = g_heap.used_bytes(), va = g_va.used_bytes();
-    const uint32_t free = g_pool_size ? g_pool_size - heap - va : L.heap_size + L.va_size - heap - va;
+    // The pool's own count holds the spare whole, and not the blocks in it.
+    const uint32_t free = g_pool_size ? g_pool_size - g_pool.used_bytes() : L.heap_size + L.va_size - heap - va;
     return {heap, g_heap.peak(), L.heap_size, va, g_va.peak(), L.va_size, free, g_va.largest_free(),
+            g_spare_size ? g_spare.used_bytes() : 0, g_spare_size ? g_pool.spare_takes() : 0,
             (uint32_t)d2rt_box86_dynarec_kb(), (uint32_t)d2rt_box86_custommalloc_kb(), (uint32_t)d2rt_box86_jmptbl_kb()};
 }
 Bridge &bridge() { return *g_br; }
@@ -518,9 +524,14 @@ void check_time_limit(uint64_t ms)
              (unsigned long long)(ms / 1000), g_stats.peeks, g_stats.files_opened,
              (unsigned long long)(g_stats.bytes_read >> 10), g_stats.frames, g_heap.used_bytes() >> 10,
              g_heap.peak() >> 10, g_va.used_bytes() >> 10, g_va.peak() >> 10,
-             (unsigned)((g_pool_size ? g_pool_size - g_heap.cur() - g_va.cur() : g_va.largest_free()) >> 10),
+             (unsigned)((g_pool_size ? g_pool_size - g_pool.cur() : g_va.largest_free()) >> 10),
              (unsigned)d2rt_box86_dynarec_kb(),
              (unsigned)d2rt_box86_custommalloc_kb(), (unsigned)d2rt_box86_jmptbl_kb(), (unsigned)(host_used >> 10));
+        if (g_spare_size && g_pool.spare_takes() != g_spare_logged) {
+            g_spare_logged = g_pool.spare_takes();
+            logf("pool spare: %u requests taken so far, %u of %u KiB in use, pool largest free %u KiB", g_spare_logged,
+                 g_spare.cur() >> 10, g_spare_size >> 10, g_pool.largest_free() >> 10);
+        }
         if (g_opt.heartbeat)
             g_opt.heartbeat();
     }
@@ -729,6 +740,9 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
                  f.cur >> 10, f.peak >> 10, f.largest >> 10);
         if (n <= 2)
             log_va_owners();
+        if (n <= 2 && g_spare_size)
+            logf("pool spare: %u requests taken, %u of %u KiB in use", g_pool.spare_takes(), g_spare.cur() >> 10,
+                 g_spare_size >> 10);
     });
     g_va_owner.clear();
     g_va_pending = 0;
@@ -738,6 +752,12 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
         g_pool.init(L.heap_base, g_pool_size, 16, "pool");
         g_heap.share(g_pool, 16, false, "heap");
         g_va.share(g_pool, 0x10000, true, "va");
+        g_spare_size = g_spare_logged = 0;
+        if (g_opt.pool_spare) {
+            if (g_pool.set_spare(g_spare, g_opt.pool_spare, 0x10000))
+                g_spare_size = g_spare.largest_free();   // all of it, still unused
+            logf("pool spare: %u KiB%s", g_opt.pool_spare >> 10, g_spare_size ? "" : " does not fit, none");
+        }
     } else {
         g_heap.init(L.heap_base, L.heap_size, 16, "heap");
         g_va.init(L.va_base, L.va_size, 0x10000, "va");

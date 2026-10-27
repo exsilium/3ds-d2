@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Exile <exile@chamber.ee>
+Date: Mon, 26 Oct 2026 00:41:15 +0200
+Subject: [PATCH] guest_region: a spare block for requests the shared pool no
+ longer fits
+
+A pool can keep one contiguous block back (set_spare). A face whose
+request fits nowhere else in the pool takes it from the spare, so a pool
+whose free space has gone to pieces still serves its next large request.
+---
+ src/runtime/guest_region.h | 33 +++++++++++++++++++++++++++++++--
+ 1 file changed, 31 insertions(+), 2 deletions(-)
+
+diff --git a/src/runtime/guest_region.h b/src/runtime/guest_region.h
+index 866849f..a94c8d9 100644
+--- a/src/runtime/guest_region.h
++++ b/src/runtime/guest_region.h
+@@ -77,13 +77,37 @@ public:
+         base_ = pool.base_; limit_ = pool.limit_; freeb_.clear();
+     }
+ 
++    // Keeps `bytes` of this pool (rounded up to `al`) back as `spare`: one
++    // contiguous block, carved from the top before the faces allocate. A
++    // face whose request fits nowhere else in the pool takes it from the
++    // spare. A pool short of space overall still fails; one whose free
++    // space has gone to pieces (a long session's heap and VirtualAlloc
++    // blocks interleaved) still has room for its next large request. The
++    // spare counts as used in this pool's cur(). False if it does not fit.
++    bool set_spare(GuestRegion& spare, uint32_t bytes, uint32_t al) {
++        const uint32_t a = carve(bytes, al, true);
++        if (!a) return false;
++        spare.init(a, used_[a], align_, "spare");
++        spare_ = &spare;
++        return true;
++    }
++    // Requests the faces have taken from the spare since set_spare.
++    uint32_t spare_takes() const { return spare_takes_; }
++
+     // Returns the guest address of an n-byte block, or 0. First-fit over
+     // the free-block map, which is ordered by address.
+     uint32_t alloc(uint32_t n) {
+         if (pool_) {
+-            const uint32_t a = (n > limit_ - base_) ? 0 : pool_->carve(n, align_, top_);
++            GuestRegion* from = pool_;
++            uint32_t a = (n > limit_ - base_) ? 0 : pool_->carve(n, align_, top_);
++            GuestRegion* spare = pool_->spare_;
++            if (!a && spare && n <= spare->limit_ - spare->base_) {
++                from = spare;
++                a = spare->carve(n, align_, top_);
++                if (a) pool_->spare_takes_++;
++            }
+             if (!a) { record_fail(n); return 0; }
+-            const uint32_t sz = pool_->used_[a];
++            const uint32_t sz = from->used_[a];
+             used_[a] = sz;
+             cur_ += sz; if (cur_ > peak_) peak_ = cur_;
+             return a;
+@@ -115,6 +139,9 @@ public:
+         if (pool_) {
+             auto it = used_.find(a); if (it == used_.end()) return false;
+             cur_ -= it->second; used_.erase(it);
++            // The spare first: its first block starts where the pool's
++            // record of the whole spare does.
++            if (pool_->spare_ && pool_->spare_->free(a)) return true;
+             return pool_->free(a);
+         }
+         auto it = used_.find(a); if (it == used_.end()) return false;
+@@ -187,6 +214,8 @@ private:
+ 
+     GuestRegion* pool_ = nullptr;   // set by share(): this region is a face of it
+     bool top_ = false;
++    GuestRegion* spare_ = nullptr;  // set by set_spare(), on the pool
++    uint32_t spare_takes_ = 0;
+ 
+     const char* name_ = "region";
+     uint32_t base_ = 0, limit_ = 0, align_ = 16;

@@ -1217,6 +1217,7 @@ int main()
     opt.command_line = "game.exe -w";
     opt.cpuid_edx = rt::kCpuidNoSimd;
     opt.total_phys_mb = 64;   // the game's own 24 MiB sprite-cache floor
+    opt.pool_spare = game::kCtrPoolSpare;
     // Cheaper video defaults than a PC's (the game's Options menu still
     // changes them): 640x480 in game (36% fewer pixels to draw, and exactly
     // 2:1 down to the 240-line screen), low lighting, no blended shadows, no
@@ -1226,8 +1227,13 @@ int main()
     opt.sleep_ms = [](uint32_t ms) { svcSleepThread((s64)ms * 1000000); };
     opt.heartbeat_ms = 10000;
     opt.heartbeat = [] {
-        game::govern_sprite_cache(*g_guest_cpu, rt::memory_report().free, game::kCtrPoolReserve,
-                                  game::kCtrSpriteCacheMin);
+        // A request served from the spare had no other piece of the pool
+        // left: the cache goes down to its minimum.
+        const rt::MemoryReport m = rt::memory_report();
+        const uint32_t pool_free = m.spare_used ? 0 : m.free;
+        if (pool_free < game::kCtrPoolReserve)
+            game::request_pool_release();
+        game::govern_sprite_cache(*g_guest_cpu, pool_free, game::kCtrPoolReserve, game::kCtrSpriteCacheMin);
         const game::SpriteCacheStats sc = game::sprite_cache_stats(*g_guest_cpu);
         char line[96];
         std::snprintf(line, sizeof line, "[rt] sprite cache %u/%u KiB, %u sprites", sc.used >> 10, sc.limit >> 10,
@@ -1240,11 +1246,15 @@ int main()
     // Native floor, wall and sprite blitters in place of their translations,
     // and the native cinematics player.
     // Memory (issue #15): a smaller sprite cache, the game's fatal exit
-    // ending the run at once, and the cache's fill after each heartbeat.
+    // ending the run at once, and the cache's fill after each heartbeat;
+    // the pool systems' empty blocks given back when the pool runs short,
+    // and their blocks 128 KiB instead of 512 KiB.
     opt.install_native = [](d2rt::Cpu &c) {
         g_guest_cpu = &c;
         game::set_sprite_cache_floor(c, game::kCtrSpriteCacheFloor);
         game::install_fatal_exit(c);
+        game::install_pool_release(c);
+        game::set_pool_block_size(c, game::kCtrPoolBlock);
         game::install_d2_native(c);
         game::install_cinematics(c);
         game::install_automap_capture(c);   // the bottom screen's MAP tab

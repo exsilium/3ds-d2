@@ -116,6 +116,13 @@ Everything builds inside Docker containers with a pinned toolchain (devkitARM, l
 
    For a copy cloned without `--recursive`, run `git submodule update --init` first.
 
+   On Windows, run the commands below in Git Bash. Git for Windows checks text files out with CRLF line endings by default (`core.autocrlf=true`), which breaks the scripts in the Linux build containers. The repository's `.gitattributes` keeps its own files LF, but it does not reach the submodule, so clone with autocrlf off and keep it off in the submodule:
+
+   ```sh
+   git -c core.autocrlf=false clone --recursive https://github.com/exsilium/3ds-d2.git
+   git -C 3ds-d2/third_party/winx86 config core.autocrlf false
+   ```
+
 2. **Build the toolchain images, once.** This downloads and builds the pinned tools, and takes a few minutes the first time:
 
    ```sh

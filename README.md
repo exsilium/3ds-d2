@@ -103,6 +103,31 @@ When the game asks for text, such as a character name, a keyboard opens on the b
 
 If the app shows "Game.exe not found", check the folder name and that `Game.exe` is inside `/3ds/3ds-d2/game/`.
 
+### Problem reports
+
+If 3ds-d2 crashes (Luma3DS shows its exception screen), the next start keeps that session's `game.log`, `stderr.txt` and the Luma3DS crash dump in `/3ds/3ds-d2/reports/<time>-<build>/` before anything is overwritten. The top screen then shows the report and asks whether to send it. It does the same after a session that ended on a fatal error, and after a session in which you tapped **report a problem** at the bottom of the INFO tab. The report is made only after the game has ended, never while you play.
+
+The screen lists what would be sent:
+
+- the whole `game.log` (a four-hour session writes about 1 MiB; only past 32 MiB is the middle left out), `stderr.txt`, and the Luma3DS dumps saved during the session, gzip-compressed for the upload;
+- the build ID, version, CIA or 3dsx, where the game files are read from, the console model, region, system version and kernel version;
+- figures from the log: minutes played, frame rate in play, memory peaks;
+- your description, if you write one: press **Y** to type it with the system keyboard.
+
+Save files and character names are never sent.
+
+On a report's screen:
+
+- **A** sends it over Wi-Fi to the project's [Sentry](https://sentry.io) account. Sentry's ID for it is shown, and kept in the report's folder (`sent.txt`).
+- **Y** writes or changes your description.
+- **X** marks it as not to be sent (A still sends it later).
+- **SELECT** twice deletes the report and its files.
+- **B** goes back to the list of reports.
+
+Reports you don't send wait for later: playing without the internet (on a plane, say), each session's report stays on the SD card, and the next start with reports waiting shows the list of them. There, **X** sends every waiting report, oldest first, and **A** opens one to read, change, send or delete it; **START** goes on to the game. Hold **SELECT** while 3ds-d2 starts to open the list when nothing is waiting, for example to delete old reports.
+
+Nothing is sent unless you press A or X. Up to 32 reports wait to be sent; of those sent or marked not to be sent, the newest 8 stay. The folders are on the SD card, so you can also attach one to a GitHub issue yourself. Builds made without a Sentry project (`D2_REPORT_DSN=`, see [Building the CIA](#building-the-cia)) never ask and never send; they only keep a crashed session's files.
+
 ## Building the CIA
 
 Everything builds inside Docker containers with a pinned toolchain (devkitARM, libctru, makerom). The host needs only **Docker** and **git**: Docker Desktop on macOS (Apple Silicon or Intel) or Windows, or Docker Engine on Linux. You don't need the game files to build the app.
@@ -153,6 +178,8 @@ The build ID is a hash of everything that goes into the CIA, so the same sources
 Two variants carry the game files inside the CIA itself instead of reading them from the SD card. Such a CIA is for your own console only:
 - `scripts/docker.sh package-cia --full <game-dir>`: all 12 files (~2 GB).
 - `scripts/docker.sh package-cia --slim <game-dir>`: without music, speech and cinematics (~850 MB, no sound).
+
+Every build, your own included, offers [problem reports](#problem-reports) to the project's Sentry, whose DSN is in `packaging/cia/report.dsn` (a public key that can only send events). Each report's release is the version the session was played on (`3ds-d2@<version>`), and its build ID is the release's `dist` and the `build_id` tag, so all builds of a version share one release in Sentry and reports from one build can still be filtered (`dist:<build ID>`). To send your reports to your own project instead, set its DSN when building: `D2_REPORT_DSN=https://<key>@<org>.ingest.sentry.io/<project> scripts/docker.sh package-cia ...` (`SENTRY_AUTH_TOKEN=<token> scripts/sentry-setup.sh [<org> [<project>]]` creates one and writes its DSN to that file). `D2_REPORT_DSN=` (empty) builds an app that never offers or sends anything. The console's own HTTPS cannot complete a handshake with Sentry's servers (they take only TLS 1.2 with SNI), so the app brings its own TLS: mbedTLS and the root certificates of Sentry's current and announced certificate authorities, built into a separate module (`src/tls/`, shipped as `tls.bin` in the RomFS). The module takes no memory during play. To send a report, the app loads it into executable memory (the way the JIT makes its code), sends over the console's sockets, and frees it again. `scripts/docker.sh test tls` loads the same module under qemu-arm and sends a test event to the project. An `http://` DSN (a relay that forwards to Sentry) is sent without the module.
 
 More documentation:
 - [docs/build-and-run.md](docs/build-and-run.md): builds, tests and the Azahar emulator lanes.

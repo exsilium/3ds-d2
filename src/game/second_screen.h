@@ -10,7 +10,9 @@
 //          weapon swap, show items, chat, close all)
 //   ZOOM   the frame at 1:1 around the cursor, readable text; touch points
 //          straight at the game
-//   INFO   the diagnostics (frame rate, memory) and the runtime's messages
+//   INFO   the diagnostics (frame rate, memory) and the runtime's messages;
+//          the button under them asks for a report of this session when the
+//          game ends (issue #26: nothing is collected or sent meanwhile)
 //   PANEL  offered while a panel is open (inventory, stash, shop, character,
 //          skills...), and shown by itself when one opens: the panel's half
 //          of the frame at 1:1 (D2's panels are 320 pixels wide at 640x480),
@@ -67,6 +69,7 @@ struct BottomView {
     uint32_t keys_lit = 0;
     // kInfo, and the upper part of kKeyboard.
     std::vector<Line> lines;
+    bool report = false;              // kInfo: a report is asked for (its button lit)
     // kKeyboard.
     std::string osk_title;
     std::vector<Osk::KeyView> osk_keys;
@@ -98,6 +101,10 @@ public:
     static constexpr int kMsBtnX = 136, kMsBtnW = 84, kScaleBtnX = 224, kScaleBtnW = 56;
     static constexpr int kHelpBtnX = 284, kHelpBtnW = 36;
     bool take_settings_changed() { bool r = settings_changed_; settings_changed_ = false; return r; }
+    // INFO's button, in the same strip: a report of this session, offered
+    // when the game ends. The platform reads it then; until then it is a flag.
+    static constexpr int kReportBtnX = 164, kReportBtnW = 156;
+    bool report_requested() const { return report_; }
     // The buttons' shortcuts (Select + D-pad): the next or previous tab
     // along the bar (PANEL too while a panel is open), MAP, and MAP's size
     // (both showing the map, not HELP). Not while the keyboard is open.
@@ -142,6 +149,7 @@ private:
     int map_scale_ = 1;
     uint32_t map_ms_ = 500;
     bool settings_changed_ = false;
+    bool report_ = false;
     const Osk *osk_ = nullptr;
 
     // The game.

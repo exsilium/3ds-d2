@@ -7,6 +7,10 @@
 //   Start   OK (Enter) + close Select  close
 // Platform-neutral: the platform draws title() and keys() in pixels and
 // passes taps, in the same coordinates, to tap().
+//
+// open_text() instead types into a string of the platform's, outside the
+// game (a report's description, before the game starts or after it ended):
+// nothing goes to the game and nothing is logged.
 #ifndef D2_GAME_OSK_H
 #define D2_GAME_OSK_H
 
@@ -22,6 +26,7 @@ public:
     static constexpr int kWidth = 320, kHeight = 140;
 
     void open();
+    void open_text(std::string *text);
     void close() { open_ = false; }
     bool is_open() const { return open_; }
 
@@ -48,6 +53,7 @@ public:
 private:
     void press(int code);
 
+    std::string *text_ = nullptr;      // open_text's string, or null: the game's text field
     bool open_ = false, shift_ = false, dirty_ = true;
     int flash_ = -1;                   // index of the key shown pressed, -1 = none
     uint64_t now_ms_ = 0, flash_until_ms_ = 0;

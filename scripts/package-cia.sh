@@ -50,6 +50,11 @@ slim|full)
     ;;
 *) echo "package-cia.sh: unknown mode $mode" >&2; exit 1 ;;
 esac
+# The TLS module for problem reports (src/tls/tls_module.h): loaded from the
+# RomFS only to send one, never kept in memory.
+tls="$(dirname "$elf")/tls.bin"
+[ -f "$tls" ] || { echo "package-cia.sh: $tls missing" >&2; exit 1; }
+cp "$tls" "$romfs/tls.bin"
 
 work=build/cia
 out=dist/cia

@@ -22,6 +22,8 @@
   - `tests/m4/ctru_font.h` is a copy of libctru's console font (`default_font.bin`), so the Linux game lane can draw the bottom screen as the 3DS app does. The 3DS app links the same font from libctru.
 - **libjpeg-turbo** 3.1.3 (IJG License, Modified BSD and zlib), the `3ds-libjpeg-turbo` package from the pinned devkitARM image. The game app links it to save screenshots (`src/app/ctr_screenshot.cpp`).
   - The IJG License asks binary distributions to state: this software is based in part on the work of the Independent JPEG Group.
+- **zlib** 1.3.1 (zlib License, Copyright (C) 1995-2024 Jean-loup Gailly and Mark Adler), the `3ds-zlib` package from the pinned devkitARM image. The game app links it to gzip problem reports (`src/app/ctr_report.cpp`).
+- **Mbed TLS** 2.28.8 (Apache-2.0, Copyright The Mbed TLS Contributors), the `3ds-mbedtls` package from the pinned devkitARM image. It is not linked into the app: `src/tls/` links it into the TLS module `tls.bin`, which the CIA and the `.3dsx` carry in their RomFS and load only to send a problem report. Binary releases must include the Apache License 2.0 text (https://www.apache.org/licenses/LICENSE-2.0) for it.
 - **newlib and libstdc++** from devkitARM, under their own licenses. libstdc++ is GPL with the GCC runtime library exception, which places no license condition on the resulting binaries.
 
 ## Used at build time

@@ -377,6 +377,9 @@ void SecondScreen::update(Pad &pad, const GameState &gs, int cursor_x, int curso
                        map_button(pad.touch_x, pad.touch_y, kind == BottomView::kMap && gs_.in_game) >= 0) {
                 grip_ = Grip::MapButton;
                 key_ = map_button(pad.touch_x, pad.touch_y, kind == BottomView::kMap && gs_.in_game);
+            } else if (kind == BottomView::kInfo && pad.touch_y >= kMapBtnY && pad.touch_x >= kReportBtnX) {
+                grip_ = Grip::MapButton;
+                key_ = 3;   // INFO's report button
             } else {
                 grip_ = Grip::Pad;
             }
@@ -422,7 +425,11 @@ void SecondScreen::update(Pad &pad, const GameState &gs, int cursor_x, int curso
         if (up && grip_ == Grip::MapButton && moved_ <= kTapSlop) {
             // A tap: the size switches; the refresh steps through its
             // choices; the corner one switches between the map and HELP.
-            if (key_ == 2) {
+            // INFO's asks for a report, or takes the request back.
+            if (key_ == 3) {
+                report_ = !report_;
+                dirty_ = true;
+            } else if (key_ == 2) {
                 set_map_help(!help_);
             } else if (key_ == 0) {
                 set_map_scale(map_scale_ == 1 ? 2 : 1);
@@ -432,7 +439,7 @@ void SecondScreen::update(Pad &pad, const GameState &gs, int cursor_x, int curso
                     i++;
                 set_map_ms(kMapMs[(i + 1) % (sizeof kMapMs / sizeof kMapMs[0])]);
             }
-            settings_changed_ = true;
+            settings_changed_ |= key_ != 3;
         }
         if (up)
             grip_ = Grip::None;
@@ -535,8 +542,10 @@ bool SecondScreen::stage(BottomView &v, uint64_t now_ms)
     case BottomView::kKeyboard: {
         v.lines = stats_;
         if (kind == BottomView::kInfo) {
-            // The newest messages under the statistics, as many as fit.
-            const int rows = kAreaH / 8 - (int)stats_.size();
+            // The newest messages under the statistics, as many as fit
+            // above the report button.
+            v.report = report_;
+            const int rows = (kAreaH - kMapBtnH) / 8 - (int)stats_.size();
             const uint32_t n = log_head_ < (uint32_t)kLogLines ? log_head_ : (uint32_t)kLogLines;
             const uint32_t show = rows > 0 ? ((uint32_t)rows < n ? (uint32_t)rows : n) : 0;
             for (uint32_t i = log_head_ - show; i < log_head_; i++)
@@ -724,8 +733,15 @@ void draw_bottom(uint16_t *fb, const BottomView &v, const uint8_t *frame, int fw
     }
     case BottomView::kInfo:
         cv.fill(0, kBarH, kW, kAreaH, kBg);
-        for (size_t i = 0; i < v.lines.size() && (int)i < kAreaH / 8; i++)
+        for (size_t i = 0; i < v.lines.size() && (int)i < (kAreaH - SecondScreen::kMapBtnH) / 8; i++)
             cv.text(0, kBarH + 1 + (int)i * 8, v.lines[i].text.c_str(), v.lines[i].color);
+        if (v.report) {
+            const int x = SecondScreen::kReportBtnX, w = SecondScreen::kReportBtnW, y = SecondScreen::kMapBtnY;
+            cv.fill(x + 1, y + 1, w - 2, SecondScreen::kMapBtnH - 2, kGold);
+            cv.centred(x, y + 4, w, "report at the end", kBg);
+        } else {
+            draw_map_button(cv, SecondScreen::kReportBtnX, SecondScreen::kReportBtnW, "report a problem");
+        }
         break;
     default:
         break;

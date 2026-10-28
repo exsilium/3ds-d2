@@ -8,6 +8,7 @@
 #                          the JIT's code chunks executable on hardware
 #                          (src/dynarec86/shim/ctr/mman_ctr.c), and Backdoor
 #   IORegisterMapping      the DSP's memory, for sound (ndsp)
+#   MemoryMapping          VRAM, read-only, for the keyboard applet's launch
 #   RomFs                  the game files (Game.exe + MPQs), mounted from the
 #                          user's own copy at packaging time; never in the repo
 #
@@ -46,7 +47,13 @@ AccessControlInfo:
   # it, or the first access is a data abort (Azahar does not check).
   IORegisterMapping:
     - 1ff00000-1ff7ffff
-  MemoryType              : Application
+  # VRAM, read-only: launching a system applet (the keyboard, for a problem
+  # report's description) reads the screen on display from it for the
+  # applet's capture (libctru's aptScreenTransfer). Without it, a data abort
+  # at the applet's launch.
+  MemoryMapping:
+    - 1f000000-1f5fffff:r
+  MemoryType             : Application
   SystemMode              : 64MB
   SystemModeExt           : 124MB
   CpuSpeed                : 804MHz

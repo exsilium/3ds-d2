@@ -9,6 +9,7 @@
 #   scripts/docker.sh test x86 [golden]  x86 fixtures on qemu-i386 vs the golden file
 #   scripts/docker.sh test cpu [armv7|armv6]  the same fixtures through the Box86 backend
 #   scripts/docker.sh test m3            a PE32 through the Win32 runtime on the ARMv6 backend
+#   scripts/docker.sh test tls           the reports' TLS module under qemu-arm: a test event to Sentry (network)
 #   scripts/docker.sh package           release build -> dist/<build-id>/ with manifest
 #   scripts/docker.sh package-cia [<game-dir>]   the hardware build: dist/cia/3ds-d2-<build-id>.cia (~2 MB),
 #                                             reading the game files from sdmc:/3ds/3ds-d2/game/; with
@@ -16,6 +17,8 @@
 #   scripts/docker.sh package-cia --slim <game-dir>   ... with your 1.14d files inside (no video/music/speech)
 #   scripts/docker.sh package-cia --full <game-dir>   ... with every MPQ inside
 #   scripts/docker.sh package-cia --prof [...]        the profiling build (game.log gets a profile every 10 s)
+#     D2_REPORT_DSN=<Sentry DSN> scripts/docker.sh package-cia ...   crash reports offered to that project (issue #26);
+#                                             default packaging/cia/report.dsn (scripts/sentry-setup.sh), empty: none
 #   scripts/docker.sh sdcard-folder <game-dir>   dist/sdcard/3ds/3ds-d2/game/ for that (copy once)
 #   scripts/docker.sh repro              two clean release builds must match byte-for-byte
 #   scripts/docker.sh shell [hosttest]   interactive shell in a build image
@@ -61,7 +64,7 @@ ensure_image() { # <target> <tag>
 run_in() { # <image> <cmd...>
     local image="$1"; shift
     local tty=(); [ -t 0 ] && [ -t 1 ] && tty=(-it)
-    docker run --rm "${tty[@]}" --network none \
+    docker run --rm "${tty[@]}" --network "${RUN_NETWORK:-none}" \
         -u "$(id -u):$(id -g)" -e HOME=/tmp \
         -v "$(host_path "$ROOT"):/work" ${RUN_EXTRA[@]+"${RUN_EXTRA[@]}"} -w /work "$image" "$@"
 }
@@ -106,6 +109,11 @@ test)
     x86)  run_in "$HOSTTEST_IMAGE" make -C tests/x86 "${2:-run}" ;;   # "golden" regenerates
     cpu)  run_in "$HOSTTEST_IMAGE" make -C tests/cpu VARIANT="${2:-armv7}" run ;;
     m3)   run_in "$HOSTTEST_IMAGE" make -C tests/m3 run ;;
+    report) run_in "$HOSTTEST_IMAGE" make -C tests/report run ;;   # game.log summary and Sentry envelope
+    tls)  # the TLS module (tls.bin) loaded as on the console: one test event to Sentry, an untrusted server refused
+        ensure_image toolchain "$TOOLCHAIN_IMAGE"
+        run_in "$TOOLCHAIN_IMAGE" make -s -C tests/cpu/ctr ../../../build/cpu/ctr/tls.bin
+        RUN_NETWORK=bridge run_in "$HOSTTEST_IMAGE" sh tests/tls/run.sh ;;   # the only lane with the network
     m4)   # <game-dir> [guest-ms] [command line]: the game directory is mounted read-only
         [ -n "${2:-}" ] && [ -f "$2/Game.exe" ] || die "test m4 <game-dir with Game.exe> [guest-ms] [command line]"
         make_args=(-C tests/m4 run MS="${3:-20000}")
@@ -113,7 +121,7 @@ test)
         RUN_EXTRA=(-v "$(host_path "$(cd "$2" && pwd)"):/game:ro")
         for v in M4_LAYOUT M4_VIRTUAL_CLOCK M4_SCRIPT M4_BOTTOM RT_MSGLOG M4_PHYS_MB M4_FAST M4_QEMU_FLAGS WX86_SON WX86_SONDUMP WX86_SONMAXS WX86_HOTPROF D2_NOLINK M4_FRAMEHASH M4_NATIVE D2_NATIVE_MASK M4_DUMPFRAME M4_VIDEO M4_VIDEO_WAV M4_PROF RT_FILETRACE M4_HASHMEM WX86_FAKETSC M4_ASYNCIO M4_SPRITE_MB M4_POOL_RESERVE_MB M4_POOL_SPARE_KB; do [ -n "${!v:-}" ] && RUN_EXTRA+=(-e "$v=${!v}"); done
         run_in "$HOSTTEST_IMAGE" make "${make_args[@]}" ;;
-    *)    die "test host | test x86 [golden] | test cpu [armv7|armv6] | test m3 | test m4 <game-dir>" ;;
+    *)    die "test host | test x86 [golden] | test cpu [armv7|armv6] | test m3 | test report | test tls | test m4 <game-dir>" ;;
     esac
     ;;
 package)
@@ -164,10 +172,15 @@ package-cia)   # [--prof] [<game-dir> | --slim|--full <game-dir>]: the game app 
     ensure_image ctrtools "$CTRTOOLS_IMAGE"
     saved_extra=("${RUN_EXTRA[@]}"); RUN_EXTRA=()
     run_in "$HOSTTEST_IMAGE" make -C tests/cpu VARIANT=armv6 lib >/dev/null     # the patched backend tree
+    # Reports (issue #26): the build ID and title version, and the Sentry
+    # project if D2_REPORT_DSN is set (even to nothing: no reports); otherwise
+    # the Makefile takes packaging/cia/report.dsn.
+    report_vars=(BUILD_ID="$(build_id)" D2_VERSION="$(sed -n 's/^version=\([0-9.]*\).*/\1/p' "$ROOT/scripts/package-cia.sh")")
+    [ -n "${D2_REPORT_DSN+x}" ] && report_vars+=(D2_REPORT_DSN="$D2_REPORT_DSN")
     if [ "$prof" = 1 ]; then
-        run_in "$TOOLCHAIN_IMAGE" make -s -j8 -C tests/cpu/ctr PROF=1 ../../../build/cpu/ctr-prof/3ds-d2-game-cia.elf
+        run_in "$TOOLCHAIN_IMAGE" make -s -j8 -C tests/cpu/ctr PROF=1 "${report_vars[@]}" ../../../build/cpu/ctr-prof/3ds-d2-game-cia.elf ../../../build/cpu/ctr-prof/tls.bin
     else
-        run_in "$TOOLCHAIN_IMAGE" make -s -j8 -C tests/cpu/ctr ../../../build/cpu/ctr/3ds-d2-game-cia.elf
+        run_in "$TOOLCHAIN_IMAGE" make -s -j8 -C tests/cpu/ctr "${report_vars[@]}" ../../../build/cpu/ctr/3ds-d2-game-cia.elf ../../../build/cpu/ctr/tls.bin
     fi
     RUN_EXTRA=("${saved_extra[@]}")
     if [ -n "$art" ]; then   # the icon, banner model and tune (packaging/cia/game_art.py)

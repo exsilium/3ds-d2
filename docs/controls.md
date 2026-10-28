@@ -60,7 +60,7 @@ The mapping lives in `src/game/controls.cpp`. It follows the ideas D2Vita proved
 | HELP | Shown in the MAP tab by **?**: the controls, one line per button or combination. The tab reads HELP and the corner button MAP; tapping either goes back to the map. **?** works before the game too, under "The map shows here in the game." On the first start (no `settings.txt` yet) the tab opens on HELP. | Touchpad, except the MAP button |
 | KEYS | 20 buttons: Skill 1–8 (F1–F8), Character, Inventory, Skills, Quests, Party, Merc, Map (Tab), Run/Walk, Swap (W), Items (Alt, latched: tap on, tap off), Chat (Enter), Close all (Space) | Presses the button: the key is held while you touch it |
 | ZOOM | The frame at 1:1 around the cursor: readable text and item details | Points at the game (below) |
-| INFO | The diagnostics: game time, fps, worst frame gap, draw time per frame, guest heap and VirtualAlloc use against their limits (with peaks), host heap, linear and application memory free, files and bytes read, then the latest runtime messages | Touchpad |
+| INFO | The diagnostics: game time, fps, worst frame gap, draw time per frame, guest heap and VirtualAlloc use against their limits (with peaks), host heap, linear and application memory free, files and bytes read, then the latest runtime messages. **report a problem** at the bottom asks for a [problem report](../README.md#problem-reports) of this session when the game ends; tap it again to take that back | Touchpad, except the report button |
 | PANEL | The open panel's half of the frame at 1:1. At 640×480 D2's panels are 320 pixels wide, the width of the screen. It scrolls to follow the cursor, and a bar on the right shows where you are. With panels on both sides (stash and inventory, shop and inventory), it shows the side the cursor is on. Tap PANEL again to move the cursor to the same spot on the other side. | Points at the game (below) |
 
 PANEL appears when a panel opens and is shown by itself. Choosing another tab hides it until another panel opens. When the panels close, the bottom screen goes back to your tab.
@@ -86,6 +86,22 @@ On the Linux lane, `M4_BOTTOM=map|help|keys|zoom|info` picks the starting tab. T
 - **While saving:** the top screen holds the frame for a moment. The bottom screen then shows the path, or why saving failed.
 
 Rosalina's screenshot (Luma3DS menu) still works too. It saves both screens as BMPs in `/luma/screenshots/`.
+
+## Problem reports
+
+The top screen shows [problem reports](../README.md#problem-reports) before the game starts (when reports wait to be sent, or with Select held while 3ds-d2 starts) and after it ends (when a report was made for that session).
+
+| Screen | Input | Action |
+| --- | --- | --- |
+| List | Up / Down, L / R | Choose a report; a page up or down |
+| List | A | Open the report |
+| List | X | Send every report waiting, oldest first; stops at the first that fails (no Wi-Fi), the rest wait |
+| List | Start | Go on (to the game, or out of the app after a session) |
+| Report | A | Send it; then its Sentry ID, and A to go on |
+| Report | Y | Write or change the description (the system keyboard; the game's own if that does not start) |
+| Report | X | Mark it as not to be sent |
+| Report | Select, twice | Delete the report and its files |
+| Report | B | Back to the list |
 
 ## Cinematics
 

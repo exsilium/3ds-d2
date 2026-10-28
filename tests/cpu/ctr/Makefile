@@ -75,9 +75,9 @@ M3OBJ := $(CPUOBJ) $(addprefix $(OUT)/rt/,$(RTFULL:.cpp=.o)) $(addprefix $(OUT)/
 GAMESRC := $(notdir $(wildcard $(ROOT)/src/game/*.cpp))
 BINKSRC := $(notdir $(wildcard $(ROOT)/src/game/bink/*.cpp))
 GAMEOBJ := $(CPUOBJ) $(addprefix $(OUT)/rt/,$(RTFULL:.cpp=.o)) $(addprefix $(OUT)/m3/,$(M3SRC:.cpp=.o)) \
-           $(addprefix $(OUT)/game/,$(GAMESRC:.cpp=.o)) $(addprefix $(OUT)/game/bink/,$(BINKSRC:.cpp=.o)) $(OUT)/game/ctr_game.o $(OUT)/game/ctr_audio.o $(OUT)/game/ctr_screenshot.o $(OUT)/runner/ctr_stubs.o
+           $(addprefix $(OUT)/game/,$(GAMESRC:.cpp=.o)) $(addprefix $(OUT)/game/bink/,$(BINKSRC:.cpp=.o)) $(OUT)/game/ctr_game.o $(OUT)/game/ctr_audio.o $(OUT)/game/ctr_screenshot.o $(OUT)/game/ctr_report.o $(OUT)/game/ctr_tls.o $(OUT)/runner/ctr_stubs.o
 
-.PHONY: all clean
+.PHONY: all clean FORCE
 all: $(OUT)/cpu-lane.3dsx $(OUT)/m3.3dsx $(OUT)/3ds-d2-game.3dsx $(OUT)/3ds-d2-game-cia.elf
 
 vpath %.c $(B86)/dynarec $(B86) $(B86)/tools $(B86)/emu $(SHIM) $(DYN86) $(CTR)
@@ -132,17 +132,63 @@ $(OUT)/game/ctr_audio.o: $(ROOT)/src/app/ctr_audio.cpp $(wildcard $(ROOT)/src/ru
 PORTLIBS := $(DEVKITPRO)/portlibs/3ds
 $(OUT)/game/ctr_screenshot.o: $(ROOT)/src/app/ctr_screenshot.cpp
 	@mkdir -p $(@D); $(CXX) $(CXXFLAGS) -O2 -I$(PORTLIBS)/include -c $< -o $@
+# Crash and session reports (issue #26): the build ID, the title version and
+# the Sentry DSN go into ctr_report.o only. report.cfg changes when they do,
+# so it is rebuilt then. Unless given, they are scripts/build-id.sh's ID (so
+# every build of other sources reports as its own), the CIA's title version,
+# and the project's DSN from packaging/cia/report.dsn; D2_REPORT_DSN= (empty)
+# builds an app that never offers or sends anything.
+# Both report objects are built for size: they never run during play, and
+# their code is resident all the same.
+ifeq ($(origin BUILD_ID),undefined)
+BUILD_ID := $(or $(shell sh $(ROOT)/scripts/build-id.sh 2>/dev/null),unversioned)
+endif
+ifeq ($(origin D2_VERSION),undefined)
+D2_VERSION := $(or $(shell sed -n 's/^version=\([0-9.]*\).*/\1/p' $(ROOT)/scripts/package-cia.sh),0.0.0)
+endif
+ifeq ($(origin D2_REPORT_DSN),undefined)
+D2_REPORT_DSN := $(shell tr -d '\r\n' < $(ROOT)/packaging/cia/report.dsn 2>/dev/null)
+endif
+REPORT_CFG := $(BUILD_ID) $(D2_VERSION) $(D2_REPORT_DSN)
+$(OUT)/game/report.cfg: FORCE
+	@mkdir -p $(@D); echo '$(REPORT_CFG)' | cmp -s - $@ || echo '$(REPORT_CFG)' > $@
+$(OUT)/game/ctr_report.o: $(ROOT)/src/app/ctr_report.cpp $(wildcard $(ROOT)/src/game/*.h) $(OUT)/game/report.cfg
+	@mkdir -p $(@D); $(CXX) $(CXXFLAGS) -Os -I$(ROOT)/src -I$(PORTLIBS)/include -DD2_BUILD_ID='"$(BUILD_ID)"' \
+	    -DD2_VERSION='"$(D2_VERSION)"' -DD2_REPORT_DSN='"$(D2_REPORT_DSN)"' -c $< -o $@
+$(OUT)/game/report.o: $(ROOT)/src/game/report.cpp $(ROOT)/src/game/report.h
+	@mkdir -p $(@D); $(CXX) $(CXXFLAGS) -Os -I$(ROOT)/src -c $< -o $@
+$(OUT)/game/ctr_tls.o: $(ROOT)/src/app/ctr_tls.cpp $(ROOT)/src/tls/tls_module.h
+	@mkdir -p $(@D); $(CXX) $(CXXFLAGS) -Os -I$(ROOT)/src -c $< -o $@
+
+# The TLS module (src/tls/tls_module.h): mbedTLS and the root certificates,
+# kept out of the app and loaded only to send a problem report. It links
+# neither newlib nor libctru (-nostdlib; tls_libc.c), and is shipped in the
+# RomFS: package-cia.sh copies it into the CIA's, the .3dsx gets its own.
+TLSFLAGS := $(ARCH) -Os -Wall -Wextra -ffunction-sections -fdata-sections -fno-common -I$(ROOT)/src \
+            -I$(PORTLIBS)/include -ffile-prefix-map=$(abspath $(ROOT))=.
+$(OUT)/tls/tls_module.o: $(ROOT)/src/tls/tls_module.c $(ROOT)/src/tls/tls_module.h $(ROOT)/src/tls/root_ca.inc
+	@mkdir -p $(@D); $(CC) $(TLSFLAGS) -c $< -o $@
+$(OUT)/tls/tls_libc.o: $(ROOT)/src/tls/tls_libc.c
+	@mkdir -p $(@D); $(CC) $(TLSFLAGS) -O2 -ffreestanding -fno-tree-loop-distribute-patterns -c $< -o $@
+$(OUT)/tls/tls_module.elf: $(OUT)/tls/tls_module.o $(OUT)/tls/tls_libc.o $(ROOT)/src/tls/module.ld
+	$(CC) $(ARCH) -nostdlib -nostartfiles -static -Wl,--gc-sections -Wl,--emit-relocs -Wl,--no-undefined \
+	    -Wl,--no-warn-rwx-segments -T $(ROOT)/src/tls/module.ld $(filter %.o,$^) -L$(PORTLIBS)/lib \
+	    -lmbedtls -lmbedx509 -lmbedcrypto -lgcc -o $@
+$(OUT)/tls.bin: $(OUT)/tls/tls_module.elf $(ROOT)/src/tls/pack_module.py
+	python3 -I $(ROOT)/src/tls/pack_module.py $< $@
+$(OUT)/romfs-3dsx/tls.bin: $(OUT)/tls.bin
+	@mkdir -p $(@D); cp $< $@
 $(OUT)/game/ctr_game_cia.o: $(ROOT)/src/app/ctr_game.cpp $(wildcard $(ROOT)/src/game/*.h) $(wildcard $(ROOT)/src/runtime/rt_*.h)
 	@mkdir -p $(@D); $(CXX) $(CXXFLAGS) -O2 -DD2_CIA -I$(ROOT)/src -c $< -o $@
 $(OUT)/3ds-d2-game-cia.elf: $(filter-out $(OUT)/game/ctr_game.o,$(GAMEOBJ)) $(OUT)/game/ctr_game_cia.o
-	$(CXX) $(LDFLAGS) $^ -L$(PORTLIBS)/lib -ljpeg -lctru -lm -o $@
+	$(CXX) $(LDFLAGS) $^ -L$(PORTLIBS)/lib -ljpeg -lz -lctru -lm -o $@
 
 $(OUT)/3ds-d2-game.elf: $(GAMEOBJ)
-	$(CXX) $(LDFLAGS) $^ -L$(PORTLIBS)/lib -ljpeg -lctru -lm -o $@
+	$(CXX) $(LDFLAGS) $^ -L$(PORTLIBS)/lib -ljpeg -lz -lctru -lm -o $@
 $(OUT)/3ds-d2-game.smdh:
 	@mkdir -p $(@D); smdhtool --create "3ds-d2" "Diablo II LoD 1.14d on the n3DS" "3ds-d2" $(CTRULIB)/default_icon.png $@
-$(OUT)/3ds-d2-game.3dsx: $(OUT)/3ds-d2-game.elf $(OUT)/3ds-d2-game.smdh
-	3dsxtool $< $@ --smdh=$(OUT)/3ds-d2-game.smdh
+$(OUT)/3ds-d2-game.3dsx: $(OUT)/3ds-d2-game.elf $(OUT)/3ds-d2-game.smdh $(OUT)/romfs-3dsx/tls.bin
+	3dsxtool $< $@ --smdh=$(OUT)/3ds-d2-game.smdh --romfs=$(OUT)/romfs-3dsx
 	@echo "built $@"
 
 $(OUT)/cpu-lane.elf: $(OBJ)

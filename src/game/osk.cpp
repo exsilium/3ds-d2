@@ -38,14 +38,46 @@ constexpr int kKeyCount = sizeof kKeys / sizeof kKeys[0];
 
 void Osk::open()
 {
+    text_ = nullptr;
     flash_ = -1;
     open_ = true;
     shift_ = false;
     dirty_ = true;
 }
 
+void Osk::open_text(std::string *text)
+{
+    open();
+    text_ = text;
+}
+
 void Osk::press(int code)
 {
+    if (text_) {
+        switch (code) {
+        case kBack:
+            // One character, with the continuation bytes of a UTF-8 one.
+            while (!text_->empty() && ((unsigned char)text_->back() & 0xC0) == 0x80)
+                text_->pop_back();
+            if (!text_->empty())
+                text_->pop_back();
+            break;
+        case kEnter:
+        case kClose:
+            open_ = false;
+            break;
+        case kShift:
+            shift_ = !shift_;
+            break;
+        default:
+            text_->push_back((char)(shift_ ? std::toupper(code) : code));
+            if (shift_ && std::isalpha(code))
+                shift_ = false;
+            break;
+        }
+        dirty_ = true;
+        return;
+    }
     if (code >= 0x20)
         rt::logf("keyboard: '%c'", shift_ ? std::toupper(code) : code);
     else

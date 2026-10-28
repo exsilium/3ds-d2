@@ -4,6 +4,7 @@
 //   sdmc:/3ds/3ds-d2/game/   Game.exe and the MPQs (read-only, the user's copy)
 //   sdmc:/3ds/3ds-d2/save/   everything the game writes (saves, settings, registry)
 //   sdmc:/3ds/3ds-d2/logs/   game.log (runtime diagnostics)
+//   sdmc:/3ds/3ds-d2/reports/  a crashed or reported session's files (ctr_report.cpp)
 //
 // Display: the game draws an 800x600 8-bit frame. The top screen shows all of
 // it stretched over the full 400x240 (2:1 across, 2.5:1 down, filtered), or a
@@ -199,6 +200,23 @@ struct Source {
 };
 bool save(const Source &src, std::string &msg);   // ctr_screenshot.cpp
 }  // namespace shot
+
+namespace report {   // ctr_report.cpp
+struct Host {
+    PrintConsole *log;
+    void (*message)(const char *);
+    void (*restore_bottom)();
+    const char *app;
+    const char *game_files;
+};
+std::string start_line();
+const char *closed_line();
+std::string keep_unclosed_session();
+std::string keep_session(const char *reason);
+bool enabled();
+bool offer_one(const Host &host, const std::string &dir);
+bool offer_pending(const Host &host);
+}  // namespace report
 
 namespace {
 
@@ -430,6 +448,8 @@ extern "C" void d2_ctr_progress_hook(const char *msg)
     std::printf("\x1b[31m%s\x1b[0m\n", msg);
     logline(msg);
     std::printf("Logs: sdmc:/3ds/3ds-d2/logs/. START: exit\n");
+    if (report::enabled())
+        std::printf("A report is offered at the next start.\n");
     while (aptMainLoop()) {
         hidScanInput();
         if (hidKeysDown() & KEY_START)
@@ -1093,6 +1113,36 @@ void sd_benchmark(const std::string &path)
 }
 #endif
 
+// game.log's last line: the session ended in order (report.h). A log
+// without it is a crash, offered as a report at the next start.
+void close_log()
+{
+    logline(report::closed_line());
+    if (g_log)
+        std::fclose(g_log);
+    g_log = nullptr;
+}
+
+// The game files' flavour, for reports: the SD card's, or the CIA's own
+// with the cinematics (full) or empty stand-ins for them (slim).
+const char *game_files(const std::string &dir)
+{
+    if (dir != kRomfsGameDir)
+        return "sdcard";
+    struct stat st;
+    return stat((dir + "/d2video.mpq").c_str(), &st) == 0 && st.st_size > (1 << 20) ? "romfs-full" : "romfs-slim";
+}
+
+report::Host report_host(const std::string &game_dir)
+{
+#ifdef D2_CIA
+    const char *app = "cia";
+#else
+    const char *app = "3dsx";
+#endif
+    return {&g_log_con, [](const char *s) { status("%s", s); }, console_again, app, game_files(game_dir)};
+}
+
 void wait_for_start()
 {
     std::printf("\nPress START to exit.\n");
@@ -1150,12 +1200,18 @@ int main()
     mkdir(kRoot, 0777);
     mkdir(kSaveDir, 0777);
     mkdir(kLogDir, 0777);
+    // The last session's logs, if it never closed, move to a report folder
+    // before this session's replace them.
+    const std::string kept = report::keep_unclosed_session();
     g_log_path = std::string(kLogDir) + "/game.log";
     g_log = std::fopen(g_log_path.c_str(), "w");
     std::freopen((std::string(kLogDir) + "/stderr.txt").c_str(), "w", stderr);
     // The main thread's handler is the default for the others; the guest runs here.
     threadOnException(on_cpu_exception, g_exc_stack + sizeof g_exc_stack, WRITE_DATA_TO_HANDLER_STACK);
     status("3ds-d2: Diablo II on the 3DS");
+    logline(report::start_line().c_str());
+    if (!kept.empty())
+        status("The last session did not end normally. Its logs: %s", kept.c_str() + std::strlen(kRoot) + 1);
     status("heap %u KiB at %08lx, linear %u KiB, app memory %u KiB", (unsigned)(__ctru_heap_size >> 10),
            (unsigned long)__ctru_heap, (unsigned)(__ctru_linear_heap_size >> 10),
            (unsigned)(osGetMemRegionSize(MEMREGION_APPLICATION) >> 10));
@@ -1177,9 +1233,17 @@ int main()
         game_dir = kRomfsGameDir;
     status("app memory %u KiB, game files: %s",
            (unsigned)(osGetMemRegionSize(MEMREGION_APPLICATION) >> 10), game_dir.c_str());
+    // Reports not answered yet (the last session's crash, or one kept for
+    // later), before the game takes the memory.
+    if (!report::offer_pending(report_host(game_dir))) {
+        close_log();
+        gfxExit();
+        return 0;
+    }
     if (exe.empty() && !read_file(game_dir + "/Game.exe", exe)) {
         status("Game.exe not found in %s.", kGameDir);
         status("Copy Game.exe (1.14d) and the .mpq files there.");
+        close_log();
         wait_for_start();
         gfxExit();
         return 1;
@@ -1203,6 +1267,7 @@ int main()
 #ifdef D2_CIA
     if (!arena_layout) {
         status("Only %u KiB of heap: the game needs at least 87 MiB.", (unsigned)(__ctru_heap_size >> 10));
+        close_log();
         wait_for_start();
         gfxExit();
         return 1;
@@ -1301,8 +1366,21 @@ int main()
         status("Diablo II ran out of memory (%u requests refused, see game.log).", rt::stats().alloc_failures);
     else if (game::fatal_exit_caller())
         status("Diablo II stopped on an internal error at %08lx.", (unsigned long)game::fatal_exit_caller());
-    if (g_log)
-        std::fclose(g_log);
+    // A report (issue #26), now that the game's memory is free: for an
+    // error, or because the player asked for one on the INFO tab.
+    const char *why = !r.loaded                    ? "the game did not start"
+                      : rt::stats().alloc_failures ? "ran out of memory"
+                      : game::fatal_exit_caller()  ? "stopped on an internal error"
+                      : g_ss.report_requested()    ? "asked for by the player"
+                                                   : nullptr;
+    close_log();
+    if (why && report::enabled()) {
+        const std::string dir = report::keep_session(why);
+        if (!report::offer_one(report_host(game_dir), dir)) {
+            gfxExit();   // closing: offered again at the next start
+            return 0;
+        }
+    }
     wait_for_start();
     gfxExit();
     return 0;

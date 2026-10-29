@@ -30,6 +30,7 @@
 #include "game/d2_state.h"
 #include "game/osk.h"
 #include "game/second_screen.h"
+#include "game/sprite_trace.h"
 #include "runtime/rt_host.h"
 
 #include <3ds.h>
@@ -40,6 +41,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <malloc.h>
 #include <string>
 #include <sys/stat.h>
@@ -225,6 +227,7 @@ const char kGameDir[] = "sdmc:/3ds/3ds-d2/game";
 const char kRomfsGameDir[] = "romfs:/game";   // the CIA carries the game files in its RomFS
 const char kSaveDir[] = "sdmc:/3ds/3ds-d2/save";
 const char kLogDir[] = "sdmc:/3ds/3ds-d2/logs";
+const char kTracePath[] = "sdmc:/3ds/3ds-d2/logs/sprites.trc";   // INFO's sprite trace (issue #18)
 const char kSettings[] = "sdmc:/3ds/3ds-d2/settings.txt";   // the bottom screen's tab and map size
 
 FILE *g_log = nullptr;
@@ -251,6 +254,10 @@ bool g_bottom_double = false; // render thread: the bottom screen is double-buff
 extern "C" const uint8_t default_font_bin[];   // libctru's console font: 8x8, 1 bpp, bit 7 leftmost
 int g_render_core = -1;                 // the core drawing frames (-1: the game's thread)
 volatile uint32_t g_frames_skipped = 0; // frames not shown: the previous one was still drawing
+d2rt::Cpu *g_guest_cpu = nullptr;       // the game's CPU, from install_native on
+game::SpriteCacheWindow g_sprite_window{};   // the sprite cache in the last heartbeat's 10 s
+bool g_trace_refused = false;   // the sprite trace did not start: not again until asked again
+bool g_trace_used = false;      // the sprite trace ran: the session's report is offered for it
 game::Autoplay g_autoplay;
 bool g_autoplay_on = false;   // sdmc:/3ds/3ds-d2/autoplay.txt, until the first physical input
 
@@ -289,8 +296,13 @@ void show_stats(float fps, float draw_ms, float worst_ms)
     std::snprintf(line[4], 48, "guest va   %6u pk %6u big  %6u", m.va_used >> 10, m.va_peak >> 10,
                   m.largest_free >> 10);
     std::snprintf(line[5], 48, "host heap  %6u/%6u KiB", (unsigned)(mi.uordblks >> 10), (unsigned)(__ctru_heap_size >> 10));
-    std::snprintf(line[6], 48, "linear free %5u KiB", (unsigned)(linearSpaceFree() >> 10));
-    std::snprintf(line[7], 48, "app free    %5u KiB", (unsigned)(osGetMemRegionFree(MEMREGION_APPLICATION) >> 10));
+    std::snprintf(line[6], 48, "linear free %5u  app free %5u KiB", (unsigned)(linearSpaceFree() >> 10),
+                  (unsigned)(osGetMemRegionFree(MEMREGION_APPLICATION) >> 10));
+    // The sprite cache (issue #18): its size, and the last heartbeat's
+    // sprites taken and let go of, per 10 s.
+    const game::SpriteCacheStats sc = g_guest_cpu ? game::sprite_cache_stats(*g_guest_cpu) : game::SpriteCacheStats{};
+    std::snprintf(line[7], 48, "sprites %5u/%5u in %4u out %4u", sc.used >> 10, sc.limit >> 10,
+                  g_sprite_window.inserted, g_sprite_window.evicted);
     const bool jit_full = dyn86_jit_allocfail != 0;   // translated code no longer fits: the game will stall
     if (jit_full)
         std::snprintf(line[8], 48, "JIT MEMORY FULL code %u jmptbl %u", m.jit_code_kb, m.jmptbl_kb);
@@ -1156,9 +1168,27 @@ void wait_for_start()
     }
 }
 
-}  // namespace
+// The sprite trace (sprite_trace.h): started and stopped as INFO's button
+// says, at the heartbeat, which also gives it the cache and the pool. It
+// goes with the session's logs, and with them into its report.
+void trace_heartbeat(const rt::MemoryReport &m, const game::SpriteCacheStats &sc)
+{
+    if (!g_ss.trace_requested()) {
+        g_trace_refused = false;
+        game::sprite_trace_stop();
+        return;
+    }
+    if (!game::sprite_trace_on() && !g_trace_refused) {
+        g_trace_refused = !game::sprite_trace_start(kTracePath);
+        g_trace_used |= !g_trace_refused;
+        if (g_trace_refused)
+            status("sprite trace: could not start (%s)", kTracePath);
+    }
+    game::sprite_trace_beat({sc.limit, sc.used, sc.sprites, m.free, m.spare_used ? 1u : 0u, m.largest_free,
+                             game::sprite_cache_taken(), (uint32_t)game::dcc_cells_decoded(), g_timing.total_frames});
+}
 
-static d2rt::Cpu *g_guest_cpu = nullptr;   // the game's CPU, from install_native on
+}  // namespace
 
 #ifdef D2_CIA
 // The guest arena is carved out of the heap, 16 MiB-aligned, and the host
@@ -1203,6 +1233,7 @@ int main()
     // The last session's logs, if it never closed, move to a report folder
     // before this session's replace them.
     const std::string kept = report::keep_unclosed_session();
+    std::remove(kTracePath);   // the last session's, if it closed (its report has its own copy)
     g_log_path = std::string(kLogDir) + "/game.log";
     g_log = std::fopen(g_log_path.c_str(), "w");
     std::freopen((std::string(kLogDir) + "/stderr.txt").c_str(), "w", stderr);
@@ -1295,15 +1326,18 @@ int main()
         // A request served from the spare had no other piece of the pool
         // left: the cache goes down to its minimum.
         const rt::MemoryReport m = rt::memory_report();
-        const uint32_t pool_free = m.spare_used ? 0 : m.free;
-        if (pool_free < game::kCtrPoolReserve)
+        if (m.spare_used || m.free < game::kCtrPoolRelease)
             game::request_pool_release();
-        game::govern_sprite_cache(*g_guest_cpu, pool_free, game::kCtrPoolReserve, game::kCtrSpriteCacheMin);
+        const game::SpriteCacheWindow w = game::sprite_cache_window(*g_guest_cpu);
+        game::govern_sprite_cache(*g_guest_cpu, m.free, m.spare_used, w.evicted, game::kCtrPoolReserve,
+                                  game::kCtrSpriteCacheMin);
+        g_sprite_window = w;
         const game::SpriteCacheStats sc = game::sprite_cache_stats(*g_guest_cpu);
-        char line[96];
-        std::snprintf(line, sizeof line, "[rt] sprite cache %u/%u KiB, %u sprites", sc.used >> 10, sc.limit >> 10,
-                      sc.sprites);
+        char line[128];
+        std::snprintf(line, sizeof line, "[rt] sprite cache %u/%u KiB, %u sprites, in %u, out %u",
+                      sc.used >> 10, sc.limit >> 10, sc.sprites, w.inserted, w.evicted);
         logline(line);
+        trace_heartbeat(m, sc);
     };
     // Sound through ds_emul into the DSP (ctr_audio.cpp), mixed on another core.
     setenv("WX86_SON", "vita", 1);   // ds_emul's name for the console's realtime sink
@@ -1317,6 +1351,8 @@ int main()
     opt.install_native = [](d2rt::Cpu &c) {
         g_guest_cpu = &c;
         game::set_sprite_cache_floor(c, game::kCtrSpriteCacheFloor);
+        game::install_sprite_cache_counter(c);
+        game::install_sprite_trace(c);
         game::install_fatal_exit(c);
         game::install_pool_release(c);
         game::set_pool_block_size(c, game::kCtrPoolBlock);
@@ -1357,6 +1393,7 @@ int main()
 #endif
     aptUnhook(&g_apt_cookie);
     stop_render_thread();
+    game::sprite_trace_stop();
     console_again();   // the game's end shows on the console, as before the second screen
     if (!r.loaded)
         status("FATAL: %s", r.error.c_str());
@@ -1372,6 +1409,7 @@ int main()
                       : rt::stats().alloc_failures ? "ran out of memory"
                       : game::fatal_exit_caller()  ? "stopped on an internal error"
                       : g_ss.report_requested()    ? "asked for by the player"
+                      : g_trace_used               ? "a sprite trace"
                                                    : nullptr;
     close_log();
     if (why && report::enabled()) {

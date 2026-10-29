@@ -25,16 +25,18 @@ PROF = re.compile(r"prof: (\d+) ms, frames (\d+), idle (\d+) ms, switches (\d+),
 INTRIN = re.compile(r"DccCell appels=(\d+)")
 FILES = re.compile(r"prof files: (\d+) reads \((\d+) async\).*?disk (\d+) reads (\d+) KiB in (\d+) ms; cache (\d+) KiB")
 HEART = re.compile(r"t=(\d+)s .*?heap=(\d+)/(\d+)KiB va=(\d+)/(\d+)KiB free=(\d+)KiB jit=(\d+) meta=(\d+) jmptbl=(\d+)KiB host=(\d+)KiB")
-SPRITE = re.compile(r"sprite cache (\d+)/(\d+) KiB, (\d+) sprites")
+OPENED = re.compile(r"t=\d+s peeks=\d+ files=(\d+) ")
+SPRITE = re.compile(r"sprite cache (\d+)/(\d+) KiB, (\d+) sprites(?:, in (\d+), out (\d+))?")
 STATE = re.compile(r"game state: (.*?) \(ui")
 
 FIELDS = ["t", "state", "ms", "frames", "fps", "idle_ms", "switches", "cache_syncs", "cache_sync_us", "cells",
-          "reads", "disk_reads", "disk_kib", "disk_ms", "heap_kib", "heap_peak_kib", "va_kib", "va_peak_kib",
-          "free_kib", "jit_kib", "meta_kib", "host_kib", "sprite_kib", "sprite_limit_kib", "sprites"]
+          "reads", "opened", "load", "disk_reads", "disk_kib", "disk_ms", "heap_kib", "heap_peak_kib", "va_kib", "va_peak_kib",
+          "free_kib", "jit_kib", "meta_kib", "host_kib", "sprite_kib", "sprite_limit_kib", "sprites", "sprites_in",
+          "sprites_out"]
 
 
 def parse(path):
-    rows, cur, state, cells_before = [], None, "start", None
+    rows, cur, state, cells_before, opened_before = [], None, "start", None, None
     for line in open(path, encoding="utf-8", errors="replace"):
         m = STATE.search(line)
         if m:
@@ -59,6 +61,11 @@ def parse(path):
             cur.update(reads=int(m.group(1)), disk_reads=int(m.group(3)), disk_kib=int(m.group(4)),
                        disk_ms=int(m.group(5)))
             continue
+        m = OPENED.search(line)
+        if m:
+            opened = int(m.group(1))
+            cur["opened"] = opened - opened_before if opened_before is not None else 0
+            opened_before = opened
         m = HEART.search(line)
         if m:
             cur.update(t=int(m.group(1)), heap_kib=int(m.group(2)), heap_peak_kib=int(m.group(3)),
@@ -68,8 +75,13 @@ def parse(path):
         m = SPRITE.search(line)
         if m:   # the heartbeat's last line
             cur.update(sprite_kib=int(m.group(1)), sprite_limit_kib=int(m.group(2)), sprites=int(m.group(3)))
+            if m.group(4) is not None:   # logs from builds with the insertion counter (issue #18)
+                cur.update(sprites_in=int(m.group(4)), sprites_out=int(m.group(5)))
             for k in FIELDS:
                 cur.setdefault(k, 0)
+            # An area load (a waypoint, a portal, a respawn): the game opens and
+            # reads the area's files and draws few frames or none.
+            cur["load"] = int(cur["opened"] >= 10 or cur["reads"] >= 1000)
             rows.append(cur)
             cur = None
     return rows
@@ -114,11 +126,21 @@ def report(rows):
         fps_line("re-loading sprites, 5k-50k cells", [r for r in play if 5000 <= r["cells"] < 50000 and r["cache_syncs"] < 100])
         fps_line("re-loading sprites, >=50k cells", [r for r in play if r["cells"] >= 50000 and r["cache_syncs"] < 100])
         fps_line("translating (>=100 cache syncs)", [r for r in play if r["cache_syncs"] >= 100])
+        fps_line("area loads (>=10 opens or >=1000 reads)", [r for r in play if r["load"]])
         fps_line("sprite cache over its limit", [r for r in play if r["sprite_kib"] > r["sprite_limit_kib"]])
         fps_line("sprite cache limit <= 8 MiB", [r for r in play if r["sprite_limit_kib"] <= 8192])
         fps_line("sprite cache limit >= 12 MiB", [r for r in play if r["sprite_limit_kib"] >= 12288])
         print(f"  share of play windows re-loading sprites: {sum(1 for r in play if r['cells'] >= 5000) / len(play):.0%}; "
               f"idle share of core 0: {sum(r['idle_ms'] for r in play) / (sum(r['ms'] for r in play)):.1%}")
+        # Issue #18's targets: cells decoded p90 under 20k per window, no window
+        # under 10 fps that is not an area load.
+        slow = [r for r in play if r["fps"] < 10]
+        print(f"  cells decoded per window: median {pct([r['cells'] for r in play], .5):.0f}, "
+              f"p90 {pct([r['cells'] for r in play], .9):.0f}; windows under 10 fps: {len(slow)}, "
+              f"{sum(1 for r in slow if not r['load'])} of them not area loads")
+        if any(r["sprites_in"] for r in play):
+            print(f"  sprites taken {sum(r['sprites_in'] for r in play)}, let go of {sum(r['sprites_out'] for r in play)}; "
+                  f"windows evicting: {sum(1 for r in play if r['sprites_out']) / len(play):.0%}")
 
         print("\nin play, fps histogram (windows):")
         hist = collections.Counter(min(30, int(r["fps"] // 2) * 2) for r in play)
@@ -129,7 +151,8 @@ def report(rows):
         for r in sorted(play, key=lambda r: r["fps"])[:12]:
             print(f"  t={r['t']:6d}s {r['fps']:5.1f} fps  idle {r['idle_ms']:4d} ms  syncs {r['cache_syncs']:5d}  "
                   f"cells {r['cells']:7d}  disk {r['disk_ms']:4d} ms / {r['disk_kib']:5d} KiB  free {r['free_kib']:6d} KiB  "
-                  f"sprites {r['sprite_kib']:5d}/{r['sprite_limit_kib']:5d} KiB")
+                  f"sprites {r['sprite_kib']:5d}/{r['sprite_limit_kib']:5d} KiB in {r['sprites_in']:4d} out {r['sprites_out']:4d}"
+                  f"{'  area load' if r['load'] else ''}")
 
     print("\nmemory over time (KiB):")
     print("       t    heap  heap^    va     va^   free   jit  meta   host  sprite/limit")

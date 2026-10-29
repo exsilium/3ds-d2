@@ -5,11 +5,16 @@
 #ifndef D2_GAME_D2_NATIVE_H
 #define D2_GAME_D2_NATIVE_H
 
+#include <cstdint>
+
 namespace d2rt { struct Cpu; }
 
 namespace game {
 
 int install_d2_native(d2rt::Cpu &c);
+
+// The cells DccCell has decoded since the start (0 without it).
+uint64_t dcc_cells_decoded();
 
 }  // namespace game
 

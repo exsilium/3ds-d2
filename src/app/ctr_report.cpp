@@ -4,6 +4,7 @@
 //
 //   sdmc:/3ds/3ds-d2/reports/<time>-<build>/   one session's report:
 //       game.log, stderr.txt   the session's logs, as they were
+//       sprites.trc            the sprite trace, if INFO's button was lit (issue #18)
 //       crash_dump_*.dmp       Luma3DS's dumps saved during it (copies)
 //       report.txt             why there is a report (key=value)
 //       note.txt               the player's description
@@ -85,6 +86,9 @@ constexpr int kKeepAnswered = 8;   // sent, or not to be sent: older ones are re
 // memory setup) and the last 31 MiB (what led to the end).
 constexpr uint64_t kLogMax = 32u << 20, kLogHead = 1u << 20;
 constexpr uint64_t kStderrMax = 4u << 20, kDumpMax = 8u << 20;
+// The sprite trace (src/game/sprite_trace.h): its first 32 MiB, whole
+// records. Half an hour of play writes a few MiB; it compresses about 3:1.
+constexpr uint64_t kTraceMax = 32u << 20, kTraceRecord = 16;
 
 #ifdef PROF_COUNTERS
 const char kProf[] = "yes";
@@ -395,6 +399,10 @@ void draw_offer(const Offer &o)
                 log > (long)kLogMax ? ", its start and end" : "");
     if (exists(o.dir + "/stderr.txt"))
         std::printf(" stderr.txt\n");
+    const long trace = file_size(o.dir + "/sprites.trc");
+    if (trace > 0)
+        std::printf(" sprites.trc (%s%s)\n", kib(trace < (long)kTraceMax ? trace : (long)kTraceMax).c_str(),
+                    trace > (long)kTraceMax ? ", its start" : "");
     for (const std::string &d : o.dumps)
         std::printf(" %.48s\n", d.c_str());
     std::printf(" build, version, model, region, firmware\n");
@@ -604,6 +612,22 @@ void add_file_item(Gzip &gz, const std::string &path, const std::string &name, c
     std::fclose(f);
 }
 
+// The sprite trace: binary records, so no note in it, only whole records
+// from its start.
+void add_trace_item(Gzip &gz, const std::string &path)
+{
+    const long size = file_size(path);
+    FILE *f = size > 0 ? std::fopen(path.c_str(), "rb") : nullptr;
+    if (!f)
+        return;
+    uint64_t n = (uint64_t)size < kTraceMax ? (uint64_t)size : kTraceMax;
+    n -= n > 32 ? (n - 32) % kTraceRecord : 0;   // after the 32-byte header
+    gz.add(game::report::attachment_header("sprites.trc", "application/octet-stream", n));
+    gz.add_file(f, 0, n);
+    gz.add("\n", 1);
+    std::fclose(f);
+}
+
 bool build_envelope(const Host &host, const Offer &o, const game::report::Dsn &dsn, std::string &body)
 {
     namespace r = game::report;
@@ -666,6 +690,7 @@ bool build_envelope(const Host &host, const Offer &o, const game::report::Dsn &d
     gz.add(r::envelope_head(dsn, e));
     add_file_item(gz, o.dir + "/game.log", "game.log", "text/plain", kLogMax, kLogHead);
     add_file_item(gz, o.dir + "/stderr.txt", "stderr.txt", "text/plain", kStderrMax, 0);
+    add_trace_item(gz, o.dir + "/sprites.trc");
     for (const std::string &d : o.dumps)
         add_file_item(gz, o.dir + "/" + d, d, "application/octet-stream", kDumpMax, kDumpMax);
     return gz.finish(body);
@@ -1033,6 +1058,7 @@ std::string keep_unclosed_session()
     const std::string dir = make_report_dir(s.start_time() ? s.start_time() : unix_now(), build);
     move_file(log, dir + "/game.log");
     move_file(std::string(kLogDir) + "/stderr.txt", dir + "/stderr.txt");
+    move_file(std::string(kLogDir) + "/sprites.trc", dir + "/sprites.trc");
     const int dumps = s.start_time() ? copy_new_dumps(dir, s.start_time()) : 0;
     write_all(dir + "/report.txt", "reason=" + reason_of(s, dumps) + "\nbuild=" + build + "\n");
     if (!have_dsn())
@@ -1049,6 +1075,7 @@ std::string keep_session(const char *reason)
     const std::string dir = make_report_dir(unix_now(), D2_BUILD_ID);
     copy_file(std::string(kLogDir) + "/game.log", dir + "/game.log");
     copy_file(std::string(kLogDir) + "/stderr.txt", dir + "/stderr.txt");
+    copy_file(std::string(kLogDir) + "/sprites.trc", dir + "/sprites.trc");
     write_all(dir + "/report.txt", std::string("reason=") + reason + "\nbuild=" + D2_BUILD_ID + "\n");
     prune_reports();
     return dir;

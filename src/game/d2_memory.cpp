@@ -37,6 +37,7 @@
 // is in the pool systems the game creates for the client's and the
 // server's game, which it releases too.
 #include "game/d2_memory.h"
+#include "game/sprite_governor.h"
 
 #include "runtime/cpu.h"
 #include "runtime/guest_sync.h"
@@ -103,10 +104,24 @@ constexpr uint32_t kReleaseSlackEnd = 0x006cb6b0;
 constexpr uint32_t kBlockSizeInsn = 0x00409fa8, kBlockSizeNext = 0x00409fad;
 constexpr uint8_t kBlockSizeOrig[] = {0xb8, 0x00, 0x00, 0x08, 0x00};
 constexpr uint32_t kBlockSizeStub = 0x006cb6b0, kBlockSizeStubEnd = 0x006cb6c0;
+// 0x5ff3f0, the cache's room for a new sprite, counts it in once it has
+// evicted enough: mov edx, [ebp+8]; add dword [edi+0xc], 1;
+// add [edi+8], edx (the entry's own bytes: its frames are counted as they
+// are decoded); then 0x5ff480 leaves the cache's lock. Every sprite the
+// cache takes passes here, so with the entry count the heartbeat knows how
+// many it let go of. The stub, in .text's slack after the block size's:
+//   call <native>; <the 10 bytes>; jmp 0x5ff480
+constexpr uint32_t kInsert = 0x005ff476, kInsertNext = 0x005ff480;
+constexpr uint8_t kInsertOrig[] = {0x8b, 0x55, 0x08, 0x83, 0x47, 0x0c, 0x01, 0x01, 0x57, 0x08};
+constexpr uint32_t kInsertStub = 0x006cb6c0, kInsertStubEnd = 0x006cb6e0;
 
 uint32_t g_fatal_caller = 0;
-uint32_t g_game_limit = 0;      // the cache size the game set
-uint32_t g_written_limit = 0;   // the last limit govern_sprite_cache wrote
+SpriteGovernor g_governor;
+uint32_t g_inserted = 0;   // since the start, wrapping
+struct {
+    uint32_t inserted, sprites;
+    bool valid;
+} g_window_mark{};
 bool g_release_wanted = false;
 std::vector<std::pair<uint32_t, uint32_t>> g_released;   // {memory, header}, for the stub to free
 uint8_t *g_release_flag = nullptr;                      // host address of kReleaseFlag
@@ -269,24 +284,67 @@ SpriteCacheStats sprite_cache_stats(d2rt::Cpu &c)
     return {c.read_u32(kSpriteCache + 8), c.read_u32(kSpriteCache + 4), c.read_u32(kSpriteCache + 0xc)};
 }
 
-uint32_t govern_sprite_cache(d2rt::Cpu &c, uint32_t pool_free, uint32_t reserve, uint32_t min_limit)
+bool install_sprite_cache_counter(d2rt::Cpu &c)
+{
+    uint8_t have[sizeof kInsertOrig];
+    uint8_t slack[kInsertStubEnd - kInsertStub];
+    static const uint8_t kZero[sizeof slack] = {};
+    if (!c.read(kInsert, have, sizeof have) || std::memcmp(have, kInsertOrig, sizeof have) != 0 ||
+        !c.read(kInsertStub, slack, sizeof slack) || std::memcmp(slack, kZero, sizeof slack) != 0)
+        return false;
+    // eax and ecx are dead there, edx is loaded again after.
+    const uint32_t count = rt::native_entry("SpriteCacheInsert", 0, [](d2rt::Cpu &) -> uint32_t {
+        __atomic_fetch_add(&g_inserted, 1u, __ATOMIC_RELAXED);
+        return 0;
+    });
+    if (!count)
+        return false;
+    uint8_t s[5 + sizeof kInsertOrig + 5] = {0xe8};
+    put_rel32(s + 1, kInsertStub + 5, count);
+    std::memcpy(s + 5, kInsertOrig, sizeof kInsertOrig);
+    s[15] = 0xe9;
+    put_rel32(s + 16, kInsertStub + sizeof s, kInsertNext);
+    uint8_t jump[sizeof kInsertOrig] = {0xe9, 0, 0, 0, 0, 0x90, 0x90, 0x90, 0x90, 0x90};
+    put_rel32(jump + 1, kInsert + 5, kInsertStub);
+    c.write(kInsertStub, s, sizeof s);
+    c.write(kInsert, jump, sizeof jump);
+    c.invalidate_code(kInsertStub, sizeof s);
+    c.invalidate_code(kInsert, sizeof jump);
+    rt::logf("sprite cache: insertions counted at %08x", kInsert);
+    return true;
+}
+
+SpriteCacheWindow sprite_cache_window(d2rt::Cpu &c)
+{
+    const uint32_t inserted = __atomic_load_n(&g_inserted, __ATOMIC_RELAXED);
+    const uint32_t sprites = c.read_u32(kSpriteCache + 0xc);
+    SpriteCacheWindow w{};
+    if (g_window_mark.valid) {
+        w.inserted = inserted - g_window_mark.inserted;
+        // Out: what came in less what the count grew by. A cache the game
+        // re-created (its count back to 0) gives less than 0: nothing known.
+        const int64_t out = (int64_t)w.inserted - ((int64_t)sprites - g_window_mark.sprites);
+        w.evicted = out > 0 ? (uint32_t)out : 0;
+    }
+    g_window_mark = {inserted, sprites, true};
+    return w;
+}
+
+uint32_t sprite_cache_taken() { return __atomic_load_n(&g_inserted, __ATOMIC_RELAXED); }
+
+uint32_t govern_sprite_cache(d2rt::Cpu &c, uint32_t pool_free, bool spare_used, uint32_t evicted, uint32_t reserve,
+                             uint32_t min_limit)
 {
     const uint32_t cur = c.read_u32(kSpriteCache + 4);
     if (!cur)
         return 0;   // no cache yet
-    if (cur != g_written_limit)
-        g_game_limit = cur;   // the game (re)created it
-    // Twice the shortfall: at one for one, two hours in the Dark Wood held
-    // the pool at 3-7 MiB free with an 8-13 MiB cache, until a new area's
-    // heap block found no piece of the pool large enough.
-    const uint32_t short_by = pool_free < reserve ? 2 * (reserve - pool_free) : 0;
-    uint32_t want = g_game_limit > short_by + min_limit ? g_game_limit - short_by : min_limit;
-    want = want < g_game_limit ? want & ~0x3FFFFu : g_game_limit;   // 256 KiB steps
+    const SpriteGovernor::Beat beat{cur, c.read_u32(kSpriteCache + 8), evicted, pool_free, spare_used};
+    const uint32_t want = g_governor.step(beat, reserve, min_limit);
     if (want == cur)
         return cur;
     c.write_u32(kSpriteCache + 4, want);
-    g_written_limit = want;
-    rt::logf("sprite cache limit %u KiB (pool free %u KiB)", want >> 10, pool_free >> 10);
+    rt::logf("sprite cache limit %u KiB (pool free %u KiB%s, working set %u KiB)", want >> 10, pool_free >> 10,
+             spare_used ? ", spare used" : "", g_governor.working_set() >> 10);
     return want;
 }
 

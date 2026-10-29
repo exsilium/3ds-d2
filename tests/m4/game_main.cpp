@@ -18,6 +18,9 @@
 // M4_VIDEO_WAV=<file> records their soundtrack, paced as a console would
 // play it.
 //
+// M4_SPRITE_TRACE=<file> writes the sprite trace (game/sprite_trace.h) from
+// the first heartbeat on.
+//
 // M4_SCRIPT drives game::Controls (the 3DS control scheme) with scripted pad
 // events (game::Autoplay, src/game/autoplay.h), ';'-separated, e.g.
 //   "20000 tap 400 307;26000 tap 400 290;32000 text Tester;34000 press R;..."
@@ -30,6 +33,7 @@
 #include "game/d2_native.h"
 #include "game/d2_state.h"
 #include "game/second_screen.h"
+#include "game/sprite_trace.h"
 #include "runtime/rt_host.h"
 #include "ctru_font.h"
 #include "png.h"
@@ -166,6 +170,8 @@ int main(int argc, char **argv)
         guest_cpu = &c;
         if (sprite_floor)
             game::set_sprite_cache_floor(c, sprite_floor);
+        game::install_sprite_cache_counter(c);
+        game::install_sprite_trace(c);
         game::install_fatal_exit(c);
         if (ctr_layout) {
             game::install_pool_release(c);
@@ -196,15 +202,27 @@ int main(int argc, char **argv)
         static const uint32_t reserve = std::getenv("M4_POOL_RESERVE_MB")
                                             ? (uint32_t)std::atoi(std::getenv("M4_POOL_RESERVE_MB")) << 20
                                             : game::kCtrPoolReserve;
+        const game::SpriteCacheWindow w = game::sprite_cache_window(*guest_cpu);
         if (ctr_layout) {
             const rt::MemoryReport m = rt::memory_report();
-            const uint32_t pool_free = m.spare_used ? 0 : m.free;
-            if (pool_free < reserve)
+            if (m.spare_used || m.free < game::kCtrPoolRelease)
                 game::request_pool_release();
-            game::govern_sprite_cache(*guest_cpu, pool_free, reserve, game::kCtrSpriteCacheMin);
+            game::govern_sprite_cache(*guest_cpu, m.free, m.spare_used, w.evicted, reserve, game::kCtrSpriteCacheMin);
         }
         const game::SpriteCacheStats sc = game::sprite_cache_stats(*guest_cpu);
-        std::fprintf(stderr, "[rt] sprite cache %u/%u KiB, %u sprites\n", sc.used >> 10, sc.limit >> 10, sc.sprites);
+        std::fprintf(stderr, "[rt] sprite cache %u/%u KiB, %u sprites, in %u, out %u\n", sc.used >> 10,
+                     sc.limit >> 10, sc.sprites, w.inserted, w.evicted);
+        // M4_SPRITE_TRACE=<file>: the sprite trace (sprite_trace.h), from the first heartbeat on.
+        if (const char *trace = std::getenv("M4_SPRITE_TRACE")) {
+            static bool tried = false;
+            if (!tried) {
+                tried = true;
+                game::sprite_trace_start(trace);
+            }
+            const rt::MemoryReport m = rt::memory_report();
+            game::sprite_trace_beat({sc.limit, sc.used, sc.sprites, m.free, m.spare_used ? 1u : 0u, m.largest_free,
+                                     game::sprite_cache_taken(), (uint32_t)game::dcc_cells_decoded(), 0});
+        }
     };
 
     std::vector<uint8_t> exe;
@@ -483,6 +501,7 @@ int main(int argc, char **argv)
     });
 #endif
     rt::RunResult r = rt::run_exe(std::move(exe), opt);
+    game::sprite_trace_stop();
     if (io_thread.joinable())
         io_thread.join();
 #ifdef PROF_COUNTERS

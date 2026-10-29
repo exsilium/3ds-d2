@@ -1515,4 +1515,6 @@ int install_d2_native(Cpu &c)
     return n;
 }
 
+uint64_t dcc_cells_decoded() { return g_dcc_intrin ? g_dcc_intrin->calls : 0; }
+
 }  // namespace game

@@ -256,3 +256,75 @@ Two changes:
 - **A steeper governor.** The cache limit drops by twice the shortfall, so it reaches 4 MiB at 4 MiB free (at 1:1 it would need 0). With this session's 6 MiB free the cache would have been 8 MiB rather than 12. That leaves the pool systems ~4 MiB more of evicted units to reuse before they ask for new blocks.
 
 On the lane, `M4_POOL_SPARE_KB` sets another spare size (0: none).
+
+### Act I for 3 h 51 min: the governor's thrash (issue #18, 2026-10-28)
+
+The pool release build played Act I for 3 h 51 min on a New 3DS and ended cleanly. In play the median was 21.8 fps against the cap of 25, and 43% of the play windows were re-loading sprites the cache had evicted: 37.7M DCC cells decoded over the session, about 70 town-loads' worth. The windows decoding 50k cells or more ran at a median of 16 fps; the quiet ones at 24.2. The limit was rewritten 875 times between 4.9 and 13 MiB, while the pool stayed at 4 to 8 MiB free and the spare was never used.
+
+Lowering the limit does not give the pool its space back: the pool systems keep the evicted units, and only empty blocks go back. The old governor recomputed the limit from the game's 16 MiB on every heartbeat (minus twice the shortfall), so each 1 MiB swing of the pool's free space moved it by 2 MiB, down and back up.
+
+The governor now (`game::SpriteGovernor`, `src/game/sprite_governor.cpp`, tested by `scripts/docker.sh test governor`):
+
+- lowers the limit only on the second heartbeat in a row short of the reserve, by the shortfall, from what the cache holds rather than from its limit;
+- raises it 256 KiB per heartbeat while the pool is at least 512 KiB above the reserve;
+- does not lower it below the cache's working set, the most it held in a heartbeat without evictions over the last 10 minutes, unless the pool is under half the reserve;
+- takes it to the 4 MiB minimum at once when a request was served from the spare, as before.
+
+The heartbeat's sprite cache line now says what the cache did in the window: `sprite cache <used>/<limit> KiB, <n> sprites, in <taken>, out <let go of>`. A stub on the cache's insertion path (`0x5ff476`) counts the sprites it takes; with the entry count, that gives the ones it let go of. The INFO tab shows the same (`sprites <used>/<limit> in <n> out <n>`), and `tools/session_report.py` prints the cells-decoded median and p90 per window, the windows under 10 fps, and the sprites taken and let go of.
+
+### Act I to Andariel, 4 h 25 min: the first run of the new governor (2026-10-29)
+
+Build `6410d5481ab6` on a New 3DS XL: 15,917 s, Act I through to Andariel with several deaths, ended cleanly (Sentry event 3DS-D2-7, sent from the INFO tab). `tools/session_report.py`:
+
+| | 3 h 51 min, old governor | 4 h 25 min, new governor |
+| --- | --- | --- |
+| fps in play, median / p10 | 21.8 / 13.7 | 22.1 / 14.6 |
+| DCC cells decoded per second of session | 2,720 | 1,930 |
+| cells per window in play, p90 | 97k | 57k |
+| play windows re-loading sprites (>= 5k cells) | 43% | 33% |
+| windows >= 50k cells: count, fps median | 219, 16.0 | 165, 14.3 |
+| limit changes | 875 | 85 |
+| play windows under 10 fps / not area loads | | 54 / 24 |
+| spare used | never | once |
+
+The sessions are not the same play: this one went further, through the Catacombs to Andariel, where the slow windows cluster (t > 13,000 s). The comparison is a trend, not a measurement of the governor alone.
+
+What the log shows:
+
+- **The governor did nothing for the first 1,360 s.** The game's 16 MiB limit was in force, the cache filled it, and the pool went down to 3.9 MiB free and stayed there for 14 heartbeats until a request took the spare (pool free 2,087 KiB, largest piece 303 KiB). The glue took any limit it had not written itself for a cache the game had just created, and started counting again: before its first write, that was every heartbeat, so two short heartbeats in a row never happened. The policy now recognises a re-created cache itself (a limit other than the one it last returned), and the test lane covers this case.
+- **From t = 2,950 s to the end the limit was held at 7.8 to 7.9 MiB, with the pool at 6.5 to 9.9 MiB free.** Never above the 10 MiB reserve, so never raised; and the "working set" floor counted heartbeats in which the cache was at its limit, so it measured the limit and held it there. Several megabytes of the pool went unused for three and a half hours while the cache re-loaded sprites.
+- **Of the 54 play windows under 10 fps, 30 are area loads** (waypoints, portals, respawns: 1,000 to 5,500 reads and 10 or more files opened in the window, few or no frames). Of the other 24, 20 decoded 89k to 415k cells: sprite re-loads remain the cause of the slow windows that are not loads.
+
+Changes:
+
+- The re-creation fix above.
+- The working set counts only heartbeats in which the cache had room (at least 256 KiB below its limit) and evicted nothing.
+- The limit goes up only while the cache is at it: a limit raised in town drifted towards 16 MiB, for the next area to fill faster than two heartbeats.
+- Reserve 6 MiB and spare 2 MiB (`kCtrPoolReserve`, `kCtrPoolSpare`). The pool systems' empty blocks are still released below 10 MiB free (`kCtrPoolRelease`).
+- `tools/session_report.py` marks area loads and counts the windows under 10 fps that are not.
+
+### Sprite traces: judging a limit without a two-hour session (issue #18)
+
+A session tells how one governor did in the play it happened to get, and two sessions never get the same play. The INFO tab's "trace sprites" button writes the cache's traffic to the session's `logs/sprites.trc` until it is tapped again. A traced session is offered as a report when the game ends, and the trace goes to Sentry with its logs (`src/game/sprite_trace.h`; `M4_SPRITE_TRACE=<file>` in the m4 lane). Each record is one of these:
+
+- a sprite drawn: the first time in each second, or after it grew;
+- a sprite the cache let go of, and why;
+- each heartbeat: the cache, the pool and the counters.
+
+A sprite's key is a hash of what the game's sprite table looks it up by, so a sprite that is evicted and decoded again keeps its key.
+
+`tools/sprite_trace.py` replays a trace through a model of the cache: least recently used first, at most 0x1400 sprites. It first replays the trace under the limits the governor set, and the model's evictions should match the game's. It then replays fixed limits, giving the bytes each limit would have decoded again. One trace of a heavy route (the Catacombs, crowded fights) answers "what does a MiB of cache save" for every limit at once. A console session is then needed only to confirm a chosen policy, plus one long run for the no-fatal and never-the-spare checks.
+
+### The first sprite trace: 20 minutes to the Stony Field (issue #18, 3DS-D2-9, 2026-10-29)
+
+The game evicted 2,139 sprites and drew none of them again. Replayed under the governor's limits, the model evicts 1,869 and decodes 4 again. Every cell decoded in the session (5.66M, 41 MiB of sprites) was the first decode of a sprite new to the game: 2,259 of them, at 7 to 294 a minute. The game's partial list updates (94% of uses move their sprite up) change nothing when replayed as full ones.
+
+So at the governor's limits, evictions cost nothing in this play, and the working-set floor protected sprites that never came back. It held the limit at 15.9 MiB while the pool went down to 2.4 MiB free; in the 30-minute session before it (3DS-D2-8) the low point was 2.76 MiB. The floor now holds only within 1 MiB of the reserve (`SpriteGovernor::kFloorSlack`).
+
+The game tells sprites apart by token, component, armour class, mode, weapon class, and a pointer to the sprite's cell file (the sprite table's record, +8 to +0x20). Act I's first areas do not have 2,259 such combinations. The likely cause is cell files freed and loaded again, each time under a new pointer, so their sprites are new again. This is not confirmed yet. The slow windows that were not area loads point the same way: each spent 2 to 3 s waiting and read 3 to 4 MB. Version 2 of the trace records those words for each sprite, so the next trace can confirm or rule this out.
+
+### Trace version 2: cell files loaded again (issue #18, 3DS-D2-A, 2026-10-30)
+
+21 minutes with the bounded floor: the pool's low point was 3,400 KiB, against 2,374 KiB in 3DS-D2-9, and the frame rate was unchanged. The game drew 1 evicted sprite again, and the model re-decodes 0.7 MiB at the governor's limits.
+
+Of 2,252 sprites, 545 differ from an earlier one only in the cell file pointer (+0x20). They are the same graphics, decoded again after the game freed their file and loaded it again: 10.1 of 46.4 MiB (22%), a median of 510 s after the previous load. Most belong to corrupt rogues, the Fallen, Fallen shamans and skeletons. The other 1,707 graphics are real variety: corrupt rogues alone have 692 sprites, because each one's armour and weapon change its components. The slow windows that are not area loads are the moments new monsters appear: 3 to 5 MB read from the SD card, 1 to 3 s spent waiting on it, and 120k to 230k cells decoded.

@@ -380,6 +380,10 @@ void SecondScreen::update(Pad &pad, const GameState &gs, int cursor_x, int curso
             } else if (kind == BottomView::kInfo && pad.touch_y >= kMapBtnY && pad.touch_x >= kReportBtnX) {
                 grip_ = Grip::MapButton;
                 key_ = 3;   // INFO's report button
+            } else if (kind == BottomView::kInfo && pad.touch_y >= kMapBtnY && pad.touch_x >= kTraceBtnX &&
+                       pad.touch_x < kTraceBtnX + kTraceBtnW) {
+                grip_ = Grip::MapButton;
+                key_ = 4;   // INFO's sprite trace button
             } else {
                 grip_ = Grip::Pad;
             }
@@ -425,9 +429,13 @@ void SecondScreen::update(Pad &pad, const GameState &gs, int cursor_x, int curso
         if (up && grip_ == Grip::MapButton && moved_ <= kTapSlop) {
             // A tap: the size switches; the refresh steps through its
             // choices; the corner one switches between the map and HELP.
-            // INFO's asks for a report, or takes the request back.
+            // INFO's ask for a report or the sprite trace, or take the
+            // request back.
             if (key_ == 3) {
                 report_ = !report_;
+                dirty_ = true;
+            } else if (key_ == 4) {
+                trace_ = !trace_;
                 dirty_ = true;
             } else if (key_ == 2) {
                 set_map_help(!help_);
@@ -439,7 +447,7 @@ void SecondScreen::update(Pad &pad, const GameState &gs, int cursor_x, int curso
                     i++;
                 set_map_ms(kMapMs[(i + 1) % (sizeof kMapMs / sizeof kMapMs[0])]);
             }
-            settings_changed_ |= key_ != 3;
+            settings_changed_ |= key_ < 3;
         }
         if (up)
             grip_ = Grip::None;
@@ -545,6 +553,7 @@ bool SecondScreen::stage(BottomView &v, uint64_t now_ms)
             // The newest messages under the statistics, as many as fit
             // above the report button.
             v.report = report_;
+            v.trace = trace_;
             const int rows = (kAreaH - kMapBtnH) / 8 - (int)stats_.size();
             const uint32_t n = log_head_ < (uint32_t)kLogLines ? log_head_ : (uint32_t)kLogLines;
             const uint32_t show = rows > 0 ? ((uint32_t)rows < n ? (uint32_t)rows : n) : 0;
@@ -741,6 +750,13 @@ void draw_bottom(uint16_t *fb, const BottomView &v, const uint8_t *frame, int fw
             cv.centred(x, y + 4, w, "report at the end", kBg);
         } else {
             draw_map_button(cv, SecondScreen::kReportBtnX, SecondScreen::kReportBtnW, "report a problem");
+        }
+        if (v.trace) {
+            const int x = SecondScreen::kTraceBtnX, w = SecondScreen::kTraceBtnW, y = SecondScreen::kMapBtnY;
+            cv.fill(x + 1, y + 1, w - 2, SecondScreen::kMapBtnH - 2, kGold);
+            cv.centred(x, y + 4, w, "tracing sprites", kBg);
+        } else {
+            draw_map_button(cv, SecondScreen::kTraceBtnX, SecondScreen::kTraceBtnW, "trace sprites");
         }
         break;
     default:

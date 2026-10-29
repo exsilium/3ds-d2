@@ -12,7 +12,9 @@
 //          straight at the game
 //   INFO   the diagnostics (frame rate, memory) and the runtime's messages;
 //          the button under them asks for a report of this session when the
-//          game ends (issue #26: nothing is collected or sent meanwhile)
+//          game ends (issue #26: nothing is collected or sent meanwhile), and
+//          the one beside it traces the sprite cache to the SD card (issue
+//          #18, sprite_trace.h) until it is tapped again
 //   PANEL  offered while a panel is open (inventory, stash, shop, character,
 //          skills...), and shown by itself when one opens: the panel's half
 //          of the frame at 1:1 (D2's panels are 320 pixels wide at 640x480),
@@ -70,6 +72,7 @@ struct BottomView {
     // kInfo, and the upper part of kKeyboard.
     std::vector<Line> lines;
     bool report = false;              // kInfo: a report is asked for (its button lit)
+    bool trace = false;               // kInfo: the sprite trace is asked for (its button lit)
     // kKeyboard.
     std::string osk_title;
     std::vector<Osk::KeyView> osk_keys;
@@ -105,6 +108,10 @@ public:
     // when the game ends. The platform reads it then; until then it is a flag.
     static constexpr int kReportBtnX = 164, kReportBtnW = 156;
     bool report_requested() const { return report_; }
+    // And the sprite trace's, left of it: the platform starts and stops the
+    // trace at its heartbeat as this flag says.
+    static constexpr int kTraceBtnX = 4, kTraceBtnW = 156;
+    bool trace_requested() const { return trace_; }
     // The buttons' shortcuts (Select + D-pad): the next or previous tab
     // along the bar (PANEL too while a panel is open), MAP, and MAP's size
     // (both showing the map, not HELP). Not while the keyboard is open.
@@ -150,6 +157,7 @@ private:
     uint32_t map_ms_ = 500;
     bool settings_changed_ = false;
     bool report_ = false;
+    bool trace_ = false;
     const Osk *osk_ = nullptr;
 
     // The game.

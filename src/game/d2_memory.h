@@ -25,21 +25,51 @@ struct SpriteCacheStats {
 };
 SpriteCacheStats sprite_cache_stats(d2rt::Cpu &c);
 
-// Holds the guest pool's free space near `reserve` by lowering the sprite
-// cache's limit by twice what the pool is short of it, down to `min_limit`
-// and never above the size the game gave the cache (it re-creates the cache
-// between the menus and a game). The cache evicts down to a lowered limit
-// as it takes new sprites, and the memory it lets go of stays in the game's
-// pool system for its other data, which then stops taking more of the
-// guest pool. Call it periodically with the pool's free bytes. Logs each
-// change; returns the limit in force.
-constexpr uint32_t kCtrPoolReserve = 10u << 20;
+// Counts the sprites the cache takes (a stub on its insertion path), for
+// sprite_cache_window. Returns false, changing nothing, on a different
+// Game.exe.
+bool install_sprite_cache_counter(d2rt::Cpu &c);
+
+// What the cache did since the last call (all 0 on the first, and without
+// the counter): sprites taken, and sprites let go of (evicted, or freed by
+// the game).
+struct SpriteCacheWindow {
+    uint32_t inserted, evicted;
+};
+SpriteCacheWindow sprite_cache_window(d2rt::Cpu &c);
+// The sprites the cache has taken since the start (wrapping).
+uint32_t sprite_cache_taken();
+
+// Holds the guest pool's free space near `reserve` with the sprite cache's
+// limit (SpriteGovernor, sprite_governor.h: lowered after two heartbeats
+// short of the reserve, raised in steps as the pool recovers, not below the
+// cache's working set), between `min_limit` and the size the game gave the
+// cache (it re-creates the cache between the menus and a game). The cache
+// evicts down to a lowered limit as it takes new sprites, and the memory it
+// lets go of stays in the game's pool system for its other data, which then
+// stops taking more of the guest pool. Call it once per heartbeat with the
+// pool's free bytes, whether a request was served from the pool's spare,
+// and sprite_cache_window's evictions. Logs each change; returns the limit
+// in force.
+//
+// The reserve was 10 MiB with a 1 MiB spare. In 4 h 25 min of Act I
+// (2026-10-29) the pool then stayed at 6.5 to 9.9 MiB free for three and a
+// half hours, short of the reserve all along, while the cache was held at
+// 7.9 MiB and re-loaded sprites in a third of the play windows; the spare was
+// taken once, when the governor had not acted. 6 MiB and a 2 MiB spare give
+// the cache those megabytes and keep twice the spare back in one piece.
+constexpr uint32_t kCtrPoolReserve = 6u << 20;
 constexpr uint32_t kCtrSpriteCacheMin = 4u << 20;
+// The pool systems' empty blocks are released below this much free
+// (request_pool_release), as they were below the old reserve: well before
+// the governor has to act.
+constexpr uint32_t kCtrPoolRelease = 10u << 20;
 // Of the pool, kept back in one piece for a request that fits nowhere else
 // (rt::RunOptions::pool_spare): the heap blocks the console was refused at
 // the end of long sessions were 262 to 656 KiB.
-constexpr uint32_t kCtrPoolSpare = 1u << 20;
-uint32_t govern_sprite_cache(d2rt::Cpu &c, uint32_t pool_free, uint32_t reserve, uint32_t min_limit);
+constexpr uint32_t kCtrPoolSpare = 2u << 20;
+uint32_t govern_sprite_cache(d2rt::Cpu &c, uint32_t pool_free, bool spare_used, uint32_t evicted, uint32_t reserve,
+                             uint32_t min_limit);
 
 // Makes the game's fatal exit, exit(-1) after an internal error (an
 // allocation that failed, a pool that overflowed, an assertion), end the

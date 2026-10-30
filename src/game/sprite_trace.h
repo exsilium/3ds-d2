@@ -10,7 +10,7 @@
 // compare and a jump.
 //
 // The file: a 32-byte header, then 16-byte records, little-endian.
-//   header  "D2SPTRC1", u32 version (2), u32 record size (16),
+//   header  "D2SPTRC1", u32 version (3), u32 record size (16),
 //           u32 use window (ms), u32 start (Unix time), u32 0, u32 0
 //   record  u32 type << 28 | ms since the start, u32 a, u32 b, u32 c
 // The types (kUse... below):
@@ -30,14 +30,17 @@
 //           decoded since the start (low 32 bits), c frames presented.
 //   lost    a records not written (the file could not take them).
 //   ident   (version 2) before a sprite's first use record (and again if
-//           it was not seen for a while): what its key is a hash of, the
-//           record's words +4 to +0x20, two at a time in b and c of five
-//           records (A: +4 +8, B: +0xc +0x10, C: +0x14 +0x18, D: +0x1c
-//           +0x20, E: the first word +0x20 points at), all with a = the
-//           key. Which of them makes sprites new tells whether the game
-//           decodes the same graphics again under another key.
+//           it was not seen for a while): the record's words +4 to +0x20,
+//           two at a time in b and c of five records (A: +4 +8, B: +0xc
+//           +0x10, C: +0x14 +0x18, D: +0x1c +0x20, E: the first word +0x20
+//           points at), all with a = the key.
 // The key is a hash of what the game's own sprite table (0x88db58) looks
-// sprites up by, so a sprite evicted and decoded again keeps its key.
+// sprites up by, its record's +4 to +0x1c, so a sprite evicted and decoded
+// again keeps its key (version 3). Version 2 hashed +0x20 as well: that is
+// the sprite's own block in the cache, new each time it is decoded, so
+// there a sprite decoded again had a new key, and differed from its earlier
+// self only in +0x20 (issue #31; tools/sprite_trace.py keys such traces by
+// their ident records).
 #ifndef D2_GAME_SPRITE_TRACE_H
 #define D2_GAME_SPRITE_TRACE_H
 

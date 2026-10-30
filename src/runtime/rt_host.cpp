@@ -61,7 +61,7 @@ RunOptions g_opt;
 Bridge *g_br = nullptr;
 CooperativeScheduler *g_sched = nullptr;
 std::atomic<Cpu *> g_tick_cpu{nullptr};   // the CPU while the scheduler runs (profile_tick)
-uint32_t g_exe_base = 0;
+uint32_t g_exe_base = 0, g_exe_size = 0;
 bool g_exited = false;
 bool g_timed_out = false;
 Stats g_stats;
@@ -389,6 +389,97 @@ namespace {
 // split between translated code and shims, the busiest shims, and an EIP
 // profile per guest thread (one sample per preempted slice), after which the
 // samples are reset so every interval is a profile of its own.
+// Where the thread presenting frames spends its time (issue #31): the host
+// time between two calls of check_time_limit on the scheduler's thread (at
+// each advance of the guest clock, and from now_ms) is charged to what that
+// thread was doing at the first of them: running, ready
+// while another guest thread runs, or blocked, by what it waits on (a
+// Sleep is blocked on nothing). Millisecond resolution, so sums over a
+// heartbeat, not single waits.
+constexpr const char *kFrameKinds[] = {"run", "ready", "sleep", "critsec", "event", "fileio", "multi", "thread",
+                                       "other"};
+constexpr size_t kFrameKindCount = sizeof kFrameKinds / sizeof kFrameKinds[0];
+uint64_t g_frame_ms[kFrameKindCount] = {}, g_frame_mark[kFrameKindCount] = {};
+size_t g_frame_was = kFrameKindCount;   // what it was doing at the last advance (none yet)
+uint64_t g_frame_at = 0;
+// Its blocked time by where it waits from (the guest code it resumes in),
+// for the heartbeat's few largest.
+uint32_t g_frame_where = 0;
+std::map<uint32_t, uint64_t> g_frame_wait_at;
+
+// Where a blocked guest thread waits from: its saved EIP when that is in the
+// game's image, else (a shim's trap) the return address on its stack.
+uint32_t wait_site(const GuestThread &t)
+{
+    const uint32_t eip = t.ctx.eip;
+    if (eip >= g_exe_base && eip < g_exe_base + g_exe_size)
+        return eip;
+    Cpu *c = g_tick_cpu.load(std::memory_order_relaxed);
+    return c ? c->read_u32(t.ctx.gpr[R_ESP]) : eip;
+}
+
+size_t frame_thread_doing()
+{
+    const int id = g_stats.frame_thread;
+    GuestThread *t = id >= 0 && g_sched ? g_sched->thread_by_id((uint32_t)id) : nullptr;
+    if (!t)
+        return kFrameKindCount;
+    switch (t->state) {
+    case GuestThread::State::Running: return 0;
+    case GuestThread::State::Ready: return 1;
+    case GuestThread::State::Blocked: break;
+    default: return kFrameKindCount;
+    }
+    g_frame_where = wait_site(*t);
+    if (!t->wait_obj)
+        return 2;
+    const char *k = static_cast<Waitable *>(t->wait_obj)->kind();
+    for (size_t i = 3; i + 1 < kFrameKindCount; i++)
+        if (std::strcmp(k, kFrameKinds[i]) == 0)
+            return i;
+    return kFrameKindCount - 1;
+}
+
+void sample_frame_thread()
+{
+    // The host's clock: check_time_limit is given the scheduler's and now_ms's
+    // in turn, which differ by an offset.
+    const uint64_t ms = wx86_now_ms();
+    if (g_frame_was < kFrameKindCount && ms > g_frame_at) {
+        g_frame_ms[g_frame_was] += ms - g_frame_at;
+        if (g_frame_was >= 2)
+            g_frame_wait_at[g_frame_where] += ms - g_frame_at;
+    }
+    g_frame_at = ms;
+    g_frame_was = frame_thread_doing();
+}
+
+void log_frame_thread()
+{
+    char line[256];
+    size_t off = std::snprintf(line, sizeof line, "prof frame thread %d:", g_stats.frame_thread);
+    for (size_t i = 0; i < kFrameKindCount && off < sizeof line; i++) {
+        off += std::snprintf(line + off, sizeof line - off, " %s %llu", kFrameKinds[i],
+                             (unsigned long long)(g_frame_ms[i] - g_frame_mark[i]));
+        g_frame_mark[i] = g_frame_ms[i];
+    }
+    logf("%s ms", line);
+    // The sites it waited longest from (200 ms or more).
+    std::vector<std::pair<uint64_t, uint32_t>> top;
+    for (const auto &w : g_frame_wait_at)
+        if (w.second >= 200)
+            top.push_back({w.second, w.first});
+    g_frame_wait_at.clear();
+    if (top.empty())
+        return;
+    std::sort(top.rbegin(), top.rend());
+    off = std::snprintf(line, sizeof line, "prof frame thread waits:");
+    for (size_t i = 0; i < top.size() && i < 6 && off < sizeof line; i++)
+        off += std::snprintf(line + off, sizeof line - off, " %08x:%llu", top[i].second,
+                             (unsigned long long)top[i].first);
+    logf("%s ms", line);
+}
+
 struct ProfMark {
     uint64_t ms, idle_ms, switches, sync_ticks;
     uint32_t syncs, frames;
@@ -431,13 +522,16 @@ void prof_report(uint64_t ms)
     }
     const FileStats &f = now.files, &f0 = g_mark.files;
     logf("prof files: %llu reads (%llu async), %llu hits, %llu fills, %llu direct, %llu seeks; disk %llu reads %llu KiB in "
-         "%llu ms; cache %llu KiB",
+         "%llu ms; cache %llu KiB; waited %llu ms in %llu reads (frame thread %llu ms), stalled %llu ms",
          (unsigned long long)(f.calls - f0.calls), (unsigned long long)(f.async - f0.async),
          (unsigned long long)(f.hits - f0.hits),
          (unsigned long long)(f.fills - f0.fills), (unsigned long long)(f.direct - f0.direct),
          (unsigned long long)(f.seeks - f0.seeks), (unsigned long long)(f.disk_reads - f0.disk_reads),
          (unsigned long long)((f.disk_bytes - f0.disk_bytes) >> 10), (unsigned long long)((f.disk_us - f0.disk_us) / 1000),
-         (unsigned long long)(f.cache_bytes >> 10));
+         (unsigned long long)(f.cache_bytes >> 10), (unsigned long long)((f.wait_us - f0.wait_us) / 1000),
+         (unsigned long long)(f.waits - f0.waits), (unsigned long long)((f.wait_frame_us - f0.wait_frame_us) / 1000),
+         (unsigned long long)((f.stall_us - f0.stall_us) / 1000));
+    log_frame_thread();
 #ifdef PROF_COUNTERS
     now.run_ns = prof::run_ns;
     now.trap_ns = prof::trap_ns;
@@ -502,6 +596,8 @@ void prof_report(uint64_t ms)
 
 void check_time_limit(uint64_t ms)
 {
+    if (t_runs_guest && g_sched)
+        sample_frame_thread();
     if (g_opt.service && t_runs_guest && !g_in_service) {
         const uint64_t real = wx86_now_ms();
         if (real - g_last_service_ms >= 50) {
@@ -722,6 +818,7 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
         return res;
     }
     g_exe_base = img->load_base();
+    g_exe_size = img->image_size();
     std::vector<uint8_t>().swap(exe);   // the image holds its own copy now
 
     // Guest memory: heap, VirtualAlloc arena, scratch, PEB and main TEB.

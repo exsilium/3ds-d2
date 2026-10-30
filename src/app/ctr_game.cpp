@@ -31,6 +31,7 @@
 #include "game/osk.h"
 #include "game/second_screen.h"
 #include "game/sprite_trace.h"
+#include "game/storm_reads.h"
 #include "runtime/rt_host.h"
 
 #include <3ds.h>
@@ -1334,8 +1335,8 @@ int main()
         g_sprite_window = w;
         const game::SpriteCacheStats sc = game::sprite_cache_stats(*g_guest_cpu);
         char line[128];
-        std::snprintf(line, sizeof line, "[rt] sprite cache %u/%u KiB, %u sprites, in %u, out %u",
-                      sc.used >> 10, sc.limit >> 10, sc.sprites, w.inserted, w.evicted);
+        std::snprintf(line, sizeof line, "[rt] sprite cache %u/%u KiB, %u sprites, in %u, out %u, decoded %u in %u ms",
+                      sc.used >> 10, sc.limit >> 10, sc.sprites, w.inserted, w.evicted, w.decodes, w.decode_ms);
         logline(line);
         trace_heartbeat(m, sc);
     };
@@ -1352,7 +1353,9 @@ int main()
         g_guest_cpu = &c;
         game::set_sprite_cache_floor(c, game::kCtrSpriteCacheFloor);
         game::install_sprite_cache_counter(c);
+        game::install_sprite_decode_timer(c);
         game::install_sprite_trace(c);
+        game::install_storm_read_priority(c);
         game::install_fatal_exit(c);
         game::install_pool_release(c);
         game::set_pool_block_size(c, game::kCtrPoolBlock);

@@ -4,7 +4,8 @@
 //
 //   sdmc:/3ds/3ds-d2/reports/<time>-<build>/   one session's report:
 //       game.log, stderr.txt   the session's logs, as they were
-//       sprites.trc            the sprite trace, if INFO's button was lit (issue #18)
+//       sprites.trc            a profiler run's sprite trace (issue #18)
+//       files.trc              a profiler run's file-read trace (issue #21)
 //       crash_dump_*.dmp       Luma3DS's dumps saved during it (copies)
 //       report.txt             why there is a report (key=value)
 //       note.txt               the player's description
@@ -89,12 +90,9 @@ constexpr uint64_t kStderrMax = 4u << 20, kDumpMax = 8u << 20;
 // The sprite trace (src/game/sprite_trace.h): its first 32 MiB, whole
 // records. Half an hour of play writes a few MiB; it compresses about 3:1.
 constexpr uint64_t kTraceMax = 32u << 20, kTraceRecord = 16;
-
-#ifdef PROF_COUNTERS
-const char kProf[] = "yes";
-#else
-const char kProf[] = "no";
-#endif
+// The file-read trace (rt::set_file_trace): text, its first 16 MiB. A line
+// per read of the game's; it compresses about 5:1.
+constexpr uint64_t kFileTraceMax = 16u << 20;
 
 void say(const Host &host, const std::string &s)
 {
@@ -403,6 +401,10 @@ void draw_offer(const Offer &o)
     if (trace > 0)
         std::printf(" sprites.trc (%s%s)\n", kib(trace < (long)kTraceMax ? trace : (long)kTraceMax).c_str(),
                     trace > (long)kTraceMax ? ", its start" : "");
+    const long reads = file_size(o.dir + "/files.trc");
+    if (reads > 0)
+        std::printf(" files.trc (%s%s)\n", kib(reads < (long)kFileTraceMax ? reads : (long)kFileTraceMax).c_str(),
+                    reads > (long)kFileTraceMax ? ", its start" : "");
     for (const std::string &d : o.dumps)
         std::printf(" %.48s\n", d.c_str());
     std::printf(" build, version, model, region, firmware\n");
@@ -639,7 +641,8 @@ bool build_envelope(const Host &host, const Offer &o, const game::report::Dsn &d
     if (o.log.start_time())
         e.started = clock_text(o.log.start_time());
     const bool crashed = o.reason.compare(0, 7, "crashed") == 0;
-    e.level = crashed ? "fatal" : o.reason == "asked for by the player" ? "info" : "error";
+    const bool asked = o.reason == "asked for by the player" || o.reason == "a profiler run";
+    e.level = crashed ? "fatal" : asked ? "info" : "error";
     // The release is the version the session was played on; its build is
     // the dist (and the build_id tag), so a release gathers all its builds.
     // A log from before 0.4.0 does not say its version: only if it is this
@@ -675,7 +678,7 @@ bool build_envelope(const Host &host, const Offer &o, const game::report::Dsn &d
               {"version", version.empty() ? "unknown" : version},
               {"app", host.app},
               {"mode", host.game_files},
-              {"prof", kProf},
+              {"profile", o.log.profiled().empty() ? "none" : o.log.profiled()},   // a profiler run's options
               {"model", model_name(model)},
               {"region", region_name(region)},
               {"kernel", kernel_s},
@@ -691,6 +694,7 @@ bool build_envelope(const Host &host, const Offer &o, const game::report::Dsn &d
     add_file_item(gz, o.dir + "/game.log", "game.log", "text/plain", kLogMax, kLogHead);
     add_file_item(gz, o.dir + "/stderr.txt", "stderr.txt", "text/plain", kStderrMax, 0);
     add_trace_item(gz, o.dir + "/sprites.trc");
+    add_file_item(gz, o.dir + "/files.trc", "files.trc", "text/plain", kFileTraceMax, kFileTraceMax);
     for (const std::string &d : o.dumps)
         add_file_item(gz, o.dir + "/" + d, d, "application/octet-stream", kDumpMax, kDumpMax);
     return gz.finish(body);
@@ -1059,6 +1063,7 @@ std::string keep_unclosed_session()
     move_file(log, dir + "/game.log");
     move_file(std::string(kLogDir) + "/stderr.txt", dir + "/stderr.txt");
     move_file(std::string(kLogDir) + "/sprites.trc", dir + "/sprites.trc");
+    move_file(std::string(kLogDir) + "/files.trc", dir + "/files.trc");
     const int dumps = s.start_time() ? copy_new_dumps(dir, s.start_time()) : 0;
     write_all(dir + "/report.txt", "reason=" + reason_of(s, dumps) + "\nbuild=" + build + "\n");
     if (!have_dsn())
@@ -1076,6 +1081,7 @@ std::string keep_session(const char *reason)
     copy_file(std::string(kLogDir) + "/game.log", dir + "/game.log");
     copy_file(std::string(kLogDir) + "/stderr.txt", dir + "/stderr.txt");
     copy_file(std::string(kLogDir) + "/sprites.trc", dir + "/sprites.trc");
+    copy_file(std::string(kLogDir) + "/files.trc", dir + "/files.trc");
     write_all(dir + "/report.txt", std::string("reason=") + reason + "\nbuild=" + D2_BUILD_ID + "\n");
     prune_reports();
     return dir;

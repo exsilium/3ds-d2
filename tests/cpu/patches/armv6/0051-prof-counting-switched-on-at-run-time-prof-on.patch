@@ -1,0 +1,172 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Fri, 30 Oct 2026 17:46:49 +0200
+Subject: [PATCH] prof: counting switched on at run time (prof::on)
+
+PROF_COUNTERS built the counters in and counted in every session: two
+clock reads per shim call and per slice, per-thread map updates, and the
+EIP samples, ~12% of a frame on the console. The 3DS app had a separate
+profiling build for it. prof::on now switches the counting: off, each
+trap and slice costs a load and a branch. It is read once per trap and
+once per slice, so a change lands between them. On by default, as
+PROF_COUNTERS builds behaved before.
+---
+ src/runtime/bridge.cpp            | 11 +++++++----
+ src/runtime/prof.cpp              |  1 +
+ src/runtime/prof.h                | 10 +++++++++-
+ src/runtime/sched_cooperative.cpp | 22 +++++++++++++---------
+ src/runtime/sched_native.cpp      |  5 +++--
+ 5 files changed, 33 insertions(+), 16 deletions(-)
+
+diff --git a/src/runtime/bridge.cpp b/src/runtime/bridge.cpp
+index 1747017..4e3d872 100644
+--- a/src/runtime/bridge.cpp
++++ b/src/runtime/bridge.cpp
+@@ -525,7 +525,8 @@ bool Bridge::trap_handler(Cpu& cpu, uint32_t trap_va) {
+               std::memcpy(ref, cur, 24);
+           } } }
+ #ifdef PROF_COUNTERS
+-    uint64_t t0 = prof::now_ns();
++    const bool prof_on = prof::on;   // once: the trap is timed whole or not at all
++    uint64_t t0 = prof_on ? prof::now_ns() : 0;
+ #endif
+     // GIL observability (§19): name the shim body currently running. This
+     // runs under the GIL (trap-dispatch gil::Guard), so the write is the
+@@ -562,9 +563,11 @@ bool Bridge::trap_handler(Cpu& cpu, uint32_t trap_va) {
+         std::fprintf(stderr,"[tag %llu] %s -> eax=0x%08x\n",
+             (unsigned long long)tn, slot->shim.tag.c_str(), eax); }
+ #ifdef PROF_COUNTERS
+-    uint64_t dt = prof::now_ns() - t0;
+-    slot->prof_calls++; slot->prof_ns += dt;
+-    prof::trap_calls++;  prof::trap_ns += dt;
++    if (prof_on) {
++        uint64_t dt = prof::now_ns() - t0;
++        slot->prof_calls++; slot->prof_ns += dt;
++        prof::trap_calls++;  prof::trap_ns += dt;
++    }
+ #endif
+     // Simulate `ret [imm]`: pop retaddr; for stdcall also pop argc dwords.
+     uint32_t esp_add = 4;                              // pop return address
+diff --git a/src/runtime/prof.cpp b/src/runtime/prof.cpp
+index 1425c82..415c13a 100644
+--- a/src/runtime/prof.cpp
++++ b/src/runtime/prof.cpp
+@@ -34,6 +34,7 @@ uint64_t now_ns() {
+ #endif
+ }
+ 
++bool on = true;
+ uint64_t run_ns = 0;
+ uint64_t trap_ns = 0;
+ uint64_t trap_calls = 0;
+diff --git a/src/runtime/prof.h b/src/runtime/prof.h
+index cd38137..9b2a354 100644
+--- a/src/runtime/prof.h
++++ b/src/runtime/prof.h
+@@ -6,13 +6,21 @@
+ // piggybacks on quantum preemption (one sample per preempted slice), not a
+ // per-instruction hook, so the sample distribution matches real execution.
+ //
+-// Compiles away entirely without -DPROF_COUNTERS.
++// Compiles away entirely without -DPROF_COUNTERS. With it, `on` switches the
++// counting at run time: off, each hot spot costs a load and a branch, and
++// nothing is counted, timed or sampled. A host can build the counters in and
++// profile only the sessions that ask for it.
+ #pragma once
+ #include <cstdint>
+ 
+ namespace d2rt { namespace prof {
+ 
+ #ifdef PROF_COUNTERS
++// Counting on (the default, as before the switch existed). Read once at the
++// start of each slice and each trap, so a change lands between them, never
++// inside one. Set it from the scheduler's thread.
++extern bool on;
++
+ uint64_t now_ns();                       // monotonic (qemu/linux + Vita)
+ 
+ // Time split. run_ns covers cpu->run() (dynarec + OS traps executed inside);
+diff --git a/src/runtime/sched_cooperative.cpp b/src/runtime/sched_cooperative.cpp
+index 274414f..ddaad11 100755
+--- a/src/runtime/sched_cooperative.cpp
++++ b/src/runtime/sched_cooperative.cpp
+@@ -145,8 +145,8 @@ void CooperativeScheduler::resume(GuestThread* t) {
+ uint32_t CooperativeScheduler::wait(Waitable* w, uint32_t timeout_ms) {
+     if (!w) return 0;
+ #ifdef PROF_COUNTERS
+-    prof::wait_calls++;
+-    if (w->try_acquire(cur_)) { prof::wait_immediate++; return w->result(); }
++    if (prof::on) prof::wait_calls++;
++    if (w->try_acquire(cur_)) { if (prof::on) prof::wait_immediate++; return w->result(); }
+ #else
+     if (w->try_acquire(cur_)) return w->result();   // already signaled
+ #endif
+@@ -324,10 +324,12 @@ void CooperativeScheduler::run_slice(GuestThread* t) {
+     slice_insns_ = 0; preempted_ = false;
+     const char* fault = nullptr;
+ #ifdef PROF_COUNTERS
+-    uint64_t prof_t0 = prof::now_ns();
++    // prof::on once per slice: the slice is counted whole or not at all.
++    const bool prof_on = prof::on;
++    uint64_t prof_t0 = prof_on ? prof::now_ns() : 0;
+     const uint64_t prof_trap0 = prof::trap_ns;
+     const uint64_t prof_tick0 = prof::ticks();
+-    uint32_t prof_b0 = 0; cpu_->thread_emu_blocks(nullptr, &prof_b0);   // blocks per thread (exact)
++    uint32_t prof_b0 = 0; if (prof_on) cpu_->thread_emu_blocks(nullptr, &prof_b0);   // blocks per thread (exact)
+ #endif
+     // D2_JITPROFILE guest-run timer. Deliberately here — ONE pair of clock
+     // reads per scheduler slice — and NOT around each dynablock: per-block
+@@ -338,8 +340,10 @@ void CooperativeScheduler::run_slice(GuestThread* t) {
+     bool ok = cpu_->run(cpu_->reg(R_EIP), &fault);
+     if (dyn86_jitprof) dyn86_jp_run_us += dyn86_jp_now_us() - jp_t0;
+ #ifdef PROF_COUNTERS
+-    { uint64_t dt = prof::now_ns() - prof_t0; prof::run_ns += dt; t->prof_ns += dt;
+-      prof::add_slice_tid(t->id, dt, prof::trap_ns - prof_trap0); }
++    if (prof_on) {
++        uint64_t dt = prof::now_ns() - prof_t0; prof::run_ns += dt; t->prof_ns += dt;
++        prof::add_slice_tid(t->id, dt, prof::trap_ns - prof_trap0);
++    }
+ #endif
+     cpu_->save_context(t->ctx);
+     if (cpu_->take_limit_hit()) preempted_ = true;        // native insn-budget expiry
+@@ -350,14 +354,14 @@ void CooperativeScheduler::run_slice(GuestThread* t) {
+     // tick: one sample per period of time (a slice that outlived several, in
+     // a loop inside one block, carries them all). Without a timer, one
+     // sample per preempted slice.
+-    {
++    if (prof_on) {
+         const uint64_t n = prof_tick0 ? prof::ticks() - prof_tick0 : preempted_ ? 1 : 0;
+         for (uint64_t i = 0; i < n && i < 64; ++i) {
+             prof::sample_eip(cpu_->reg(R_EIP)); prof::sample_eip_tid(cpu_->reg(R_EIP), t->id);
+         }
++        uint32_t prof_b1 = 0; cpu_->thread_emu_blocks(nullptr, &prof_b1);
++        prof::add_blocks_tid(t->id, prof_b1 - prof_b0); prof::note_thread(t->id, t->entry);
+     }
+-    { uint32_t prof_b1 = 0; cpu_->thread_emu_blocks(nullptr, &prof_b1);
+-      prof::add_blocks_tid(t->id, prof_b1 - prof_b0); prof::note_thread(t->id, t->entry); }
+ #endif
+     if (preempted_) {
+         if (t->state == S::Running) t->state = S::Ready;  // time-slice expired; resume later
+diff --git a/src/runtime/sched_native.cpp b/src/runtime/sched_native.cpp
+index 15b0854..be4ac63 100644
+--- a/src/runtime/sched_native.cpp
++++ b/src/runtime/sched_native.cpp
+@@ -836,7 +836,8 @@ void NativeScheduler::run_guest(GuestThread* t) {
+             // line reports dynarec=0.0, dumping everything into "outside
+             // run". run_ns is INCLUSIVE (translated code + shim bodies
+             // executed within the slice), so pure dynarec = run - trap.
+-            const uint64_t prof_t0 = d2rt::prof::now_ns();
++            const bool prof_on = d2rt::prof::on;
++            const uint64_t prof_t0 = prof_on ? d2rt::prof::now_ns() : 0;
+ #endif
+             // Feeds dyn86_jp_run_us under the NATIVE scheduler too, not just
+             // under coop, still gated behind the dyn86_jitprof knob. Without
+@@ -848,7 +849,7 @@ void NativeScheduler::run_guest(GuestThread* t) {
+             ok = cpu_->run(eip, &fault);
+             dyn86_jp_run_us += dyn86_jp_now_us() - run_t0;
+ #ifdef PROF_COUNTERS
+-            { const uint64_t dt = d2rt::prof::now_ns() - prof_t0;
++            if (prof_on) { const uint64_t dt = d2rt::prof::now_ns() - prof_t0;
+               d2rt::prof::run_ns += dt; t->prof_ns += dt; }
+ #endif
+             if (!ok) break;                              // fault

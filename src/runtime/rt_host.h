@@ -142,6 +142,7 @@ struct Stats {
     uint64_t bytes_read = 0;
     uint32_t dib_sections = 0;
     uint32_t frames = 0;         // blits of a DIB section to the window
+    int frame_thread = -1;       // the guest thread that blitted the last one
     uint32_t alloc_failures = 0; // guest heap or VirtualAlloc requests refused
 };
 Stats &stats();
@@ -157,6 +158,14 @@ struct FileStats {
     uint64_t disk_reads = 0, disk_bytes = 0, disk_us = 0;   // file system reads by the cache
     uint64_t cache_bytes = 0; // block memory held now (freed with its handle)
     uint64_t async = 0;       // reads handed to the I/O worker, the guest thread waiting
+    // Time the game waited on the file system (issue #31): a guest thread
+    // waiting on the I/O worker as a guest wait, the other threads running
+    // (from the read's submission to the waiter waking; wait_frame_us those
+    // of the thread presenting frames, whose frames stop meanwhile); and
+    // reads ReadFile completed before returning, every guest thread stopped
+    // (an OVERLAPPED read, a full request pool, or synchronous reads).
+    uint64_t waits = 0, wait_us = 0, wait_frame_us = 0;
+    uint64_t stall_us = 0;
 };
 const FileStats &file_stats();
 // The asynchronous reads' worker (RunOptions::io_start): started and stopped

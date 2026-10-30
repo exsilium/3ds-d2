@@ -34,6 +34,7 @@
 #include "game/d2_state.h"
 #include "game/second_screen.h"
 #include "game/sprite_trace.h"
+#include "game/storm_reads.h"
 #include "runtime/rt_host.h"
 #include "ctru_font.h"
 #include "png.h"
@@ -171,7 +172,11 @@ int main(int argc, char **argv)
         if (sprite_floor)
             game::set_sprite_cache_floor(c, sprite_floor);
         game::install_sprite_cache_counter(c);
+        game::install_sprite_decode_timer(c);
         game::install_sprite_trace(c);
+        // Storm serving a waiting caller first, as on the console (M4_STORM_PRIO=0: as the game does).
+        if (!std::getenv("M4_STORM_PRIO") || std::string(std::getenv("M4_STORM_PRIO")) != "0")
+            game::install_storm_read_priority(c);
         game::install_fatal_exit(c);
         if (ctr_layout) {
             game::install_pool_release(c);
@@ -210,8 +215,8 @@ int main(int argc, char **argv)
             game::govern_sprite_cache(*guest_cpu, m.free, m.spare_used, w.evicted, reserve, game::kCtrSpriteCacheMin);
         }
         const game::SpriteCacheStats sc = game::sprite_cache_stats(*guest_cpu);
-        std::fprintf(stderr, "[rt] sprite cache %u/%u KiB, %u sprites, in %u, out %u\n", sc.used >> 10,
-                     sc.limit >> 10, sc.sprites, w.inserted, w.evicted);
+        std::fprintf(stderr, "[rt] sprite cache %u/%u KiB, %u sprites, in %u, out %u, decoded %u in %u ms\n",
+                     sc.used >> 10, sc.limit >> 10, sc.sprites, w.inserted, w.evicted, w.decodes, w.decode_ms);
         // M4_SPRITE_TRACE=<file>: the sprite trace (sprite_trace.h), from the first heartbeat on.
         if (const char *trace = std::getenv("M4_SPRITE_TRACE")) {
             static bool tried = false;

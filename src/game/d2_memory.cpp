@@ -114,12 +114,34 @@ constexpr uint32_t kBlockSizeStub = 0x006cb6b0, kBlockSizeStubEnd = 0x006cb6c0;
 constexpr uint32_t kInsert = 0x005ff476, kInsertNext = 0x005ff480;
 constexpr uint8_t kInsertOrig[] = {0x8b, 0x55, 0x08, 0x83, 0x47, 0x0c, 0x01, 0x01, 0x57, 0x08};
 constexpr uint32_t kInsertStub = 0x006cb6c0, kInsertStubEnd = 0x006cb6e0;
+// 0x5ff6e0 decodes a sprite's frames into the cache from its DCC file, once
+// the game's asynchronous load of the file (0x40a620, queued at 0x5ffbbd and
+// 0x5ff977) is done: the draw's poll of the load (0x40a7f0, from 0x600367)
+// runs it on the game's thread. Every first decode, and every decode after
+// an eviction, passes there; the file's read does not (Storm's read thread,
+// 0x41a550, reads it and signals the load's event, while the game's thread
+// goes on drawing without the sprite).
+// It takes three stack arguments and returns with ret 0xc; its first bytes
+// are push ebp; mov ebp, esp; push ebx; push esi. The stub, in .text's
+// slack after the sprite trace's:
+//   S+0   push eax; push ecx; push edx; call begin; pop edx; pop ecx; pop eax
+//   S+11  push [esp+0xc] three times (the arguments again); call S+52
+//   S+28  push eax; push ecx; push edx; call end; pop edx; pop ecx; pop eax
+//   S+39  ret 0xc
+//   S+52  <the 5 bytes>; jmp 0x5ff6e5
+constexpr uint32_t kDecode = 0x005ff6e0, kDecodeNext = 0x005ff6e5;
+constexpr uint8_t kDecodeOrig[] = {0x55, 0x8b, 0xec, 0x53, 0x56};
+constexpr uint32_t kDecodeStub = 0x006cb740, kDecodeStubEnd = 0x006cb780;
 
 uint32_t g_fatal_caller = 0;
 SpriteGovernor g_governor;
 uint32_t g_inserted = 0;   // since the start, wrapping
+uint32_t g_decodes = 0;    // sprites decoded since the start, and the time it took
+uint64_t g_decode_us = 0;
+uint64_t g_decode_from = 0;   // the decode under way began (0: none)
 struct {
-    uint32_t inserted, sprites;
+    uint32_t inserted, sprites, decodes;
+    uint64_t decode_us;
     bool valid;
 } g_window_mark{};
 bool g_release_wanted = false;
@@ -314,6 +336,62 @@ bool install_sprite_cache_counter(d2rt::Cpu &c)
     return true;
 }
 
+bool install_sprite_decode_timer(d2rt::Cpu &c)
+{
+    uint8_t have[sizeof kDecodeOrig];
+    uint8_t slack[kDecodeStubEnd - kDecodeStub];
+    static const uint8_t kZero[sizeof slack] = {};
+    if (!c.read(kDecode, have, sizeof have) || std::memcmp(have, kDecodeOrig, sizeof have) != 0 ||
+        !c.read(kDecodeStub, slack, sizeof slack) || std::memcmp(slack, kZero, sizeof slack) != 0)
+        return false;
+    // The game's thread alone decodes, and the guest's threads take turns:
+    // no lock. A decode does not nest in another.
+    const uint32_t begin = rt::native_entry("SpriteDecodeBegin", 0, [](d2rt::Cpu &) -> uint32_t {
+        g_decode_from = rt::now_us();
+        return 0;
+    });
+    const uint32_t end = rt::native_entry("SpriteDecodeEnd", 0, [](d2rt::Cpu &) -> uint32_t {
+        if (g_decode_from) {
+            g_decode_us += rt::now_us() - g_decode_from;
+            g_decodes++;
+            g_decode_from = 0;
+        }
+        return 0;
+    });
+    if (!begin || !end)
+        return false;
+    uint8_t s[kDecodeStubEnd - kDecodeStub] = {};
+    const uint8_t save[] = {0x50, 0x51, 0x52}, restore[] = {0x5a, 0x59, 0x58};
+    const uint8_t arg[] = {0xff, 0x74, 0x24, 0x0c};   // push dword [esp+0xc]
+    uint32_t at = 0;
+    auto put = [&](const uint8_t *b, uint32_t n) {
+        std::memcpy(s + at, b, n);
+        at += n;
+    };
+    auto call = [&](uint8_t op, uint32_t target) {
+        s[at] = op;
+        put_rel32(s + at + 1, kDecodeStub + at + 5, target);
+        at += 5;
+    };
+    put(save, 3), call(0xe8, begin), put(restore, 3);
+    put(arg, 4), put(arg, 4), put(arg, 4);
+    call(0xe8, kDecodeStub + 52);
+    put(save, 3), call(0xe8, end), put(restore, 3);
+    const uint8_t ret[] = {0xc2, 0x0c, 0x00};
+    put(ret, 3);
+    at = 52;
+    put(kDecodeOrig, sizeof kDecodeOrig);
+    call(0xe9, kDecodeNext);
+    uint8_t jump[sizeof kDecodeOrig] = {0xe9};
+    put_rel32(jump + 1, kDecode + 5, kDecodeStub);
+    c.write(kDecodeStub, s, sizeof s);
+    c.write(kDecode, jump, sizeof jump);
+    c.invalidate_code(kDecodeStub, sizeof s);
+    c.invalidate_code(kDecode, sizeof jump);
+    rt::logf("sprite cache: decodes timed at %08x", kDecode);
+    return true;
+}
+
 SpriteCacheWindow sprite_cache_window(d2rt::Cpu &c)
 {
     const uint32_t inserted = __atomic_load_n(&g_inserted, __ATOMIC_RELAXED);
@@ -321,12 +399,14 @@ SpriteCacheWindow sprite_cache_window(d2rt::Cpu &c)
     SpriteCacheWindow w{};
     if (g_window_mark.valid) {
         w.inserted = inserted - g_window_mark.inserted;
+        w.decodes = g_decodes - g_window_mark.decodes;
+        w.decode_ms = (uint32_t)((g_decode_us - g_window_mark.decode_us) / 1000);
         // Out: what came in less what the count grew by. A cache the game
         // re-created (its count back to 0) gives less than 0: nothing known.
         const int64_t out = (int64_t)w.inserted - ((int64_t)sprites - g_window_mark.sprites);
         w.evicted = out > 0 ? (uint32_t)out : 0;
     }
-    g_window_mark = {inserted, sprites, true};
+    g_window_mark = {inserted, sprites, g_decodes, g_decode_us, true};
     return w;
 }
 

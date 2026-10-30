@@ -192,6 +192,7 @@ public:
     Sockets()
     {
         buf_ = static_cast<u32 *>(memalign(0x1000, kSize));
+        no_memory_ = !buf_;
         if (buf_ && R_FAILED(socInit(buf_, kSize))) {
             std::free(buf_);
             buf_ = nullptr;
@@ -205,10 +206,12 @@ public:
         }
     }
     bool ok() const { return buf_ != nullptr; }
+    bool no_memory() const { return no_memory_; }
 
 private:
     static constexpr u32 kSize = 0x100000;
     u32 *buf_ = nullptr;
+    bool no_memory_ = false;
 };
 
 int connect_to(const std::string &host, const std::string &port, std::string &err)
@@ -261,7 +264,7 @@ bool post(const std::string &url, const std::string &headers, const std::string 
         return false;
     Sockets sockets;
     if (!sockets.ok()) {
-        err = "the network service did not start";
+        err = sockets.no_memory() ? "no memory for the network service" : "the network service did not start";
         return false;
     }
     int fd = connect_to(host, port, err);

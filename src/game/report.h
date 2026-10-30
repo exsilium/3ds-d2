@@ -51,6 +51,10 @@ public:
     // The lines that say how it ended: `crash:` (the CPU exception handler),
     // FATAL, out of memory, the game's internal error. At most 40.
     const std::vector<std::string> &crash_lines() const { return crash_; }
+    // What the session's profiler runs measured (profiler.h): the options of
+    // every "profiler run: start" line, in the order first seen, comma
+    // separated; "" without a run.
+    const std::string &profiled() const { return profiled_; }
 
     struct Figures {
         uint32_t seconds = 0;          // the last heartbeat's game time
@@ -58,13 +62,16 @@ public:
         float fps_median = 0, fps_p10 = 0;   // over those windows
         uint32_t pool_free_min_kib = 0;      // the guest pool's lowest free (0: no heartbeat)
         uint32_t heap_peak_kib = 0, va_peak_kib = 0, host_peak_kib = 0, jit_kib = 0;
+        // In play, from the hitch counters ("prof hitch:", issue #19):
+        // frames that took over 100 ms, and the longest.
+        uint32_t hitches_100ms = 0, longest_frame_ms = 0;
     };
     Figures figures() const;
 
 private:
     bool started_ = false, closed_ = false, in_game_ = false;
     uint64_t start_time_ = 0;
-    std::string build_, version_;
+    std::string build_, version_, profiled_;
     std::vector<std::string> crash_;
     uint32_t last_t_ = 0, last_frames_ = 0;
     bool have_beat_ = false;

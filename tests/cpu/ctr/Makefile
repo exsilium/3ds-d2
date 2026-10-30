@@ -38,14 +38,12 @@ CXXFLAGS := -O2 -g $(ARCH) -std=gnu++17 -D__3DS__ -DD2RT_CPU_BOX86 -I$(CTR) -I$(
 # and the app crashed at its first HeapAlloc.
 CFLAGS += -MMD -MP
 CXXFLAGS += -MMD -MP
-# PROF=1 (package-cia --prof): the profiling build. WinVita's PROF_COUNTERS
-# (run/shim time split, EIP samples per guest thread) reported to game.log
-# every 10 s; objects in their own directory so the two builds never mix.
-ifeq ($(PROF),1)
-OUT := $(ROOT)/build/cpu/ctr-prof
+# WinVita's PROF_COUNTERS (run/shim time split, EIP samples per guest
+# thread), in every build: counting only while a profiler run's guest code
+# profile asks for it (rt::set_profiling, issue #19), a branch per shim call
+# and per slice otherwise.
 CFLAGS += -DPROF_COUNTERS
 CXXFLAGS += -DPROF_COUNTERS
-endif
 LDFLAGS := -specs=3dsx.specs -g $(ARCH) -L$(CTRULIB)/lib -Wl,-Map,$(OUT)/cpu-lane.map
 
 CORE := dynarec/dynarec.c dynarec/dynablock.c dynarec/dynarec_arm.c dynarec/dynarec_arm_functions.c \
@@ -78,6 +76,13 @@ GAMEOBJ := $(CPUOBJ) $(addprefix $(OUT)/rt/,$(RTFULL:.cpp=.o)) $(addprefix $(OUT
            $(addprefix $(OUT)/game/,$(GAMESRC:.cpp=.o)) $(addprefix $(OUT)/game/bink/,$(BINKSRC:.cpp=.o)) $(OUT)/game/ctr_game.o $(OUT)/game/ctr_audio.o $(OUT)/game/ctr_screenshot.o $(OUT)/game/ctr_report.o $(OUT)/game/ctr_tls.o $(OUT)/runner/ctr_stubs.o
 
 .PHONY: all clean FORCE
+
+# The compile flags: when they change (PROF_COUNTERS joining every build),
+# every object is built again instead of old and new ones linked together.
+FLAGS_CFG := $(subst ',,$(CFLAGS) | $(CXXFLAGS))
+$(OUT)/flags.cfg: FORCE
+	@mkdir -p $(@D); echo '$(FLAGS_CFG)' | cmp -s - $@ || echo '$(FLAGS_CFG)' > $@
+$(sort $(OBJ) $(M3OBJ) $(GAMEOBJ) $(OUT)/game/ctr_game_cia.o): $(OUT)/flags.cfg
 all: $(OUT)/cpu-lane.3dsx $(OUT)/m3.3dsx $(OUT)/3ds-d2-game.3dsx $(OUT)/3ds-d2-game-cia.elf
 
 vpath %.c $(B86)/dynarec $(B86) $(B86)/tools $(B86)/emu $(SHIM) $(DYN86) $(CTR)

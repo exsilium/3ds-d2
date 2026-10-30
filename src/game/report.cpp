@@ -1,6 +1,8 @@
 // See report.h.
 #include "game/report.h"
 
+#include "game/profiler.h"
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -124,6 +126,26 @@ void LogSummary::feed(const char *line)
     }
     if (const char *st = std::strstr(l, "game state: ")) {
         in_game_ = std::strncmp(st + 12, "in game", 7) == 0;
+        return;
+    }
+    const size_t run_len = sizeof kProfilerRunLine - 1;
+    if (std::strncmp(l, kProfilerRunLine, run_len) == 0) {
+        if (std::strncmp(l + run_len, "start ", 6) == 0)
+            for (const char *p = l + run_len + 6; *p;) {
+                const std::string name(p, std::strcspn(p, ","));
+                p += name.size() + (p[name.size()] ? 1 : 0);
+                if (!name.empty() && ("," + profiled_ + ",").find("," + name + ",") == std::string::npos)
+                    profiled_ += (profiled_.empty() ? "" : ",") + name;
+            }
+        return;
+    }
+    uint64_t slow = 0, stalled = 0, longest = 0;
+    if (std::strstr(l, "prof hitch: ") && field(l, "<=250ms ", slow) && field(l, ">250ms ", stalled) &&
+        field(l, "longest ", longest)) {
+        if (in_game_) {
+            f_.hitches_100ms += (uint32_t)(slow + stalled);
+            f_.longest_frame_ms = std::max(f_.longest_frame_ms, (uint32_t)longest);
+        }
         return;
     }
     uint64_t ms = 0, frames = 0, switches = 0;
@@ -281,7 +303,9 @@ std::string event_json(const Event &e)
              ",\"fps_p10_play\":" + num(f.fps_p10, 1) + ",\"pool_free_min_kib\":" + std::to_string(f.pool_free_min_kib) +
              ",\"guest_heap_peak_kib\":" + std::to_string(f.heap_peak_kib) +
              ",\"guest_va_peak_kib\":" + std::to_string(f.va_peak_kib) +
-             ",\"host_peak_kib\":" + std::to_string(f.host_peak_kib) + ",\"jit_kib\":" + std::to_string(f.jit_kib) + "}";
+             ",\"host_peak_kib\":" + std::to_string(f.host_peak_kib) + ",\"jit_kib\":" + std::to_string(f.jit_kib) +
+             ",\"hitches_100ms_play\":" + std::to_string(f.hitches_100ms) +
+             ",\"longest_frame_ms_play\":" + std::to_string(f.longest_frame_ms) + "}";
     }
     o += "}";
     std::string lines;

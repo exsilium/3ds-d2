@@ -2,6 +2,7 @@
 #include "game/second_screen.h"
 
 #include "game/automap.h"
+#include "game/profiler.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -197,6 +198,15 @@ void SecondScreen::set_map_help(bool on)
     dirty_ = true;
 }
 
+void SecondScreen::set_profile_choice(uint32_t bits)
+{
+    bits &= kProfileAll;
+    if (bits != profile_)
+        settings_changed_ = true;
+    profile_ = bits;
+    dirty_ = true;
+}
+
 void SecondScreen::request(Controls::Bottom r)
 {
     switch (r) {
@@ -379,11 +389,15 @@ void SecondScreen::update(Pad &pad, const GameState &gs, int cursor_x, int curso
                 key_ = map_button(pad.touch_x, pad.touch_y, kind == BottomView::kMap && gs_.in_game);
             } else if (kind == BottomView::kInfo && pad.touch_y >= kMapBtnY && pad.touch_x >= kReportBtnX) {
                 grip_ = Grip::MapButton;
-                key_ = 3;   // INFO's report button
-            } else if (kind == BottomView::kInfo && pad.touch_y >= kMapBtnY && pad.touch_x >= kTraceBtnX &&
-                       pad.touch_x < kTraceBtnX + kTraceBtnW) {
+                key_ = 3;   // INFO's report button (the checklist's way back)
+            } else if (kind == BottomView::kInfo && pad.touch_y >= kMapBtnY && pad.touch_x >= kProfBtnX &&
+                       pad.touch_x < kProfBtnX + kProfBtnW) {
                 grip_ = Grip::MapButton;
-                key_ = 4;   // INFO's sprite trace button
+                key_ = 4;   // INFO's profiler run button (the checklist's start/stop)
+            } else if (kind == BottomView::kInfo && checklist_ && pad.touch_y >= kProfRowY &&
+                       pad.touch_y < kProfRowY + kProfileOptionCount * kProfRowH) {
+                grip_ = Grip::MapButton;
+                key_ = 5 + (pad.touch_y - kProfRowY) / kProfRowH;   // a row of the checklist
             } else {
                 grip_ = Grip::Pad;
             }
@@ -429,14 +443,24 @@ void SecondScreen::update(Pad &pad, const GameState &gs, int cursor_x, int curso
         if (up && grip_ == Grip::MapButton && moved_ <= kTapSlop) {
             // A tap: the size switches; the refresh steps through its
             // choices; the corner one switches between the map and HELP.
-            // INFO's ask for a report or the sprite trace, or take the
-            // request back.
-            if (key_ == 3) {
+            // INFO's ask for a report, or take the request back; its
+            // profiler run's checklist, where the ticks change only between
+            // runs, and a run starts only with something ticked.
+            if (key_ == 3 && checklist_) {
+                checklist_ = false;
+                dirty_ = true;
+            } else if (key_ == 3) {
                 report_ = !report_;
                 dirty_ = true;
-            } else if (key_ == 4) {
-                trace_ = !trace_;
+            } else if (key_ == 4 && !checklist_) {
+                checklist_ = true;
                 dirty_ = true;
+            } else if (key_ == 4) {
+                profiling_ = !profiling_ && profile_ != 0;
+                dirty_ = true;
+            } else if (key_ >= 5) {
+                if (!profiling_)
+                    set_profile_choice(profile_ ^ kProfileOptions[key_ - 5].bit);
             } else if (key_ == 2) {
                 set_map_help(!help_);
             } else if (key_ == 0) {
@@ -553,7 +577,9 @@ bool SecondScreen::stage(BottomView &v, uint64_t now_ms)
             // The newest messages under the statistics, as many as fit
             // above the report button.
             v.report = report_;
-            v.trace = trace_;
+            v.profiling = profiling_;
+            v.checklist = checklist_;
+            v.profile = profile_;
             const int rows = (kAreaH - kMapBtnH) / 8 - (int)stats_.size();
             const uint32_t n = log_head_ < (uint32_t)kLogLines ? log_head_ : (uint32_t)kLogLines;
             const uint32_t show = rows > 0 ? ((uint32_t)rows < n ? (uint32_t)rows : n) : 0;
@@ -742,21 +768,41 @@ void draw_bottom(uint16_t *fb, const BottomView &v, const uint8_t *frame, int fw
     }
     case BottomView::kInfo:
         cv.fill(0, kBarH, kW, kAreaH, kBg);
-        for (size_t i = 0; i < v.lines.size() && (int)i < (kAreaH - SecondScreen::kMapBtnH) / 8; i++)
-            cv.text(0, kBarH + 1 + (int)i * 8, v.lines[i].text.c_str(), v.lines[i].color);
-        if (v.report) {
+        if (v.checklist) {
+            // The profiler run's options: a box, its name, and under it what
+            // it writes and costs; greyed while the run is on.
+            cv.text(4, kBarH + 6, v.profiling ? "PROFILER RUN: on, until stopped" : "PROFILER RUN: tap what to measure",
+                    kGold);
+            for (int i = 0; i < kProfileOptionCount; i++) {
+                const ProfileOptionInfo &o = kProfileOptions[i];
+                const int y = SecondScreen::kProfRowY + i * SecondScreen::kProfRowH + 8;
+                const bool ticked = (v.profile & o.bit) != 0;
+                const uint16_t ink = v.profiling ? kHint : rgb(230, 220, 200);
+                cv.fill(8, y, 14, 14, ink);
+                cv.fill(10, y + 2, 10, 10, ticked ? (v.profiling ? kHint : kGold) : kBg);
+                cv.text(32, y + 3, o.label, ink);
+                cv.text(32, y + 15, o.note, kHint);
+            }
+        } else {
+            for (size_t i = 0; i < v.lines.size() && (int)i < (kAreaH - SecondScreen::kMapBtnH) / 8; i++)
+                cv.text(0, kBarH + 1 + (int)i * 8, v.lines[i].text.c_str(), v.lines[i].color);
+        }
+        if (v.checklist) {
+            draw_map_button(cv, SecondScreen::kReportBtnX, SecondScreen::kReportBtnW, "back to INFO");
+        } else if (v.report) {
             const int x = SecondScreen::kReportBtnX, w = SecondScreen::kReportBtnW, y = SecondScreen::kMapBtnY;
             cv.fill(x + 1, y + 1, w - 2, SecondScreen::kMapBtnH - 2, kGold);
             cv.centred(x, y + 4, w, "report at the end", kBg);
         } else {
             draw_map_button(cv, SecondScreen::kReportBtnX, SecondScreen::kReportBtnW, "report a problem");
         }
-        if (v.trace) {
-            const int x = SecondScreen::kTraceBtnX, w = SecondScreen::kTraceBtnW, y = SecondScreen::kMapBtnY;
+        if (v.profiling) {
+            const int x = SecondScreen::kProfBtnX, w = SecondScreen::kProfBtnW, y = SecondScreen::kMapBtnY;
             cv.fill(x + 1, y + 1, w - 2, SecondScreen::kMapBtnH - 2, kGold);
-            cv.centred(x, y + 4, w, "tracing sprites", kBg);
+            cv.centred(x, y + 4, w, v.checklist ? "stop the run" : "profiling", kBg);
         } else {
-            draw_map_button(cv, SecondScreen::kTraceBtnX, SecondScreen::kTraceBtnW, "trace sprites");
+            draw_map_button(cv, SecondScreen::kProfBtnX, SecondScreen::kProfBtnW,
+                            !v.checklist ? "profiler run" : v.profile ? "start the run" : "nothing ticked");
         }
         break;
     default:

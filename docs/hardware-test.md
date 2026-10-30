@@ -53,8 +53,11 @@ The diagnostics are on the bottom screen's INFO tab (tap INFO in the tab bar; [c
 2. **draw ms/frame**: the CPU cost of scaling the frame to the top screen.
 3. **host heap** and **jit code / jmptbl** in town. Azahar measured 22 MiB used, of 34 MiB in the CIA build.
 4. A red **JIT MEMORY FULL** line, if it ever appears.
+5. **hitch** and **wait**: the last 10 s's frames over 100 and 250 ms and the longest, and what stops frames: the drawing thread's time blocked (`wait`, mostly on Storm's reads from the SD card), `ready` while another game thread runs, `host` work on its core (the scheduler, the heartbeat), and `hb`, the last heartbeat's length; on the `files` line, frames not drawn (`skip`) and sound starved (`fam`).
 
-Logs are on the SD card in `3ds/3ds-d2/logs/`: `game.log` for the runtime, and `stderr.txt` for the CPU backend, including its arena line. Saves and settings are in `3ds/3ds-d2/save/`. `python3 -I tools/session_report.py game.log` summarises a session from its heartbeats: the frame rate by game state, the slowest windows and what they were doing (sprite re-loads, new code, SD reads), and memory over time.
+To measure more, tap **profiler run** on INFO, tick what to measure and start the run (sprite trace, guest code profile, file-read trace, SD card benchmark). The session is then offered as a report with what the run wrote. There is no separate profiling build any more.
+
+Logs are on the SD card in `3ds/3ds-d2/logs/`: `game.log` for the runtime, and `stderr.txt` for the CPU backend, including its arena line. Saves and settings are in `3ds/3ds-d2/save/`. `python3 -I tools/session_report.py game.log` summarises a session from its heartbeats: the frame rate by game state, the slowest windows and what they were doing (sprite re-loads, new code, SD reads), memory over time, and the hitches (`prof hitch:` lines: frames by interval, the longest, sprites taken and let go of, the frame thread's read wait, frames not drawn, starved sound grains) with the slowest windows' causes.
 
 ## Things that differ from Azahar, and may fail first
 

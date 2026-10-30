@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Exile <exile@chamber.ee>
+Date: Fri, 30 Oct 2026 20:04:49 +0200
+Subject: [PATCH] cooperative scheduler: set_slice_sink, an observer for slice
+ boundaries
+
+---
+ src/runtime/guest_thread.h        | 6 ++++++
+ src/runtime/sched_cooperative.cpp | 2 ++
+ src/runtime/sched_cooperative.h   | 2 ++
+ 3 files changed, 10 insertions(+)
+
+diff --git a/src/runtime/guest_thread.h b/src/runtime/guest_thread.h
+index c728b18..a4f1b93 100644
+--- a/src/runtime/guest_thread.h
++++ b/src/runtime/guest_thread.h
+@@ -156,6 +156,12 @@ public:
+     using FaultFn = std::function<int(GuestThread*, uint32_t, uint32_t)>;
+     virtual void set_fault_dispatcher(FaultFn f) = 0;
+     virtual void set_time_sink(std::function<void(uint64_t)> f) = 0;
++    // Observer for slice boundaries: called with the thread's id and true
++    // before a guest thread's slice, and false after it, once its state has
++    // settled. What runs in between is that thread; what runs outside any
++    // slice is the scheduler's own host work. None by default: a scheduler
++    // without slices (native) never calls it.
++    virtual void set_slice_sink(void (*f)(uint32_t tid, bool start)) { (void)f; }
+     virtual const char* stop_reason() const = 0;
+     int current_id() { GuestThread* t = current(); return t ? (int)t->id : -1; }
+ };
+diff --git a/src/runtime/sched_cooperative.cpp b/src/runtime/sched_cooperative.cpp
+index ddaad11..fa20b48 100755
+--- a/src/runtime/sched_cooperative.cpp
++++ b/src/runtime/sched_cooperative.cpp
+@@ -440,7 +440,9 @@ void CooperativeScheduler::run() {
+                                     g->ctx.eip); }
+             return; }
+         ++switches_; t->slices++;
++        if (slice_sink_) slice_sink_(t->id, true);
+         run_slice(t);
++        if (slice_sink_) slice_sink_(t->id, false);
+         if (virt_tick_us_ && !real_now_) {      // set_virtual_tick_us: switches cost time
+             virt_us_acc_ += virt_tick_us_;
+             if (virt_us_acc_ >= 1000) {
+diff --git a/src/runtime/sched_cooperative.h b/src/runtime/sched_cooperative.h
+index 060b68f..de89c94 100755
+--- a/src/runtime/sched_cooperative.h
++++ b/src/runtime/sched_cooperative.h
+@@ -257,6 +257,7 @@ private:
+     uint32_t virt_tick_us_ = 0, virt_us_acc_ = 0;                // set_virtual_tick_us
+     uint64_t virt_ms_ = 0;                                // virtual clock for timed waits
+     std::function<void(uint64_t)> time_sink_;             // fires when virt_ms_ advances
++    void (*slice_sink_)(uint32_t, bool) = nullptr;         // set_slice_sink
+     std::function<void(uint32_t)> probe_;                 // optional breakpoint probe
+     bool shutdown_ = false;                               // request_shutdown() flag
+ public:
+@@ -264,6 +265,7 @@ public:
+     // Observer for virtual-time advances (guest-inlined GetTickCount keeps a
+     // tick dword in guest memory; rt_boot refreshes it from here).
+     void set_time_sink(std::function<void(uint64_t)> f) override { time_sink_ = std::move(f); }
++    void set_slice_sink(void (*f)(uint32_t, bool)) override { slice_sink_ = f; }
+     const char* stop_reason_ = "";
+ };
+ 

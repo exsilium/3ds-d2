@@ -496,7 +496,9 @@ int main(int argc, char **argv)
         };
     }
 #ifdef PROF_COUNTERS
-    // M4_PROF: the time-based profile sampler, as on the console (2 ms).
+    // M4_PROF: the guest code profile from the start, with the time-based
+    // sampler, as on the console (2 ms).
+    opt.profile = true;
     static std::atomic<bool> sampler_stop{false};
     std::thread sampler([] {
         while (!sampler_stop.load()) {

@@ -41,10 +41,19 @@ static const char kPlay[] =
     "[rt] game state: menus (ui 0)\n"
     "[rt] prof: 10000 ms, frames 250, idle 10 ms, switches 900, cache syncs 3 (40 us)\n"
     "[rt] t=10s peeks=1 files=2 read=3KiB frames=250 heap=100/200KiB va=300/400KiB free=5000KiB jit=10 meta=1 jmptbl=2KiB host=900KiB\n"
+    "[rt] prof hitch: frames 250, <=50ms 240, <=100ms 4, <=250ms 5, >250ms 1, longest 900 ms, sprites in 0 out 0, "
+    "wait 0 ms, ready 120 ms, host 310 ms, heartbeat 12 ms, skipped 0, famine 0\n"
     "[rt] game state: in game (ui 1)\n"
+    "profiler run: start sprites,guest\n"
     "[rt] prof: 10000 ms, frames 200, idle 0 ms, switches 900, cache syncs 3 (40 us)\n"
     "[rt] t=20s peeks=1 files=2 read=3KiB frames=450 heap=150/250KiB va=300/600KiB free=700KiB jit=30 meta=1 jmptbl=2KiB host=1200KiB\n"
+    "[rt] prof hitch: frames 200, <=50ms 190, <=100ms 7, <=250ms 2, >250ms 1, longest 412 ms, sprites in 120 out 98, "
+    "wait 830 ms, ready 200 ms, host 280 ms, heartbeat 15 ms, skipped 3, famine 0\n"
+    "profiler run: stop\n"
+    "profiler run: start guest,files\n"
     "[rt] prof: 10000 ms, frames 100, idle 0 ms, switches 900, cache syncs 3 (40 us)\n"
+    "[rt] prof hitch: frames 100, <=50ms 95, <=100ms 0, <=250ms 5, >250ms 0, longest 180 ms, sprites in 0 out 0, "
+    "wait 0 ms, ready 90 ms, host 300 ms, heartbeat 11 ms, skipped 0, famine 2\n"
     "[rt] t=30s peeks=1 files=2 read=3KiB frames=550 heap=150/250KiB va=300/600KiB free=900KiB jit=20 meta=1 jmptbl=2KiB host=1100KiB\n"
     "[rt] prof: 10000 ms, frames 0, idle 10000 ms, switches 0, cache syncs 0 (0 us)\n"
     "[rt] prof: 10000 ms, frames 150, idle 0 ms, switches 900, cache syncs 3 (40 us)\n";
@@ -69,6 +78,16 @@ int main()
         CHECK(std::fabs(f.fps_p10 - 10.0f) < 0.01f);
         CHECK(f.pool_free_min_kib == 700);
         CHECK(f.heap_peak_kib == 250 && f.va_peak_kib == 600 && f.host_peak_kib == 1200 && f.jit_kib == 30);
+        // Hitches in play only: the menu window's 900 ms frame is left out.
+        CHECK(f.hitches_100ms == 8 && f.longest_frame_ms == 412);
+        // Two profiler runs: their options once each, in order.
+        CHECK(s.profiled() == "sprites,guest,files");
+        CHECK(feed("session: start 1 build x\n").profiled().empty());
+        Event e;
+        e.figures = f;
+        e.have_figures = true;
+        const std::string j = event_json(e);
+        CHECK(j.find("\"hitches_100ms_play\":8,\"longest_frame_ms_play\":412") != std::string::npos);
     }
     {   // Cut short by a CPU exception: crash lines, no closing line.
         const std::string log = std::string(kPlay) +

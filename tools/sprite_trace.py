@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Replays a sprite trace (sprites.trc, a Sentry report's attachment, written while
-the INFO tab's "trace sprites" button is lit; src/game/sprite_trace.h has the
+"""Replays a sprite trace (sprites.trc, a Sentry report's attachment, written during
+a profiler run with "sprite trace" ticked (INFO > profiler run); src/game/sprite_trace.h has the
 format) through a model of the game's sprite cache, so a cache limit can be
 judged without playing a session for it.
 

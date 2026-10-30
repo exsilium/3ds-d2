@@ -105,13 +105,14 @@ If the app shows "Game.exe not found", check the folder name and that `Game.exe`
 
 ### Problem reports
 
-If 3ds-d2 crashes (Luma3DS shows its exception screen), the next start keeps that session's `game.log`, `stderr.txt` and the Luma3DS crash dump in `/3ds/3ds-d2/reports/<time>-<build>/` before anything is overwritten. The top screen then shows the report and asks whether to send it. It does the same after a session that ended on a fatal error, and after a session in which you tapped **report a problem** at the bottom of the INFO tab. The report is made only after the game has ended, never while you play.
+If 3ds-d2 crashes (Luma3DS shows its exception screen), the next start keeps that session's `game.log`, `stderr.txt` and the Luma3DS crash dump in `/3ds/3ds-d2/reports/<time>-<build>/` before anything is overwritten. The top screen then shows the report and asks whether to send it. It does the same after a session that ended on a fatal error, after a session in which you tapped **report a problem** at the bottom of the INFO tab, and after a session with a **profiler run** (INFO's other button: a checklist of measurements to run, see [docs/controls.md](docs/controls.md#bottom-screen)). The report is made only after the game has ended, never while you play.
 
 The screen lists what would be sent:
 
 - the whole `game.log` (a four-hour session writes about 1 MiB; only past 32 MiB is the middle left out), `stderr.txt`, and the Luma3DS dumps saved during the session, gzip-compressed for the upload;
+- after a profiler run, the traces it wrote (`sprites.trc`, `files.trc`), and which measurements ran;
 - the build ID, version, CIA or 3dsx, where the game files are read from, the console model, region, system version and kernel version;
-- figures from the log: minutes played, frame rate in play, memory peaks;
+- figures from the log: minutes played, frame rate in play, frames over 100 ms in play and the longest, memory peaks;
 - your description, if you write one: press **Y** to type it with the system keyboard.
 
 Save files and character names are never sent.

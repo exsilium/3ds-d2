@@ -1,8 +1,9 @@
 // A trace of the sprite cache's traffic (issue #18), for replaying the
 // cache offline under other limits and governors (tools/sprite_trace.py)
 // instead of playing a two-hour session for each change. Off unless asked
-// for: the INFO tab's "trace sprites" button on the console (the session's
-// logs/sprites.trc, sent with its report), M4_SPRITE_TRACE in the m4 lane.
+// for: a profiler run with "sprite trace" ticked on the console (INFO's
+// "profiler run", game/profiler.h; the session's logs/sprites.trc, sent with
+// its report), M4_SPRITE_TRACE in the m4 lane.
 //
 // Two stubs on the cache's paths, behind one flag byte the guest tests
 // (sprite_trace.cpp): every sprite the game finds in the cache to draw, and

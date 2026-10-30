@@ -93,6 +93,7 @@ struct RunOptions {
     uint32_t trap_report = 0;                      // at exit, print the N most-called imports (stdout)
     uint32_t heartbeat_ms = 0;                     // log progress counters every N ms of guest time
     std::function<void()> heartbeat;               // after each heartbeat's line: the app's own counters
+    bool profile = false;                          // the guest code profile from the start (set_profiling)
     // Registry DWORDs seeded under the game's settings key when absent (the
     // game's own Options menu still changes and saves them): the 3DS app picks
     // cheaper video settings than a PC's defaults.
@@ -146,6 +147,19 @@ struct Stats {
     uint32_t alloc_failures = 0; // guest heap or VirtualAlloc requests refused
 };
 Stats &stats();
+// Where the thread presenting frames has spent its time since the start (ms),
+// as the heartbeat's "prof frame thread" line splits it: running, ready
+// while another guest thread runs, waiting on host work on its core (the
+// scheduler between slices, the heartbeat, the app's service), and blocked
+// on a guest object (a Sleep left out). The scheduler's thread.
+struct FrameThreadTimes {
+    uint64_t run_ms = 0, ready_ms = 0, host_ms = 0, blocked_ms = 0;
+};
+FrameThreadTimes frame_thread_times();
+// How long the last heartbeat took (us): the runtime's lines and
+// RunOptions::heartbeat, on the guest's core, so the frame after it waited
+// as long. The scheduler's thread.
+uint64_t last_heartbeat_us();
 
 // The read cache of game files (rt_shims_files.cpp): cumulative counters,
 // reported per interval with the heartbeat.
@@ -173,10 +187,26 @@ const FileStats &file_stats();
 void start_async_io();
 void stop_async_io();
 
-// Time-based profile sampling (PROF_COUNTERS builds; a no-op otherwise): a
-// host timer thread calls this at a fixed period, on another core. It ends
-// the running guest thread's slice at its next translated block, and the
-// scheduler samples where it stopped. Safe from any thread, at any time.
+// The game's reads of read-only game files, one line each, for replaying the
+// read cache's policy offline (issue #21): "file <fd> <size> <path>" the
+// first time a file is read in this trace, then "read <ms> <fd> <pos> <n>"
+// per ReadFile, cached or not, synchronous or not. nullptr stops it; the
+// caller closes the file after that. The game's thread (the heartbeat).
+// RT_FILETRACE=1 traces to stderr from the start.
+void set_file_trace(FILE *f);
+
+// The guest code profile (PROF_COUNTERS builds: prof.h): time in translated
+// code and in each shim, per guest thread, and EIP samples, logged with every
+// heartbeat ("prof: run", "prof shims", "prof thread", "prof eip"). Off, it
+// costs a branch per shim call and per slice. Starts as RunOptions::profile
+// says. Returns false, changing nothing, in a build without the counters.
+// The game's thread (the heartbeat).
+bool set_profiling(bool on);
+
+// Time-based profile sampling: while profiling, a host timer thread calls
+// this at a fixed period, on another core. It ends the running guest
+// thread's slice at its next translated block, and the scheduler samples
+// where it stopped. Safe from any thread, at any time.
 void profile_tick();
 
 // Guest memory use, for on-screen diagnostics (walks the allocators: call it

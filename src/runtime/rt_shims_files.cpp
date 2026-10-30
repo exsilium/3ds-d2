@@ -511,6 +511,7 @@ struct RtFile : Waitable {
     // Closed by suspend_files: fp's position to come back to.
     bool suspended = false;
     long fp_pos = 0;
+    uint32_t traced = 0;             // the file trace (set_file_trace) that named it
     RtFile() { g_files.push_back(this); }
     ~RtFile() override
     {
@@ -751,14 +752,24 @@ size_t stream_write(Cpu &c, FILE *fp, uint32_t va, uint32_t n)
     return std::fwrite(tmp.data(), 1, n, fp);
 }
 
+// The file trace (set_file_trace): where it goes, and which trace this is,
+// so each file is named once in it. RT_FILETRACE=1: stderr from the start.
+FILE *g_ftrace = std::getenv("RT_FILETRACE") ? stderr : nullptr;
+uint32_t g_ftrace_gen = 1;
+
+void trace_read(RtFile &f, uint32_t n)
+{
+    if (f.traced != g_ftrace_gen) {
+        f.traced = g_ftrace_gen;
+        std::fprintf(g_ftrace, "file %d %llu %s\n", f.fd, (unsigned long long)f.size, f.host.c_str());
+    }
+    std::fprintf(g_ftrace, "read %llu %d %llu %u\n", (unsigned long long)(wx86_now_us() / 1000), f.fd,
+                 (unsigned long long)f.pos, n);
+}
+
 // ReadFile on a cached file: from its position, into guest memory.
 uint32_t cached_read(Cpu &c, RtFile &f, uint32_t va, uint32_t n)
 {
-    // RT_FILETRACE=1: every read on stderr ("ftrace <fd> <pos> <n>"), for
-    // sizing the cache against the game's real access pattern.
-    static const bool trace = std::getenv("RT_FILETRACE") != nullptr;
-    if (trace)
-        std::fprintf(stderr, "ftrace %d %llu %u\n", f.fd, (unsigned long long)f.pos, n);
     if (!n)
         return 0;
     uint32_t got;
@@ -1161,6 +1172,12 @@ uint32_t module_file_name(Cpu &c, uint32_t module, uint32_t buf, uint32_t size)
 
 const FileStats &file_stats() { return g_file_stats; }
 
+void set_file_trace(FILE *f)
+{
+    g_ftrace = f;
+    g_ftrace_gen++;   // a new trace names its files again
+}
+
 void start_async_io()
 {
     g_io_quit = false;
@@ -1237,6 +1254,8 @@ void install_files(Bridge &br)
             // and the new position are known at once.
             if (ov)   // OVERLAPPED: the offset is in the structure; completes synchronously
                 f->pos = c.read_u32(ov + 8);
+            if (g_ftrace)
+                trace_read(*f, n);
             std::vector<uint8_t> tmp;
             uint8_t *dst = static_cast<uint8_t *>(c.hostptr(buf, n));
             if (!dst) {
@@ -1272,6 +1291,8 @@ void install_files(Bridge &br)
         } else if (f->cache) {
             if (ov)   // OVERLAPPED: the offset is in the structure; completes synchronously
                 f->pos = c.read_u32(ov + 8);
+            if (g_ftrace)
+                trace_read(*f, n);
             const uint64_t disk_us = g_file_stats.disk_us;
             got = cached_read(c, *f, buf, n);
             g_file_stats.stall_us += g_file_stats.disk_us - disk_us;   // synchronous: the disk time is the stall

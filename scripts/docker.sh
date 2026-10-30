@@ -16,7 +16,6 @@
 #                                             <game-dir> (or D2_GAME_DIR) its icon, banner and tune are the game's
 #   scripts/docker.sh package-cia --slim <game-dir>   ... with your 1.14d files inside (no video/music/speech)
 #   scripts/docker.sh package-cia --full <game-dir>   ... with every MPQ inside
-#   scripts/docker.sh package-cia --prof [...]        the profiling build (game.log gets a profile every 10 s)
 #     D2_REPORT_DSN=<Sentry DSN> scripts/docker.sh package-cia ...   crash reports offered to that project (issue #26);
 #                                             default packaging/cia/report.dsn (scripts/sentry-setup.sh), empty: none
 #   scripts/docker.sh sdcard-folder <game-dir>   dist/sdcard/3ds/3ds-d2/game/ for that (copy once)
@@ -129,13 +128,13 @@ package)
     do_build release
     run_in "$TOOLCHAIN_IMAGE" sh scripts/package.sh release
     ;;
-package-cia)   # [--prof] [<game-dir> | --slim|--full <game-dir>]: the game app (+ the user's own 1.14d files) -> dist/cia/*.cia
-    prof=0; [ "${1:-}" = --prof ] && { prof=1; shift; }   # the profiling build: ...-prof.cia
+package-cia)   # [<game-dir> | --slim|--full <game-dir>]: the game app (+ the user's own 1.14d files) -> dist/cia/*.cia
+    [ "${1:-}" = --prof ] && die "package-cia --prof is gone: every build has the profiler (INFO > profiler run)"
     mode=sdcard
     case "${1:-}" in --slim) mode=slim; shift ;; --full) mode=full; shift ;; --sdcard) shift ;; esac
     stage="$ROOT/build/cia/romfs/game"
     rm -rf "$ROOT/build/cia/romfs" "$ROOT/build/cia/art-src" "$ROOT/build/cia/game-art" && mkdir -p "$stage"
-    RUN_EXTRA=(-e "D2_CIA_MODE=$mode" -e "D2_CIA_PROF=$prof")
+    RUN_EXTRA=(-e "D2_CIA_MODE=$mode")
     [ -n "${D2_BANNER:-}" ] && RUN_EXTRA+=(-e "D2_BANNER=$D2_BANNER")
     [ -n "${D2_BANNER_FRAMES:-}" ] && RUN_EXTRA+=(-e "D2_BANNER_FRAMES=$D2_BANNER_FRAMES")
     [ -n "${D2_BANNER_TURN:-}" ] && RUN_EXTRA+=(-e "D2_BANNER_TURN=$D2_BANNER_TURN")
@@ -178,11 +177,7 @@ package-cia)   # [--prof] [<game-dir> | --slim|--full <game-dir>]: the game app 
     # the Makefile takes packaging/cia/report.dsn.
     report_vars=(BUILD_ID="$(build_id)" D2_VERSION="$(sed -n 's/^version=\([0-9.]*\).*/\1/p' "$ROOT/scripts/package-cia.sh")")
     [ -n "${D2_REPORT_DSN+x}" ] && report_vars+=(D2_REPORT_DSN="$D2_REPORT_DSN")
-    if [ "$prof" = 1 ]; then
-        run_in "$TOOLCHAIN_IMAGE" make -s -j8 -C tests/cpu/ctr PROF=1 "${report_vars[@]}" ../../../build/cpu/ctr-prof/3ds-d2-game-cia.elf ../../../build/cpu/ctr-prof/tls.bin
-    else
-        run_in "$TOOLCHAIN_IMAGE" make -s -j8 -C tests/cpu/ctr "${report_vars[@]}" ../../../build/cpu/ctr/3ds-d2-game-cia.elf ../../../build/cpu/ctr/tls.bin
-    fi
+    run_in "$TOOLCHAIN_IMAGE" make -s -j8 -C tests/cpu/ctr "${report_vars[@]}" ../../../build/cpu/ctr/3ds-d2-game-cia.elf ../../../build/cpu/ctr/tls.bin
     RUN_EXTRA=("${saved_extra[@]}")
     if [ -n "$art" ]; then   # the icon, banner model and tune (packaging/cia/game_art.py)
         ensure_image banner "$BANNER_IMAGE"

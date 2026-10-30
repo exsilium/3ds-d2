@@ -385,23 +385,32 @@ uint32_t guest_call(Cpu &c, uint32_t va, std::initializer_list<uint32_t> args)
 
 namespace {
 // What the last heartbeat interval cost. Always: scheduler idle time and the
-// console's cache maintenance. With PROF_COUNTERS (package-cia --prof): the
-// split between translated code and shims, the busiest shims, and an EIP
-// profile per guest thread (one sample per preempted slice), after which the
-// samples are reset so every interval is a profile of its own.
+// console's cache maintenance. While profiling (set_profiling): the split
+// between translated code and shims, the busiest shims, and an EIP profile
+// per guest thread (one sample per profile_tick, or per preempted slice
+// without a timer), after which the samples are reset so every interval is
+// a profile of its own.
 // Where the thread presenting frames spends its time (issue #31): the host
-// time between two calls of check_time_limit on the scheduler's thread (at
-// each advance of the guest clock, and from now_ms) is charged to what that
-// thread was doing at the first of them: running, ready
-// while another guest thread runs, or blocked, by what it waits on (a
-// Sleep is blocked on nothing). Millisecond resolution, so sums over a
-// heartbeat, not single waits.
-constexpr const char *kFrameKinds[] = {"run", "ready", "sleep", "critsec", "event", "fileio", "multi", "thread",
-                                       "other"};
+// time between two samples on the scheduler's thread is charged to what that
+// thread was doing at the first of them: running, ready while another guest
+// thread runs, host work on its core (the scheduler between slices, the
+// heartbeat, the app's service), or blocked, by what it waits on (a Sleep is
+// blocked on nothing). Samples are taken at each slice's start and end (the
+// scheduler's slice sink), at each advance of the guest clock and from
+// now_ms, and around the host work. Without a slice sink, running and ready
+// are the thread's state at the sample, which charges a slice that starts
+// right after one to ready (issue #19: 3DS-D2-E).
+constexpr const char *kFrameKinds[] = {"run",    "ready",  "host",  "sleep", "critsec",
+                                       "event",  "fileio", "multi", "thread", "other"};
 constexpr size_t kFrameKindCount = sizeof kFrameKinds / sizeof kFrameKinds[0];
-uint64_t g_frame_ms[kFrameKindCount] = {}, g_frame_mark[kFrameKindCount] = {};
-size_t g_frame_was = kFrameKindCount;   // what it was doing at the last advance (none yet)
+enum : size_t { kFrameRun, kFrameReady, kFrameHost, kFrameSleep, kFrameWaits };
+uint64_t g_frame_us[kFrameKindCount] = {}, g_frame_mark[kFrameKindCount] = {};
+size_t g_frame_was = kFrameKindCount;   // what it was doing at the last sample (none yet)
 uint64_t g_frame_at = 0;
+int g_slice_tid = -1;          // the guest thread whose slice runs, -1 between slices
+bool g_slice_sink = false;     // the scheduler reports its slices
+bool g_host_work = false;      // the heartbeat or the app's service runs
+uint64_t g_heartbeat_us = 0;   // the last heartbeat's length
 // Its blocked time by where it waits from (the guest code it resumes in),
 // for the heartbeat's few largest.
 uint32_t g_frame_where = 0;
@@ -425,32 +434,60 @@ size_t frame_thread_doing()
     if (!t)
         return kFrameKindCount;
     switch (t->state) {
-    case GuestThread::State::Running: return 0;
-    case GuestThread::State::Ready: return 1;
+    case GuestThread::State::Running:
+    case GuestThread::State::Ready:
+        if (g_host_work)
+            return kFrameHost;
+        if (!g_slice_sink)
+            return t->state == GuestThread::State::Running ? kFrameRun : kFrameReady;
+        return g_slice_tid < 0 ? kFrameHost : g_slice_tid == id ? kFrameRun : kFrameReady;
     case GuestThread::State::Blocked: break;
     default: return kFrameKindCount;
     }
     g_frame_where = wait_site(*t);
     if (!t->wait_obj)
-        return 2;
+        return kFrameSleep;
     const char *k = static_cast<Waitable *>(t->wait_obj)->kind();
-    for (size_t i = 3; i + 1 < kFrameKindCount; i++)
+    for (size_t i = kFrameWaits; i + 1 < kFrameKindCount; i++)
         if (std::strcmp(k, kFrameKinds[i]) == 0)
             return i;
     return kFrameKindCount - 1;
 }
 
+// The time since the last sample, charged to what the thread was doing.
+void charge_frame_thread()
+{
+    const uint64_t us = wx86_now_us();
+    if (g_frame_was < kFrameKindCount && us > g_frame_at) {
+        g_frame_us[g_frame_was] += us - g_frame_at;
+        if (g_frame_was >= kFrameSleep)
+            g_frame_wait_at[g_frame_where] += us - g_frame_at;
+    }
+    g_frame_at = us;
+}
+
 void sample_frame_thread()
 {
-    // The host's clock: check_time_limit is given the scheduler's and now_ms's
-    // in turn, which differ by an offset.
-    const uint64_t ms = wx86_now_ms();
-    if (g_frame_was < kFrameKindCount && ms > g_frame_at) {
-        g_frame_ms[g_frame_was] += ms - g_frame_at;
-        if (g_frame_was >= 2)
-            g_frame_wait_at[g_frame_where] += ms - g_frame_at;
-    }
-    g_frame_at = ms;
+    charge_frame_thread();
+    g_frame_was = frame_thread_doing();
+}
+
+// The scheduler's slice sink (its thread).
+void on_slice(uint32_t tid, bool start)
+{
+    charge_frame_thread();
+    g_slice_sink = true;
+    g_slice_tid = start ? (int)tid : -1;
+    g_frame_was = frame_thread_doing();
+}
+
+// Host work on the guest's core, from the scheduler's thread.
+void host_work(bool on)
+{
+    if (!t_runs_guest || !g_sched)
+        return;
+    charge_frame_thread();
+    g_host_work = on;
     g_frame_was = frame_thread_doing();
 }
 
@@ -460,15 +497,15 @@ void log_frame_thread()
     size_t off = std::snprintf(line, sizeof line, "prof frame thread %d:", g_stats.frame_thread);
     for (size_t i = 0; i < kFrameKindCount && off < sizeof line; i++) {
         off += std::snprintf(line + off, sizeof line - off, " %s %llu", kFrameKinds[i],
-                             (unsigned long long)(g_frame_ms[i] - g_frame_mark[i]));
-        g_frame_mark[i] = g_frame_ms[i];
+                             (unsigned long long)((g_frame_us[i] - g_frame_mark[i]) / 1000));
+        g_frame_mark[i] = g_frame_us[i];
     }
     logf("%s ms", line);
     // The sites it waited longest from (200 ms or more).
     std::vector<std::pair<uint64_t, uint32_t>> top;
     for (const auto &w : g_frame_wait_at)
-        if (w.second >= 200)
-            top.push_back({w.second, w.first});
+        if (w.second >= 200000)
+            top.push_back({w.second / 1000, w.first});
     g_frame_wait_at.clear();
     if (top.empty())
         return;
@@ -541,6 +578,10 @@ void prof_report(uint64_t ms)
     now.cs = prof::cs_enter;
     now.cs_contended = prof::cs_contended;
     now.ticks = prof::ticks();
+    if (!prof::on) {   // not profiling: nothing counted since the mark
+        g_mark = now;
+        return;
+    }
     logf("prof: run %llu ms (shims %llu ms in %llu calls), waits %llu (%llu immediate), cs %llu (%llu contended), "
          "samples %llu",
          (unsigned long long)((now.run_ns - g_mark.run_ns) / 1000000), (unsigned long long)((now.trap_ns - g_mark.trap_ns) / 1000000),
@@ -602,13 +643,19 @@ void check_time_limit(uint64_t ms)
         const uint64_t real = wx86_now_ms();
         if (real - g_last_service_ms >= 50) {
             g_in_service = true;
+            host_work(true);
             g_opt.service();
+            host_work(false);
             g_in_service = false;
             g_last_service_ms = wx86_now_ms();
         }
     }
     if (g_opt.heartbeat_ms && ms >= g_next_beat) {
         g_next_beat = ms + g_opt.heartbeat_ms;
+        // The heartbeat runs on the guest's core: the frame after it waits
+        // for all of it (last_heartbeat_us).
+        host_work(true);
+        const uint64_t beat_t0 = wx86_now_us();
         prof_report(ms);
 #ifdef __GLIBC__
         const size_t host_used = mallinfo2().uordblks;
@@ -630,6 +677,8 @@ void check_time_limit(uint64_t ms)
         }
         if (g_opt.heartbeat)
             g_opt.heartbeat();
+        g_heartbeat_us = wx86_now_us() - beat_t0;
+        host_work(false);
     }
     if (g_opt.max_ms && ms >= g_opt.max_ms && !g_timed_out && g_sched) {
         g_timed_out = true;
@@ -658,15 +707,44 @@ void tail_call(Cpu &c, uint32_t va, uint32_t shim_argc, std::initializer_list<ui
     g_br->redirect_next(va);
 }
 
+bool set_profiling(bool on)
+{
+#ifdef PROF_COUNTERS
+    if (on && !prof::on)
+        prof::reset_samples();   // what an earlier run left: not this window's
+    if (on != prof::on)
+        logf("prof: guest code profile %s", on ? "on" : "off");
+    prof::on = on;
+    return true;
+#else
+    return !on;
+#endif
+}
+
 void profile_tick()
 {
 #ifdef PROF_COUNTERS
-    if (Cpu *c = g_tick_cpu.load(std::memory_order_acquire)) {
+    if (Cpu *c = g_tick_cpu.load(std::memory_order_acquire); c && prof::on) {
         prof::tick();
         c->nudge_thread_budget(nullptr);   // the cooperative scheduler's one emu: no registry walk
     }
 #endif
 }
+
+FrameThreadTimes frame_thread_times()
+{
+    FrameThreadTimes t;
+    t.run_ms = g_frame_us[kFrameRun] / 1000;
+    t.ready_ms = g_frame_us[kFrameReady] / 1000;
+    t.host_ms = g_frame_us[kFrameHost] / 1000;
+    uint64_t blocked = 0;
+    for (size_t i = kFrameWaits; i < kFrameKindCount; i++)
+        blocked += g_frame_us[i];
+    t.blocked_ms = blocked / 1000;
+    return t;
+}
+
+uint64_t last_heartbeat_us() { return g_heartbeat_us; }
 
 uint64_t now_ms()
 {
@@ -767,6 +845,9 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
 {
     RunResult res;
     g_opt = opt;
+#ifdef PROF_COUNTERS
+    prof::on = opt.profile;   // the backend counts by default: here, only when asked
+#endif
     if (g_opt.write_root.empty())
         g_opt.write_root = g_opt.data_root;
     const Layout &L = *g_opt.layout;
@@ -970,6 +1051,7 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
         sched.set_virtual_tick_us(opt.virtual_tick_us);
     sched.set_max_switches(~0ull);   // runs end by exit or max_ms, never by a switch count
     sched.set_time_sink([](uint64_t ms) { check_time_limit(ms); });
+    sched.set_slice_sink(on_slice);
     wx86_set_scheduler(&sched);
     sched.set_main(img->entry_va(), L.main_stack + 0x200000 - 0x100, L.main_tib);
     g_tick_cpu.store(cpu, std::memory_order_release);

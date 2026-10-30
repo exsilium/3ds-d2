@@ -2,7 +2,7 @@
 """Summarises a session from the game's log (sdmc:/3ds/3ds-d2/logs/game.log,
 or the lane's): one row per 10 s heartbeat, then the frame rate by game state,
 the slow windows, what the slow windows were doing (sprite re-decoding, new
-code, SD reads), and memory over time.
+code, SD reads), the hitches, and memory over time.
 
     python3 -I tools/session_report.py dist/game.log [--csv rows.csv]
 
@@ -19,6 +19,19 @@ window's time: `waited` is the game's threads waiting on SD reads while the
 others ran (`frame` those of the thread drawing the frames, which stop
 meanwhile), `stalled` reads completed before ReadFile returned (every guest
 thread stopped), and `decode` the game decoding the sprites it loaded.
+
+Logs with the hitch counters (issue #19) carry a `prof hitch:` line per
+window: the frame intervals by length (<=50, <=100, <=250, >250 ms), the
+longest, the sprites taken and let go of, the frame thread's time blocked
+(`wait`), ready while another guest thread ran, and waiting on host work on
+its core (`host`: the scheduler between slices, the heartbeat), the length
+of the heartbeat before the window (the frame after it waited that long),
+frames not drawn and starved sound grains. A window at 20 fps can be 200
+even frames or 150 and a 2.5 s stall: `hitches` counts the frames over 100
+ms, and the windows with the longest frames are listed with what else
+happened in them. The first sessions' logs (3DS-D2-E) had the frame
+thread's read wait in place of wait, ready, host and heartbeat, and a ready
+time that included much of its own running.
 """
 import argparse
 import collections
@@ -35,16 +48,20 @@ HEART = re.compile(r"t=(\d+)s .*?heap=(\d+)/(\d+)KiB va=(\d+)/(\d+)KiB free=(\d+
 OPENED = re.compile(r"t=\d+s peeks=\d+ files=(\d+) ")
 SPRITE = re.compile(r"sprite cache (\d+)/(\d+) KiB, (\d+) sprites(?:, in (\d+), out (\d+))?"
                     r"(?:, decoded (\d+) in (\d+) ms)?")
-FRAME = re.compile(r"prof frame thread -?\d+: run (\d+) ready (\d+) sleep (\d+) critsec (\d+) event (\d+) "
-                   r"fileio (\d+) multi (\d+) thread (\d+) other (\d+) ms")
+FRAME = re.compile(r"prof frame thread -?\d+:((?: [a-z]+ \d+)+) ms")
 WAITS = re.compile(r"prof frame thread waits: (.*) ms")
-FRAME_KINDS = ["run", "ready", "sleep", "critsec", "event", "fileio", "multi", "thread", "other"]
+FRAME_KINDS = ["run", "ready", "host", "sleep", "critsec", "event", "fileio", "multi", "thread", "other"]
 STATE = re.compile(r"game state: (.*?) \(ui")
+HITCH = re.compile(r"prof hitch: frames \d+, <=50ms \d+, <=100ms \d+, <=250ms (\d+), >250ms (\d+), longest (\d+) ms, "
+                   r"sprites in \d+ out \d+, (?:read wait (\d+) ms|wait (\d+) ms, ready (\d+) ms, host (\d+) ms, "
+                   r"heartbeat (\d+) ms), skipped (\d+), famine (\d+)")
 
 FIELDS = ["t", "state", "ms", "frames", "fps", "idle_ms", "switches", "cache_syncs", "cache_sync_us", "cells",
           "reads", "opened", "load", "disk_reads", "disk_kib", "disk_ms", "heap_kib", "heap_peak_kib", "va_kib", "va_peak_kib",
           "free_kib", "jit_kib", "meta_kib", "host_kib", "sprite_kib", "sprite_limit_kib", "sprites", "sprites_in",
-          "sprites_out", "wait_ms", "wait_frame_ms", "stall_ms", "decodes", "decode_ms"] + ["ft_" + k for k in FRAME_KINDS]
+          "sprites_out", "wait_ms", "wait_frame_ms", "stall_ms", "decodes", "decode_ms", "hitches", "hitches_250",
+          "longest_ms", "read_wait_ms", "hitch_wait_ms", "hitch_ready_ms", "hitch_host_ms", "heartbeat_ms", "skipped",
+          "famine"] + ["ft_" + k for k in FRAME_KINDS]
 
 
 def parse(path):
@@ -76,8 +93,16 @@ def parse(path):
                 cur.update(wait_ms=int(m.group(7)), wait_frame_ms=int(m.group(9)), stall_ms=int(m.group(10)))
             continue
         m = FRAME.search(line)
-        if m:   # builds with the frame thread's sampler (issue #31)
-            cur.update({"ft_" + k: int(v) for k, v in zip(FRAME_KINDS, m.groups())})
+        if m:   # builds with the frame thread's sampler (issue #31); host since issue #19
+            kv = m.group(1).split()
+            cur.update({"ft_" + k: int(v) for k, v in zip(kv[::2], kv[1::2]) if k in FRAME_KINDS})
+            continue
+        m = HITCH.search(line)
+        if m:   # builds with the hitch counters (issue #19)
+            g = [int(v) if v is not None else 0 for v in m.groups()]
+            cur.update(hitches=g[0] + g[1], hitches_250=g[1], longest_ms=g[2], read_wait_ms=g[3],
+                       hitch_wait_ms=g[4], hitch_ready_ms=g[5], hitch_host_ms=g[6], heartbeat_ms=g[7],
+                       skipped=g[8], famine=g[9])
             continue
         m = WAITS.search(line)
         if m:   # where it waited longest from: "site:ms ..."
@@ -163,6 +188,10 @@ def report(rows):
         print(f"  cells decoded per window: median {pct([r['cells'] for r in play], .5):.0f}, "
               f"p90 {pct([r['cells'] for r in play], .9):.0f}; windows under 10 fps: {len(slow)}, "
               f"{sum(1 for r in slow if not r['load'])} of them not area loads")
+        if any(r["longest_ms"] for r in play):
+            print(f"  hitches (frames over 100 ms): {sum(r['hitches'] for r in play)}, over 250 ms "
+                  f"{sum(r['hitches_250'] for r in play)}; windows with one: "
+                  f"{sum(1 for r in play if r['hitches']) / len(play):.0%}; longest frame {max(r['longest_ms'] for r in play)} ms")
         if any(r["sprites_in"] for r in play):
             print(f"  sprites taken {sum(r['sprites_in'] for r in play)}, let go of {sum(r['sprites_out'] for r in play)}; "
                   f"windows evicting: {sum(1 for r in play if r['sprites_out']) / len(play):.0%}")
@@ -174,7 +203,8 @@ def report(rows):
 
         print("\nin play, the 12 slowest windows:")
         for r in sorted(play, key=lambda r: r["fps"])[:12]:
-            print(f"  t={r['t']:6d}s {r['fps']:5.1f} fps  idle {r['idle_ms']:4d} ms  syncs {r['cache_syncs']:5d}  "
+            print(f"  t={r['t']:6d}s {r['fps']:5.1f} fps  hitches {r['hitches']:3d}  idle {r['idle_ms']:4d} ms  "
+                  f"syncs {r['cache_syncs']:5d}  "
                   f"cells {r['cells']:7d}  disk {r['disk_ms']:4d} ms / {r['disk_kib']:5d} KiB  free {r['free_kib']:6d} KiB  "
                   f"sprites {r['sprite_kib']:5d}/{r['sprite_limit_kib']:5d} KiB in {r['sprites_in']:4d} out {r['sprites_out']:4d}"
                   f"{'  area load' if r['load'] else ''}")
@@ -184,17 +214,37 @@ def report(rows):
             print("\nin play, the 12 slowest windows that are not area loads, their time (ms):")
             sampled = any(r["ft_run"] for r in timed)
             print("       t    fps  waited  frame  stalled  decode  sprites decoded  cells   disk" +
-                  ("   | frame thread: run ready sleep critsec event fileio other" if sampled else ""))
+                  ("   | frame thread: run ready  host sleep critsec event fileio other" if sampled else ""))
             for r in sorted((r for r in timed if not r["load"]), key=lambda r: r["fps"])[:12]:
                 print(f"  {r['t']:6d} {r['fps']:5.1f} {r['wait_ms']:7d} {r['wait_frame_ms']:6d} {r['stall_ms']:8d} "
                       f"{r['decode_ms']:7d} {r['decodes']:16d} {r['cells']:6d} {r['disk_ms']:6d}" +
-                      (f"   | {r['ft_run']:18d} {r['ft_ready']:5d} {r['ft_sleep']:5d} {r['ft_critsec']:7d} "
-                       f"{r['ft_event']:5d} {r['ft_fileio']:6d} {r['ft_multi'] + r['ft_thread'] + r['ft_other']:5d}"
+                      (f"   | {r['ft_run']:18d} {r['ft_ready']:5d} {r['ft_host']:5d} {r['ft_sleep']:5d} "
+                       f"{r['ft_critsec']:7d} {r['ft_event']:5d} {r['ft_fileio']:6d} "
+                       f"{r['ft_multi'] + r['ft_thread'] + r['ft_other']:5d}"
                        if sampled else "") + (f"  {r['ft_sites']}" if r["ft_sites"] else ""))
             n = sum(r["ms"] for r in timed) or 1
             print(f"  all play: waited {sum(r['wait_ms'] for r in timed) / n:.1%} of the time "
                   f"(frame thread {sum(r['wait_frame_ms'] for r in timed) / n:.1%}), stalled "
                   f"{sum(r['stall_ms'] for r in timed) / n:.1%}, decoding {sum(r['decode_ms'] for r in timed) / n:.1%}")
+
+    stalled = [r for r in play if r["longest_ms"]]
+    if stalled:
+        # Issue #19: the frames the player felt, and what else the window did.
+        print("\nin play, the 12 windows with the longest frames, and their causes (ms):")
+        print("       t    fps  longest  >100ms  >250ms  evicted   wait  ready   host  heartbeat  syncs  skipped  famine"
+              "    cells")
+        for r in sorted(stalled, key=lambda r: -r["longest_ms"])[:12]:
+            # Logs before the frame thread's causes: its read wait, ready and host from its sampler.
+            wait = r["hitch_wait_ms"] or r["read_wait_ms"]
+            ready = r["hitch_ready_ms"] or r["ft_ready"]
+            host = r["hitch_host_ms"] or r["ft_host"]
+            print(f"  {r['t']:6d} {r['fps']:5.1f} {r['longest_ms']:8d} {r['hitches']:7d} {r['hitches_250']:7d} "
+                  f"{r['sprites_out']:8d} {wait:6d} {ready:6d} {host:6d} {r['heartbeat_ms']:10d} "
+                  f"{r['cache_syncs']:6d} {r['skipped']:8d} {r['famine']:7d} {r['cells']:8d}"
+                  f"{'  area load' if r['load'] else ''}")
+        beats = sorted(r["heartbeat_ms"] for r in play if r["heartbeat_ms"])
+        if beats:
+            print(f"  heartbeat: median {beats[len(beats) // 2]} ms, longest {beats[-1]} ms")
 
     print("\nmemory over time (KiB):")
     print("       t    heap  heap^    va     va^   free   jit  meta   host  sprite/limit")

@@ -3,7 +3,7 @@
 //
 //   sdmc:/3ds/3ds-d2/game/   Game.exe and the MPQs (read-only, the user's copy)
 //   sdmc:/3ds/3ds-d2/save/   everything the game writes (saves, settings, registry)
-//   sdmc:/3ds/3ds-d2/logs/   game.log (runtime diagnostics)
+//   sdmc:/3ds/3ds-d2/logs/   game.log (runtime diagnostics), a profiler run's traces
 //   sdmc:/3ds/3ds-d2/reports/  a crashed or reported session's files (ctr_report.cpp)
 //
 // Display: the game draws an 800x600 8-bit frame. The top screen shows all of
@@ -29,9 +29,11 @@
 #include "game/d2_native.h"
 #include "game/d2_state.h"
 #include "game/osk.h"
+#include "game/profiler.h"
 #include "game/second_screen.h"
 #include "game/sprite_trace.h"
 #include "game/storm_reads.h"
+#include "runtime/ds_emul.h"
 #include "runtime/rt_host.h"
 
 #include <3ds.h>
@@ -228,8 +230,9 @@ const char kGameDir[] = "sdmc:/3ds/3ds-d2/game";
 const char kRomfsGameDir[] = "romfs:/game";   // the CIA carries the game files in its RomFS
 const char kSaveDir[] = "sdmc:/3ds/3ds-d2/save";
 const char kLogDir[] = "sdmc:/3ds/3ds-d2/logs";
-const char kTracePath[] = "sdmc:/3ds/3ds-d2/logs/sprites.trc";   // INFO's sprite trace (issue #18)
-const char kSettings[] = "sdmc:/3ds/3ds-d2/settings.txt";   // the bottom screen's tab and map size
+const char kTracePath[] = "sdmc:/3ds/3ds-d2/logs/sprites.trc";   // the profiler run's sprite trace (issue #18)
+const char kFileTracePath[] = "sdmc:/3ds/3ds-d2/logs/files.trc";  // ...and its file-read trace (issue #21)
+const char kSettings[] = "sdmc:/3ds/3ds-d2/settings.txt";   // the bottom screen's tab and map size, the profiler checklist
 
 FILE *g_log = nullptr;
 game::Controls g_controls;
@@ -257,8 +260,11 @@ int g_render_core = -1;                 // the core drawing frames (-1: the game
 volatile uint32_t g_frames_skipped = 0; // frames not shown: the previous one was still drawing
 d2rt::Cpu *g_guest_cpu = nullptr;       // the game's CPU, from install_native on
 game::SpriteCacheWindow g_sprite_window{};   // the sprite cache in the last heartbeat's 10 s
-bool g_trace_refused = false;   // the sprite trace did not start: not again until asked again
-bool g_trace_used = false;      // the sprite trace ran: the session's report is offered for it
+// The profiler run (game/profiler.h), switched at the heartbeat.
+uint32_t g_prof_on = 0;        // its options running
+uint32_t g_prof_refused = 0;   // options that would not start: not again in this run
+uint32_t g_prof_used = 0;      // options that ran: the session's report is offered for them
+std::string g_bench_path;      // the SD card benchmark's file (the game's d2data.mpq)
 game::Autoplay g_autoplay;
 bool g_autoplay_on = false;   // sdmc:/3ds/3ds-d2/autoplay.txt, until the first physical input
 
@@ -271,6 +277,29 @@ struct Timing {
     uint32_t total_frames = 0;
 } g_timing;
 
+// The hitch counters (issue #19), per heartbeat window: the intervals
+// between presents by length, and the longest, from the timestamp present()
+// takes anyway. The heartbeat adds what else stopped frames (sprites taken
+// and let go of; the frame thread's time blocked, ready while another guest
+// thread ran, and waiting on host work; the heartbeat before, whose length
+// the frame after it waited; frames not drawn; the mixer's starved grains),
+// logs the window as "prof hitch:" and starts the next. Both on the game's
+// thread.
+struct Hitches {
+    uint32_t frames[4] = {};   // intervals of <=50, <=100, <=250, >250 ms
+    uint32_t longest_ms = 0;
+};
+Hitches g_hitch;   // the window so far
+struct HitchWindow {
+    Hitches h;
+    uint32_t wait_ms = 0, ready_ms = 0, host_ms = 0, heartbeat_ms = 0, skipped = 0, famine = 0;
+} g_hitch_last;    // the last whole window: INFO shows it
+struct HitchMark {
+    rt::FrameThreadTimes frame;
+    uint32_t skipped = 0;
+    unsigned long long famine = 0;
+} g_hitch_mark;
+
 uint64_t host_us() { return svcGetSystemTick() / (SYSCLOCK_ARM11 / 1000000); }
 
 inline uint16_t rgb565(uint32_t r, uint32_t g, uint32_t b) { return (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)); }
@@ -281,14 +310,9 @@ void show_stats(float fps, float draw_ms, float worst_ms)
     const struct mallinfo mi = mallinfo();
     const uint64_t t = rt::now_ms() / 1000;
     const rt::Stats &st = rt::stats();
-    char line[11][48];
-#ifdef PROF_COUNTERS
-    const char *build = "  PROF";   // the profiling build (package-cia --prof)
-#else
-    const char *build = "";
-#endif
+    char line[13][48];
     std::snprintf(line[0], 48, "3ds-d2  game time %02u:%02u:%02u%s", (unsigned)(t / 3600), (unsigned)(t / 60 % 60),
-                  (unsigned)(t % 60), build);
+                  (unsigned)(t % 60), g_prof_on ? "  PROF" : "");   // a profiler run
     std::snprintf(line[1], 48, "fps %5.1f   worst frame gap %6.1f ms", fps, worst_ms);
     std::snprintf(line[2], 48, "draw %5.2f ms c%d skip %u frames %u", draw_ms, g_render_core < 0 ? 0 : g_render_core,
                   (unsigned)g_frames_skipped, (unsigned)g_timing.total_frames);
@@ -309,11 +333,18 @@ void show_stats(float fps, float draw_ms, float worst_ms)
         std::snprintf(line[8], 48, "JIT MEMORY FULL code %u jmptbl %u", m.jit_code_kb, m.jmptbl_kb);
     else
         std::snprintf(line[8], 48, " jit code %5u meta %5u jmptbl %5u", m.jit_code_kb, m.jit_meta_kb, m.jmptbl_kb);
-    std::snprintf(line[9], 48, "files %3u  read %5u MiB", st.files_opened, (unsigned)(st.bytes_read >> 20));
-    std::snprintf(line[10], 48, "top: %s%s", g_zoom ? "1:1 zoom (Select)" : "whole frame (Select: zoom)",
+    // The hitch counters (issue #19), the last heartbeat's 10 s.
+    const HitchWindow &hw = g_hitch_last;
+    std::snprintf(line[9], 48, "files %3u read %4u MiB skip %3u fam %3u", st.files_opened,
+                  (unsigned)(st.bytes_read >> 20), (unsigned)hw.skipped, (unsigned)hw.famine);
+    std::snprintf(line[10], 48, "hitch >100ms %3u >250ms %3u max %5u ms", (unsigned)(hw.h.frames[2] + hw.h.frames[3]),
+                  (unsigned)hw.h.frames[3], (unsigned)hw.h.longest_ms);
+    std::snprintf(line[11], 48, "wait %4u ready %4u host %4u hb %4u", (unsigned)hw.wait_ms, (unsigned)hw.ready_ms,
+                  (unsigned)hw.host_ms, (unsigned)hw.heartbeat_ms);
+    std::snprintf(line[12], 48, "top: %s%s", g_zoom ? "1:1 zoom (Select)" : "whole frame (Select: zoom)",
                   g_autoplay_on ? "  AUTO" : "");
     std::vector<game::BottomView::Line> lines;
-    for (int i = 0; i < 11; i++) {
+    for (int i = 0; i < 13; i++) {
         line[i][40] = 0;   // 40 columns
         const uint16_t c = i == 0 ? rgb565(255, 220, 90) : (i == 8 && jit_full) ? rgb565(255, 60, 60) : rgb565(255, 255, 255);
         lines.push_back({line[i], c});
@@ -339,12 +370,31 @@ void update_stats()
     g_timing.worst_gap_us = 0;
 }
 
+// game.log, buffered: a line is written to the SD card at once, unless it
+// is one of the heartbeat's, which go together at its end (log_flush). A
+// write per line cost the frame after the heartbeat about 10 ms a line, 300
+// ms with the guest code profile's (issue #19: 3DS-D2-E).
+char g_log_buf[16 << 10];
+
+void log_flush()
+{
+    if (g_log)
+        std::fflush(g_log);
+}
+
 void logline(const char *s)
 {
     if (g_log) {
         std::fprintf(g_log, "%s\n", s);
         std::fflush(g_log);
     }
+}
+
+// One of the heartbeat's lines: written with the rest at its end.
+void logline_held(const char *s)
+{
+    if (g_log)
+        std::fprintf(g_log, "%s\n", s);
 }
 
 // ---- CPU exceptions (issue #5) --------------------------------------------------------
@@ -723,10 +773,9 @@ void start_render_thread()
                                                    : "game thread (no second core)");
 }
 
-#ifdef PROF_COUNTERS
 // The time-based profile sampler (rt::profile_tick): every 2 ms, from core 2
 // at a priority above the drawing and the mixer, so its period holds while
-// core 0 runs the game.
+// core 0 runs the game. Only during a profiler run's guest code profile.
 Thread g_sampler = nullptr;
 volatile bool g_sampler_stop = false;
 
@@ -740,6 +789,9 @@ void sampler_main(void *)
 
 void start_sampler()
 {
+    if (g_sampler)
+        return;
+    g_sampler_stop = false;
     s32 prio = 0x30;
     svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
     g_sampler = threadCreate(sampler_main, nullptr, 4 * 1024, prio - 3, g_render_core >= 0 ? g_render_core : 2, false);
@@ -755,7 +807,6 @@ void stop_sampler()
     threadFree(g_sampler);
     g_sampler = nullptr;
 }
-#endif
 
 // Asynchronous file reads (RunOptions::io_start): the runtime's I/O worker on
 // the second core, above the drawing, so a finished SD read reaches the
@@ -801,8 +852,15 @@ void stop_render_thread()
 void present(const rt::Frame &f)
 {
     const uint64_t t0 = host_us();
-    if (g_timing.last_present_us && t0 - g_timing.last_present_us > g_timing.worst_gap_us)
-        g_timing.worst_gap_us = t0 - g_timing.last_present_us;
+    if (g_timing.last_present_us) {
+        const uint64_t gap = t0 - g_timing.last_present_us;
+        if (gap > g_timing.worst_gap_us)
+            g_timing.worst_gap_us = gap;
+        const uint32_t ms = (uint32_t)(gap / 1000);
+        g_hitch.frames[ms <= 50 ? 0 : ms <= 100 ? 1 : ms <= 250 ? 2 : 3]++;
+        if (ms > g_hitch.longest_ms)
+            g_hitch.longest_ms = ms;
+    }
     g_timing.last_present_us = t0;
     if (!f.yuv[0]) {   // a cinematic's size is not the game's: the cursor keeps the game's frame
         g_controls.set_frame((int)f.width, (int)f.height);
@@ -897,6 +955,8 @@ void load_settings()
             g_ss.set_map_ms((uint32_t)std::atoi(value));
         else if (std::sscanf(line, "maphelp=%31s", value) == 1)
             g_ss.set_map_help(std::atoi(value) != 0);
+        else if (std::strncmp(line, "profile=", 8) == 0)   // the profiler run's checklist ("" = nothing ticked)
+            g_ss.set_profile_choice(game::profile_bits(line + 8));
     }
     std::fclose(f);
     g_ss.take_settings_changed();
@@ -905,8 +965,9 @@ void load_settings()
 void save_settings()
 {
     if (FILE *f = std::fopen(kSettings, "w")) {
-        std::fprintf(f, "bottom=%s\nmapscale=%d\nmapms=%u\nmaphelp=%d\n", game::bottom_tab_name(g_ss.tab()),
-                     g_ss.map_scale(), (unsigned)g_ss.map_ms(), g_ss.map_help() ? 1 : 0);
+        std::fprintf(f, "bottom=%s\nmapscale=%d\nmapms=%u\nmaphelp=%d\nprofile=%s\n", game::bottom_tab_name(g_ss.tab()),
+                     g_ss.map_scale(), (unsigned)g_ss.map_ms(), g_ss.map_help() ? 1 : 0,
+                     game::profile_names(g_ss.profile_choice()).c_str());
         std::fclose(f);
     }
 }
@@ -939,6 +1000,14 @@ bool apt_service()
 bool g_romfs = false;          // the CIA's RomFS is mounted
 std::string g_log_path;
 
+FILE *open_log(const char *mode)
+{
+    FILE *f = std::fopen(g_log_path.c_str(), mode);
+    if (f)
+        std::setvbuf(f, g_log_buf, _IOFBF, sizeof g_log_buf);
+    return f;
+}
+
 void close_storage()
 {
     rt::suspend_files();
@@ -959,7 +1028,7 @@ void open_storage()
     if (g_romfs)
         g_romfs = R_SUCCEEDED(romfsInit());
     if (!g_log_path.empty())
-        g_log = std::fopen(g_log_path.c_str(), "a");
+        g_log = open_log("a");
     rt::resume_files();
 }
 
@@ -976,8 +1045,10 @@ void apt_hook(APT_HookType type, void *)
     u32 thread = 0;
     svcGetThreadId(&thread, CUR_THREAD_HANDLE);
     const bool game_thread = thread == g_apt_thread;
-    if (type == APTHOOK_ONRESTORE || type == APTHOOK_ONWAKEUP)
+    if (type == APTHOOK_ONRESTORE || type == APTHOOK_ONWAKEUP) {
         g_ss.invalidate();   // the HOME menu or sleep drew over the bottom screen
+        g_timing.last_present_us = 0;   // the time away is not a frame (worst gap, hitches)
+    }
     if (type == APTHOOK_ONRESTORE && g_storage_closed && game_thread)
         open_storage();
     if (type != APTHOOK_ONSUSPEND && type != APTHOOK_ONSLEEP)
@@ -1090,11 +1161,11 @@ bool read_file(const std::string &path, std::vector<uint8_t> &out)
     return ok;
 }
 
-#ifdef PROF_COUNTERS
 // The SD card's cost model, for sizing the game-file read cache
 // (rt_shims_files.cpp): reads of each size at scattered offsets of an MPQ,
 // as the game reads them. Time per read = per-call overhead + size /
-// bandwidth; two sizes give both.
+// bandwidth; two sizes give both. A profiler run's option: about a second
+// of the game stopped while it reads.
 void sd_benchmark(const std::string &path)
 {
     const int fd = ::open(path.c_str(), O_RDONLY);
@@ -1124,7 +1195,6 @@ void sd_benchmark(const std::string &path)
     }
     ::close(fd);
 }
-#endif
 
 // game.log's last line: the session ended in order (report.h). A log
 // without it is a crash, offered as a report at the next start.
@@ -1169,24 +1239,119 @@ void wait_for_start()
     }
 }
 
-// The sprite trace (sprite_trace.h): started and stopped as INFO's button
-// says, at the heartbeat, which also gives it the cache and the pool. It
-// goes with the session's logs, and with them into its report.
-void trace_heartbeat(const rt::MemoryReport &m, const game::SpriteCacheStats &sc)
+// The file-read trace's file, and its buffer: the game reads in small
+// pieces, and the SD card wants few large writes. A second run in the same
+// session goes on in the same file.
+FILE *g_files_trace = nullptr;
+char *g_files_trace_buf = nullptr;
+bool g_files_traced = false;
+
+bool file_trace_start()
 {
-    if (!g_ss.trace_requested()) {
-        g_trace_refused = false;
-        game::sprite_trace_stop();
+    constexpr size_t kBuffer = 32 * 1024;
+    g_files_trace_buf = (char *)std::malloc(kBuffer);
+    g_files_trace = g_files_trace_buf ? std::fopen(kFileTracePath, g_files_traced ? "a" : "w") : nullptr;
+    if (!g_files_trace) {
+        std::free(g_files_trace_buf);
+        g_files_trace_buf = nullptr;
+        return false;
+    }
+    std::setvbuf(g_files_trace, g_files_trace_buf, _IOFBF, kBuffer);
+    g_files_traced = true;
+    rt::set_file_trace(g_files_trace);
+    return true;
+}
+
+void file_trace_stop()
+{
+    if (!g_files_trace)
         return;
+    rt::set_file_trace(nullptr);
+    std::fclose(g_files_trace);
+    std::free(g_files_trace_buf);
+    g_files_trace = nullptr;
+    g_files_trace_buf = nullptr;
+}
+
+// The profiler run's options (profiler.h) to `want`: those no longer
+// wanted stopped, the new ones started. An option that does not start is
+// left out of the run, and said so.
+void profiler_switch(uint32_t want)
+{
+    const uint32_t stop = g_prof_on & ~want, start = want & ~g_prof_on;
+    if (stop & game::kProfSprites)
+        game::sprite_trace_stop();
+    if (stop & game::kProfGuest) {
+        rt::set_profiling(false);
+        stop_sampler();
     }
-    if (!game::sprite_trace_on() && !g_trace_refused) {
-        g_trace_refused = !game::sprite_trace_start(kTracePath);
-        g_trace_used |= !g_trace_refused;
-        if (g_trace_refused)
-            status("sprite trace: could not start (%s)", kTracePath);
+    if (stop & game::kProfFiles)
+        file_trace_stop();
+    g_prof_on &= ~stop;
+    uint32_t refused = 0;
+    if ((start & game::kProfSprites) && !game::sprite_trace_start(kTracePath))
+        refused |= game::kProfSprites;
+    if (start & game::kProfGuest) {
+        if (rt::set_profiling(true))
+            start_sampler();
+        else
+            refused |= game::kProfGuest;
     }
-    game::sprite_trace_beat({sc.limit, sc.used, sc.sprites, m.free, m.spare_used ? 1u : 0u, m.largest_free,
-                             game::sprite_cache_taken(), (uint32_t)game::dcc_cells_decoded(), g_timing.total_frames});
+    if ((start & game::kProfFiles) && !file_trace_start())
+        refused |= game::kProfFiles;
+    if (start & game::kProfSdBench)
+        sd_benchmark(g_bench_path);   // once, as the run starts
+    if (refused)
+        status("profiler run: could not start %s", game::profile_names(refused).c_str());
+    g_prof_refused |= refused;
+    g_prof_on |= start & ~refused;
+    g_prof_used |= start & ~refused;
+    char line[96];
+    std::snprintf(line, sizeof line, "%s%s%s", game::kProfilerRunLine, g_prof_on ? "start " : "stop",
+                  game::profile_names(g_prof_on).c_str());
+    logline(line);
+}
+
+// The profiler run, at the heartbeat: on and off as INFO's checklist says;
+// the sprite trace's beat, with the cache and the pool.
+void profiler_heartbeat(const rt::MemoryReport &m, const game::SpriteCacheStats &sc)
+{
+    if (!g_ss.profiling())
+        g_prof_refused = 0;
+    const uint32_t want = g_ss.profiling() ? g_ss.profile_choice() & ~g_prof_refused : 0;
+    if (want != g_prof_on)
+        profiler_switch(want);
+    if (g_prof_on & game::kProfSprites)
+        game::sprite_trace_beat({sc.limit, sc.used, sc.sprites, m.free, m.spare_used ? 1u : 0u, m.largest_free,
+                                 game::sprite_cache_taken(), (uint32_t)game::dcc_cells_decoded(),
+                                 g_timing.total_frames});
+}
+
+// The hitch counters' window (issue #19), at the heartbeat: logged, kept
+// for INFO, and the next one started.
+void hitch_heartbeat(const game::SpriteCacheWindow &w)
+{
+    HitchMark now{rt::frame_thread_times(), g_frames_skipped, d2rt::dsound::famine_count()};
+    HitchWindow &hw = g_hitch_last;
+    hw.h = g_hitch;
+    hw.wait_ms = (uint32_t)(now.frame.blocked_ms - g_hitch_mark.frame.blocked_ms);
+    hw.ready_ms = (uint32_t)(now.frame.ready_ms - g_hitch_mark.frame.ready_ms);
+    hw.host_ms = (uint32_t)(now.frame.host_ms - g_hitch_mark.frame.host_ms);
+    hw.heartbeat_ms = (uint32_t)(rt::last_heartbeat_us() / 1000);
+    hw.skipped = now.skipped - g_hitch_mark.skipped;
+    hw.famine = (uint32_t)(now.famine - g_hitch_mark.famine);
+    g_hitch_mark = now;
+    g_hitch = Hitches{};
+    char line[256];
+    std::snprintf(line, sizeof line,
+                  "[rt] prof hitch: frames %u, <=50ms %u, <=100ms %u, <=250ms %u, >250ms %u, longest %u ms, "
+                  "sprites in %u out %u, wait %u ms, ready %u ms, host %u ms, heartbeat %u ms, skipped %u, famine %u",
+                  (unsigned)(hw.h.frames[0] + hw.h.frames[1] + hw.h.frames[2] + hw.h.frames[3]),
+                  (unsigned)hw.h.frames[0], (unsigned)hw.h.frames[1], (unsigned)hw.h.frames[2],
+                  (unsigned)hw.h.frames[3], (unsigned)hw.h.longest_ms, w.inserted, w.evicted, (unsigned)hw.wait_ms,
+                  (unsigned)hw.ready_ms, (unsigned)hw.host_ms, (unsigned)hw.heartbeat_ms, (unsigned)hw.skipped,
+                  (unsigned)hw.famine);
+    logline_held(line);
 }
 
 }  // namespace
@@ -1235,8 +1400,9 @@ int main()
     // before this session's replace them.
     const std::string kept = report::keep_unclosed_session();
     std::remove(kTracePath);   // the last session's, if it closed (its report has its own copy)
+    std::remove(kFileTracePath);
     g_log_path = std::string(kLogDir) + "/game.log";
-    g_log = std::fopen(g_log_path.c_str(), "w");
+    g_log = open_log("w");
     std::freopen((std::string(kLogDir) + "/stderr.txt").c_str(), "w", stderr);
     // The main thread's handler is the default for the others; the guest runs here.
     threadOnException(on_cpu_exception, g_exc_stack + sizeof g_exc_stack, WRITE_DATA_TO_HANDLER_STACK);
@@ -1281,9 +1447,7 @@ int main()
         return 1;
     }
     status("Game.exe: %u bytes. Starting...", (unsigned)exe.size());
-#ifdef PROF_COUNTERS
-    sd_benchmark(game_dir + "/d2data.mpq");
-#endif
+    g_bench_path = game_dir + "/d2data.mpq";
 
     load_settings();
     {
@@ -1333,12 +1497,14 @@ int main()
         game::govern_sprite_cache(*g_guest_cpu, m.free, m.spare_used, w.evicted, game::kCtrPoolReserve,
                                   game::kCtrSpriteCacheMin);
         g_sprite_window = w;
+        hitch_heartbeat(w);   // before the sprite cache line, the window's last (tools/session_report.py)
         const game::SpriteCacheStats sc = game::sprite_cache_stats(*g_guest_cpu);
         char line[128];
         std::snprintf(line, sizeof line, "[rt] sprite cache %u/%u KiB, %u sprites, in %u, out %u, decoded %u in %u ms",
                       sc.used >> 10, sc.limit >> 10, sc.sprites, w.inserted, w.evicted, w.decodes, w.decode_ms);
-        logline(line);
-        trace_heartbeat(m, sc);
+        logline_held(line);
+        profiler_heartbeat(m, sc);
+        log_flush();   // the heartbeat's lines, in one write
     };
     // Sound through ds_emul into the DSP (ctr_audio.cpp), mixed on another core.
     setenv("WX86_SON", "vita", 1);   // ds_emul's name for the console's realtime sink
@@ -1367,7 +1533,11 @@ int main()
     opt.log = [](const char *s) {
         char line[600];
         std::snprintf(line, sizeof line, "[rt] %s", s);
-        logline(line);
+        // The heartbeat's own lines wait for its end (log_flush).
+        if (std::strncmp(s, "t=", 2) == 0 || std::strncmp(s, "prof", 4) == 0)
+            logline_held(line);
+        else
+            logline(line);
         // Heartbeats: the panel shows those numbers.
         // The sound engine's "[son]" diagnostics (WinVita writes them in
         // French) go to game.log only.
@@ -1386,17 +1556,12 @@ int main()
 
     start_render_thread();
     aptHook(&g_apt_cookie, apt_hook, nullptr);
-#ifdef PROF_COUNTERS
-    start_sampler();
-#endif
     rt::RunResult r = rt::run_exe(std::move(exe), opt);
     join_io_thread();
-#ifdef PROF_COUNTERS
-    stop_sampler();
-#endif
+    if (g_prof_on)
+        profiler_switch(0);   // a run still on: its traces closed, in time for the report
     aptUnhook(&g_apt_cookie);
     stop_render_thread();
-    game::sprite_trace_stop();
     console_again();   // the game's end shows on the console, as before the second screen
     if (!r.loaded)
         status("FATAL: %s", r.error.c_str());
@@ -1412,7 +1577,7 @@ int main()
                       : rt::stats().alloc_failures ? "ran out of memory"
                       : game::fatal_exit_caller()  ? "stopped on an internal error"
                       : g_ss.report_requested()    ? "asked for by the player"
-                      : g_trace_used               ? "a sprite trace"
+                      : g_prof_used                ? "a profiler run"
                                                    : nullptr;
     close_log();
     if (why && report::enabled()) {

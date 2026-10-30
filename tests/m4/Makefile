@@ -15,9 +15,10 @@ SRCS  := game_main.cpp $(wildcard $(ROOT)/src/runtime/rt_*.cpp) $(wildcard $(ROO
 # M4_QEMU_FLAGS=-one-insn-per-tb makes qemu slow enough that the game is
 # CPU-bound, as on the 3DS: frames per second then compare the work per frame.
 QEMU  := qemu-arm -cpu arm11mpcore $(M4_QEMU_FLAGS)
-# M4_PROF=1: WinVita's PROF_COUNTERS, as in the console's profiling build
-# (package-cia --prof): the 10 s profile report goes to err.txt. A separate
-# library flavour and binary, so the two builds never mix.
+# M4_PROF=1: WinVita's PROF_COUNTERS, counting from the start, as a console
+# profiler run's guest code profile (issue #19): the 10 s profile report
+# goes to err.txt. A separate library flavour and binary, so the two builds
+# never mix.
 ifeq ($(M4_PROF),1)
 LIBTAG := _prof
 PROFDEF := -DPROF_COUNTERS

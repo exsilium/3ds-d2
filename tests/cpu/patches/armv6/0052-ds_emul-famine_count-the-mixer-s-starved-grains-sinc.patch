@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Fri, 30 Oct 2026 17:46:49 +0200
+Subject: [PATCH] ds_emul: famine_count(), the mixer's starved grains since
+ start
+
+stat_line() reports famine= per window, but keeps the window itself: a
+host that reports its own windows (the 3DS app's hitch counters) needs
+the running count to difference. Lock-free.
+---
+ src/runtime/ds_emul.cpp | 2 ++
+ src/runtime/ds_emul.h   | 5 +++++
+ 2 files changed, 7 insertions(+)
+
+diff --git a/src/runtime/ds_emul.cpp b/src/runtime/ds_emul.cpp
+index f0cfd5c..2144b6a 100644
+--- a/src/runtime/ds_emul.cpp
++++ b/src/runtime/ds_emul.cpp
+@@ -1131,6 +1131,8 @@ void shutdown() {
+                 " (le port reste au noyau, le processus sort juste apres) — VOLONTAIRE");
+ }
+ 
++unsigned long long famine_count() { return c_famine.load(std::memory_order_relaxed); }
++
+ int stat_line(char* out, unsigned n) {
+     if (!g_on || !out || !n) return 0;
+     static unsigned long long p_gr = 0, p_fa = 0, p_mix = 0, p_out = 0, p_fr = 0;
+diff --git a/src/runtime/ds_emul.h b/src/runtime/ds_emul.h
+index d733ec6..d86fd8a 100644
+--- a/src/runtime/ds_emul.h
++++ b/src/runtime/ds_emul.h
+@@ -87,6 +87,11 @@ void shutdown();
+ //   resamp=<grains mixed at a rate != the configured mix rate>  puits=  codec=h/a/fallback
+ int stat_line(char* out, unsigned n);
+ 
++// Grains the mixer found with nothing left to play (famine= above), since
++// start: a counter a host can difference itself without taking the window
++// stat_line keeps. Lock-free, any thread.
++unsigned long long famine_count();
++
+ // Sink-only self-test (D2_SONTEST=1): pushes a 440 Hz sine into a WAV sink,
+ // then reads the file back and verifies it. Isolates "the sink works" from
+ // "DirectSound emulation works". Returns 0 on PASS.

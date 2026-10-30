@@ -115,10 +115,13 @@ void *d2rt_jmptbl_alloc(size_t n)
 // the backend when it maps it (mman_ctr.c): newlib's memalign needs the
 // arena's size + 16 MiB of contiguous heap, which the 95 MiB heap only has
 // before Game.exe and the rest of the startup take their share.
-static void *g_arena;
+// Given back to the heap once the game has ended (give_back_arena), for the
+// report's sockets; munmap still keeps the block's address for the app then,
+// so that a late unmap does not free it a second time.
+static void *g_arena, *g_arena_block;
 static size_t g_arena_size;
 void *dyn86_ctr_arena_take(size_t len) { return g_arena && len <= g_arena_size ? g_arena : NULL; }
-int dyn86_ctr_arena_release(void *p) { return p && p == g_arena; }
+int dyn86_ctr_arena_release(void *p) { return p && p == g_arena_block; }
 void d2rt_jmptbl_free(void *p)
 {
     const u32 a = (u32)p;
@@ -1371,11 +1374,23 @@ static const rt::Layout *reserve_arena()
     };
     for (const rt::Layout *L : candidates) {
         if (L && (g_arena = memalign(16u << 20, L->span))) {
+            g_arena_block = g_arena;
             g_arena_size = L->span;
             return L;
         }
     }
     return nullptr;
+}
+
+// After rt::run_exe returns nothing touches the guest arena again (the I/O
+// and render threads are joined, the second screen is off), and it is plain
+// read-write heap. Without it the heap is nearly full at the game's end, too
+// full for the 1 MiB socket buffer a report needs (issue #30).
+static void give_back_arena()
+{
+    std::free(g_arena);
+    g_arena = nullptr;
+    g_arena_size = 0;
 }
 #endif
 
@@ -1580,6 +1595,9 @@ int main()
                       : g_prof_used                ? "a profiler run"
                                                    : nullptr;
     close_log();
+#ifdef D2_CIA
+    give_back_arena();
+#endif
     if (why && report::enabled()) {
         const std::string dir = report::keep_session(why);
         if (!report::offer_one(report_host(game_dir), dir)) {

@@ -14,6 +14,8 @@
 #include "runtime/ds_emul.h"
 #include "runtime/cpu.h"
 #include "runtime/guest_region.h"
+#include "runtime/guest_thread.h"
+#include "runtime/guest_thread_ctx.h"
 
 #include <cstring>
 #include <map>
@@ -54,6 +56,7 @@ uint32_t blit(Cpu &c, uint32_t src_dc)
     if (!d || d->bpp != 8)
         return 1;
     stats().frames++;
+    stats().frame_thread = wx86_sched() ? wx86_sched()->current_id() : -1;
     if (options().audio)
         d2rt::dsound::frame_pump(c);   // drives a sink the game's frames pace (wav/null); no-op for a realtime one
     if (!options().present)

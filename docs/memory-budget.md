@@ -311,7 +311,7 @@ A session tells how one governor did in the play it happened to get, and two ses
 - a sprite the cache let go of, and why;
 - each heartbeat: the cache, the pool and the counters.
 
-A sprite's key is a hash of what the game's sprite table looks it up by, so a sprite that is evicted and decoded again keeps its key.
+A sprite's key is a hash of what the game's sprite table looks it up by (its record's +4 to +0x1c), so a sprite that is evicted and decoded again keeps its key. That holds from trace version 3 on; versions 1 and 2 hashed +0x20 as well, and with it every conclusion below about evicted sprites not coming back is wrong (see [the correction](#the-correction-no-cell-files-loaded-again-issue-31)).
 
 `tools/sprite_trace.py` replays a trace through a model of the cache: least recently used first, at most 0x1400 sprites. It first replays the trace under the limits the governor set, and the model's evictions should match the game's. It then replays fixed limits, giving the bytes each limit would have decoded again. One trace of a heavy route (the Catacombs, crowded fights) answers "what does a MiB of cache save" for every limit at once. A console session is then needed only to confirm a chosen policy, plus one long run for the no-fatal and never-the-spare checks.
 
@@ -328,3 +328,81 @@ The game tells sprites apart by token, component, armour class, mode, weapon cla
 21 minutes with the bounded floor: the pool's low point was 3,400 KiB, against 2,374 KiB in 3DS-D2-9, and the frame rate was unchanged. The game drew 1 evicted sprite again, and the model re-decodes 0.7 MiB at the governor's limits.
 
 Of 2,252 sprites, 545 differ from an earlier one only in the cell file pointer (+0x20). They are the same graphics, decoded again after the game freed their file and loaded it again: 10.1 of 46.4 MiB (22%), a median of 510 s after the previous load. Most belong to corrupt rogues, the Fallen, Fallen shamans and skeletons. The other 1,707 graphics are real variety: corrupt rogues alone have 692 sprites, because each one's armour and weapon change its components. The slow windows that are not area loads are the moments new monsters appear: 3 to 5 MB read from the SD card, 1 to 3 s spent waiting on it, and 120k to 230k cells decoded.
+
+### The correction: no cell files loaded again (issue #31)
+
+The sprite table's record holds at +0x20 not a cell file but the sprite's own block in the cache: 0x5fff32 passes the cache entry's memory to 0x60adc0, which stores it there, and 0x600350 reads the sprite's flags and frames through it. The table's lookup (0x60ace0) compares only +4 to +0x1c: the token, component, armour class, mode and weapon class (+8 to +0x18, from the unit's graphics at +0x18 to +0x28), a word only some unit types set (+4), and a value 0x60ab80 derives from the direction (+0x1c). When the cache evicts a sprite, its record leaves the table (0x5fe170 through 0x60ab10), so the next lookup misses and the sprite is decoded again into a new block, under the same +4 to +0x1c and a new +0x20.
+
+The trace's key (versions 1 and 2) hashed +4 to +0x23, +0x20 included, so a sprite decoded again came back under a new key. The 545 sprites of 3DS-D2-A that "differ from an earlier one only in +0x20" are the cache's own evictions, drawn again a median of 510 s later: 10.1 MiB decoded again in 21 minutes, not 0.7. The 1,707 graphics that remain are the real first decodes. In 3DS-D2-9 (version 1) the same evictions cannot be told from new sprites, so "2,139 evicted, none drawn again" says nothing. The model's figures for both traces, and the fixed limits' columns, were computed on those keys and are wrong too: the model never saw a sprite come back.
+
+The cell files themselves are kept by the game: 0x5fe990 looks them up by path in a table at 0x88cb20, whose headers (0xc0 bytes each) are held in an LRU at 0x88db20 that 0x457300 sizes at 500 KiB (0x7d000, about 2,660 headers) and at most 0x1000 entries. The sprite table does not key on them: a cell file evicted from there and loaded again would not make its sprites new.
+
+From version 3 the key hashes +4 to +0x1c only. `tools/sprite_trace.py` keys a version 2 trace by its ident records (words +4 to +0x1c) instead, so 3DS-D2-A's trace can be read again: the evictions drawn again then show in "the game" line, by unit token, and the model and the fixed limits count them. That replay, not the 3DS-D2-A summary above, is what a cache limit or a change to the governor's floor should now be judged by.
+
+3DS-D2-A's trace, keyed by graphic: 1,538 graphics in 20.6 minutes. The game evicted 1,979 sprites and drew 681 of them again: 13.2 MiB decoded a second time, a median of 165 s after the eviction, against 34.4 MiB of first decodes. Corrupt rogues 4.3 MiB, the Fallen 2.6, Fallen shamans 1.6, skeletons 0.9. The governor held the limit at a median of 12.75 MiB (16 MiB at most), with the pool at 6.6 MiB free (median) and 3.4 MiB at its lowest. Replayed under those limits, the model evicts 1,611 and decodes 11.2 MiB again (a sprite's bytes counted as its frames are decoded, with the decode they belong to). At fixed limits:
+
+| limit | decoded again | per minute |
+| ---: | ---: | ---: |
+| 8 MiB | 42.3 MiB | 2.05 |
+| 10 MiB | 20.3 MiB | 0.99 |
+| 12 MiB | 12.1 MiB | 0.59 |
+| 14 MiB | 7.7 MiB | 0.37 |
+| 16 MiB | 4.7 MiB | 0.23 |
+
+Moving every use up the list changes these by 1.5 MiB at most. Each MiB of cache above 12 MiB saves about 1.85 MiB of decoding in 20 minutes; the pool's spare room is what has to pay for it.
+
+### Read wait and decode time (issue #31)
+
+How the game loads a sprite: the draw that misses it queues its DCC file with the game's asynchronous loader (0x40a620, from 0x5ffbbd) and draws on without it. Storm's read thread (0x41a550) reads the file through ReadFile and signals the load's event. On a later frame the draw's poll of the load (0x40a7f0) sees the event and runs its callback, 0x5ff6e0, which decodes the sprite's frames into the cache on the game's thread.
+
+Each heartbeat now splits that time:
+
+- `prof files: ... waited N ms in M reads (frame thread F ms), stalled S ms`: N is the time guest threads waited on the I/O worker while the others ran, from each read's submission to the waiter waking; F is the part of it spent by the thread presenting frames, whose frames stop meanwhile; S is reads ReadFile completed before returning, with every guest thread stopped (an OVERLAPPED read, a full request pool, or synchronous reads).
+- `sprite cache ..., decoded D in T ms`: the sprites decoded in the window and the time 0x5ff6e0 took (a stub around it, `install_sprite_decode_timer`).
+
+`tools/session_report.py` lists the slowest play windows that are not area loads with those columns, and the shares of play time.
+
+In the m4 lane, entering a game (asynchronous reads, ctr layout): Storm's thread waited 280 ms on 640 reads (14.5 MB from disk in 204 ms), the drawing thread none, and the game's thread decoded 201 sprites in 442 ms. Whether the console's slow windows are decoding, or the drawing thread starved while Storm's thread and the decode share core 0, the next console session's log says.
+
+### 3DS-D2-B: the first version 3 trace (issue #31, 2026-10-30)
+
+27 minutes to the Stony Field on `eaaf4e768cc1`. No key differs from another only in +0x20 any more: an evicted sprite drawn again keeps its key. The game evicted 1,790 sprites and drew 626 of them again, 14.1 MiB decoded a second time (median 116 s after the eviction) against 39.7 MiB of first decodes; the Fallen 3.4 MiB, YE 2.0, Fallen shamans 1.8, ZM 1.1. The limit was 8 to 16 MiB (median 11.75), the pool 3.0 MiB free at its lowest, the spare never used. At fixed limits the model decodes again 12.8 MiB at 12 MiB, 9.1 at 14, 7.0 at 16: no cache the pool can afford takes this under 1 MiB.
+
+The slow windows that are not area loads are not decoding (0.25 to 0.8 s of their 10 s) and the drawing thread waited on no read of its own, while core 0 was idle for 1.4 to 4.3 s of them: the drawing thread was blocked on something else. The 12 windows that translated new code without loading sprites ran at 21 to 26 fps.
+
+### The drawing thread's waits, and Storm's queue (issue #31)
+
+Each heartbeat logs `prof frame thread <id>: run R ready Y sleep S critsec C event E fileio F multi M thread T other O ms`: the host time between two calls of the runtime's clock hook on the scheduler's thread, charged to what the thread presenting frames was doing (running, ready while another guest thread ran, or blocked, by the kind of object), and `prof frame thread waits: <site>:<ms> ...`, the sites it was blocked at for 200 ms or more (its saved EIP, or the return address of the shim it waits in).
+
+In the m4 lane, entering a game, the drawing thread waited 1.8 s on an event, all of it at 0x41af0d: Storm's SFileReadFile waiting for its read thread. On an archive opened for asynchronous reads, Storm reads nothing on the caller's thread: it queues the read with its read thread (0x41a550), one request per sector run, and a caller without OVERLAPPED waits on an event of its own (0x41af07). The read thread takes the request whose deadline is at most 1,000 ms away, else the one nearest the archive's last position (0x41a450, 0x41a600), and every request is queued with a deadline 0x7fffffff ms away: a waiting caller's small read (0x5fe990 reading a new DCC file's header on the drawing thread) is taken only once it is the nearest, behind whole DCC files the game's asynchronous loader queued before it.
+
+`install_storm_read_priority` (src/game/storm_reads.cpp) queues a read without OVERLAPPED with the deadline now, so the read thread takes it next. It does not shorten the entry's waits in the lane (1.91 s against 1.99 s without it, `M4_STORM_PRIO=0`): little is queued then, and the waits are the reads' own round trips. It is for play, when new monsters' DCC files are queued; the next console session's `event` time and wait sites in the slow windows judge it.
+
+### 3DS-D2-C: the drawing thread blocked in polls (issue #31, 2026-10-30)
+
+21 minutes to the Stony Field on `0635ea0863c9`, the first session with the drawing thread's sampler. In the 12 slowest play windows that are not area loads (7.3 to 12.9 fps) the drawing thread waited on events for 0.55 to 4.3 s of the 10 s, and the sites say where:
+
+- `0x40a83c`, 0.2 to 2.7 s a window, the most in nearly every one: `WaitForSingleObject(event, 0)` in 0x40a7f0, the game's poll of a pending file load, made for each sprite still loading on each frame that draws it.
+- `0x41af0d`, 0.3 to 1.1 s: Storm's wait for its read thread to read for the caller (`install_storm_read_priority` was on).
+- `0x40a9bc`, 0.5 to 1.3 s in two windows: 0x40a950 waiting without a timeout for a load the game needs at once.
+
+A wait with timeout 0 is a poll: on Windows it returns WAIT_TIMEOUT at once. winx86's cooperative scheduler blocked it until the next millisecond of guest time (`virt_ms_ + (timeout_ms ? timeout_ms : 1)`), with the host asleep if no other guest thread could run, so each poll of a load not yet done cost a millisecond or more. Game.exe makes such polls at 0x40a836 (the loads), 0x40a59e (its event pool, looking for a free event each time it queues a load), 0x437519 and 0x51c149. Patch `0050` of `tests/cpu/patches/armv6` returns WAIT_TIMEOUT at once for them (and the timeout value of `wait_timeout_result`'s caller); Sleep(0) still yields. The CPU lane stays byte-identical to the upstream baseline and the m3 and m4 lanes pass.
+
+Play windows under 12 fps that are not area loads: A 7 of 119, B 6 of 137, C 7 of 125. The Storm deadline change did not move them; the polls are the larger cost.
+
+### 3DS-D2-D: polls that return at once (issue #31, 2026-10-30)
+
+20 minutes to the Stony Field on `73a1e88e8349` (patch `0050`). `0x40a83c` is gone from the drawing thread's wait sites. In play, against the three sessions before:
+
+| | A | B | C | D |
+| --- | ---: | ---: | ---: | ---: |
+| play windows (not area loads) | 119 | 137 | 125 | 114 |
+| under 12 fps | 7 | 6 | 7 | **3** |
+| under 10 fps | 2 | 4 | 3 | **1** |
+| slowest | 8.2 | 8.6 | 7.3 | **9.9** |
+| fps p10 / median | 14.6 / 22.4 | 14.2 / 23.9 | 13.2 / 22.8 | **16.6** / 23.4 |
+| windows decoding 50k+ cells: median fps | 17.3 | 17.3 | 16.3 | **19.6** |
+| core 0 idle | 5.4% | 4.7% | 5.7% | **1.7%** |
+| drawing thread blocked on events | | | 7.2% | **2.7%** |
+
+The slowest windows now have the drawing thread running for 7.6 to 8.4 s of 10 s and ready (another guest thread on core 0) for 1.0 to 1.8 s; what it still waits on is Storm reading for it (`0x41af0d`, up to 1 s) and, once, a load it needed at once (`0x40a9bc`). Some of them load no sprites at all (t = 560 to 580 s, 14 to 16 fps, under 8k cells): drawing a crowded screen. The pool's low point was 2.48 MiB, the spare never used; the game evicted 1,967 sprites and drew 691 of them again (15.3 MiB).

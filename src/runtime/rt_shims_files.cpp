@@ -544,10 +544,21 @@ struct IoRequest : Waitable {
     uint8_t *dst = nullptr;
     uint32_t n = 0;
     std::atomic<int> state{0};   // 0 free, 1 queued, 2 done; the waiter's acquire frees it
+    uint64_t wait_from_us = 0;   // a guest wait on it: when the read was queued (0: not one)
+    int waiter = -1;             // and the waiting thread
     bool try_acquire(GuestThread *) override
     {
         int done = 2;
-        return state.compare_exchange_strong(done, 0, std::memory_order_acq_rel);
+        if (!state.compare_exchange_strong(done, 0, std::memory_order_acq_rel))
+            return false;
+        if (wait_from_us) {
+            const uint64_t us = wx86_now_us() - wait_from_us;
+            g_file_stats.waits++;
+            g_file_stats.wait_us += us;
+            if (waiter == stats().frame_thread)
+                g_file_stats.wait_frame_us += us;            wait_from_us = 0;
+        }
+        return true;
     }
     bool ready(GuestThread *) override { return state.load(std::memory_order_acquire) == 2; }
     uint32_t result() const override { return 1; }   // ReadFile's TRUE
@@ -1234,10 +1245,15 @@ void install_files(Bridge &br)
             }
             if (!f->cache->try_read(f->pos, dst, n, got)) {
                 got = f->pos < f->size ? (uint32_t)std::min<uint64_t>(n, f->size - f->pos) : 0;
+                const uint64_t t0 = wx86_now_us();
                 IoRequest *r;
                 while (!(r = io_submit(f->cache.get(), f->pos, dst, n)))
                     io_pause();   // every request in flight
                 if (!ov && tmp.empty()) {
+                    const uint64_t t1 = wx86_now_us();
+                    g_file_stats.stall_us += t1 - t0;
+                    r->waiter = wx86_sched()->current_id();
+                    r->wait_from_us = t1;
                     f->pos += got;
                     stats().bytes_read += got;
                     g_file_stats.async++;
@@ -1248,6 +1264,7 @@ void install_files(Bridge &br)
                 while (r->state.load(std::memory_order_acquire) != 2)
                     io_pause();
                 r->state.store(0, std::memory_order_release);   // free the request
+                g_file_stats.stall_us += wx86_now_us() - t0;
             }
             if (!tmp.empty() && got)
                 c.write(buf, tmp.data(), got);
@@ -1255,7 +1272,9 @@ void install_files(Bridge &br)
         } else if (f->cache) {
             if (ov)   // OVERLAPPED: the offset is in the structure; completes synchronously
                 f->pos = c.read_u32(ov + 8);
+            const uint64_t disk_us = g_file_stats.disk_us;
             got = cached_read(c, *f, buf, n);
+            g_file_stats.stall_us += g_file_stats.disk_us - disk_us;   // synchronous: the disk time is the stall
         } else {
             if (ov)
                 std::fseek(f->fp, (long)c.read_u32(ov + 8), SEEK_SET);

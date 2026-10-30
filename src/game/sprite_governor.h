@@ -22,7 +22,10 @@
 //   reserve was the bound before: the floor then held the pool at 2.7 to 4
 //   MiB free, near the 2 MiB spare, for minutes on end (2026-10-29, 30 and
 //   20 min sessions), while a sprite trace of the second showed no sprite
-//   the cache let go of ever drawn again: holding it bought nothing;
+//   the cache let go of ever drawn again: holding it bought nothing. That
+//   trace's keys changed with each decode, so it could not show one (issue
+//   #31): in the next, 10 of 46 MiB were evictions decoded again. The
+//   bound wants judging again on a version 3 trace;
 // - a request served from the pool's spare means no other piece of the pool
 //   was left: the minimum at once.
 //

@@ -1,10 +1,16 @@
 // See sprite_trace.h. The cache's code (0x89db60, d2_memory.cpp):
 //
 // 0x6001f0 finds a sprite to draw in the game's sprite table (0x88db58,
-// 0x60adc0 makes its records): +4 to +0x20 what the table looks sprites up
-// by (0x60ace0 compares them), +0x24 the sprite's cache entry. An entry
-// holds its bytes at +4 (0x5ff630 adds each frame's as it is decoded) and
-// its record at +8. Found, it reaches 0x600350 with the record in eax:
+// 0x60adc0 makes its records): +4 to +0x1c what the table looks sprites up
+// by (0x60ace0 compares them: token, component, armour class, mode and
+// weapon class at +8 to +0x18, and 0x60ab80's value from the direction at
+// +0x1c), +0x20 the sprite's own
+// block in the cache (0x5fff32 passes the entry's memory), +0x24 its cache
+// entry. An entry holds that block at +0, its bytes at +4 (0x5ff630 adds
+// each frame's as it is decoded) and its record at +8. An evicted sprite's
+// record goes (0x5fe170), so the next lookup misses and the sprite is
+// decoded again into a new block. Found, it reaches 0x600350 with the
+// record in eax:
 //   mov ebx, [eax+0x20]; test ebx, ebx; je ...
 // Only when its caller's second argument ([ebp+0xc]) is 0 does it go on to
 // 0x60038b, which moves the entry to the recently used end of the cache's
@@ -83,10 +89,12 @@ void record(uint32_t type, uint32_t a, uint32_t b, uint32_t c)
         g_lost++;
 }
 
-// FNV-1a over the record's lookup fields; never 0 (0: no record).
+// FNV-1a over the record's lookup fields, +4 to +0x1c; never 0 (0: no
+// record). Version 2 hashed +0x20 too, the sprite's block, which is new each
+// time it is decoded: a sprite evicted and drawn again had a new key.
 uint32_t key_of(d2rt::Cpu &c, uint32_t rec)
 {
-    uint8_t k[0x20];
+    uint8_t k[0x1c];
     if (!rec || !c.read(rec + 4, k, sizeof k))
         return 0;
     uint32_t h = 2166136261u;
@@ -110,7 +118,7 @@ void on_use(d2rt::Cpu &c)
         uint32_t f[9] = {};
         c.read(rec + 4, f, 0x20);
         if (f[7])
-            c.read(f[7], &f[8], 4);   // +0x20 points at the sprite's cell file: its first word
+            c.read(f[7], &f[8], 4);   // +0x20 points at the sprite's block: its first word
         record(kIdentA, key, f[0], f[1]);
         record(kIdentB, key, f[2], f[3]);
         record(kIdentC, key, f[4], f[5]);
@@ -222,7 +230,7 @@ bool sprite_trace_start(const char *path)
     if (!again) {
         g_started = true;
         g_start_ms = rt::now_ms();
-        uint32_t header[8] = {0, 0, 2, 16, kWindowMs, (uint32_t)std::time(nullptr), 0, 0};
+        uint32_t header[8] = {0, 0, 3, 16, kWindowMs, (uint32_t)std::time(nullptr), 0, 0};
         std::memcpy(header, "D2SPTRC1", 8);
         std::fwrite(header, sizeof header, 1, g_file);
     }

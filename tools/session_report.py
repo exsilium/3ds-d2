@@ -11,8 +11,14 @@ switches, cache syncs), `prof intrin:` (DCC cells decoded so far), `prof
 files:` (reads, disk time) and `t=` (memory). The state comes from the last
 `game state:` line before it. Windows with no frames and no switches are
 suspends (HOME menu, lid) and are left out of the play figures. The cells
-decoded in a window are a count of sprite loads: in play they are re-loads
-of sprites the cache evicted.
+decoded in a window are a count of sprite loads: sprites new to the game,
+and sprites the cache evicted and the game drew again (issue #31).
+
+Logs from builds with the read and decode counters (issue #31) split a
+window's time: `waited` is the game's threads waiting on SD reads while the
+others ran (`frame` those of the thread drawing the frames, which stop
+meanwhile), `stalled` reads completed before ReadFile returned (every guest
+thread stopped), and `decode` the game decoding the sprites it loaded.
 """
 import argparse
 import collections
@@ -23,16 +29,22 @@ import sys
 
 PROF = re.compile(r"prof: (\d+) ms, frames (\d+), idle (\d+) ms, switches (\d+), cache syncs (\d+) \((\d+) us\)")
 INTRIN = re.compile(r"DccCell appels=(\d+)")
-FILES = re.compile(r"prof files: (\d+) reads \((\d+) async\).*?disk (\d+) reads (\d+) KiB in (\d+) ms; cache (\d+) KiB")
+FILES = re.compile(r"prof files: (\d+) reads \((\d+) async\).*?disk (\d+) reads (\d+) KiB in (\d+) ms; cache (\d+) KiB"
+                   r"(?:; waited (\d+) ms in (\d+) reads \(frame thread (\d+) ms\), stalled (\d+) ms)?")
 HEART = re.compile(r"t=(\d+)s .*?heap=(\d+)/(\d+)KiB va=(\d+)/(\d+)KiB free=(\d+)KiB jit=(\d+) meta=(\d+) jmptbl=(\d+)KiB host=(\d+)KiB")
 OPENED = re.compile(r"t=\d+s peeks=\d+ files=(\d+) ")
-SPRITE = re.compile(r"sprite cache (\d+)/(\d+) KiB, (\d+) sprites(?:, in (\d+), out (\d+))?")
+SPRITE = re.compile(r"sprite cache (\d+)/(\d+) KiB, (\d+) sprites(?:, in (\d+), out (\d+))?"
+                    r"(?:, decoded (\d+) in (\d+) ms)?")
+FRAME = re.compile(r"prof frame thread -?\d+: run (\d+) ready (\d+) sleep (\d+) critsec (\d+) event (\d+) "
+                   r"fileio (\d+) multi (\d+) thread (\d+) other (\d+) ms")
+WAITS = re.compile(r"prof frame thread waits: (.*) ms")
+FRAME_KINDS = ["run", "ready", "sleep", "critsec", "event", "fileio", "multi", "thread", "other"]
 STATE = re.compile(r"game state: (.*?) \(ui")
 
 FIELDS = ["t", "state", "ms", "frames", "fps", "idle_ms", "switches", "cache_syncs", "cache_sync_us", "cells",
           "reads", "opened", "load", "disk_reads", "disk_kib", "disk_ms", "heap_kib", "heap_peak_kib", "va_kib", "va_peak_kib",
           "free_kib", "jit_kib", "meta_kib", "host_kib", "sprite_kib", "sprite_limit_kib", "sprites", "sprites_in",
-          "sprites_out"]
+          "sprites_out", "wait_ms", "wait_frame_ms", "stall_ms", "decodes", "decode_ms"] + ["ft_" + k for k in FRAME_KINDS]
 
 
 def parse(path):
@@ -60,6 +72,16 @@ def parse(path):
         if m:
             cur.update(reads=int(m.group(1)), disk_reads=int(m.group(3)), disk_kib=int(m.group(4)),
                        disk_ms=int(m.group(5)))
+            if m.group(7) is not None:   # logs from builds with the read wait counters (issue #31)
+                cur.update(wait_ms=int(m.group(7)), wait_frame_ms=int(m.group(9)), stall_ms=int(m.group(10)))
+            continue
+        m = FRAME.search(line)
+        if m:   # builds with the frame thread's sampler (issue #31)
+            cur.update({"ft_" + k: int(v) for k, v in zip(FRAME_KINDS, m.groups())})
+            continue
+        m = WAITS.search(line)
+        if m:   # where it waited longest from: "site:ms ..."
+            cur["ft_sites"] = m.group(1)
             continue
         m = OPENED.search(line)
         if m:
@@ -77,8 +99,11 @@ def parse(path):
             cur.update(sprite_kib=int(m.group(1)), sprite_limit_kib=int(m.group(2)), sprites=int(m.group(3)))
             if m.group(4) is not None:   # logs from builds with the insertion counter (issue #18)
                 cur.update(sprites_in=int(m.group(4)), sprites_out=int(m.group(5)))
+            if m.group(6) is not None:   # and with the decode timer (issue #31)
+                cur.update(decodes=int(m.group(6)), decode_ms=int(m.group(7)))
             for k in FIELDS:
                 cur.setdefault(k, 0)
+            cur.setdefault("ft_sites", "")
             # An area load (a waypoint, a portal, a respawn): the game opens and
             # reads the area's files and draws few frames or none.
             cur["load"] = int(cur["opened"] >= 10 or cur["reads"] >= 1000)
@@ -153,6 +178,23 @@ def report(rows):
                   f"cells {r['cells']:7d}  disk {r['disk_ms']:4d} ms / {r['disk_kib']:5d} KiB  free {r['free_kib']:6d} KiB  "
                   f"sprites {r['sprite_kib']:5d}/{r['sprite_limit_kib']:5d} KiB in {r['sprites_in']:4d} out {r['sprites_out']:4d}"
                   f"{'  area load' if r['load'] else ''}")
+        timed = [r for r in play if r["decodes"] or r["wait_ms"] or r["stall_ms"]]
+        if timed:
+            # Issue #31: where a slow window's time went, of its 10 s.
+            print("\nin play, the 12 slowest windows that are not area loads, their time (ms):")
+            sampled = any(r["ft_run"] for r in timed)
+            print("       t    fps  waited  frame  stalled  decode  sprites decoded  cells   disk" +
+                  ("   | frame thread: run ready sleep critsec event fileio other" if sampled else ""))
+            for r in sorted((r for r in timed if not r["load"]), key=lambda r: r["fps"])[:12]:
+                print(f"  {r['t']:6d} {r['fps']:5.1f} {r['wait_ms']:7d} {r['wait_frame_ms']:6d} {r['stall_ms']:8d} "
+                      f"{r['decode_ms']:7d} {r['decodes']:16d} {r['cells']:6d} {r['disk_ms']:6d}" +
+                      (f"   | {r['ft_run']:18d} {r['ft_ready']:5d} {r['ft_sleep']:5d} {r['ft_critsec']:7d} "
+                       f"{r['ft_event']:5d} {r['ft_fileio']:6d} {r['ft_multi'] + r['ft_thread'] + r['ft_other']:5d}"
+                       if sampled else "") + (f"  {r['ft_sites']}" if r["ft_sites"] else ""))
+            n = sum(r["ms"] for r in timed) or 1
+            print(f"  all play: waited {sum(r['wait_ms'] for r in timed) / n:.1%} of the time "
+                  f"(frame thread {sum(r['wait_frame_ms'] for r in timed) / n:.1%}), stalled "
+                  f"{sum(r['stall_ms'] for r in timed) / n:.1%}, decoding {sum(r['decode_ms'] for r in timed) / n:.1%}")
 
     print("\nmemory over time (KiB):")
     print("       t    heap  heap^    va     va^   free   jit  meta   host  sprite/limit")

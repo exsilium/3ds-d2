@@ -30,11 +30,18 @@ SpriteCacheStats sprite_cache_stats(d2rt::Cpu &c);
 // Game.exe.
 bool install_sprite_cache_counter(d2rt::Cpu &c);
 
+// Times the game's decoding of sprites (a stub around 0x5ff6e0, which
+// decodes a sprite's frames once its DCC file is read), for
+// sprite_cache_window. Returns false, changing nothing, on a different
+// Game.exe.
+bool install_sprite_decode_timer(d2rt::Cpu &c);
+
 // What the cache did since the last call (all 0 on the first, and without
-// the counter): sprites taken, and sprites let go of (evicted, or freed by
-// the game).
+// the counter and the timer): sprites taken, sprites let go of (evicted, or
+// freed by the game), and the sprites decoded and the time that took.
 struct SpriteCacheWindow {
     uint32_t inserted, evicted;
+    uint32_t decodes, decode_ms;
 };
 SpriteCacheWindow sprite_cache_window(d2rt::Cpu &c);
 // The sprites the cache has taken since the start (wrapping).

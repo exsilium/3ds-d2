@@ -810,4 +810,16 @@ void draw_bottom(uint16_t *fb, const BottomView &v, const uint8_t *frame, int fw
     }
 }
 
+void draw_suspending(uint16_t *fb, const uint8_t *font)
+{
+    const Canvas cv{fb, font};
+    const int h = 64, y = (SecondScreen::kHeight - h) / 2;
+    cv.fill(0, 0, kW, SecondScreen::kHeight, kBg);
+    cv.fill(0, y, kW, h, kBarBg);
+    cv.fill(0, y, kW, 1, kHint);
+    cv.fill(0, y + h - 1, kW, 1, kHint);
+    cv.centred(0, y + 18, kW, "Suspending...", kGold);
+    cv.centred(0, y + 38, kW, "The HOME menu opens in a few seconds.", kBarText);
+}
+
 }  // namespace game

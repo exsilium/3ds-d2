@@ -1646,12 +1646,125 @@ uint32_t sprite_path(Cpu &c)
     return 1;
 }
 
-// D2_NATIVE_CHECK=1 (Linux lane): each SpriteCacheTouch and SpritePath call
+// ---- Locked lookups -------------------------------------------------------------------
+//
+// A table at [0x883d38] of entries found by id, each with its own lock, and
+// a current entry at [0x882d34] taken by id from [0x882d38]. A lookup
+// returns the entry locked; 52df40 unlocks the current one. In fights the
+// three cost ~3.2 ms of an 81 ms frame, almost all in their four or five
+// lock calls (issue #38).
+constexpr uint32_t kLockTable = 0x00883d38;     // the table: +0x1c buckets, +0x24 mask, +0x50 its lock
+constexpr uint32_t kCurLock = 0x00882d18;       // guards the current id
+constexpr uint32_t kCurEntry = 0x00882d34, kCurId = 0x00882d38;
+
+// 52e650(ecx=table, [8]=id): buckets of 12 bytes, {+0 the offset of the
+// link in an entry, +8 the first entry}; an entry's next is at link + 4 and
+// a list ends at a value <= 0 (signed). The id is the entry's first dword.
+uint32_t table_find(uint32_t table, uint32_t id)
+{
+    const uint32_t bucket = U32(table + 0x1c) + 12 * (id & U32(table + 0x24));
+    for (int32_t e = I32(bucket + 8); e > 0; e = I32(U32(bucket) + e + 4))
+        if (U32(e) == id)
+            return e;
+    return 0;
+}
+
+// Takes a section for the current thread, as EnterCriticalSection does when
+// it doesn't wait; false (and nothing taken) when another thread holds it.
+bool take_section(uint32_t cs)
+{
+    WxCrit *k = wx86_crit_for(cs);
+    ThreadScheduler *s = wx86_sched();
+    GuestThread *t = s ? s->current() : nullptr;
+    return k->ready(t) && k->try_acquire(t);
+}
+
+// 52e860's work without its waits: the entry for `id` in `e`, locked, or 0.
+// False, with nothing taken, when the original must run: the table's lock
+// or the entry's held by another thread, or an entry with no lock (the
+// original's fatal error). The table's lock (+0x50) is skipped when free or
+// the current thread's, as section_free says.
+bool lookup_locked(uint32_t id, uint32_t &e)
+{
+    const uint32_t table = U32(kLockTable);
+    e = 0;
+    if (!table)
+        return true;
+    if (!section_free(table + 0x50))
+        return false;
+    e = table_find(table, id);
+    if (!e)
+        return true;
+    const uint32_t cs = U32(e + 0x18);
+    return cs && take_section(cs);
+}
+
+// 52e860(ecx=id): the entry, locked, or 0.
+uint32_t locked_lookup(Cpu &c)
+{
+    uint32_t e;
+    if (lookup_locked(c.reg(R_ECX), e))
+        return e;
+    // The original from 52e868 (the jmp covers 52e864): push ebx, push esi,
+    // esi = the table.
+    const uint32_t esp = c.reg(R_ESP);
+    put32(esp - 4, c.reg(R_EBX));
+    put32(esp - 8, c.reg(R_ESI));
+    c.set_reg(R_ESI, U32(kLockTable));
+    resume_original(c, 0x0052e868, esp - 8, 0);
+    return c.reg(R_EAX);
+}
+
+// 52f6e0(): the current entry, looked up (52e860) by the id at [0x882d38],
+// read under its own lock (0 and -1: none), stored at [0x882d34] and
+// returned locked.
+uint32_t current_lookup(Cpu &c)
+{
+    const uint32_t esp = c.reg(R_ESP);
+    if (!section_free(kCurLock)) {
+        // The original from 52f6e6 (the jmp covers 52f6e4): push esi, push
+        // the lock for its EnterCriticalSection.
+        put32(esp - 4, c.reg(R_ESI));
+        put32(esp - 8, kCurLock);
+        resume_original(c, 0x0052f6e6, esp - 8, 0);
+        return c.reg(R_EAX);
+    }
+    uint32_t id = U32(kCurId), e;
+    if (id == 0xffffffffu)
+        id = 0;
+    if (!lookup_locked(id, e)) {
+        // The original from 52f709, past its lock: push esi, esi = the id,
+        // then the call to 52e860 (which waits) and the store.
+        put32(esp - 4, c.reg(R_ESI));
+        c.set_reg(R_ESI, id);
+        resume_original(c, 0x0052f709, esp - 4, 0);
+        return c.reg(R_EAX);
+    }
+    put32(kCurEntry, e);
+    return e;
+}
+
+// 52df40(): unlocks the current entry (LeaveCriticalSection on its +0x18).
+uint32_t current_unlock(Cpu &c)
+{
+    const uint32_t e = U32(kCurEntry), cs = e ? U32(e + 0x18) : 0;
+    if (!cs) {
+        // The original's fatal error, from 52df45 (the jmp covers its first
+        // instruction, eax = the current entry).
+        resume_original(c, 0x0052df45, c.reg(R_ESP), 0);
+        return e;
+    }
+    wx86_crit_leave(cs, wx86_sched());
+    return 0;   // LeaveCriticalSection's
+}
+
+// D2_NATIVE_CHECK=1 (Linux lane): each call to one of the natives below that
 // the native code takes also runs the original, from a trampoline in .text's
 // zero slack, on the same input, and logs where the results differ. The
 // native result is the one kept. Not in line (guest_call).
-constexpr uint32_t kCheckTouch = 0x006cb7e0, kCheckPath = 0x006cb7f0, kCheckEnd = 0x006cb800;
-uint32_t g_check_calls[2], g_check_bad[2];
+constexpr uint32_t kCheckTouch = 0x006cb7e0, kCheckPath = 0x006cb7f0, kCheckLookup = 0x006cb800,
+                   kCheckCurrent = 0x006cb810, kCheckEnd = 0x006cb820;
+uint32_t g_check_calls[4], g_check_bad[4];
 
 void check_count(int k, bool bad, const char *name)
 {
@@ -1715,6 +1828,80 @@ uint32_t sprite_path_checked(Cpu &c)
     return r;
 }
 
+// An entry's lock as the lookups leave it: its owner and recursion count.
+struct EntryLock {
+    uint32_t owner = 0;
+    int count = 0;
+    bool operator!=(const EntryLock &o) const { return owner != o.owner || count != o.count; }
+};
+
+EntryLock entry_lock(uint32_t e)
+{
+    const WxCrit *k = e && U32(e + 0x18) ? wx86_crit_lookup(U32(e + 0x18)) : nullptr;
+    return k ? EntryLock{k->owner, k->count} : EntryLock{};
+}
+
+// The original's entry, then its lock given back (the original took it as
+// the native will), so that the native runs on the same state.
+uint32_t undo_lookup(uint32_t e)
+{
+    if (e && U32(e + 0x18))
+        wx86_crit_leave(U32(e + 0x18), wx86_sched());
+    return e;
+}
+
+// lookup_locked would serve this id (it takes nothing to find out).
+bool lookup_native(uint32_t id)
+{
+    const uint32_t table = U32(kLockTable);
+    if (!table)
+        return true;
+    if (!section_free(table + 0x50))
+        return false;
+    const uint32_t e = table_find(table, id);
+    return !e || (U32(e + 0x18) && section_free(U32(e + 0x18)));
+}
+
+// `stored`: the native left at [0x882d34] what the original did (always, for
+// 52e860, which stores nothing).
+void check_lookup(int k, const char *name, uint32_t id, uint32_t e0, const EntryLock &l0, uint32_t e, bool stored)
+{
+    const EntryLock l = entry_lock(e);
+    const bool bad = e != e0 || l != l0 || !stored;
+    if (bad && g_check_bad[k] < 20)
+        rt::logf("native check: %s(%08x) gave %08x (lock %x/%d), the original %08x (lock %x/%d)%s", name, id, e,
+                 l.owner, l.count, e0, l0.owner, l0.count, stored ? "" : ", stored apart");
+    check_count(k, bad, name);
+}
+
+uint32_t locked_lookup_checked(Cpu &c)
+{
+    const uint32_t id = c.reg(R_ECX);
+    if (!lookup_native(id))
+        return locked_lookup(c);
+    const uint32_t e0 = rt::guest_call(c, kCheckLookup, {});
+    const EntryLock l0 = entry_lock(e0);
+    undo_lookup(e0);
+    const uint32_t r = locked_lookup(c);
+    check_lookup(2, "LockedLookup", id, e0, l0, r, true);
+    return r;
+}
+
+uint32_t current_lookup_checked(Cpu &c)
+{
+    const uint32_t id = U32(kCurId) == 0xffffffffu ? 0 : U32(kCurId);
+    if (!section_free(kCurLock) || !lookup_native(id))
+        return current_lookup(c);
+    const uint32_t before = U32(kCurEntry);
+    const uint32_t e0 = rt::guest_call(c, kCheckCurrent, {}), stored0 = U32(kCurEntry);
+    const EntryLock l0 = entry_lock(e0);
+    undo_lookup(e0);
+    put32(kCurEntry, before);
+    const uint32_t r = current_lookup(c);
+    check_lookup(3, "CurrentLookup", id, e0, l0, r, stored0 == e0 && U32(kCurEntry) == r);
+    return r;
+}
+
 // The trampolines: each original's first instructions (the ones its hook's
 // jmp covers), then a jmp to the rest.
 bool install_check(Cpu &c)
@@ -1729,8 +1916,16 @@ bool install_check(Cpu &c)
     uint8_t path[11] = {0x55, 0x8b, 0xec, 0x8b, 0x4d, 0x08, 0xe9};
     const uint32_t rel_path = 0x005fe616 - (kCheckPath + 11);
     std::memcpy(path + 7, &rel_path, 4);
+    uint8_t lookup[13] = {0x53, 0x56, 0x8b, 0x35, 0x38, 0x3d, 0x88, 0x00, 0xe9};
+    const uint32_t rel_lookup = 0x0052e868 - (kCheckLookup + 13);
+    std::memcpy(lookup + 9, &rel_lookup, 4);
+    uint8_t current[11] = {0x56, 0x68, 0x18, 0x2d, 0x88, 0x00, 0xe9};
+    const uint32_t rel_current = 0x0052f6e6 - (kCheckCurrent + 11);
+    std::memcpy(current + 7, &rel_current, 4);
     c.write(kCheckTouch, touch, sizeof touch);
     c.write(kCheckPath, path, sizeof path);
+    c.write(kCheckLookup, lookup, sizeof lookup);
+    c.write(kCheckCurrent, current, sizeof current);
     c.invalidate_code(kCheckTouch, sizeof slack);
     return true;
 }
@@ -1844,6 +2039,16 @@ int install_d2_native(Cpu &c)
              !check);
     else
         bit <<= 1;
+    // The locked lookups: their only entries are calls to the first byte
+    // (checked by disassembly).
+    static const uint8_t k52e860[] = {0x53, 0x56, 0x8b, 0x35, 0x38, 0x3d, 0x88, 0x00, 0x85, 0xf6, 0x8b, 0xd9};
+    HOOK(c, 0x0052e860, k52e860, sizeof k52e860, 0, check ? locked_lookup_checked : locked_lookup, "LockedLookup",
+         !check);
+    static const uint8_t k52f6e0[] = {0x56, 0x68, 0x18, 0x2d, 0x88, 0x00, 0x33, 0xf6};
+    HOOK(c, 0x0052f6e0, k52f6e0, sizeof k52f6e0, 0, check ? current_lookup_checked : current_lookup,
+         "CurrentLookup", !check);
+    static const uint8_t k52df40[] = {0xa1, 0x34, 0x2d, 0x88, 0x00, 0x85, 0xc0, 0x75, 0x1f};
+    HOOK(c, 0x0052df40, k52df40, sizeof k52df40, 0, current_unlock, "CurrentUnlock", true);
 #undef HOOK
     return n;
 }

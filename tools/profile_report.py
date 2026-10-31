@@ -43,6 +43,11 @@ and the lock calls, wsprintfA and StretchBlt take the in-line shim path
 (rt_host.cpp), so the samples after them are the call-out, the body, and the
 short block before the call.
 
+The threads' table is given for the play windows and for the area loads
+apart (issue #22): a window is an area load when the game made 1000 reads or
+more in it (`prof files:`), as tools/session_report.py counts them. A
+thread's slices are its turns on core 0; their sum is the window's switches.
+
 Each window lists only its thread's busiest EIPs, so the tail of a thread's
 samples is not seen: `listed` is the share of the samples the lists cover,
 and the shares are of all the thread's samples. The profiler costs core 0
@@ -55,7 +60,8 @@ import re
 import struct
 import sys
 
-PROF = re.compile(r"prof: (\d+) ms, frames (\d+), idle (\d+) ms")
+PROF = re.compile(r"prof: (\d+) ms, frames (\d+), idle (\d+) ms(?:, switches (\d+))?")
+FILES = re.compile(r"prof files: (\d+) reads")
 THREAD = re.compile(r"prof thread (\d+) \(entry ([0-9a-f]+)\): run (\d+) ms \(shims (\d+) ms\) in (\d+) slices, "
                     r"(\d+) samples")
 EIPS = re.compile(r"prof eip t(\d+)((?: [0-9a-f]+:\d+)+)")
@@ -71,6 +77,7 @@ NATIVES = {0x4f69b0: "FloorIsoFlat", 0x4f6f60: "RleFlat", 0x4f7580: "RleFlatClip
            0x4756d0: "LightGrid", 0x4ddef0: "LightBlock", 0x4f8b80: "FloorTile", 0x41dce0: "AdpcmDecode",
            0x41f9e0: "HuffmanDecode", 0x41e000: "PkExplode", 0x524c60: "LangLookup", 0x60b9a0: "DccPixelBuffer"}
 TICK_MS = 2.0
+LOAD_READS = 1000   # a window with this many reads is an area load (tools/session_report.py's count)
 
 
 class Binary:
@@ -204,15 +211,20 @@ def parse(path):
         m = PROF.search(line)
         if m:
             cur = dict(ms=int(m.group(1)), frames=int(m.group(2)), idle=int(m.group(3)), state=state, on=on,
-                       threads={}, eips=collections.defaultdict(collections.Counter), shims=collections.Counter())
+                       switches=int(m.group(4) or 0), reads=0, threads={},
+                       eips=collections.defaultdict(collections.Counter), shims=collections.Counter())
             continue
         if cur is None:
+            continue
+        m = FILES.search(line)
+        if m:
+            cur["reads"] = int(m.group(1))
             continue
         m = THREAD.search(line)
         if m:
             tid = int(m.group(1))
             cur["threads"][tid] = dict(entry=int(m.group(2), 16), run=int(m.group(3)), shims=int(m.group(4)),
-                                       samples=int(m.group(6)))
+                                       slices=int(m.group(5)), samples=int(m.group(6)))
             continue
         m = EIPS.search(line)
         if m:
@@ -280,6 +292,33 @@ def main():
               f"{100 * t['run'] / ms:.1f}% | {t['shims'] / 1000:.1f} s ({100 * t['shims'] / max(t['run'], 1):.0f}%) | "
               f"{t['samples']} |")
     print(f"| idle | | {idle / 1000:.1f} s | {100 * idle / ms:.1f}% | | |")
+
+    in_game = [w for w in windows if w["state"].startswith("in game")]
+    loads = [w for w in in_game if w["reads"] >= LOAD_READS]
+    play = [w for w in in_game if w["reads"] < LOAD_READS]
+    print(f"\nIn play ({len(play)} windows) and in area loads ({len(loads)} windows"
+          + (f", t={', '.join(str(w['t']) for w in loads)}" if loads else "") + "), a share of core 0 "
+          "and the turns on it (slices) a 10 s:\n")
+    print("| Thread | Play | Slices | Load | Slices |")
+    print("| --- | --- | --- | --- | --- |")
+
+    def cells(run, slices):
+        out = []
+        for ws in (play, loads):
+            span = sum(w["ms"] for w in ws)
+            if not span:
+                out += ["", ""]
+                continue
+            out += [f"{100 * sum(map(run, ws)) / span:.1f}%" if run else "",
+                    f"{10000 * sum(map(slices, ws)) / span:.0f}" if slices else ""]
+        return " | ".join(out)
+
+    for tid, t in sorted(totals.items(), key=lambda kv: -kv[1]["run"]):
+        ts = lambda w, tid=tid: w["threads"].get(tid, dict(run=0, slices=0))
+        print(f"| {tid} ({thread_name(tid, t['entry'], main_tid)}) | "
+              f"{cells(lambda w: ts(w)['run'], lambda w: ts(w)['slices'])} |")
+    print(f"| idle | {cells(lambda w: w['idle'], None)} |")
+    print(f"| all (switches) | {cells(None, lambda w: w['switches'])} |")
 
     shims = collections.Counter()
     for w in windows:

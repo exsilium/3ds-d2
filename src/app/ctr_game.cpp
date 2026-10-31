@@ -1058,6 +1058,12 @@ void log_home_trip()
 bool apt_service()
 {
     svcGetThreadId(&g_apt_thread, CUR_THREAD_HANDLE);
+    // libctru takes the system's signals (the HOME press among them) on its
+    // APT thread, priority 0x31 on core 0, below this thread (0x30), which
+    // runs the game there and seldom blocks: a press waited seconds for it
+    // before aptShouldJumpToHome() said so (issue #27). Block for a moment so
+    // it runs; with no signal pending it stays asleep.
+    svcSleepThread(1000);
     if (!g_home.panel_up && aptShouldJumpToHome()) {
         g_home = HomeTrip{};
         g_home.seen = host_us();

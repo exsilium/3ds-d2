@@ -335,7 +335,8 @@ void show_stats(float fps, float draw_ms, float worst_ms)
     if (jit_full)
         std::snprintf(line[8], 48, "JIT MEMORY FULL code %u jmptbl %u", m.jit_code_kb, m.jmptbl_kb);
     else
-        std::snprintf(line[8], 48, " jit code %5u meta %5u jmptbl %5u", m.jit_code_kb, m.jit_meta_kb, m.jmptbl_kb);
+        std::snprintf(line[8], 48, "jit %5u/%5u meta %5u jmptbl %5u", m.jit_used_kb, m.jit_code_kb, m.jit_meta_kb,
+                      m.jmptbl_kb);   // jit: held by blocks / chunks opened (issue #23)
     // The hitch counters (issue #19), the last heartbeat's 10 s.
     const HitchWindow &hw = g_hitch_last;
     std::snprintf(line[9], 48, "files %3u read %4u MiB skip %3u fam %3u", st.files_opened,

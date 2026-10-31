@@ -28,6 +28,7 @@
 extern "C" {
 #include "my_cpuid.h"
 size_t d2rt_box86_dynarec_kb(void);
+size_t d2rt_box86_dynarec_used_kb(void);
 size_t d2rt_box86_custommalloc_kb(void);
 size_t d2rt_box86_jmptbl_kb(void);
 int dyn86_intrin_report(char *out, unsigned cap);   // translation-time intrinsics: calls and served
@@ -345,7 +346,8 @@ MemoryReport memory_report()
     const uint32_t free = g_pool_size ? g_pool_size - g_pool.used_bytes() : L.heap_size + L.va_size - heap - va;
     return {heap, g_heap.peak(), L.heap_size, va, g_va.peak(), L.va_size, free, g_va.largest_free(),
             g_spare_size ? g_spare.used_bytes() : 0, g_spare_size ? g_pool.spare_takes() : 0,
-            (uint32_t)d2rt_box86_dynarec_kb(), (uint32_t)d2rt_box86_custommalloc_kb(), (uint32_t)d2rt_box86_jmptbl_kb()};
+            (uint32_t)d2rt_box86_dynarec_kb(), (uint32_t)d2rt_box86_dynarec_used_kb(),
+            (uint32_t)d2rt_box86_custommalloc_kb(), (uint32_t)d2rt_box86_jmptbl_kb()};
 }
 Bridge &bridge() { return *g_br; }
 uint32_t exe_base() { return g_exe_base; }
@@ -662,14 +664,18 @@ void check_time_limit(uint64_t ms)
 #else
         const size_t host_used = mallinfo().uordblks;
 #endif
+        // jit= is the code chunks opened (2 MiB steps), jitused= what the
+        // translated blocks in them hold now (issue #23). jitused= goes last:
+        // the parsers of older logs stop at host=.
         logf("t=%llus peeks=%u files=%u read=%lluKiB frames=%u heap=%u/%uKiB va=%u/%uKiB free=%uKiB jit=%u meta=%u jmptbl=%uKiB "
-             "host=%uKiB",
+             "host=%uKiB jitused=%uKiB",
              (unsigned long long)(ms / 1000), g_stats.peeks, g_stats.files_opened,
              (unsigned long long)(g_stats.bytes_read >> 10), g_stats.frames, g_heap.used_bytes() >> 10,
              g_heap.peak() >> 10, g_va.used_bytes() >> 10, g_va.peak() >> 10,
              (unsigned)((g_pool_size ? g_pool_size - g_pool.cur() : g_va.largest_free()) >> 10),
              (unsigned)d2rt_box86_dynarec_kb(),
-             (unsigned)d2rt_box86_custommalloc_kb(), (unsigned)d2rt_box86_jmptbl_kb(), (unsigned)(host_used >> 10));
+             (unsigned)d2rt_box86_custommalloc_kb(), (unsigned)d2rt_box86_jmptbl_kb(), (unsigned)(host_used >> 10),
+             (unsigned)d2rt_box86_dynarec_used_kb());
         if (g_spare_size && g_pool.spare_takes() != g_spare_logged) {
             g_spare_logged = g_pool.spare_takes();
             logf("pool spare: %u requests taken so far, %u of %u KiB in use, pool largest free %u KiB", g_spare_logged,

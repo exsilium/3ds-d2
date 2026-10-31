@@ -406,3 +406,63 @@ Play windows under 12 fps that are not area loads: A 7 of 119, B 6 of 137, C 7 o
 | drawing thread blocked on events | | | 7.2% | **2.7%** |
 
 The slowest windows now have the drawing thread running for 7.6 to 8.4 s of 10 s and ready (another guest thread on core 0) for 1.0 to 1.8 s; what it still waits on is Storm reading for it (`0x41af0d`, up to 1 s) and, once, a load it needed at once (`0x40a9bc`). Some of them load no sprites at all (t = 560 to 580 s, 14 to 16 fps, under 8k cells): drawing a crowded screen. The pool's low point was 2.48 MiB, the spare never used; the game evicted 1,967 sprites and drew 691 of them again (15.3 MiB).
+
+### What a decoded sprite holds (issue #33)
+
+**What a sprite is.** One graphic (token, component, armour class, mode and weapon class) for a group of its file's directions: four of a monster's eight (the record's +0x1c, which 0x60ab80 derives from the direction, is the group, 0 or 1), eight of the player's 16, an object's only one. A draw facing a direction of a group not yet decoded loads the group.
+
+**What it allocates.** All from the cache's pool system (`[0x89db60]`, through 0x40b430):
+
+| | bytes | pool unit |
+| --- | ---: | ---: |
+| the sprite's block (0x5ffe90 or 0x5fffa0, through 0x5ffc40) | 0xb8 | 256 |
+| its record in the sprite table (0x60adc0) | 0x30 | 64 |
+| the load of its file (0x40a620), which keeps the frames | 0x54 | 128 |
+| the frames (0x60bff0, `.\SRC\Codec.cpp` line 0x561) | Σ OutSizeCoded | the next power of two |
+
+The cache's entries come from a list of 0x1400 the cache holds (0x5ff3f0), not from the pool.
+
+**The frames are DC6 frames already.** 0x60bff0 decodes the group's directions into a buffer the size of each direction's box (0x8f03e8), then 0x60bdb0 run-length codes each frame out of it: `0x80` ends a row, `0x80|n` skips n transparent pixels, `n` followed by n bytes is an opaque run (n ≤ 127). The rows run bottom-up unless the frame's flag says otherwise. Each frame has a 0x20-byte header in front (flags, width, height, x and y offset, and the run bytes' length at +0x1c) and 3 bytes after its runs (`lea ebx,[ebx+len+0x23]`). The box is the frame's own, from the DCC frame header, not the direction's. Transparent pixels at a row's right end cost nothing, at its left 1 byte per 127, and a transparent row 1 byte. The DCC file already gives each frame's coded length: a direction's OutSizeCoded is exactly Σ (CodedBytes + 0x23) over its frames, and 0x60bff0 allocates the group's OutSizeCoded before decoding a pixel.
+
+**The pool's overhead.** The pool system's classes are powers of two from 16 bytes to 256 KiB (0x4091b0: class = ⌈log₂ n⌉ − 4), with no header in a unit (each block keeps a bitmap of its units). A request over 256 KiB goes to 0x409770, which mallocs n + 4 bytes from the C heap.
+
+**What the cache counts.** An entry's bytes (+4) start at 0xb8, and 0x5ff6e0 adds the group's OutSizeCoded once it is decoded (0x5ff630). For a sprite made by 0x5fffa0 (from 0x6001c8 and 0x60068c), 0x60002e also adds what 0x5ffa20 returns: the bytes of the file it queued for the group. 0x40a4c0 frees that buffer as soon as 0x5ff6e0 has decoded the frames, and the load keeps the frames in its place. Nothing takes those bytes back off the count. Sprites made by 0x5ffe90 never count them. For a DC6 file (no decoding), the file's bytes are the sprite, and counting them is right.
+
+`tools/sprite_trace.py --game dist/game` reads each sprite's DCC file from the MPQs (by its graphic's words, the group from +0x1c and the bytes it was counted at) and takes its bytes apart. For 3DS-D2-B, 1,192 of 1,416 sprites had files, 31.9 of the 34.8 MiB counted. The rest are objects named by number.
+
+| 3DS-D2-B | MiB |
+| --- | ---: |
+| the sprites, as the cache counts them | 31.9 |
+| their frames | 24.6 |
+| of which frame headers and ends (35 bytes a frame) | 1.9 |
+| counted, not held: the file's bytes, freed once decoded | 7.1 |
+| the pools' rounding of the frames | 9.1 |
+| **held** (2.4 of it malloc'd, blocks over 256 KiB) | **34.2** |
+
+The rounding is 37% of the frames' bytes (36% in 3DS-D2-E). The cache's count lands within 7% of what the sprites hold only because the bytes it counts and does not hold nearly cancel the rounding it does not count. Small frames carry the headers: a zombie's frame is 0.19 KiB, and the 35 bytes are 18% of ZM's frames, 1% of YE's. Row ends are 6% of the run bytes (from the frames' heights), and the run bytes are 0.54 of the frames' boxes.
+
+**YE is the Brute** (the Stony Field). One of its sprites is 72 frames (18 a direction, four directions) of about 75 by 100 pixels, 5.3 KiB each run-length coded. Its size comes from the frames' size and number, not from padding. Its mean of 321 KiB in the issue includes 1.0 MiB of file bytes counted and not held across its 12 sprites. Its death group decodes to 396,203 bytes, its first attack's to 268,398. Both are over 256 KiB, so they are malloc'd, and they are 386 and 262 KiB with malloc's 4 bytes: the requests of the two `heap full` exits from `0x4097be` above (the Cold Plains, "want 386 KiB", and the Dark Wood, "want 262 KiB"). In 3DS-D2-B seven blocks went to the heap, YE's and BN's (the Foul Crow Nest), 2.4 MiB.
+
+**Smaller frames, or fewer bytes per frame.** The frames already are what the issue proposes: run-length coded, in their own boxes. Beyond the opaque pixels and the run bytes, what is left is the headers and ends (8% of the frames) and the row ends. The waste is in the allocation. With the fixed limits as the memory the sprites hold (the fixed blocks in their classes, the frames as each layout allocates them, the file's bytes only while they are held), the replay gives:
+
+| memory held | the game's pools | four classes a power of two | and 8-byte frame headers | to the byte |
+| ---: | ---: | ---: | ---: | ---: |
+| 6 MiB | 82.2 | 53.2 | 47.7 | 44.1 |
+| 8 MiB | 48.6 | 27.6 | 25.0 | 23.2 |
+| 10 MiB | 27.8 | 19.7 | 13.5 | 12.8 |
+| 12 MiB | 21.4 | 10.2 | 8.3 | 8.0 |
+| 14 MiB | 12.8 | 7.1 | 6.6 | 6.5 |
+| 16 MiB | 8.3 | 4.6 | 4.0 | 3.8 |
+| 20 MiB | 4.6 | 3.0 | 2.7 | 2.4 |
+
+These are the MiB decoded again in 27 minutes, counted as the earlier tables count them. Under the game's pools, each MiB held from 10 to 16 MiB saves 3.3 MiB of decoding. Four classes to each power of two (rounding 9.5% of the frames instead of 37%) halve the decoding at 12 MiB held, and reach the game's 16 MiB figure at about 13 MiB. In 3DS-D2-E (18 minutes) the game's 7.3 MiB becomes 4.1 at 12 MiB, and 2.6 becomes 1.1 at 16. The replay packs blocks perfectly under every layout. The pools also lose memory to partly used blocks (see "Back in camp" above), and so would a sprite allocator, so the columns compare the classes alone. Allocated to the byte is the bound. A uniform `--scale` stands in for one layout for another only roughly, because the rounding depends on each block's size: with `--scale 1.07` (the game's held against counted) it is 19.1 MiB at 12 MiB, against 21.4 sprite by sprite.
+
+**Go or no-go.**
+
+- **The frame format: no.** It is DC6 already. An 8-byte header would save 1.5 MiB of 24.6, against the 6.8 MiB of rounding that four classes save. The native blitters take only the runs (a source, a destination, the rows and the pitch). Their callers in the game's own code read the header, and each of those readers would need finding and patching.
+- **The frames' allocation: go, as a follow-up.** It needs:
+  1. a native allocator for the frames with four classes to each power of two, over 256 KiB as well, so the Brute's blocks leave the heap. It takes its blocks from the shared pool as the pool system does, and gives empty ones back;
+  2. the allocation at 0x60c103 (Codec.cpp line 0x561) sent to it;
+  3. the pool system's free (0x40b480) sending blocks in its range to it, since the load's free (0x40aba9) and its other paths return the frames there;
+  4. the cache counting what a sprite holds: each block's class instead of OutSizeCoded, and not the file's bytes 0x5ffa20 returns for a DCC group;
+  5. the m4 lane drawing the same frames (the bytes are unchanged), and a console session judged by the governor's limit, the pool's free space and the cells decoded.

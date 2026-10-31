@@ -219,6 +219,11 @@ private:
 void draw_bottom(uint16_t *fb, const BottomView &v, const uint8_t *frame, int fw, int fh, const uint16_t *pal565,
                  const uint8_t *font);
 
+// The panel shown while the HOME menu takes over (issue #27): the whole
+// screen, in the same layout, colours and font as draw_bottom. No
+// allocation and no file access: drawn while the storage is being closed.
+void draw_suspending(uint16_t *fb, const uint8_t *font);
+
 }  // namespace game
 
 #endif

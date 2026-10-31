@@ -11,9 +11,11 @@ The log has, per heartbeat window while the profile is on, a `prof thread`
 line per guest thread (its run time, the part of it in shims, and its
 samples), that thread's busiest EIPs (`prof eip t<id>`, up to 120 per window
 for a busy thread) and the busiest shims by time (`prof shims:`, 12 per
-window). The samples are time-based: one every 2 ms of a timer on another
-core (rt::profile_tick), so a sample stands for ~2 ms of core 0. Windows are
-picked by the heartbeat's `t=` seconds (--from, --to).
+window). `prof clock:` counts the in-line GetTickCount and timeGetTime
+reads, by the caller's return address (issue #39). The samples are
+time-based: one every 2 ms of a timer on another core (rt::profile_tick), so
+a sample stands for ~2 ms of core 0. Windows are picked by the heartbeat's
+`t=` seconds (--from, --to).
 
 A tick stops the guest at its next block entry. One that lands in a shim or a
 native routine (d2_native.cpp's hooks) takes effect when it returns, so its
@@ -66,6 +68,7 @@ THREAD = re.compile(r"prof thread (\d+) \(entry ([0-9a-f]+)\): run (\d+) ms \(sh
                     r"(\d+) samples")
 EIPS = re.compile(r"prof eip t(\d+)((?: [0-9a-f]+:\d+)+)")
 SHIMS = re.compile(r"prof shims:((?: \S+=\d+ms)+)")
+CLOCK = re.compile(r"prof clock: (\d+) reads in line(?:, by caller((?: [0-9a-f]+:\d+)+))?")
 HEART = re.compile(r"t=(\d+)s ")
 STATE = re.compile(r"game state: (.*?) \(ui")
 PROFILE_ON = re.compile(r"prof: guest code profile (on|off)")
@@ -212,13 +215,21 @@ def parse(path):
         if m:
             cur = dict(ms=int(m.group(1)), frames=int(m.group(2)), idle=int(m.group(3)), state=state, on=on,
                        switches=int(m.group(4) or 0), reads=0, threads={},
-                       eips=collections.defaultdict(collections.Counter), shims=collections.Counter())
+                       eips=collections.defaultdict(collections.Counter), shims=collections.Counter(),
+                       clock=0, clock_at=collections.Counter())
             continue
         if cur is None:
             continue
         m = FILES.search(line)
         if m:
             cur["reads"] = int(m.group(1))
+            continue
+        m = CLOCK.search(line)
+        if m:
+            cur["clock"] = int(m.group(1))
+            for pair in (m.group(2) or "").split():
+                ret, n = pair.split(":")
+                cur["clock_at"][int(ret, 16)] += int(n)
             continue
         m = THREAD.search(line)
         if m:
@@ -328,6 +339,19 @@ def main():
     print("| --- | --- | --- | --- |")
     for name, t in shims.most_common(args.top):
         print(f"| {name} | {t / 1000:.1f} s | {t / max(frames, 1):.2f} | {100 * t / ms:.1f}% |")
+
+    clock, clock_at = 0, collections.Counter()
+    for w in windows:
+        clock += w["clock"]
+        clock_at.update(w["clock_at"])
+    if clock:
+        print(f"\nGetTickCount and timeGetTime in line: {clock} reads, {clock / max(frames, 1):.0f} a frame. "
+              "The callers by return address:\n")
+        print("| Function | Return address | Reads | A frame |")
+        print("| --- | --- | --- | --- |")
+        for ret, n in clock_at.most_common(8):
+            f = f"`{exe.function(ret):#x}`" if exe.lo <= ret < exe.hi else "outside Game.exe"
+            print(f"| {f} | `{ret:#x}` | {n} | {n / max(frames, 1):.1f} |")
 
     tid = args.thread if args.thread is not None else main_tid
     funcs, eips = collections.Counter(), collections.defaultdict(collections.Counter)

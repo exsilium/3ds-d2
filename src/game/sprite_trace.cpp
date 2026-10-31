@@ -3,12 +3,14 @@
 // 0x6001f0 finds a sprite to draw in the game's sprite table (0x88db58,
 // 0x60adc0 makes its records): +4 to +0x1c what the table looks sprites up
 // by (0x60ace0 compares them: token, component, armour class, mode and
-// weapon class at +8 to +0x18, and 0x60ab80's value from the direction at
-// +0x1c), +0x20 the sprite's own
+// weapon class at +8 to +0x18, and at +0x1c 0x60ab80's group of directions
+// the direction is in), +0x20 the sprite's own
 // block in the cache (0x5fff32 passes the entry's memory), +0x24 its cache
-// entry. An entry holds that block at +0, its bytes at +4 (0x5ff630 adds
-// each frame's as it is decoded) and its record at +8. An evicted sprite's
-// record goes (0x5fe170), so the next lookup misses and the sprite is
+// entry. An entry holds that block at +0, its bytes at +4 (0xb8 for the
+// block; 0x5ff630 adds the group's frames once decoded and, for a sprite
+// made by 0x5fffa0, the file's bytes read for them, which stay counted once
+// freed: docs/memory-budget.md, issue #33) and its record at +8. An evicted
+// sprite's record goes (0x5fe170), so the next lookup misses and the sprite is
 // decoded again into a new block. Found, it reaches 0x600350 with the
 // record in eax:
 //   mov ebx, [eax+0x20]; test ebx, ebx; je ...

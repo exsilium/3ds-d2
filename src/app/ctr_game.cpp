@@ -985,11 +985,92 @@ u32 g_apt_thread = 0;   // the thread in aptMainLoop (the game's)
 bool g_storage_closed = false;
 void open_storage();
 
+// A HOME round trip (issue #27): the press seen here, the suspend hook and
+// its parts, the return. Host clock, us; logged as one "home:" line when
+// the storage is open again.
+struct HomeTrip {
+    uint64_t seen = 0, panel = 0, hook = 0, hook_exit = 0, restore = 0;
+    uint64_t render_wait = 0, storage = 0, reopen = 0;
+    bool panel_up = false;   // the "Suspending" panel is on the bottom screen: drawn once a press
+} g_home;
+
+void wait_render_idle()
+{
+    while (__atomic_load_n(&g_render_busy, __ATOMIC_ACQUIRE))
+        svcSleepThread(1000000);
+}
+
+// The HOME button was pressed: the jump to the HOME menu takes ~5 s before
+// the screens change, with the game's last frame up. The bottom screen says
+// why, until the HOME menu has the screens. Drawn into the bottom's other
+// buffer, so the screen as it was is one swap away on the way back. Only
+// once the second screen is double-buffered (not over the startup console,
+// which nothing would redraw). The top screen keeps the game's frame.
+void show_suspending()
+{
+    g_home.panel_up = true;
+    if (!g_bottom_double)
+        return;
+    wait_render_idle();   // no new frame starts meanwhile: only this thread (present) starts them
+    gspWaitForVBlank1();  // the last frame's swap has taken: one swap per screen per frame
+    uint16_t *fb = (uint16_t *)gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, nullptr, nullptr);
+    game::draw_suspending(fb, default_font_bin);
+    gfxFlushBuffers();
+    gfxScreenSwapBuffers(GFX_BOTTOM, false);
+    gspWaitForVBlank1();  // on the glass before libctru takes the screens
+    g_home.panel = host_us();
+}
+
+// Back from the HOME menu (or the jump did not happen): the bottom screen
+// as it was, in the buffer behind the panel, and the second screen redraws
+// it with the next frame anyway (apt_hook). At once: during a load or a
+// cinematic no frame draws the bottom screen.
+void hide_suspending()
+{
+    g_home.panel_up = false;
+    if (!g_home.panel)
+        return;
+    wait_render_idle();
+    gfxScreenSwapBuffers(GFX_BOTTOM, false);
+}
+
+// For example "home: seen +0 ms, panel +21, hook +40, render wait 0,
+// storage 120, restore after 8.2 s, reopen 35 ms". "seen -": the suspend
+// came without the press seen here first; "panel -": none drawn.
+void log_home_trip()
+{
+    const HomeTrip &h = g_home;
+    if (!h.hook)
+        return;   // no suspend: nothing to time
+    const uint64_t t0 = h.seen ? h.seen : h.hook;
+    char panel[16] = "-";
+    if (h.panel)
+        std::snprintf(panel, sizeof panel, "+%u", (unsigned)((h.panel - t0) / 1000));
+    char line[160];
+    std::snprintf(line, sizeof line,
+                  "home: seen %s ms, panel %s, hook +%u, render wait %u, storage %u, restore after %.1f s, reopen %u ms",
+                  h.seen ? "+0" : "-", panel, (unsigned)((h.hook - t0) / 1000), (unsigned)(h.render_wait / 1000),
+                  (unsigned)(h.storage / 1000), h.restore ? (double)(h.restore - h.hook_exit) / 1e6 : 0.0,
+                  (unsigned)(h.reopen / 1000));
+    logline(line);
+}
+
 bool apt_service()
 {
     svcGetThreadId(&g_apt_thread, CUR_THREAD_HANDLE);
-    if (aptMainLoop())
+    if (!g_home.panel_up && aptShouldJumpToHome()) {
+        g_home = HomeTrip{};
+        g_home.seen = host_us();
+        show_suspending();
+    }
+    if (aptMainLoop()) {
+        if (g_home.panel_up || g_home.hook) {
+            hide_suspending();
+            log_home_trip();
+            g_home = HomeTrip{};
+        }
         return true;
+    }
     if (g_storage_closed)
         open_storage();   // closed from the HOME menu: the game may still write on its way out
     rt::request_exit(0);
@@ -1053,14 +1134,27 @@ void apt_hook(APT_HookType type, void *)
         g_ss.invalidate();   // the HOME menu or sleep drew over the bottom screen
         g_timing.last_present_us = 0;   // the time away is not a frame (worst gap, hitches)
     }
-    if (type == APTHOOK_ONRESTORE && g_storage_closed && game_thread)
-        open_storage();
+    if (type == APTHOOK_ONRESTORE && game_thread) {
+        g_home.restore = host_us();
+        if (g_storage_closed) {
+            open_storage();
+            g_home.reopen = host_us() - g_home.restore;
+        }
+    }
     if (type != APTHOOK_ONSUSPEND && type != APTHOOK_ONSLEEP)
         return;
-    while (__atomic_load_n(&g_render_busy, __ATOMIC_ACQUIRE))
-        svcSleepThread(1000000);
-    if (type == APTHOOK_ONSUSPEND && game_thread && !g_storage_closed)
-        close_storage();
+    const bool home = type == APTHOOK_ONSUSPEND && game_thread;
+    if (home)
+        g_home.hook = host_us();
+    wait_render_idle();
+    if (home) {
+        const uint64_t t = host_us();
+        g_home.render_wait = t - g_home.hook;
+        if (!g_storage_closed)
+            close_storage();
+        g_home.hook_exit = host_us();
+        g_home.storage = g_home.hook_exit - t;
+    }
 }
 
 void poll()

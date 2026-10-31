@@ -10,8 +10,10 @@ most of a thread's time.
 The log has, per heartbeat window while the profile is on, a `prof thread`
 line per guest thread (its run time, the part of it in shims, and its
 samples), that thread's busiest EIPs (`prof eip t<id>`, up to 120 per window
-for a busy thread) and the busiest shims by time (`prof shims:`, 12 per
-window). `prof clock:` counts the in-line GetTickCount and timeGetTime
+for a busy thread), the rest of its EIPs folded into 64-byte buckets (`prof
+tail t<id>`, up to 480 of the busiest, and a `prof tail t<id>:` line with the
+samples in the buckets left out; issue #40) and the busiest shims by time
+(`prof shims:`, 12 per window). `prof clock:` counts the in-line GetTickCount and timeGetTime
 reads, by the caller's return address (issue #39). The samples are
 time-based: one every 2 ms of a timer on another core (rt::profile_tick), so
 a sample stands for ~2 ms of core 0. Windows are picked by the heartbeat's
@@ -50,9 +52,13 @@ apart (issue #22): a window is an area load when the game made 1000 reads or
 more in it (`prof files:`), as tools/session_report.py counts them. A
 thread's slices are its turns on core 0; their sum is the window's switches.
 
-Each window lists only its thread's busiest EIPs, so the tail of a thread's
-samples is not seen: `listed` is the share of the samples the lists cover,
-and the shares are of all the thread's samples. The profiler costs core 0
+A tail bucket folds into the function its first byte is in, as translated
+code: the bucket does not say which of its EIPs follow a call, nor which
+side of a function start inside it they are on. The tail's own table names
+the functions that the exact lists miss. Logs from before the tail buckets
+list only the busiest EIPs, so the tail of a thread's samples is not seen
+there. `listed` is the share of the samples the lists and buckets cover, and
+the shares are of all the thread's samples. The profiler costs core 0
 time of its own (~12% in issue #3), so per-frame times read high.
 """
 import argparse
@@ -67,6 +73,8 @@ FILES = re.compile(r"prof files: (\d+) reads")
 THREAD = re.compile(r"prof thread (\d+) \(entry ([0-9a-f]+)\): run (\d+) ms \(shims (\d+) ms\) in (\d+) slices, "
                     r"(\d+) samples")
 EIPS = re.compile(r"prof eip t(\d+)((?: [0-9a-f]+:\d+)+)")
+TAIL = re.compile(r"prof tail t(\d+)((?: [0-9a-f]+:\d+)+)")
+TAIL_LEFT = re.compile(r"prof tail t(\d+): (\d+) of (\d+) buckets, (\d+) samples left out")
 SHIMS = re.compile(r"prof shims:((?: \S+=\d+ms)+)")
 CLOCK = re.compile(r"prof clock: (\d+) reads in line(?:, by caller((?: [0-9a-f]+:\d+)+))?")
 HEART = re.compile(r"t=(\d+)s ")
@@ -216,6 +224,7 @@ def parse(path):
             cur = dict(ms=int(m.group(1)), frames=int(m.group(2)), idle=int(m.group(3)), state=state, on=on,
                        switches=int(m.group(4) or 0), reads=0, threads={},
                        eips=collections.defaultdict(collections.Counter), shims=collections.Counter(),
+                       tail=collections.defaultdict(collections.Counter), tail_left=collections.Counter(),
                        clock=0, clock_at=collections.Counter())
             continue
         if cur is None:
@@ -242,6 +251,16 @@ def parse(path):
             for pair in m.group(2).split():
                 eip, hits = pair.split(":")
                 cur["eips"][int(m.group(1))][int(eip, 16)] += int(hits)
+            continue
+        m = TAIL.search(line)
+        if m:
+            for pair in m.group(2).split():
+                bucket, hits = pair.split(":")
+                cur["tail"][int(m.group(1))][int(bucket, 16)] += int(hits)
+            continue
+        m = TAIL_LEFT.search(line)
+        if m:
+            cur["tail_left"][int(m.group(1))] += int(m.group(4))
             continue
         m = SHIMS.search(line)
         if m:
@@ -374,24 +393,46 @@ def main():
             else:
                 kinds[f"after a call to {'an import' if call[0] == 'import' else 'a native routine'}"] += hits
                 returns[call[1]] += hits
+    tail, left, tailed = collections.Counter(), 0, sum(1 for w in windows if w["tail"][tid])
+    for w in windows:
+        left += w["tail_left"][tid]
+        for bucket, hits in w["tail"][tid].items():
+            f = exe.function(bucket) if exe.lo <= bucket < exe.hi else "outside"
+            kinds["tail buckets"] += hits
+            funcs[f] += hits
+            tail[f] += hits
     samples = totals[tid]["samples"]
     listed = sum(kinds.values())
     pct = lambda n: f"{100 * n / max(samples, 1):.1f}%"
     print(f"\nThread {tid} ({thread_name(tid, totals[tid]['entry'], main_tid)}): {samples} samples, "
           f"{100 * listed / max(samples, 1):.0f}% of them in the windows' lists: "
           + ", ".join(f"{k} {pct(n)}" for k, n in kinds.most_common()) + ".")
+    if tailed:
+        print(f"Tail buckets in {tailed} of {len(windows)} windows; {left} samples ({pct(left)}) in the buckets "
+              "left out.")
+    else:
+        print("No tail buckets in these windows: the exact lists held every EIP, or the log is from before issue #40 "
+              "and they hold only the busiest.")
 
     def ms_frame(n):
         per_frame = n * TICK_MS / max(frames, 1)
         return f"{per_frame:.2f} | {100 * per_frame / frame_ms:.1f}%"
 
-    print("\nTranslated functions:\n")
-    print("| # | Function | Samples | Share of thread | ms a frame | Share of a frame | Hottest EIPs |")
-    print("| --- | --- | --- | --- | --- | --- | --- |")
+    label = lambda f: "outside Game.exe" if f == "outside" else f"`{f:#x}`"
+    print("\nTranslated functions (the exact lists and the tail buckets):\n")
+    print("| # | Function | Samples | In the tail | Share of thread | ms a frame | Share of a frame | Hottest EIPs |")
+    print("| --- | --- | --- | --- | --- | --- | --- | --- |")
     for n, (f, hits) in enumerate(funcs.most_common(args.top), 1):
         hot = ", ".join(f"`{e:#x}` {h}" for e, h in eips[f].most_common(3))
-        label = "outside Game.exe" if f == "outside" else f"`{f:#x}`"
-        print(f"| {n} | {label} | {hits} | {pct(hits)} | {ms_frame(hits)} | {hot} |")
+        print(f"| {n} | {label(f)} | {hits} | {tail[f]} | {pct(hits)} | {ms_frame(hits)} | {hot} |")
+
+    if tail:
+        print(f"\nThe tail: functions by their samples in the buckets, what the exact lists miss "
+              f"({pct(sum(tail.values()))} of the thread):\n")
+        print("| # | Function | Tail samples | Share of thread | ms a frame | Share of a frame | In the exact lists |")
+        print("| --- | --- | --- | --- | --- | --- | --- |")
+        for n, (f, hits) in enumerate(tail.most_common(args.top), 1):
+            print(f"| {n} | {label(f)} | {hits} | {pct(hits)} | {ms_frame(hits)} | {funcs[f] - hits} |")
 
     print("\nReturns from imports and native routines (their time as the thread saw it):\n")
     print("| Callee | Samples | Share of thread | ms a frame | Share of a frame |")

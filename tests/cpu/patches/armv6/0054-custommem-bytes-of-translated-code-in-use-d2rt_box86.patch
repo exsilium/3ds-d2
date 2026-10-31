@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Sat, 31 Oct 2026 09:15:34 +0200
+Subject: [PATCH] custommem: bytes of translated code in use
+ (d2rt_box86_dynarec_used_kb)
+
+---
+ third_party/box86-dynarec/custommem.c | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/third_party/box86-dynarec/custommem.c b/third_party/box86-dynarec/custommem.c
+index 16aeec9..eeccfbe 100644
+--- a/third_party/box86-dynarec/custommem.c
++++ b/third_party/box86-dynarec/custommem.c
+@@ -597,6 +597,7 @@ dynablock_t* FindDynablockFromNativeAddress(void* p)
+ 
+ #ifdef TRACE_MEMSTAT
+ static uint32_t dynarec_allocated = 0;
++static uint32_t dynarec_used = 0;
+ #endif
+ /* Bytes of translated code (AllocDynarecMap), for a port's memory panel. */
+ size_t d2rt_box86_dynarec_kb(void){
+@@ -606,6 +607,17 @@ size_t d2rt_box86_dynarec_kb(void){
+     return 0;
+ #endif
+ }
++/* Of those, the bytes blocks hold now: dynarec_allocated only grows by whole
++ * chunks, and space freed in a chunk is used again before a new one opens.
++ * Counted where the block is taken and given back, under mutex_dynarec,
++ * once per translation and once per freed block: never per executed block. */
++size_t d2rt_box86_dynarec_used_kb(void){
++#ifdef TRACE_MEMSTAT
++    return dynarec_used >> 10;
++#else
++    return 0;
++#endif
++}
+ 
+ /* D2Vita (lot eviction JIT) — pourquoi ces deux symboles vivent ICI.
+  *
+@@ -679,6 +691,9 @@ uintptr_t AllocDynarecMap(size_t size)
+             void* sub = getFirstBlock(list->chunks[i].block, size, &rsize, list->chunks[i].first);
+             if(sub) {
+                 void* ret = allocBlock(list->chunks[i].block, sub, size, NULL);
++#ifdef TRACE_MEMSTAT
++                dynarec_used += ((blockmark_t*)sub)->next.size;   /* the split may leave it a little larger */
++#endif
+                 if(sub==list->chunks[i].first)
+                     list->chunks[i].first = getNextFreeBlock(sub);
+                 if(rsize==list->chunks[i].maxfree)
+@@ -765,6 +780,9 @@ uintptr_t AllocDynarecMap(size_t size)
+             n->prev.size = m->next.size;
+             // alloc 1st block
+             void* ret  = allocBlock(list->chunks[i].block, p, size, NULL);
++#ifdef TRACE_MEMSTAT
++            dynarec_used += m->next.size;
++#endif
+             list->chunks[i].maxfree = getMaxFreeBlock(list->chunks[i].block, list->chunks[i].size, NULL);
+             if(list->chunks[i].maxfree)
+                 list->chunks[i].first = getNextFreeBlock(m);
+@@ -803,6 +821,9 @@ void FreeDynarecMap(uintptr_t addr)
+         if ((addr>(uintptr_t)list->chunks[i].block)
+          && (addr<((uintptr_t)list->chunks[i].block+list->chunks[i].size))) {
+             void* sub = (void*)(addr-sizeof(blockmark_t));
++#ifdef TRACE_MEMSTAT
++            dynarec_used -= ((blockmark_t*)sub)->next.size;   /* before freeBlock merges it with its neighbours */
++#endif
+             size_t newfree = freeBlock(list->chunks[i].block, sub, &list->chunks[i].first);
+             if(list->chunks[i].maxfree < newfree)
+                 list->chunks[i].maxfree = newfree;

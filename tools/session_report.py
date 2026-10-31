@@ -45,6 +45,7 @@ INTRIN = re.compile(r"DccCell appels=(\d+)")
 FILES = re.compile(r"prof files: (\d+) reads \((\d+) async\).*?disk (\d+) reads (\d+) KiB in (\d+) ms; cache (\d+) KiB"
                    r"(?:; waited (\d+) ms in (\d+) reads \(frame thread (\d+) ms\), stalled (\d+) ms)?")
 HEART = re.compile(r"t=(\d+)s .*?heap=(\d+)/(\d+)KiB va=(\d+)/(\d+)KiB free=(\d+)KiB jit=(\d+) meta=(\d+) jmptbl=(\d+)KiB host=(\d+)KiB")
+JITUSED = re.compile(r"host=\d+KiB jitused=(\d+)KiB")   # logs from builds with the counter (issue #23)
 OPENED = re.compile(r"t=\d+s peeks=\d+ files=(\d+) ")
 SPRITE = re.compile(r"sprite cache (\d+)/(\d+) KiB, (\d+) sprites(?:, in (\d+), out (\d+))?"
                     r"(?:, decoded (\d+) in (\d+) ms)?")
@@ -58,7 +59,7 @@ HITCH = re.compile(r"prof hitch: frames \d+, <=50ms \d+, <=100ms \d+, <=250ms (\
 
 FIELDS = ["t", "state", "ms", "frames", "fps", "idle_ms", "switches", "cache_syncs", "cache_sync_us", "cells",
           "reads", "opened", "load", "disk_reads", "disk_kib", "disk_ms", "heap_kib", "heap_peak_kib", "va_kib", "va_peak_kib",
-          "free_kib", "jit_kib", "meta_kib", "host_kib", "sprite_kib", "sprite_limit_kib", "sprites", "sprites_in",
+          "free_kib", "jit_kib", "jit_used_kib", "meta_kib", "host_kib", "sprite_kib", "sprite_limit_kib", "sprites", "sprites_in",
           "sprites_out", "wait_ms", "wait_frame_ms", "stall_ms", "decodes", "decode_ms", "hitches", "hitches_250",
           "longest_ms", "read_wait_ms", "hitch_wait_ms", "hitch_ready_ms", "hitch_host_ms", "heartbeat_ms", "skipped",
           "famine"] + ["ft_" + k for k in FRAME_KINDS]
@@ -118,6 +119,9 @@ def parse(path):
             cur.update(t=int(m.group(1)), heap_kib=int(m.group(2)), heap_peak_kib=int(m.group(3)),
                        va_kib=int(m.group(4)), va_peak_kib=int(m.group(5)), free_kib=int(m.group(6)),
                        jit_kib=int(m.group(7)), meta_kib=int(m.group(8)), host_kib=int(m.group(10)))
+            m = JITUSED.search(line)
+            if m:
+                cur["jit_used_kib"] = int(m.group(1))
             continue
         m = SPRITE.search(line)
         if m:   # the heartbeat's last line
@@ -247,13 +251,14 @@ def report(rows):
             print(f"  heartbeat: median {beats[len(beats) // 2]} ms, longest {beats[-1]} ms")
 
     print("\nmemory over time (KiB):")
-    print("       t    heap  heap^    va     va^   free   jit  meta   host  sprite/limit")
+    print("       t    heap  heap^    va     va^   free   jit  used  meta   host  sprite/limit")
     step = max(1, len(rows) // 16)
     for r in rows[::step] + ([last] if (len(rows) - 1) % step else []):
         print(f"  {r['t']:6d} {r['heap_kib']:7d} {r['heap_peak_kib']:6d} {r['va_kib']:6d} {r['va_peak_kib']:6d} "
-              f"{r['free_kib']:6d} {r['jit_kib']:5d} {r['meta_kib']:5d} {r['host_kib']:6d}  {r['sprite_kib']}/{r['sprite_limit_kib']}")
+              f"{r['free_kib']:6d} {r['jit_kib']:5d} {r['jit_used_kib']:5d} {r['meta_kib']:5d} {r['host_kib']:6d}  {r['sprite_kib']}/{r['sprite_limit_kib']}")
     print(f"  peaks: heap {max(r['heap_peak_kib'] for r in rows)}, va {max(r['va_peak_kib'] for r in rows)}, "
-          f"host {max(r['host_kib'] for r in rows)}, jit {max(r['jit_kib'] for r in rows)}; "
+          f"host {max(r['host_kib'] for r in rows)}, jit {max(r['jit_kib'] for r in rows)} "
+          f"(used {max(r['jit_used_kib'] for r in rows)}); "
           f"pool free low {min(r['free_kib'] for r in rows)}; sprite cache limit changes "
           f"{sum(1 for a, b in zip(rows, rows[1:]) if a['sprite_limit_kib'] != b['sprite_limit_kib'])}")
 

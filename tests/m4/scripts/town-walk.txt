@@ -1,0 +1,18 @@
+# A walk in the Rogue Encampment: a new Barbarian, then 24 s of walking
+# round the camp among its NPCs.
+#   M4_SCRIPT="$(cat tests/m4/scripts/town-walk.txt)"
+20000 tap 400 307
+26000 tap 400 290
+32000 text Tester
+34000 press R
+34100 press START
+34300 release START
+34400 release R
+34500 wait ingame
+38500 circle 120 0
+42500 circle 0 120
+46500 circle -120 0
+50500 circle 0 -120
+54500 circle 120 120
+58500 circle -120 -120
+62500 circle 0 0

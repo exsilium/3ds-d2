@@ -288,6 +288,12 @@ uint32_t write_cstr(d2rt::Cpu &c, uint32_t va, uint32_t cap, const std::string &
 
 // The VirtualAlloc region (file mapping views come from it too).
 wx86::GuestRegion &va_region();
+// A block of it for native code, as VirtualAlloc would give the guest one
+// (not zeroed), owned by `owner` in the "VirtualAlloc by caller" lines; 0
+// when the pool has no free piece that large (tried only when it has one,
+// so no "va full" is logged or counted for it). And its return.
+uint32_t va_alloc(uint32_t bytes, uint32_t owner);
+void va_free(uint32_t va);
 
 // Guest paths (rt_shims_files.cpp). A guest path ("C:\\Data\\x.mpq",
 // "data\\x.mpq", "/x") becomes a host path under write_root or data_root.

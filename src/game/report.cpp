@@ -157,6 +157,18 @@ void LogSummary::feed(const char *line)
             play_fps_.push_back(frames * 1000.0f / ms);
         return;
     }
+    uint64_t in_use = 0, held = 0;
+    if (std::strstr(l, "sprite frames ") && field(l, "sprite frames ", in_use) && peak_field(l, "sprite frames ", held)) {
+        uint64_t v = 0;
+        f_.frames_held_peak_kib = std::max(f_.frames_held_peak_kib, (uint32_t)held);
+        if (held > in_use)
+            f_.frames_unused_peak_kib = std::max(f_.frames_unused_peak_kib, (uint32_t)(held - in_use));
+        if (field(l, "over 256 KiB ", v))
+            f_.frames_over_256k = (uint32_t)v;
+        if (field(l, "to the pool ", v))
+            f_.frames_to_pool = (uint32_t)v;
+        return;
+    }
     uint64_t t = 0;
     if (std::strstr(l, "t=") && field(l, "t=", t) && std::strstr(l, " heap=")) {
         uint64_t v = 0;
@@ -305,7 +317,13 @@ std::string event_json(const Event &e)
              ",\"guest_va_peak_kib\":" + std::to_string(f.va_peak_kib) +
              ",\"host_peak_kib\":" + std::to_string(f.host_peak_kib) + ",\"jit_kib\":" + std::to_string(f.jit_kib) +
              ",\"hitches_100ms_play\":" + std::to_string(f.hitches_100ms) +
-             ",\"longest_frame_ms_play\":" + std::to_string(f.longest_frame_ms) + "}";
+             ",\"longest_frame_ms_play\":" + std::to_string(f.longest_frame_ms);
+        if (f.frames_held_peak_kib)
+            o += ",\"sprite_frames_held_peak_kib\":" + std::to_string(f.frames_held_peak_kib) +
+                 ",\"sprite_frames_unused_peak_kib\":" + std::to_string(f.frames_unused_peak_kib) +
+                 ",\"sprite_frames_over_256k\":" + std::to_string(f.frames_over_256k) +
+                 ",\"sprite_frames_to_pool\":" + std::to_string(f.frames_to_pool);
+        o += "}";
     }
     o += "}";
     std::string lines;

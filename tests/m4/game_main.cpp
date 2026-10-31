@@ -167,6 +167,7 @@ int main(int argc, char **argv)
     if (const char *mb = std::getenv("M4_SPRITE_MB"))
         sprite_floor = (uint32_t)std::atoi(mb) << 20;
     static d2rt::Cpu *guest_cpu = nullptr;
+    static const bool sprite_frames = ctr && (!std::getenv("M4_SPRITE_FRAMES") || std::string(std::getenv("M4_SPRITE_FRAMES")) != "0");
     opt.install_native = [](d2rt::Cpu &c) {
         guest_cpu = &c;
         if (sprite_floor)
@@ -181,6 +182,10 @@ int main(int argc, char **argv)
         if (ctr_layout) {
             game::install_pool_release(c);
             game::set_pool_block_size(c, game::kCtrPoolBlock);
+            // The sprites' frames in blocks of their own (M4_SPRITE_FRAMES=0: in the pool system, as the
+            // game does); with M4_NATIVE=late, from the arrival in the game world as well.
+            if (sprite_frames && !native_late)
+                game::install_sprite_frames(c);
         }
         if (native_late)
             g_cpu = &c;
@@ -215,6 +220,9 @@ int main(int argc, char **argv)
             game::govern_sprite_cache(*guest_cpu, m.free, m.spare_used, w.evicted, reserve, game::kCtrSpriteCacheMin);
         }
         const game::SpriteCacheStats sc = game::sprite_cache_stats(*guest_cpu);
+        char frames[192];
+        if (game::sprite_frames_line(frames, sizeof frames))
+            std::fprintf(stderr, "[rt] %s\n", frames);
         std::fprintf(stderr, "[rt] sprite cache %u/%u KiB, %u sprites, in %u, out %u, decoded %u in %u ms\n",
                      sc.used >> 10, sc.limit >> 10, sc.sprites, w.inserted, w.evicted, w.decodes, w.decode_ms);
         // M4_SPRITE_TRACE=<file>: the sprite trace (sprite_trace.h), from the first heartbeat on.
@@ -442,6 +450,8 @@ int main(int argc, char **argv)
             in_game_since = now;
             if (g_cpu)
                 game::install_d2_native(*g_cpu);
+            if (g_cpu && sprite_frames)
+                game::install_sprite_frames(*g_cpu);
         }
         if (in_game_since && !reset_done && now - in_game_since > 10000 && std::getenv("WX86_HOTPROF")) {
             dyn86_hotprof_reset();

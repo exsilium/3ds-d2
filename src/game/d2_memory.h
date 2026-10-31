@@ -4,6 +4,9 @@
 #ifndef D2_GAME_D2_MEMORY_H
 #define D2_GAME_D2_MEMORY_H
 
+#include "game/sprite_frames.h"
+
+#include <cstddef>
 #include <cstdint>
 
 namespace d2rt { struct Cpu; }
@@ -106,6 +109,29 @@ bool install_pool_release(d2rt::Cpu &c);
 constexpr uint32_t kCtrPoolBlock = 128u << 10;
 bool set_pool_block_size(d2rt::Cpu &c, uint32_t bytes);
 void request_pool_release();
+
+// The sprite cache's decoded frames in blocks of their own (FrameHeap,
+// sprite_frames.h) instead of the pool system the cache allocates from
+// (issue #44): four classes to each power of two instead of one, and groups
+// over 256 KiB in the shared pool instead of the C heap. The cache then
+// counts what a sprite holds (its frames' class), and no longer the bytes of
+// a DCC file freed once decoded. The frames' blocks come from the shared
+// pool through rt::va_alloc (their owner 0x60c108 in "VirtualAlloc by
+// caller") and go back to it as they empty; with none to be had, the frames
+// go to the pool system as before. Install before the game runs. Returns
+// false, changing nothing, on a different Game.exe or a layout whose pool
+// is too large for the stubs' map of it.
+bool install_sprite_frames(d2rt::Cpu &c);
+bool sprite_frames_on();
+struct SpriteFramesStats {
+    FrameHeap::Stats heap;
+    uint32_t to_pool;   // groups the allocator had no block for, given to the pool system
+    uint32_t dropped;   // bytes of blocks that went with a pool system the game destroyed
+};
+SpriteFramesStats sprite_frames_stats();
+// The heartbeat's line on them, "sprite frames <in use>/<held> KiB in <n>
+// blocks, ..." (tools/session_report.py); false without them.
+bool sprite_frames_line(char *buf, size_t n);
 
 }  // namespace game
 

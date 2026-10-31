@@ -9,7 +9,9 @@
 // entry. An entry holds that block at +0, its bytes at +4 (0xb8 for the
 // block; 0x5ff630 adds the group's frames once decoded and, for a sprite
 // made by 0x5fffa0, the file's bytes read for them, which stay counted once
-// freed: docs/memory-budget.md, issue #33) and its record at +8. An evicted
+// freed: docs/memory-budget.md, issue #33; with the frames in blocks of
+// their own, the class of their unit and no file bytes for a DCC group,
+// issue #44) and its record at +8. An evicted
 // sprite's record goes (0x5fe170), so the next lookup misses and the sprite is
 // decoded again into a new block. Found, it reaches 0x600350 with the
 // record in eax:
@@ -35,6 +37,7 @@
 // The natives run on the guest's thread (the scheduler is cooperative), as
 // does the heartbeat, so the file needs no lock of its own.
 #include "game/sprite_trace.h"
+#include "game/d2_memory.h"
 
 #include "runtime/cpu.h"
 #include "runtime/rt_host.h"
@@ -232,7 +235,7 @@ bool sprite_trace_start(const char *path)
     if (!again) {
         g_started = true;
         g_start_ms = rt::now_ms();
-        uint32_t header[8] = {0, 0, 3, 16, kWindowMs, (uint32_t)std::time(nullptr), 0, 0};
+        uint32_t header[8] = {0, 0, 4, 16, kWindowMs, (uint32_t)std::time(nullptr), sprite_frames_on() ? 1u : 0u, 0};
         std::memcpy(header, "D2SPTRC1", 8);
         std::fwrite(header, sizeof header, 1, g_file);
     }

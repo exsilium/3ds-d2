@@ -11,8 +11,11 @@
 // compare and a jump.
 //
 // The file: a 32-byte header, then 16-byte records, little-endian.
-//   header  "D2SPTRC1", u32 version (3), u32 record size (16),
-//           u32 use window (ms), u32 start (Unix time), u32 0, u32 0
+//   header  "D2SPTRC1", u32 version (4), u32 record size (16),
+//           u32 use window (ms), u32 start (Unix time), u32 flags, u32 0
+// Flags (version 4): bit 0, the frames in blocks of their own (issue #44,
+// install_sprite_frames): a sprite's bytes are then 0xb8 and the class of
+// its frames' unit, without the bytes of a DCC file read for them.
 //   record  u32 type << 28 | ms since the start, u32 a, u32 b, u32 c
 // The types (kUse... below):
 //   use     a sprite found to draw: a key, b its bytes now, with bit 31
@@ -41,7 +44,7 @@
 // the sprite's own block in the cache, new each time it is decoded, so
 // there a sprite decoded again had a new key, and differed from its earlier
 // self only in +0x20 (issue #31; tools/sprite_trace.py keys such traces by
-// their ident records).
+// their ident records). Version 4 adds the flags; its records are version 3's.
 #ifndef D2_GAME_SPRITE_TRACE_H
 #define D2_GAME_SPRITE_TRACE_H
 

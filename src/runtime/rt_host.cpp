@@ -73,6 +73,49 @@ uint32_t g_exit_code = 0;
 thread_local bool t_runs_guest = false;
 bool g_in_service = false;
 uint64_t g_last_service_ms = 0;   // real clock (wx86_now_ms)
+uint64_t g_t0_ms = 0;   // real clock at run start: guest time starts at 0 in both modes
+// GetTickCount and timeGetTime as the in-line intrinsic serves them (issue
+// #39): on the real clock, the clock at the start of the current slice,
+// raised by every now_ms read in it, so it never runs behind a time the guest
+// got elsewhere (a message's). The scheduler's own clock moves only between
+// slices too. now_ms for each call cost three host clock reads and the frame
+// thread's sample, and the hottest caller, a unit's timer list (0x470c30),
+// runs for every unit in a fight. Written from host threads as well (now_ms),
+// hence the atomic.
+std::atomic<uint32_t> g_tick{0};
+// The in-line reads since the start, and, while profiling, by the call's
+// return address (an open-addressed table; the heartbeat logs the window's
+// busiest). 32 bits: the
+// windows' differences survive a wrap, and the ARM11 has no 64-bit atomics
+// without libatomic.
+std::atomic<uint32_t> g_tick_reads{0};
+constexpr size_t kTickSites = 1024;
+std::atomic<uint32_t> g_tick_unsited{0};   // table full
+std::atomic<uint32_t> g_tick_site[kTickSites], g_tick_site_reads[kTickSites], g_tick_site_mark[kTickSites];
+
+void raise_tick(uint64_t ms)
+{
+    const uint32_t v = (uint32_t)ms;
+    uint32_t cur = g_tick.load(std::memory_order_relaxed);
+    while ((int32_t)(v - cur) > 0 && !g_tick.compare_exchange_weak(cur, v, std::memory_order_relaxed))
+        ;
+}
+
+#ifdef PROF_COUNTERS
+void count_tick_site(uint32_t ret)
+{
+    for (size_t k = 0, i = (ret * 2654435761u) >> 22; k < kTickSites; k++, i = (i + 1) % kTickSites) {
+        uint32_t s = g_tick_site[i].load(std::memory_order_relaxed);
+        if (!s && g_tick_site[i].compare_exchange_strong(s, ret, std::memory_order_relaxed))
+            s = ret;
+        if (s == ret) {
+            g_tick_site_reads[i].fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+    g_tick_unsited.fetch_add(1, std::memory_order_relaxed);
+}
+#endif
 wx86::GuestRegion g_heap, g_va;
 // When the layout puts the heap and VirtualAlloc ranges side by side (all of
 // them do), both are faces of one pool: the heap grows up from its base, VA
@@ -457,7 +500,8 @@ size_t frame_thread_doing()
 }
 
 // The time since the last sample, charged to what the thread was doing.
-void charge_frame_thread()
+// Returns the real clock it read (wx86_now_us).
+uint64_t charge_frame_thread()
 {
     const uint64_t us = wx86_now_us();
     if (g_frame_was < kFrameKindCount && us > g_frame_at) {
@@ -466,6 +510,7 @@ void charge_frame_thread()
             g_frame_wait_at[g_frame_where] += us - g_frame_at;
     }
     g_frame_at = us;
+    return us;
 }
 
 void sample_frame_thread()
@@ -477,7 +522,9 @@ void sample_frame_thread()
 // The scheduler's slice sink (its thread).
 void on_slice(uint32_t tid, bool start)
 {
-    charge_frame_thread();
+    const uint64_t us = charge_frame_thread();
+    if (start && g_opt.real_clock)
+        raise_tick(us / 1000 - g_t0_ms);   // now_ms's value, from the clock read just made
     g_slice_sink = true;
     g_slice_tid = start ? (int)tid : -1;
     g_frame_was = frame_thread_doing();
@@ -524,7 +571,36 @@ struct ProfMark {
     uint32_t syncs, frames;
     FileStats files;
     uint64_t run_ns = 0, trap_ns = 0, trap_calls = 0, waits = 0, waits_now = 0, cs = 0, cs_contended = 0, ticks = 0;
+    uint32_t tick_reads = 0;
 } g_mark{};
+
+// The in-line clock reads of the window, and while profiling the callers
+// that made the most (return address: reads), as tools/profile_report.py
+// reads them.
+void log_tick_reads(uint32_t reads)
+{
+    char line[256];
+    size_t off = std::snprintf(line, sizeof line, "prof clock: %u reads in line", (unsigned)reads);
+    std::vector<std::pair<uint32_t, uint32_t>> top;   // reads, return address
+    for (size_t i = 0; i < kTickSites; i++) {
+        const uint32_t s = g_tick_site[i].load(std::memory_order_relaxed);
+        const uint32_t n = g_tick_site_reads[i].load(std::memory_order_relaxed);
+        const uint32_t d = n - g_tick_site_mark[i].load(std::memory_order_relaxed);
+        g_tick_site_mark[i].store(n, std::memory_order_relaxed);
+        if (s && d)
+            top.push_back({d, s});
+    }
+    std::sort(top.begin(), top.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
+    const char *sep = ", by caller";
+    for (size_t i = 0; i < top.size() && i < 8 && off < sizeof line; i++) {
+        off += std::snprintf(line + off, sizeof line - off, "%s %08x:%u", sep, (unsigned)top[i].second,
+                             (unsigned)top[i].first);
+        sep = "";
+    }
+    if (const uint32_t u = g_tick_unsited.load(std::memory_order_relaxed); u && off < sizeof line)
+        std::snprintf(line + off, sizeof line - off, " (%u without a slot so far)", (unsigned)u);
+    logf("%s", line);
+}
 
 #ifdef PROF_COUNTERS
 struct ThreadProf { uint32_t tid, entry; uint64_t samples, blocks, run_ns = 0, trap_ns = 0, slices = 0; };
@@ -550,10 +626,12 @@ void prof_report(uint64_t ms)
     const uint64_t ticks = &dyn86_ctr_cache_sync_ticks ? dyn86_ctr_cache_sync_ticks : 0;
     ProfMark now{ms, g_sched ? g_sched->idle_ms_ : 0, g_sched ? g_sched->switches() : 0, ticks, syncs, g_stats.frames,
                  file_stats()};
+    now.tick_reads = g_tick_reads.load(std::memory_order_relaxed);
     logf("prof: %llu ms, frames %u, idle %llu ms, switches %llu, cache syncs %u (%llu us)",
          (unsigned long long)(now.ms - g_mark.ms), now.frames - g_mark.frames,
          (unsigned long long)(now.idle_ms - g_mark.idle_ms), (unsigned long long)(now.switches - g_mark.switches),
          now.syncs - g_mark.syncs, (unsigned long long)((now.sync_ticks - g_mark.sync_ticks) / 268u));   // 268 MHz tick
+    log_tick_reads(now.tick_reads - g_mark.tick_reads);
     if (dyn86_intrin_n) {
         char line[256];
         if (dyn86_intrin_report(line, sizeof line) > 0)
@@ -639,6 +717,7 @@ void prof_report(uint64_t ms)
 
 void check_time_limit(uint64_t ms)
 {
+    raise_tick(ms);
     if (t_runs_guest && g_sched)
         sample_frame_thread();
     if (g_opt.service && t_runs_guest && !g_in_service) {
@@ -692,7 +771,6 @@ void check_time_limit(uint64_t ms)
         g_sched->request_shutdown();
     }
 }
-uint64_t g_t0_ms = 0;   // real clock at run start: guest time starts at 0 in both modes
 }  // namespace
 
 void tail_call(Cpu &c, uint32_t va, uint32_t shim_argc, std::initializer_list<uint32_t> args)
@@ -1006,17 +1084,34 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
     // The game's clock reads, served in line from translated code (WinVita's
     // lock-free in-line intrinsic): no trap, no exit from the dynarec loop.
     // On the console a GetTickCount trap cost more than its body: ~10% of a
-    // town frame went to them. Same value as the shims (now_ms). Armed
+    // town frame went to them. The value is the slice's clock (g_tick): on
+    // the virtual clock, now_ms's own, which moves only between slices. Armed
     // before the game runs: a slot already translated can't be rewritten.
     static const char *const kClockImports[][2] = {{"KERNEL32.dll", "GetTickCount"}, {"WINMM.dll", "timeGetTime"}};
     for (const auto &imp : kClockImports) {
         const uint32_t slot = br->shim_trap_existing(imp[0], imp[1]);
         if (slot && cpu->set_intrinsic_nogil(slot, [](Cpu::IntrinFrame &f, uint32_t) {
-                f.eax = (uint32_t)now_ms();
+                if (!g_sched)
+                    f.eax = (uint32_t)now_ms();
+                else
+                    f.eax = g_opt.real_clock ? g_tick.load(std::memory_order_relaxed) : (uint32_t)g_sched->virt_ms();
                 f.pop = 0;
+                g_tick_reads.fetch_add(1, std::memory_order_relaxed);
+#ifdef PROF_COUNTERS
+                if (prof::on)
+                    count_tick_site(f.ret);
+#endif
                 return true;
             }))
             logf("%s: served in line", imp[1]);
+    }
+    {
+        // What the per-call clock read cost (issue #39): 1000 reads, in us,
+        // are ns a read.
+        const uint64_t t0 = wx86_now_us();
+        for (int i = 0; i < 1000; i++)
+            (void)wx86_now_us();
+        logf("clock: a host clock read costs %llu ns", (unsigned long long)(wx86_now_us() - t0));
     }
     // The hottest other imports go through the bridge without leaving the
     // dynarec loop (WinVita's in-line shim path): same shim, no trap. Under

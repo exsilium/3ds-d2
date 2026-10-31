@@ -220,7 +220,8 @@ struct MemoryReport {
     // RunOptions::pool_spare: bytes in use in it, and requests it has served.
     uint32_t spare_used, spare_takes;
     // Host memory of the CPU backend (0 when the build does not count it):
-    uint32_t jit_code_kb;    // translated ARM code
+    uint32_t jit_code_kb;    // translated ARM code: the 2 MiB chunks opened for it
+    uint32_t jit_used_kb;    // of those, what the translated blocks hold now
     uint32_t jit_meta_kb;    // block descriptors and the rest of its own allocator
     uint32_t jmptbl_kb;      // jump tables: 256 KiB per 64 KiB of guest code that ever ran
 };

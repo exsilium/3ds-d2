@@ -16,7 +16,11 @@
 #include "game/d2_native.h"
 #include "game/pklib_explode.h"
 
+#include "runtime/bridge.h"
 #include "runtime/cpu.h"
+#include "runtime/guest_sync.h"
+#include "runtime/guest_thread.h"
+#include "runtime/guest_thread_ctx.h"
 #include "runtime/rt_host.h"
 
 #include <cstdint>
@@ -1414,6 +1418,323 @@ uint32_t dcc_pixel_buffer(Cpu &c)
     return 0;
 }
 
+// ---- Sprite cache ---------------------------------------------------------------------
+//
+// D2CMP's sprite lookup (0x6001f0) runs once per sprite drawn, so its per-hit
+// helpers grow with the units on screen. In fights two of them were ~10% of
+// the frame, most of it in the imports they call (issue #37).
+
+// Native code runs between two guest thread switches (one cooperative
+// scheduler, no guest thread in parallel), so a section that is free, or
+// already held by the current thread, may be skipped: taking and releasing
+// it around the work changes nothing. Held by another thread (preempted
+// inside it), the original must run, and wait.
+bool section_free(uint32_t cs)
+{
+    WxCrit *k = wx86_crit_lookup(cs);
+    if (!k)
+        return true;
+    ThreadScheduler *s = wx86_sched();
+    const GuestThread *t = s ? s->current() : nullptr;
+    const uint32_t owner = __atomic_load_n(&k->owner, __ATOMIC_SEQ_CST) & ~WX86_CRIT_WAITERS;
+    return owner == 0 || owner == (t ? t->id : 1u);
+}
+
+// Resumes the original at `va` once the shim returns: the bridge then pops
+// the return address and `stack_args` dwords from the ESP set here.
+void resume_original(Cpu &c, uint32_t va, uint32_t esp, uint32_t stack_args)
+{
+    c.set_reg(R_ESP, esp - 4 - 4 * stack_args);
+    rt::bridge().redirect_next(va);
+}
+
+// 5ff1b0(ecx=cache, eax=entry): unlinks an entry from the list its flags
+// name (+0xc bit 0: the cache's +0x1c / +0x20 list, else +0x14 / +0x18,
+// head / tail); entries link by +0x14 next and +0x18 previous. A pinned head
+// (+0xc bit 1) stays. Null links are written through as the original does.
+void cache_unlink(uint32_t cache, uint32_t e)
+{
+    const uint32_t head_at = cache + ((U32(e + 0xc) & 1) ? 0x1c : 0x14), tail_at = head_at + 4;
+    const uint32_t head = U32(head_at);
+    if (!head)
+        return;
+    if (e == head) {
+        if (U32(head + 0xc) & 2)
+            return;
+        const uint32_t next = U32(head + 0x14);
+        put32(head_at, next);
+        if (next)
+            put32(next + 0x18, 0);
+        else
+            put32(tail_at, 0);
+        put32(head + 0x14, 0);
+        put32(head + 0x18, 0);
+        return;
+    }
+    if (e == U32(tail_at)) {
+        const uint32_t prev = U32(e + 0x18);
+        put32(tail_at, prev);
+        put32(prev + 0x14, 0);
+        put32(e + 0x14, 0);
+        put32(e + 0x18, 0);
+        return;
+    }
+    const uint32_t prev = U32(e + 0x18);
+    if (!prev && !U32(e + 0x14))
+        return;   // in no list
+    put32(prev + 0x14, U32(e + 0x14));
+    put32(U32(e + 0x14) + 0x18, U32(e + 0x18));
+    put32(e + 0x14, 0);
+    put32(e + 0x18, 0);
+}
+
+// 5ff5b0(ecx=cache, edx=entry), a cache hit: if the cache is on (+0xc),
+// counts the hit (+0x4c), and under its lock (+0x30) moves the entry to the
+// recently used end of the main list, flag bit 0 cleared, stamped with
+// GetTickCount (+0x10). The stamp is now_ms, the value the GetTickCount
+// intrinsic gives: evictions go by it. Its only caller reads no register
+// after it.
+uint32_t cache_touch(Cpu &c)
+{
+    const uint32_t cache = c.reg(R_ECX), e = c.reg(R_EDX);
+    if (!U32(cache + 0xc))
+        return c.reg(R_EAX);
+    if (!e || !section_free(cache + 0x30)) {
+        // The original from 5ff5bc (the jmp covers 5ff5b3): push esi, push
+        // edi, esi = cache, edi = entry. A null entry is its fatal error.
+        const uint32_t esp = c.reg(R_ESP);
+        put32(esp - 4, c.reg(R_ESI));
+        put32(esp - 8, c.reg(R_EDI));
+        c.set_reg(R_ESI, cache);
+        c.set_reg(R_EDI, e);
+        resume_original(c, 0x005ff5bc, esp - 8, 0);
+        return c.reg(R_EAX);
+    }
+    put32(cache + 0x4c, U32(cache + 0x4c) + 1);
+    cache_unlink(cache, e);
+    put32(e + 0xc, U32(e + 0xc) & ~1u);
+    const uint32_t tail = U32(cache + 0x18);
+    if (!tail) {
+        put32(cache + 0x14, e);
+    } else {
+        put32(tail + 0x14, e);
+        put32(e + 0x18, U32(cache + 0x18));
+    }
+    put32(cache + 0x18, e);
+    put32(e + 0x10, (uint32_t)rt::now_ms());
+    return 0;   // LeaveCriticalSection's
+}
+
+constexpr uint32_t kUseDcc = 0x00741efc;          // nonzero: animations from .dcc files
+constexpr uint32_t kLocaleChanged = 0x0096dfe4;   // the C runtime's __locale_changed
+constexpr uint32_t kDc6Name = 0x006e363c;         // the one name always drawn from .dc6
+constexpr uint32_t kDirChars = 0x006dcc34, kDirMonsters = 0x006d6cac, kDirObjects = 0x006e3628;
+
+// What 5fe610's monster class tables (ids 0xf2..0x16f and 0x220..0x2c5) do
+// to the .dcc choice; read from its jump tables at install.
+enum : uint8_t { kKeepDcc, kDc6, kDc6IfNoMode };
+uint8_t g_mon_lo[0x7e], g_mon_hi[0xa6];
+
+bool read_class_table(uint32_t index, uint32_t targets, uint8_t *out, uint32_t n)
+{
+    for (uint32_t i = 0; i < n; i++) {
+        const uint8_t k = *H(index + i);
+        if (k > 2)
+            return false;
+        switch (U32(targets + 4 * k)) {
+        case 0x005fe6ee: out[i] = kKeepDcc; break;
+        case 0x005fe6e5: out[i] = kDc6; break;
+        case 0x005fe6df: out[i] = kDc6IfNoMode; break;
+        default: return false;
+        }
+    }
+    return true;
+}
+
+// The C runtime's _strnicmp(a, b, 0x7fffffff) == 0 in the C locale.
+bool ascii_ieq(const uint8_t *a, const uint8_t *b)
+{
+    for (;; a++, b++) {
+        const uint8_t x = *a >= 'A' && *a <= 'Z' ? *a + 0x20 : *a;
+        const uint8_t y = *b >= 'A' && *b <= 'Z' ? *b + 0x20 : *b;
+        if (x != y)
+            return false;
+        if (!x)
+            return true;
+    }
+}
+
+// 5fe610(ebx=out, esi=unit's sprite info, [8]=name), ret 4: the sprite's
+// file, "<dir>\<token>\<mode>\<name>.dcc" or ".dc6", 1; or an empty string,
+// 0. Info: +8 the unit type (0 player, 1 monster, 2 object; 3, 4 and 6 have
+// other patterns, left to the original), +0xc the class, +0x10 the mode,
+// +0x18 / +0x1c three-character tokens (a space ends one), +0x44 bit 0 set
+// for a .dcc file and cleared for the .dc6 name. Formatted as the wsprintfA
+// shim formats it: at most 1024 characters, each string read up to 1024.
+uint32_t sprite_path(Cpu &c)
+{
+    const uint32_t out = c.reg(R_EBX), info = c.reg(R_ESI), name = c.arg(0);
+    if (!*H(name)) {
+        *H(out) = 0;
+        c.set_reg(R_ECX, name);
+        return 0;
+    }
+    const uint32_t type = U32(info + 8);
+    uint32_t dcc = U32(kUseDcc);
+    if (type == 3 || type == 4 || type == 6 || (dcc && U32(kLocaleChanged))) {
+        // The original from 5fe616 (the jmp covers 5fe613): push ebp, mov
+        // ebp,esp, mov ecx,[ebp+8].
+        const uint32_t esp = c.reg(R_ESP);
+        put32(esp - 4, c.reg(R_EBP));
+        c.set_reg(R_EBP, esp - 4);
+        c.set_reg(R_ECX, name);
+        resume_original(c, 0x005fe616, esp - 4, 1);
+        return c.reg(R_EAX);
+    }
+    if (dcc && ascii_ieq(H(name), H(kDc6Name))) {
+        dcc = 0;
+        put32(info + 0x44, U32(info + 0x44) & ~1u);
+    }
+    uint32_t dir;
+    const int32_t cls = I32(info + 0xc);
+    if (type == 0) {
+        dir = kDirChars;
+    } else if (type == 1) {
+        dir = kDirMonsters;
+        uint8_t act = kKeepDcc;
+        if (cls == 0x209)
+            act = kDc6;
+        else if (cls > 0x209 && (uint32_t)(cls - 0x220) <= 0xa5)
+            act = g_mon_hi[cls - 0x220];
+        else if (cls < 0x209 && (uint32_t)(cls - 0xf2) <= 0x7d)
+            act = g_mon_lo[cls - 0xf2];
+        if (act == kDc6 || (act == kDc6IfNoMode && !U32(info + 0x10)))
+            dcc = 0;
+    } else if (type == 2) {
+        dir = kDirObjects;
+        if (cls == 0x156 || cls == 0x233)
+            dcc = 0;
+    } else {
+        *H(out) = 0;
+        return 0;
+    }
+    char token[4] = {}, mode[4] = {};
+    for (int i = 0; i < 3; i++) {
+        const uint8_t t = *H(info + 0x18 + i), m = *H(info + 0x1c + i);
+        token[i] = t == ' ' ? 0 : (char)t;
+        mode[i] = m == ' ' ? 0 : (char)m;
+    }
+    char buf[1025];
+    uint32_t n = 0;
+    const auto put = [&](const char *s) {
+        for (uint32_t i = 0; i < 1024 && s[i]; i++)
+            if (n < 1024)
+                buf[n++] = s[i];
+    };
+    put(reinterpret_cast<const char *>(H(dir)));
+    put("\\");
+    put(token);
+    put("\\");
+    put(mode);
+    put("\\");
+    put(reinterpret_cast<const char *>(H(name)));
+    put(dcc ? ".dcc" : ".dc6");
+    buf[n] = 0;
+    std::memcpy(H(out), buf, n + 1);
+    if (dcc)
+        put32(info + 0x44, U32(info + 0x44) | 1);
+    return 1;
+}
+
+// D2_NATIVE_CHECK=1 (Linux lane): each SpriteCacheTouch and SpritePath call
+// the native code takes also runs the original, from a trampoline in .text's
+// zero slack, on the same input, and logs where the results differ. The
+// native result is the one kept. Not in line (guest_call).
+constexpr uint32_t kCheckTouch = 0x006cb7e0, kCheckPath = 0x006cb7f0, kCheckEnd = 0x006cb800;
+uint32_t g_check_calls[2], g_check_bad[2];
+
+void check_count(int k, bool bad, const char *name)
+{
+    g_check_calls[k]++;
+    g_check_bad[k] += bad;
+    const uint32_t n = g_check_calls[k];
+    if ((n & (n - 1)) == 0 || (n & 0xffff) == 0)
+        rt::logf("native check: %s %u calls, %u differ", name, g_check_calls[k], g_check_bad[k]);
+}
+
+// The places 5ff5b0 can write: the cache, the entry, its neighbours, the tail.
+uint32_t cache_touch_checked(Cpu &c)
+{
+    const uint32_t cache = c.reg(R_ECX), e = c.reg(R_EDX);
+    if (!U32(cache + 0xc) || !e || !section_free(cache + 0x30))
+        return cache_touch(c);
+    const uint32_t at[5] = {cache, e, U32(e + 0x14), U32(e + 0x18), U32(cache + 0x18)};
+    const uint32_t len[5] = {0x50, 0x1c, 0x1c, 0x1c, 0x1c};
+    uint8_t before[5][0x50], orig[5][0x50];
+    for (int i = 0; i < 5; i++)
+        if (at[i])
+            std::memcpy(before[i], H(at[i]), len[i]);
+    rt::guest_call(c, kCheckTouch, {});
+    for (int i = 0; i < 5; i++)
+        if (at[i])
+            std::memcpy(orig[i], H(at[i]), len[i]);
+    for (int i = 4; i >= 0; i--)
+        if (at[i])
+            std::memcpy(H(at[i]), before[i], len[i]);
+    const uint32_t r = cache_touch(c);
+    bool bad = false;
+    for (int i = 0; i < 5; i++)
+        if (at[i] && std::memcmp(orig[i], H(at[i]), len[i])) {
+            if (g_check_bad[0] < 20)
+                rt::logf("native check: SpriteCacheTouch(%08x, %08x) differs at %08x", cache, e, at[i]);
+            bad = true;
+        }
+    check_count(0, bad, "SpriteCacheTouch");
+    return r;
+}
+
+uint32_t sprite_path_checked(Cpu &c)
+{
+    const uint32_t out = c.reg(R_EBX), info = c.reg(R_ESI), name = c.arg(0), type = U32(info + 8);
+    if (!*H(name) || type == 3 || type == 4 || type == 6 || (U32(kUseDcc) && U32(kLocaleChanged)))
+        return sprite_path(c);
+    const uint32_t flags = U32(info + 0x44);
+    const uint32_t r0 = rt::guest_call(c, kCheckPath, {name});
+    char s0[1025];
+    for (uint32_t i = 0; i < sizeof s0 && (s0[i] = (char)*H(out + i)) != 0; i++) {
+    }
+    const uint32_t f0 = U32(info + 0x44);
+    put32(info + 0x44, flags);
+    const uint32_t r = sprite_path(c);
+    const bool bad = r != r0 || U32(info + 0x44) != f0 || std::strcmp(s0, reinterpret_cast<const char *>(H(out)));
+    if (bad && g_check_bad[1] < 20)
+        rt::logf("native check: SpritePath(type %u, class %d, \"%s\") gave \"%s\" %u %08x, the original \"%s\" %u %08x",
+                 type, I32(info + 0xc), reinterpret_cast<const char *>(H(name)), reinterpret_cast<const char *>(H(out)), r,
+                 U32(info + 0x44), s0, r0, f0);
+    check_count(1, bad, "SpritePath");
+    return r;
+}
+
+// The trampolines: each original's first instructions (the ones its hook's
+// jmp covers), then a jmp to the rest.
+bool install_check(Cpu &c)
+{
+    uint8_t slack[kCheckEnd - kCheckTouch];
+    static const uint8_t kZero[sizeof slack] = {};
+    if (!c.read(kCheckTouch, slack, sizeof slack) || std::memcmp(slack, kZero, sizeof slack))
+        return false;
+    uint8_t touch[12] = {0x56, 0x8b, 0xf1, 0x83, 0x7e, 0x0c, 0x00, 0xe9};
+    const uint32_t rel_touch = 0x005ff5b7 - (kCheckTouch + 12);
+    std::memcpy(touch + 8, &rel_touch, 4);
+    uint8_t path[11] = {0x55, 0x8b, 0xec, 0x8b, 0x4d, 0x08, 0xe9};
+    const uint32_t rel_path = 0x005fe616 - (kCheckPath + 11);
+    std::memcpy(path + 7, &rel_path, 4);
+    c.write(kCheckTouch, touch, sizeof touch);
+    c.write(kCheckPath, path, sizeof path);
+    c.invalidate_code(kCheckTouch, sizeof slack);
+    return true;
+}
+
 }  // namespace
 
 int install_d2_native(Cpu &c)
@@ -1511,6 +1832,18 @@ int install_d2_native(Cpu &c)
         n++;
     }
     bit <<= 1;
+    const bool check = std::getenv("D2_NATIVE_CHECK") && install_check(c);
+    static const uint8_t k5ff5b0[] = {0x56, 0x8b, 0xf1, 0x83, 0x7e, 0x0c, 0x00, 0x57, 0x8b, 0xfa};
+    HOOK(c, 0x005ff5b0, k5ff5b0, sizeof k5ff5b0, 0, check ? cache_touch_checked : cache_touch, "SpriteCacheTouch",
+         !check);
+    // SpritePath: only with its class tables as expected.
+    static const uint8_t k5fe610[] = {0x55, 0x8b, 0xec, 0x8b, 0x4d, 0x08, 0x83, 0xec, 0x08, 0x80, 0x39, 0x00};
+    if (read_class_table(0x005fe85c, 0x005fe850, g_mon_lo, sizeof g_mon_lo) &&
+        read_class_table(0x005fe8e8, 0x005fe8dc, g_mon_hi, sizeof g_mon_hi))
+        HOOK(c, 0x005fe610, k5fe610, sizeof k5fe610, 1, check ? sprite_path_checked : sprite_path, "SpritePath",
+             !check);
+    else
+        bit <<= 1;
 #undef HOOK
     return n;
 }

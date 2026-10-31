@@ -1,0 +1,55 @@
+# A fight in Blood Moor (issue #37): a new Barbarian, out of the Rogue
+# Encampment over the bridge, then 32 s of short pushes round the compass
+# among the quill rats there (the circle pad holds the left button, so a
+# push at a monster attacks it). The route is the map the Linux lane's
+# virtual clock gives (M4_VIRTUAL_CLOCK=1, WX86_FAKETSC=1); the times after
+# "wait ingame" count from arriving in the game world.
+#   M4_SCRIPT="$(cat tests/m4/scripts/fight.txt)"
+# or, on the console, as sdmc:/3ds/3ds-d2/autoplay.txt.
+20000 tap 400 307
+26000 tap 400 290
+32000 text Tester
+34000 press R
+34100 press START
+34300 release START
+34400 release R
+34500 wait ingame
+# To the fence's corner by the river, up to the bridge's deck, over it.
+38000 circle 70 -140
+50000 circle 140 70
+53000 circle 0 140
+54000 circle 150 -50
+# Blood Moor: four rounds of eight pushes, one second each.
+74000 circle 50 0
+75000 circle 35 35
+76000 circle 0 50
+77000 circle -35 35
+78000 circle -50 0
+79000 circle -35 -35
+80000 circle 0 -50
+81000 circle 35 -35
+82000 circle 50 0
+83000 circle 35 35
+84000 circle 0 50
+85000 circle -35 35
+86000 circle -50 0
+87000 circle -35 -35
+88000 circle 0 -50
+89000 circle 35 -35
+90000 circle 50 0
+91000 circle 35 35
+92000 circle 0 50
+93000 circle -35 35
+94000 circle -50 0
+95000 circle -35 -35
+96000 circle 0 -50
+97000 circle 35 -35
+98000 circle 50 0
+99000 circle 35 35
+100000 circle 0 50
+101000 circle -35 35
+102000 circle -50 0
+103000 circle -35 -35
+104000 circle 0 -50
+105000 circle 35 -35
+106000 circle 0 0

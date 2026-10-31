@@ -197,7 +197,7 @@ void set_file_trace(FILE *f);
 
 // The guest code profile (PROF_COUNTERS builds: prof.h): time in translated
 // code and in each shim, per guest thread, and EIP samples, logged with every
-// heartbeat ("prof: run", "prof shims", "prof thread", "prof eip"). Off, it
+// heartbeat ("prof: run", "prof shims", "prof thread", "prof eip", "prof tail"). Off, it
 // costs a branch per shim call and per slice. Starts as RunOptions::profile
 // says. Returns false, changing nothing, in a build without the counters.
 // The game's thread (the heartbeat).

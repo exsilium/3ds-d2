@@ -51,6 +51,7 @@ extern uint64_t dyn86_ctr_cache_sync_ticks __attribute__((weak));
 #include <map>
 #include <memory>
 #include <set>
+#include <unordered_map>
 #include <vector>
 
 using namespace d2rt;
@@ -698,13 +699,38 @@ void prof_report(uint64_t ms)
              t.tid, t.entry, (unsigned long long)(t.run_ns / 1000000), (unsigned long long)(t.trap_ns / 1000000),
              (unsigned long long)t.slices, (unsigned long long)t.samples, (unsigned long long)t.blocks);
         Eips v;
+        prof::top_eips_tid(t.tid, -1, collect, &v);
         // Time samples spread over many EIPs: the busy threads get a longer list.
-        prof::top_eips_tid(t.tid, t.samples > 1000 ? 120 : 40, collect, &v);
-        for (size_t i = 0; i < v.size(); i += 20) {
-            char head[32];
-            std::snprintf(head, sizeof head, "prof eip t%u", t.tid);
-            log_eips(head, Eips(v.begin() + i, v.begin() + std::min(v.size(), i + 20)));
+        const bool busy = t.samples > 1000;
+        const size_t exact = std::min(v.size(), (size_t)(busy ? 120 : 40));
+        char head[32];
+        std::snprintf(head, sizeof head, "prof eip t%u", t.tid);
+        for (size_t i = 0; i < exact; i += 20)
+            log_eips(head, Eips(v.begin() + i, v.begin() + std::min(exact, i + 20)));
+        // The rest, folded into 64-byte buckets (issue #40): in a fight the
+        // time is spread over many functions, each too small for the exact
+        // list. The busiest buckets, then how many samples are in neither.
+        std::unordered_map<uint32_t, uint64_t> fold;
+        for (size_t i = exact; i < v.size(); i++)
+            fold[v[i].first & ~63u] += v[i].second;
+        std::vector<std::pair<uint64_t, uint32_t>> tail;   // hits, bucket
+        for (const auto &b : fold)
+            tail.push_back({b.second, b.first});
+        std::sort(tail.rbegin(), tail.rend());
+        const size_t listed = std::min(tail.size(), (size_t)(busy ? 480 : 60));
+        std::snprintf(head, sizeof head, "prof tail t%u", t.tid);
+        for (size_t i = 0; i < listed; i += 20) {
+            Eips chunk;
+            for (size_t j = i; j < listed && j < i + 20; j++)
+                chunk.push_back({tail[j].second, tail[j].first});
+            log_eips(head, chunk);
         }
+        uint64_t left = 0;
+        for (size_t i = listed; i < tail.size(); i++)
+            left += tail[i].first;
+        if (!tail.empty())
+            logf("prof tail t%u: %zu of %zu buckets, %llu samples left out", t.tid, listed, tail.size(),
+                 (unsigned long long)left);
     }
     Eips buckets;   // 64-byte buckets, all threads: hot loops spread over several EIPs
     prof::top_eips(40, collect, &buckets);

@@ -14,7 +14,9 @@ for a busy thread), the rest of its EIPs folded into 64-byte buckets (`prof
 tail t<id>`, up to 480 of the busiest, and a `prof tail t<id>:` line with the
 samples in the buckets left out; issue #40) and the busiest shims by time
 (`prof shims:`, 12 per window). `prof clock:` counts the in-line GetTickCount and timeGetTime
-reads, by the caller's return address (issue #39). The samples are
+reads, by the caller's return address (issue #39), and `prof locks:` the
+EnterCriticalSection and LeaveCriticalSection calls: served lock-free in line,
+through the shim, the Enters that waited, and the callers (issue #48). The samples are
 time-based: one every 2 ms of a timer on another core (rt::profile_tick), so
 a sample stands for ~2 ms of core 0. Windows are picked by the heartbeat's
 `t=` seconds (--from, --to).
@@ -42,10 +44,10 @@ before an issue is opened for it.
 A tick in translated code stops the guest at the next block entry too, so a
 sample on a block also stands for the end of the block before it. Within a
 function that is the same function; across a call, the caller's last block
-is charged to the callee's entry. GetTickCount is served in line (no trap)
-and the lock calls, wsprintfA and StretchBlt take the in-line shim path
-(rt_host.cpp), so the samples after them are the call-out, the body, and the
-short block before the call.
+is charged to the callee's entry. GetTickCount is served in line (no trap),
+so are the lock calls that neither wait nor wake anyone (the others, wsprintfA
+and StretchBlt take the in-line shim path, rt_host.cpp), so the samples after
+them are the call-out, the body, and the short block before the call.
 
 The threads' table is given for the play windows and for the area loads
 apart (issue #22): a window is an area load when the game made 1000 reads or
@@ -77,6 +79,8 @@ TAIL = re.compile(r"prof tail t(\d+)((?: [0-9a-f]+:\d+)+)")
 TAIL_LEFT = re.compile(r"prof tail t(\d+): (\d+) of (\d+) buckets, (\d+) samples left out")
 SHIMS = re.compile(r"prof shims:((?: \S+=\d+ms)+)")
 CLOCK = re.compile(r"prof clock: (\d+) reads in line(?:, by caller((?: [0-9a-f]+:\d+)+))?")
+LOCKS = re.compile(r"prof locks: (\d+) in line, (\d+) through the shim \((\d+) waited\)"
+                   r"(?:, by caller((?: [0-9a-f]+:\d+)+))?")
 HEART = re.compile(r"t=(\d+)s ")
 STATE = re.compile(r"game state: (.*?) \(ui")
 PROFILE_ON = re.compile(r"prof: guest code profile (on|off)")
@@ -225,7 +229,7 @@ def parse(path):
                        switches=int(m.group(4) or 0), reads=0, threads={},
                        eips=collections.defaultdict(collections.Counter), shims=collections.Counter(),
                        tail=collections.defaultdict(collections.Counter), tail_left=collections.Counter(),
-                       clock=0, clock_at=collections.Counter())
+                       clock=0, clock_at=collections.Counter(), locks=[0, 0, 0], locks_at=collections.Counter())
             continue
         if cur is None:
             continue
@@ -239,6 +243,13 @@ def parse(path):
             for pair in (m.group(2) or "").split():
                 ret, n = pair.split(":")
                 cur["clock_at"][int(ret, 16)] += int(n)
+            continue
+        m = LOCKS.search(line)
+        if m:
+            cur["locks"] = [int(m.group(i)) for i in (1, 2, 3)]
+            for pair in (m.group(4) or "").split():
+                ret, n = pair.split(":")
+                cur["locks_at"][int(ret, 16)] += int(n)
             continue
         m = THREAD.search(line)
         if m:
@@ -369,6 +380,22 @@ def main():
         print("| Function | Return address | Reads | A frame |")
         print("| --- | --- | --- | --- |")
         for ret, n in clock_at.most_common(8):
+            f = f"`{exe.function(ret):#x}`" if exe.lo <= ret < exe.hi else "outside Game.exe"
+            print(f"| {f} | `{ret:#x}` | {n} | {n / max(frames, 1):.1f} |")
+
+    locks, locks_at = [0, 0, 0], collections.Counter()
+    for w in windows:
+        locks = [a + b for a, b in zip(locks, w["locks"])]
+        locks_at.update(w["locks_at"])
+    if sum(locks):
+        in_line, shim, waited = locks
+        per = lambda n: n / max(frames, 1)
+        print(f"\nEnterCriticalSection and LeaveCriticalSection: {in_line + shim} calls, {per(in_line + shim):.0f} a "
+              f"frame; {per(in_line):.0f} lock-free in line, {per(shim):.0f} through the shim, of which "
+              f"{per(waited):.1f} Enters waited. The callers by return address:\n")
+        print("| Function | Return address | Calls | A frame |")
+        print("| --- | --- | --- | --- |")
+        for ret, n in locks_at.most_common(8):
             f = f"`{exe.function(ret):#x}`" if exe.lo <= ret < exe.hi else "outside Game.exe"
             print(f"| {f} | `{ret:#x}` | {n} | {n / max(frames, 1):.1f} |")
 

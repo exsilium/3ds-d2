@@ -17,6 +17,7 @@
 #include "runtime/guest_thread_ctx.h"
 #include "runtime/host_clock.h"
 #include "runtime/pe_image.h"
+#include "runtime/prof.h"
 #include "runtime/win32_shims_wait.h"
 
 #include <cctype>
@@ -486,7 +487,78 @@ uint32_t module_entry(Cpu &c, uint32_t h, uint32_t me, bool first)
 
 uint32_t g_unhandled_filter = 0;
 
+// ---- critical sections ------------------------------------------------------------
+//
+// State in WinVita's engine table, the guest struct stays zero (see
+// guest_sync.h). The lock calls are the game's most frequent imports: ~900
+// a frame in a fight (the Linux lane's fight.txt). Those that neither wait nor have
+// anyone to wake are served lock-free from translated code (issue #48),
+// before the in-line shim and its Bridge round trip. Under the cooperative
+// scheduler one guest thread runs at a time, on the host thread that serves
+// the call, and no other host thread touches a section, so its state needs
+// no lock. An Enter is served when the section is free or already the
+// caller's; a Leave always, as the shim does it, without the scheduler's
+// notify: a no-op there, a blocked thread's wait is tried again at each
+// switch. A declined call has changed nothing and takes the in-line shim.
+// IntrinFrame::thread is set only under the native scheduler, whose runners
+// run in parallel: there every call declines.
+
+LockCalls g_locks;
+
+// The profiler's count of a lock call, by its return address: `ret`, or
+// from the shim's `c`, read only while profiling.
+void count_lock(bool enter, uint32_t ret, Cpu *c = nullptr)
+{
+#ifdef PROF_COUNTERS
+    if (enter)
+        ++prof::cs_enter;
+    if (prof::on)
+        count_lock_site(c ? c->trap_retaddr() : ret);
+#else
+    (void)enter;
+    (void)ret;
+    (void)c;
+#endif
+}
+
+bool enter_in_line(Cpu::IntrinFrame &f, uint32_t)
+{
+    if (f.thread)
+        return false;
+    WxCrit *k = wx86_crit_lookup(f.arg0);   // unknown: the shim creates it
+    ThreadScheduler *s = wx86_sched();
+    GuestThread *t = s ? s->current() : nullptr;
+    if (!k || !k->ready(t) || !k->try_acquire(t))
+        return false;
+    f.eax = 0;
+    f.pop = 4;
+    g_locks.in_line++;
+    count_lock(true, f.ret);
+    return true;
+}
+
+bool leave_in_line(Cpu::IntrinFrame &f, uint32_t)
+{
+    if (f.thread)
+        return false;
+    wx86_crit_leave(f.arg0, nullptr);
+    f.eax = 0;
+    f.pop = 4;
+    g_locks.in_line++;
+    count_lock(false, f.ret);
+    return true;
+}
+
 }  // namespace
+
+LockCalls lock_calls() { return g_locks; }
+
+bool install_lock_fast_path(Cpu &cpu, Bridge &br)
+{
+    const uint32_t enter = br.shim_trap_existing("KERNEL32.dll", "EnterCriticalSection");
+    const uint32_t leave = br.shim_trap_existing("KERNEL32.dll", "LeaveCriticalSection");
+    return enter && leave && cpu.set_intrinsic_nogil(enter, enter_in_line) && cpu.set_intrinsic_nogil(leave, leave_in_line);
+}
 
 std::string module_name_of(uint32_t base)
 {
@@ -688,8 +760,7 @@ void install_kernel32(Bridge &br)
         return 1;
     });
 
-    // ---- critical sections: state in WinVita's engine table, the guest
-    // struct stays zero (see guest_sync.h) ----
+    // ---- critical sections (see enter_in_line) ----
     auto init_cs = [](Cpu &c) {
         zero_guest(c, c.arg(0), 24);
         c.write_u32(c.arg(0) + 4, 0xFFFFFFFFu);   // LockCount -1: free
@@ -706,8 +777,15 @@ void install_kernel32(Bridge &br)
     K("EnterCriticalSection", 1, [](Cpu &c) {
         WxCrit *k = wx86_crit_for(c.arg(0));
         ThreadScheduler *s = wx86_sched();
-        if (!k->try_acquire(s ? s->current() : nullptr) && s)
+        g_locks.shim++;
+        count_lock(true, 0, &c);
+        if (!k->try_acquire(s ? s->current() : nullptr) && s) {
+            g_locks.waits++;
+#ifdef PROF_COUNTERS
+            ++prof::cs_contended;
+#endif
             s->wait_noresult(k, kInfinite);   // blocks; the scheduler acquires it on wake
+        }
         return 0u;
     });
     K("TryEnterCriticalSection", 1, [](Cpu &c) -> uint32_t {
@@ -715,6 +793,8 @@ void install_kernel32(Bridge &br)
         return wx86_crit_for(c.arg(0))->try_acquire(s ? s->current() : nullptr) ? 1u : 0u;
     });
     K("LeaveCriticalSection", 1, [](Cpu &c) {
+        g_locks.shim++;
+        count_lock(false, 0, &c);
         wx86_crit_leave(c.arg(0), wx86_sched());
         return 0u;
     });

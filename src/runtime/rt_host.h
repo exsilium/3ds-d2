@@ -326,6 +326,18 @@ bool hook_function(d2rt::Cpu &c, uint32_t va, const uint8_t *expect, uint32_t n,
 uint32_t native_entry(const char *name, uint32_t stack_args, std::function<uint32_t(d2rt::Cpu &)> fn);
 
 void install_kernel32(d2rt::Bridge &br);
+// The lock calls (EnterCriticalSection, LeaveCriticalSection) since the
+// start, from rt_shims_kernel32.cpp: served lock-free in line, through the
+// shim, and the Enters among those that waited. The profiler's windows log
+// them (issue #48), the callers by return address while profiling
+// (count_lock_site, rt_host.cpp).
+struct LockCalls { uint32_t in_line = 0, shim = 0, waits = 0; };
+LockCalls lock_calls();
+void count_lock_site(uint32_t ret);
+// Serves the lock calls that neither wait nor wake anyone lock-free, in
+// front of their in-line shims: armed after set_inline_shim, before the
+// game runs. False if the backend has no lock-free path.
+bool install_lock_fast_path(d2rt::Cpu &cpu, d2rt::Bridge &br);
 void install_advapi32(d2rt::Bridge &br);
 void install_misc(d2rt::Bridge &br);
 void install_net(d2rt::Bridge &br);

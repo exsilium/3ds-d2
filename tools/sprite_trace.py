@@ -36,7 +36,10 @@ the sprites hold: under the game's pools (each block a power of two), with
 four size classes to each power of two, that with smaller frame headers,
 and with the frames allocated to the byte (the bound).
 Sprites without a DCC file (objects named by number) hold their bytes as
-the cache counts them.
+the cache counts them. A version 4 trace of a build with the frames in
+blocks of their own (issue #44) has the cache counting the class of a
+group's unit and no file bytes for it: the lines on what the sprites hold
+then say how many sprites it counted at the unit the allocator predicts.
 
 A sprite is one graphic: the sprite table's record words +4 to +0x1c, which
 are all its lookup (0x60ace0) compares. +0x20 is the sprite's own block in the
@@ -61,6 +64,7 @@ MAX_SPRITES = 0x1400
 EVICT_GREW, EMPTIED, EVICT_NEW, DECODE_FAILED = 0x5FF67D, 0x5FFBFB, 0x5FFCCF, 0x60009C
 POLICY = {EVICT_GREW, EVICT_NEW}
 TOUCHED = 1 << 31   # a use's bytes: the game moved the sprite up its list
+FRAMES_HELD = 1     # header flag (version 4): the frames in blocks of their own, counted as held
 MiB = 1 << 20
 
 
@@ -68,12 +72,13 @@ def read(path):
     data = open(path, "rb").read()
     if data[:8] != b"D2SPTRC1":
         sys.exit(f"{path}: not a sprite trace")
-    version, size, window_ms, start = struct.unpack_from("<4I", data, 8)
-    if version not in (1, 2, 3) or size != 16:
+    version, size, window_ms, start, flags = struct.unpack_from("<5I", data, 8)
+    if version not in (1, 2, 3, 4) or size != 16:
         sys.exit(f"{path}: version {version}, record size {size}: not this tool's")
     n = (len(data) - 32) // 16
     records = [struct.unpack_from("<4I", data, 32 + 16 * i) for i in range(n)]
-    return ({"window_ms": window_ms, "start": start, "version": version},
+    return ({"window_ms": window_ms, "start": start, "version": version,
+             "frames_held": version >= 4 and bool(flags & FRAMES_HELD)},
             [(r[0] >> 28, r[0] & 0x0FFFFFFF, r[1], r[2], r[3]) for r in records])
 
 
@@ -219,6 +224,10 @@ def token(v):
 # more (0x409770). The cache counts the 0xb8, the frames, and, for a sprite
 # made by 0x5fffa0, the bytes of the file it read for them (0x5ffa20), which
 # are freed once the frames are decoded (0x40a4c0) and stay counted.
+# With the frames in blocks of their own (issue #44, a version 4 trace's
+# flag), the cache counts the 0xb8 and the class of the frames' unit (four
+# to each power of two, quarter_block), and no file bytes for a DCC group:
+# the bytes the sprite holds, the blocks' own partly used room aside.
 MPQS = ("d2exp.mpq", "d2data.mpq", "d2char.mpq")
 ROOTS = ("monsters", "chars", "objects", "missiles", "overlays")
 BLOCK = 0xB8
@@ -243,7 +252,7 @@ def quarter_block(n):
     return (n + step - 1) // step * step
 
 
-def sprite_parts(game_dir, words, sizes):
+def sprite_parts(game_dir, words, sizes, frames_held=False):
     """key -> (frames' bytes, file bytes read for them, frames), for each
     sprite whose DCC file is found; sizes: key -> the bytes it was used at.
     The group's size is the one that explains the most of them."""
@@ -276,7 +285,8 @@ def sprite_parts(game_dir, words, sizes):
             if i + g > ndir:
                 continue
             p = (sum(out[i:i + g]), offsets[i + g] - offsets[i], per_dir * g)
-            hits = sum(1 for n in sizes.get(key, ()) if n - BLOCK in (p[0], p[0] + p[1], p[1]))
+            counted = (p[0], p[0] + p[1], p[1]) + ((quarter_block(p[0]), pool_block(p[0])) if frames_held else ())
+            hits = sum(1 for n in sizes.get(key, ()) if n - BLOCK in counted)
             if hits > best[0]:
                 best = (hits, p)
         if best[1]:
@@ -284,15 +294,18 @@ def sprite_parts(game_dir, words, sizes):
     return parts
 
 
-def held(parts, key, n, layout):
+def held(parts, key, n, layout, frames_held=False):
     """The memory a sprite holds when the cache counts n bytes for it: under
     the game's pools, with four classes to each power of two, that with
     8-byte frame headers, or with its frames allocated to the byte. A sprite
-    without parts is one block of n - 0xb8."""
+    without parts is one block of n - 0xb8. frames_held: the cache counted
+    its frames' class (a version 4 trace with the flag)."""
     f, frames = n - BLOCK, 0
     p = parts.get(key)
     if p:
-        if f in (p[0], p[0] + p[1]):
+        if frames_held and f in (quarter_block(p[0]), pool_block(p[0])):
+            f, frames = p[0], p[2]   # decoded, into the allocator's unit or (none to be had) the pool's
+        elif f in (p[0], p[0] + p[1]):
             f, frames = p[0], p[2]   # decoded: the file's bytes are freed
         elif f == p[1]:
             f = p[1]                 # still loading: the file's bytes
@@ -307,7 +320,7 @@ def held(parts, key, n, layout):
     return FIXED + quarter_block(f)
 
 
-def what_sprites_hold(parts, sizes):
+def what_sprites_hold(parts, sizes, frames_held=False):
     """Lines on the sprites with parts, each at the most it was counted at."""
     t = collections.Counter()
     for key, (out, raw, frames) in parts.items():
@@ -316,7 +329,11 @@ def what_sprites_hold(parts, sizes):
         t["counted"] += top
         t["frames"] += out
         t["headers"] += FRAME * frames
-        t["unheld"] += max(top - BLOCK - out, 0)
+        if frames_held:
+            # Counted as the allocator's unit: what it predicts the sprite holds.
+            t["as_unit"] += top - BLOCK == quarter_block(out)
+            t["as_pool"] += top - BLOCK == pool_block(out) != quarter_block(out)
+        t["unheld"] += max(top - BLOCK - (quarter_block(out) if frames_held else out), 0)
         t["rounding"] += pool_block(out) - out
         t["quarter"] += quarter_block(out) - out
         t["heap"] += out if out > 0x40000 else 0
@@ -329,7 +346,10 @@ def what_sprites_hold(parts, sizes):
             f"  counted and not held {t['unheld'] / MiB:.1f} MiB (the file's bytes, freed once decoded)",
             f"  held {t['held'] / MiB:.1f} MiB: the pools' rounding {t['rounding'] / MiB:.1f} MiB more "
             f"(four classes to a power of two: {t['quarter'] / MiB:.1f}), "
-            f"{t['heap'] / MiB:.1f} MiB malloc'd (blocks over 256 KiB)"]
+            f"{t['heap'] / MiB:.1f} MiB malloc'd (blocks over 256 KiB)"] + (
+            [f"  counted as their frames' unit in the allocator (four classes a power of two): {t['as_unit']} of "
+             f"{t['sprites']}, as the pool system's block: {t['as_pool']}, the rest still loading or not "
+             f"the group's file"] if frames_held else [])
 
 
 def main():
@@ -360,7 +380,8 @@ def main():
     touched = sum(1 for r in records if r[0] == USE and r[3] & TOUCHED)
 
     print(f"trace: {span_s / 60:.1f} min, {len(records)} records, use window {head['window_ms']} ms, "
-          f"version {head['version']}")
+          f"version {head['version']}" + (", frames in blocks of their own (the cache counts what they hold)"
+                                            if head["frames_held"] else ""))
     print(f"  uses {kinds[USE]} ({kinds[USE] / span_s:.0f}/s, {touched} moving their sprite up), "
           f"sprites {len(sprites)}, heartbeats {len(beats)}" + (f", LOST {lost}" if lost else ""))
     names = {EVICT_GREW: "evicted (a sprite grew)", EVICT_NEW: "evicted (a new sprite)", EMPTIED: "cache emptied",
@@ -415,9 +436,9 @@ def main():
         for r in records:
             if r[0] == USE:
                 sizes[r[2]].add(r[3] & ~TOUCHED)
-        parts = sprite_parts(args.game, words, sizes)
+        parts = sprite_parts(args.game, words, sizes, head["frames_held"])
         print()
-        for line in what_sprites_hold(parts, sizes):
+        for line in what_sprites_hold(parts, sizes, head["frames_held"]):
             print(line)
         print("\nthe limit as the memory the sprites hold: re-decoded MiB (the cache's bytes, as above)")
         print("fixed limit   the game's pools   four classes a power of two   and 8-byte frame headers"
@@ -426,7 +447,7 @@ def main():
             row = f"{mb:7.1f} MiB"
             for layout, width in zip(LAYOUTS, (19, 30, 25, 14)):
                 m = replay(records, lambda ms, L=int(mb * MiB): L, False,
-                           lambda key, n, layout=layout: held(parts, key, n, layout))
+                           lambda key, n, layout=layout: held(parts, key, n, layout, head["frames_held"]))
                 row += f"{m.redecoded / MiB:{width}.1f}"
             print(row)
 

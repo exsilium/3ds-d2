@@ -20,6 +20,10 @@ others ran (`frame` those of the thread drawing the frames, which stop
 meanwhile), `stalled` reads completed before ReadFile returned (every guest
 thread stopped), and `decode` the game decoding the sprites it loaded.
 
+Logs of builds with the frames in blocks of their own (issue #44) have a
+`sprite frames` line per window: what their units and blocks hold, and the
+requests in the units; the memory table then has them over time.
+
 Logs with the hitch counters (issue #19) carry a `prof hitch:` line per
 window: the frame intervals by length (<=50, <=100, <=250, >250 ms), the
 longest, the sprites taken and let go of, the frame thread's time blocked
@@ -47,6 +51,8 @@ FILES = re.compile(r"prof files: (\d+) reads \((\d+) async\).*?disk (\d+) reads 
 HEART = re.compile(r"t=(\d+)s .*?heap=(\d+)/(\d+)KiB va=(\d+)/(\d+)KiB free=(\d+)KiB jit=(\d+) meta=(\d+) jmptbl=(\d+)KiB host=(\d+)KiB")
 JITUSED = re.compile(r"host=\d+KiB jitused=(\d+)KiB")   # logs from builds with the counter (issue #23)
 OPENED = re.compile(r"t=\d+s peeks=\d+ files=(\d+) ")
+FRAMES = re.compile(r"sprite frames (\d+)/(\d+) KiB in (\d+) blocks, (\d+) units asking (\d+) KiB, "
+                    r"blocks taken (\d+) given (\d+), over 256 KiB (\d+), to the pool (\d+)")
 SPRITE = re.compile(r"sprite cache (\d+)/(\d+) KiB, (\d+) sprites(?:, in (\d+), out (\d+))?"
                     r"(?:, decoded (\d+) in (\d+) ms)?")
 FRAME = re.compile(r"prof frame thread -?\d+:((?: [a-z]+ \d+)+) ms")
@@ -62,7 +68,8 @@ FIELDS = ["t", "state", "ms", "frames", "fps", "idle_ms", "switches", "cache_syn
           "free_kib", "jit_kib", "jit_used_kib", "meta_kib", "host_kib", "sprite_kib", "sprite_limit_kib", "sprites", "sprites_in",
           "sprites_out", "wait_ms", "wait_frame_ms", "stall_ms", "decodes", "decode_ms", "hitches", "hitches_250",
           "longest_ms", "read_wait_ms", "hitch_wait_ms", "hitch_ready_ms", "hitch_host_ms", "heartbeat_ms", "skipped",
-          "famine"] + ["ft_" + k for k in FRAME_KINDS]
+          "famine", "frames_kib", "frames_held_kib", "frames_blocks", "frames_asked_kib", "frames_big",
+          "frames_to_pool"] + ["ft_" + k for k in FRAME_KINDS]
 
 
 def parse(path):
@@ -122,6 +129,12 @@ def parse(path):
             m = JITUSED.search(line)
             if m:
                 cur["jit_used_kib"] = int(m.group(1))
+            continue
+        m = FRAMES.search(line)
+        if m:   # builds with the frames in blocks of their own (issue #44)
+            g = [int(v) for v in m.groups()]
+            cur.update(frames_kib=g[0], frames_held_kib=g[1], frames_blocks=g[2], frames_asked_kib=g[4],
+                       frames_big=g[7], frames_to_pool=g[8])
             continue
         m = SPRITE.search(line)
         if m:   # the heartbeat's last line
@@ -256,6 +269,20 @@ def report(rows):
     for r in rows[::step] + ([last] if (len(rows) - 1) % step else []):
         print(f"  {r['t']:6d} {r['heap_kib']:7d} {r['heap_peak_kib']:6d} {r['va_kib']:6d} {r['va_peak_kib']:6d} "
               f"{r['free_kib']:6d} {r['jit_kib']:5d} {r['jit_used_kib']:5d} {r['meta_kib']:5d} {r['host_kib']:6d}  {r['sprite_kib']}/{r['sprite_limit_kib']}")
+    if any(r["frames_held_kib"] for r in rows):
+        # Issue #44: the sprites' frames in blocks of their own. What the
+        # classes cost (units against their requests), what partly used
+        # blocks cost (blocks against units), and the groups the pool system
+        # would have malloc'd.
+        print("\nsprite frames over time (KiB): units / blocks, the requests in the units, blocks")
+        for r in rows[::step] + ([last] if (len(rows) - 1) % step else []):
+            print(f"  {r['t']:6d} {r['frames_kib']:7d} / {r['frames_held_kib']:6d} {r['frames_asked_kib']:7d} "
+                  f"{r['frames_blocks']:5d}")
+        top = max(rows, key=lambda r: r["frames_held_kib"])
+        print(f"  at the most held (t={top['t']} s): {top['frames_held_kib']} KiB in blocks, {top['frames_kib']} in units "
+              f"({top['frames_held_kib'] - top['frames_kib']} partly used room), {top['frames_asked_kib']} asked "
+              f"({top['frames_kib'] - top['frames_asked_kib']} the classes' rounding); groups over 256 KiB "
+              f"{last['frames_big']}, to the pool system {last['frames_to_pool']}")
     print(f"  peaks: heap {max(r['heap_peak_kib'] for r in rows)}, va {max(r['va_peak_kib'] for r in rows)}, "
           f"host {max(r['host_kib'] for r in rows)}, jit {max(r['jit_kib'] for r in rows)} "
           f"(used {max(r['jit_used_kib'] for r in rows)}); "

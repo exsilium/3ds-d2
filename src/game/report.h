@@ -65,6 +65,11 @@ public:
         // In play, from the hitch counters ("prof hitch:", issue #19):
         // frames that took over 100 ms, and the longest.
         uint32_t hitches_100ms = 0, longest_frame_ms = 0;
+        // The sprite cache's frames in blocks of their own ("sprite frames",
+        // issue #44): the most their blocks held, the most of that in no
+        // unit (partly used blocks), and by the end the groups over 256 KiB
+        // they took (the C heap's before) and those they had no block for.
+        uint32_t frames_held_peak_kib = 0, frames_unused_peak_kib = 0, frames_over_256k = 0, frames_to_pool = 0;
     };
     Figures figures() const;
 

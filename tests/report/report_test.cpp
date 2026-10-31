@@ -51,6 +51,10 @@ static const char kPlay[] =
     "wait 830 ms, ready 200 ms, host 280 ms, heartbeat 15 ms, skipped 3, famine 0\n"
     "profiler run: stop\n"
     "profiler run: start guest,files\n"
+    "[rt] sprite frames 5000/6400 KiB in 60 blocks, 700 units asking 4700 KiB, blocks taken 80 given 20, "
+    "over 256 KiB 2, to the pool 0\n"
+    "[rt] sprite frames 7000/7300 KiB in 70 blocks, 900 units asking 6600 KiB, blocks taken 95 given 25, "
+    "over 256 KiB 3, to the pool 1\n"
     "[rt] prof: 10000 ms, frames 100, idle 0 ms, switches 900, cache syncs 3 (40 us)\n"
     "[rt] prof hitch: frames 100, <=50ms 95, <=100ms 0, <=250ms 5, >250ms 0, longest 180 ms, sprites in 0 out 0, "
     "wait 0 ms, ready 90 ms, host 300 ms, heartbeat 11 ms, skipped 0, famine 2\n"
@@ -88,6 +92,14 @@ int main()
         e.have_figures = true;
         const std::string j = event_json(e);
         CHECK(j.find("\"hitches_100ms_play\":8,\"longest_frame_ms_play\":412") != std::string::npos);
+        // The frames' blocks: the peak held, the most partly used room, the last counts.
+        CHECK(f.frames_held_peak_kib == 7300 && f.frames_unused_peak_kib == 1400);
+        CHECK(f.frames_over_256k == 3 && f.frames_to_pool == 1);
+        CHECK(j.find("\"sprite_frames_held_peak_kib\":7300,\"sprite_frames_unused_peak_kib\":1400,"
+                     "\"sprite_frames_over_256k\":3,\"sprite_frames_to_pool\":1}") != std::string::npos);
+        Event none;
+        none.have_figures = true;
+        CHECK(event_json(none).find("sprite_frames") == std::string::npos);   // a build without them
     }
     {   // Cut short by a CPU exception: crash lines, no closing line.
         const std::string log = std::string(kPlay) +

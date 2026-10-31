@@ -466,3 +466,26 @@ These are the MiB decoded again in 27 minutes, counted as the earlier tables cou
   3. the pool system's free (0x40b480) sending blocks in its range to it, since the load's free (0x40aba9) and its other paths return the frames there;
   4. the cache counting what a sprite holds: each block's class instead of OutSizeCoded, and not the file's bytes 0x5ffa20 returns for a DCC group;
   5. the m4 lane drawing the same frames (the bytes are unchanged), and a console session judged by the governor's limit, the pool's free space and the cells decoded.
+
+### The frames in blocks of their own (issue #44)
+
+`game::install_sprite_frames` (`src/game/d2_memory.cpp`, the allocator in `src/game/sprite_frames.cpp`) takes the decoded frames out of the pool system:
+
+- **The allocation.** The call to 0x40b430 at 0x60c103 goes to a native, `SpriteFramesAlloc`. A request is rounded up to one of four classes to each power of two (16 bytes at least: `quarter_block` in `tools/sprite_trace.py`), with no ceiling, so a group over 256 KiB no longer goes to the C heap. Blocks come from the shared pool in its 64 KiB granules, through `rt::va_alloc`. A class's units come in slabs: for units up to 64 KiB, a run of 4 KiB pages in a 64 KiB block that other classes' slabs share; for larger ones, a block of their own of 64 to 256 KiB (over 256 KiB, the unit's own size in granules). A slab is the smallest that wastes at most an eighth of itself after its last unit, else the one that wastes the least. A unit goes to the fullest slab of its class with room, a slab to the fullest block with room for it; an empty slab gives its pages back, and an empty block goes back to the pool at once. A slab per class in blocks of their own was the first version: in the fight below its 61 blocks held 5,184 KiB for 3,584 KiB of units, more than the pool system's powers of two would have taken. Most classes hold a handful of units (31 classes for 184 units at the fight's end), so each one's partly used block cost more than its rounding saved. Replayed on those units, a block per class holds 41% more than they do, 4 KiB pages in shared blocks 2.5%. With no block to be had (the pool has no free piece that large), the frames go to the pool system as before.
+- **The free.** Every free of the pool systems reaches 0x409ab0, 0x40b480's (the load's, 0x40aba9) and the others'. A stub in front of it looks the pointer's 64 KiB granule up in a byte map in `.text`'s slack (`0x6cb8c0`, a byte for each granule of the pool) and sends the frames' to `SpriteFramesFree`. Any other free costs the stub four to seven instructions.
+- **A pool system destroyed** (0x409c80) takes the frames asked of it with it, as it would have taken its own blocks.
+- **The count.** 0x5ff6e0 counts a decoded group as its unit's class (the pool system's block for frames it had to take), not OutSizeCoded; 0x5fffa0 no longer counts the bytes of a DCC file read for a group (0x60002e), which 0x40a4c0 frees once decoded. A DC6 file's bytes still count. The cache's count is then the memory its sprites hold, apart from the blocks' partly used room.
+- **The governor** counts the frames' free units with the pool's free space.
+
+Every heartbeat logs `sprite frames <in units>/<in blocks> KiB in <n> blocks, <m> units asking <x> KiB, blocks taken <t> given <g>, over 256 KiB <b>, to the pool <p>`: blocks against units is what partly used blocks cost, units against the requests what the classes cost. `tools/session_report.py` shows them over time, and a report to Sentry carries `sprite_frames_held_peak_kib`, `sprite_frames_unused_peak_kib` (the most partly used room), `sprite_frames_over_256k` and `sprite_frames_to_pool`. "VirtualAlloc by caller" names the frames' blocks `0060c108`. A sprite trace is version 4, its header's flag bit 0 set; `tools/sprite_trace.py --game` then counts how many sprites the cache counted at the unit the allocator predicts.
+
+On the Linux lane (`fight.txt`, `ctr-n3`, virtual clock, `M4_NATIVE=late`, the allocator installed on arrival in the game world), against `M4_SPRITE_FRAMES=0`:
+
+| | the pool system | blocks of their own |
+| --- | ---: | ---: |
+| frames, 4,705 | | all hash the same |
+| the cache's count at the end | 9,014 KiB | 8,167 KiB |
+| pool free at the end | 25,532 KiB | 25,981 KiB |
+| the frames: units / blocks | | 3,584 / 3,904 KiB in 49 blocks (203 units asking 3,243) |
+
+The cache count drops because a DCC group's file bytes are no longer counted. The sprites decoded before the install (67 of 251 in the trace) still hold the pool system's blocks. Of the 184 decoded after it, `tools/sprite_trace.py --game` finds all 184 counted at the class the allocator predicts. This is a short fight with the cache half full and no evictions. The console session in #24 measures what partly used slabs cost once the cache churns, along with the governor's limit, the pool's free space and the cells decoded.

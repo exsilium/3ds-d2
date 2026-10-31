@@ -212,6 +212,22 @@ void init_teb(Cpu &cpu, uint32_t teb, uint32_t stack_top, uint32_t stack_limit)
 const RunOptions &options() { return g_opt; }
 const Layout &layout() { return *g_opt.layout; }
 wx86::GuestRegion &va_region() { return g_va; }
+uint32_t va_alloc(uint32_t bytes, uint32_t owner)
+{
+    // A free piece that large may still not hold it at the VA's alignment.
+    if (g_va.largest_free() < bytes + 0xffff)
+        return 0;
+    va_owner_sync();   // the last VirtualAlloc's block takes its own owner first
+    const uint32_t a = g_va.alloc(bytes);
+    if (a)
+        g_va_owner[a] = owner;
+    return a;
+}
+void va_free(uint32_t va)
+{
+    g_va_owner.erase(va);
+    g_va.free(va);
+}
 Stats &stats() { return g_stats; }
 bool guest_read(uint32_t va, void *out, uint32_t n)
 {

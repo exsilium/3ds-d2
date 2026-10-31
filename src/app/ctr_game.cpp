@@ -1515,7 +1515,11 @@ int main()
         g_sprite_window = w;
         hitch_heartbeat(w);   // before the sprite cache line, the window's last (tools/session_report.py)
         const game::SpriteCacheStats sc = game::sprite_cache_stats(*g_guest_cpu);
-        char line[128];
+        char line[208], frames[192];
+        if (game::sprite_frames_line(frames, sizeof frames)) {
+            std::snprintf(line, sizeof line, "[rt] %s", frames);
+            logline_held(line);
+        }
         std::snprintf(line, sizeof line, "[rt] sprite cache %u/%u KiB, %u sprites, in %u, out %u, decoded %u in %u ms",
                       sc.used >> 10, sc.limit >> 10, sc.sprites, w.inserted, w.evicted, w.decodes, w.decode_ms);
         logline_held(line);
@@ -1530,7 +1534,8 @@ int main()
     // Memory (issue #15): a smaller sprite cache, the game's fatal exit
     // ending the run at once, and the cache's fill after each heartbeat;
     // the pool systems' empty blocks given back when the pool runs short,
-    // and their blocks 128 KiB instead of 512 KiB.
+    // and their blocks 128 KiB instead of 512 KiB; the sprites' frames in
+    // blocks of their own, in finer classes (issue #44).
     opt.install_native = [](d2rt::Cpu &c) {
         g_guest_cpu = &c;
         game::set_sprite_cache_floor(c, game::kCtrSpriteCacheFloor);
@@ -1541,6 +1546,7 @@ int main()
         game::install_fatal_exit(c);
         game::install_pool_release(c);
         game::set_pool_block_size(c, game::kCtrPoolBlock);
+        game::install_sprite_frames(c);
         game::install_d2_native(c);
         game::install_cinematics(c);
         game::install_automap_capture(c);   // the bottom screen's MAP tab

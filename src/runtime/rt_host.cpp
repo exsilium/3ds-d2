@@ -84,15 +84,58 @@ uint64_t g_t0_ms = 0;   // real clock at run start: guest time starts at 0 in bo
 // runs for every unit in a fight. Written from host threads as well (now_ms),
 // hence the atomic.
 std::atomic<uint32_t> g_tick{0};
-// The in-line reads since the start, and, while profiling, by the call's
-// return address (an open-addressed table; the heartbeat logs the window's
-// busiest). 32 bits: the
-// windows' differences survive a wrap, and the ARM11 has no 64-bit atomics
-// without libatomic.
+// Calls counted by the caller's return address while profiling: an
+// open-addressed table, of which the heartbeat logs each window's busiest.
+// 32 bits: the windows' differences survive a wrap, and the ARM11 has no
+// 64-bit atomics without libatomic.
+struct CallSites {
+    static constexpr size_t kSlots = 1024;
+    std::atomic<uint32_t> unsited{0};   // table full
+    std::atomic<uint32_t> site[kSlots], calls[kSlots], mark[kSlots];
+
+    void count(uint32_t ret)
+    {
+        for (size_t k = 0, i = (ret * 2654435761u) >> 22; k < kSlots; k++, i = (i + 1) % kSlots) {
+            uint32_t s = site[i].load(std::memory_order_relaxed);
+            if (!s && site[i].compare_exchange_strong(s, ret, std::memory_order_relaxed))
+                s = ret;
+            if (s == ret) {
+                calls[i].fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+        }
+        unsited.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // Appends the window's 8 busiest (", by caller <ret>:<calls> ...") to
+    // `line` from `off`, and starts the next window.
+    void log_window(char *line, size_t off, size_t cap)
+    {
+        std::vector<std::pair<uint32_t, uint32_t>> top;   // calls, return address
+        for (size_t i = 0; i < kSlots; i++) {
+            const uint32_t s = site[i].load(std::memory_order_relaxed);
+            const uint32_t n = calls[i].load(std::memory_order_relaxed);
+            const uint32_t d = n - mark[i].load(std::memory_order_relaxed);
+            mark[i].store(n, std::memory_order_relaxed);
+            if (s && d)
+                top.push_back({d, s});
+        }
+        std::sort(top.begin(), top.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
+        const char *sep = ", by caller";
+        for (size_t i = 0; i < top.size() && i < 8 && off < cap; i++) {
+            off += std::snprintf(line + off, cap - off, "%s %08x:%u", sep, (unsigned)top[i].second,
+                                 (unsigned)top[i].first);
+            sep = "";
+        }
+        if (const uint32_t u = unsited.load(std::memory_order_relaxed); u && off < cap)
+            std::snprintf(line + off, cap - off, " (%u without a slot so far)", (unsigned)u);
+    }
+};
+// The in-line reads since the start, and while profiling by caller.
 std::atomic<uint32_t> g_tick_reads{0};
-constexpr size_t kTickSites = 1024;
-std::atomic<uint32_t> g_tick_unsited{0};   // table full
-std::atomic<uint32_t> g_tick_site[kTickSites], g_tick_site_reads[kTickSites], g_tick_site_mark[kTickSites];
+CallSites g_tick_sites;
+// The lock calls by caller while profiling (count_lock_site).
+CallSites g_lock_sites;
 
 void raise_tick(uint64_t ms)
 {
@@ -102,21 +145,6 @@ void raise_tick(uint64_t ms)
         ;
 }
 
-#ifdef PROF_COUNTERS
-void count_tick_site(uint32_t ret)
-{
-    for (size_t k = 0, i = (ret * 2654435761u) >> 22; k < kTickSites; k++, i = (i + 1) % kTickSites) {
-        uint32_t s = g_tick_site[i].load(std::memory_order_relaxed);
-        if (!s && g_tick_site[i].compare_exchange_strong(s, ret, std::memory_order_relaxed))
-            s = ret;
-        if (s == ret) {
-            g_tick_site_reads[i].fetch_add(1, std::memory_order_relaxed);
-            return;
-        }
-    }
-    g_tick_unsited.fetch_add(1, std::memory_order_relaxed);
-}
-#endif
 wx86::GuestRegion g_heap, g_va;
 // When the layout puts the heap and VirtualAlloc ranges side by side (all of
 // them do), both are faces of one pool: the heap grows up from its base, VA
@@ -589,6 +617,7 @@ struct ProfMark {
     FileStats files;
     uint64_t run_ns = 0, trap_ns = 0, trap_calls = 0, waits = 0, waits_now = 0, cs = 0, cs_contended = 0, ticks = 0;
     uint32_t tick_reads = 0;
+    LockCalls locks{};
 } g_mark{};
 
 // The in-line clock reads of the window, and while profiling the callers
@@ -597,25 +626,20 @@ struct ProfMark {
 void log_tick_reads(uint32_t reads)
 {
     char line[256];
-    size_t off = std::snprintf(line, sizeof line, "prof clock: %u reads in line", (unsigned)reads);
-    std::vector<std::pair<uint32_t, uint32_t>> top;   // reads, return address
-    for (size_t i = 0; i < kTickSites; i++) {
-        const uint32_t s = g_tick_site[i].load(std::memory_order_relaxed);
-        const uint32_t n = g_tick_site_reads[i].load(std::memory_order_relaxed);
-        const uint32_t d = n - g_tick_site_mark[i].load(std::memory_order_relaxed);
-        g_tick_site_mark[i].store(n, std::memory_order_relaxed);
-        if (s && d)
-            top.push_back({d, s});
-    }
-    std::sort(top.begin(), top.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
-    const char *sep = ", by caller";
-    for (size_t i = 0; i < top.size() && i < 8 && off < sizeof line; i++) {
-        off += std::snprintf(line + off, sizeof line - off, "%s %08x:%u", sep, (unsigned)top[i].second,
-                             (unsigned)top[i].first);
-        sep = "";
-    }
-    if (const uint32_t u = g_tick_unsited.load(std::memory_order_relaxed); u && off < sizeof line)
-        std::snprintf(line + off, sizeof line - off, " (%u without a slot so far)", (unsigned)u);
+    g_tick_sites.log_window(line, std::snprintf(line, sizeof line, "prof clock: %u reads in line", (unsigned)reads),
+                            sizeof line);
+    logf("%s", line);
+}
+
+// The window's lock calls (issue #48): served in line, through the shim, the
+// Enters that waited, and while profiling the callers that made the most.
+void log_lock_calls(const LockCalls &d)
+{
+    char line[256];
+    g_lock_sites.log_window(line,
+                            std::snprintf(line, sizeof line, "prof locks: %u in line, %u through the shim (%u waited)",
+                                          (unsigned)d.in_line, (unsigned)d.shim, (unsigned)d.waits),
+                            sizeof line);
     logf("%s", line);
 }
 
@@ -649,6 +673,9 @@ void prof_report(uint64_t ms)
          (unsigned long long)(now.idle_ms - g_mark.idle_ms), (unsigned long long)(now.switches - g_mark.switches),
          now.syncs - g_mark.syncs, (unsigned long long)((now.sync_ticks - g_mark.sync_ticks) / 268u));   // 268 MHz tick
     log_tick_reads(now.tick_reads - g_mark.tick_reads);
+    now.locks = lock_calls();
+    log_lock_calls({now.locks.in_line - g_mark.locks.in_line, now.locks.shim - g_mark.locks.shim,
+                    now.locks.waits - g_mark.locks.waits});
     if (dyn86_intrin_n) {
         char line[256];
         if (dyn86_intrin_report(line, sizeof line) > 0)
@@ -871,6 +898,8 @@ FrameThreadTimes frame_thread_times()
 }
 
 uint64_t last_heartbeat_us() { return g_heartbeat_us; }
+
+void count_lock_site(uint32_t ret) { g_lock_sites.count(ret); }
 
 uint64_t now_ms()
 {
@@ -1141,7 +1170,7 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
                 g_tick_reads.fetch_add(1, std::memory_order_relaxed);
 #ifdef PROF_COUNTERS
                 if (prof::on)
-                    count_tick_site(f.ret);
+                    g_tick_sites.count(f.ret);
 #endif
                 return true;
             }))
@@ -1170,6 +1199,10 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
             cpu->set_inline_shim(slot);
             logf("%s: in line", imp[1]);
         }
+    // In front of the lock calls' in-line shims, the calls that neither wait
+    // nor wake anyone served lock-free, without the Bridge (issue #48).
+    if (install_lock_fast_path(*cpu, *br))
+        logf("EnterCriticalSection, LeaveCriticalSection: lock-free in line when uncontended");
     res.unresolved_imports = br->unresolved_count();
     res.loaded = true;
     logf("loaded %s at %08x entry %08x, %u unresolved import(s)", g_opt.exe_name.c_str(), g_exe_base,

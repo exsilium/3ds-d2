@@ -100,6 +100,25 @@ int main()
         Event none;
         none.have_figures = true;
         CHECK(event_json(none).find("sprite_frames") == std::string::npos);   // a build without them
+        CHECK(event_json(none).find("heap_refused") == std::string::npos);    // nor the system lines
+    }
+    {   // The system lines (issue #24): the lowest free and room, the last refusal count.
+        const char *sys =
+            "[rt] system: free KiB app 440 sys 81592 base 11588 linear 990 heap 3743, heap room 1900 low 1200, heap "
+            "refused 0 (first 0 B), threads 7 events 2 mutexes 0 semaphores 0 timers 0 shmem 0 arbiters 1, blocks 23\n"
+            "[rt] system at video open: free KiB app 440 sys 81592 base 11588 linear 990 heap 100, heap room 50 low "
+            "50, heap refused 9 (first 4096 B), threads 7 events 2 mutexes 0 semaphores 0 timers 0 shmem 0 arbiters "
+            "1, blocks 23\n"
+            "[rt] system: free KiB app 440 sys 81592 base 11588 linear 958 heap 1815, heap room 1500 low 700, heap "
+            "refused 2 (first 8192 B), threads 7 events 2 mutexes 0 semaphores 0 timers 0 shmem 0 arbiters 1, blocks 23\n";
+        const LogSummary::Figures f = feed(sys).figures();
+        CHECK(f.have_system);
+        CHECK(f.host_free_min_kib == 1815 && f.heap_room_min_kib == 700 && f.heap_refused == 2);
+        Event e;
+        e.figures = f;
+        e.have_figures = true;
+        CHECK(event_json(e).find("\"host_free_min_kib\":1815,\"heap_room_min_kib\":700,\"heap_refused\":2}") !=
+              std::string::npos);
     }
     {   // Cut short by a CPU exception: crash lines, no closing line.
         const std::string log = std::string(kPlay) +

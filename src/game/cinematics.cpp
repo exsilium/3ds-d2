@@ -377,10 +377,14 @@ uint32_t video_open(Cpu &c)
         rt::logf("cinematic: not found, skipped");
         return 0;
     }
+    if (rt::options().video_event)
+        rt::options().video_event("open");
     g_session.reset(new Session);
     if (!g_session->open(host, offset)) {
         rt::logf("cinematic: cannot be decoded, skipped");
         g_session.reset();
+        if (rt::options().video_event)
+            rt::options().video_event("close");
         return 0;
     }
     g_playing = true;
@@ -393,6 +397,8 @@ uint32_t video_step(Cpu &)
     if (ms < 0) {
         g_session.reset();   // the decoder's memory goes with it
         g_playing = false;
+        if (rt::options().video_event)
+            rt::options().video_event("close");
     }
     return (uint32_t)ms;
 }

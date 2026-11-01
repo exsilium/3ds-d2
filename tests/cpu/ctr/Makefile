@@ -70,6 +70,8 @@ M3OBJ := $(CPUOBJ) $(addprefix $(OUT)/rt/,$(RTFULL:.cpp=.o)) $(addprefix $(OUT)/
          $(OUT)/m3/ctr_main.o $(OUT)/runner/ctr_stubs.o $(OUT)/m3/m3test_exe.o
 
 # The game app (src/app/ctr_game.cpp): the same runtime plus the controls.
+# Its host heap's growth goes through ctr_game.cpp's __wrap__sbrk_r (issue #24).
+GAMELDFLAGS := -Wl,--wrap=_sbrk_r
 GAMESRC := $(notdir $(wildcard $(ROOT)/src/game/*.cpp))
 BINKSRC := $(notdir $(wildcard $(ROOT)/src/game/bink/*.cpp))
 GAMEOBJ := $(CPUOBJ) $(addprefix $(OUT)/rt/,$(RTFULL:.cpp=.o)) $(addprefix $(OUT)/m3/,$(M3SRC:.cpp=.o)) \
@@ -186,10 +188,10 @@ $(OUT)/romfs-3dsx/tls.bin: $(OUT)/tls.bin
 $(OUT)/game/ctr_game_cia.o: $(ROOT)/src/app/ctr_game.cpp $(wildcard $(ROOT)/src/game/*.h) $(wildcard $(ROOT)/src/runtime/rt_*.h)
 	@mkdir -p $(@D); $(CXX) $(CXXFLAGS) -O2 -DD2_CIA -I$(ROOT)/src -c $< -o $@
 $(OUT)/3ds-d2-game-cia.elf: $(filter-out $(OUT)/game/ctr_game.o,$(GAMEOBJ)) $(OUT)/game/ctr_game_cia.o
-	$(CXX) $(LDFLAGS) $^ -L$(PORTLIBS)/lib -ljpeg -lz -lctru -lm -o $@
+	$(CXX) $(LDFLAGS) $(GAMELDFLAGS) $^ -L$(PORTLIBS)/lib -ljpeg -lz -lctru -lm -o $@
 
 $(OUT)/3ds-d2-game.elf: $(GAMEOBJ)
-	$(CXX) $(LDFLAGS) $^ -L$(PORTLIBS)/lib -ljpeg -lz -lctru -lm -o $@
+	$(CXX) $(LDFLAGS) $(GAMELDFLAGS) $^ -L$(PORTLIBS)/lib -ljpeg -lz -lctru -lm -o $@
 $(OUT)/3ds-d2-game.smdh:
 	@mkdir -p $(@D); smdhtool --create "3ds-d2" "Diablo II LoD 1.14d on the n3DS" "3ds-d2" $(CTRULIB)/default_icon.png $@
 $(OUT)/3ds-d2-game.3dsx: $(OUT)/3ds-d2-game.elf $(OUT)/3ds-d2-game.smdh $(OUT)/romfs-3dsx/tls.bin

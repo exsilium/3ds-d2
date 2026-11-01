@@ -46,7 +46,9 @@ Decode-ahead on the second core, as the issue planned, is not used. During a vid
 `tests/bink/compare.sh <game-dir>` extracts all 20 videos from both archives and decodes each with `src/game/bink` and with FFmpeg (8.1):
 
 - **Video:** every frame of every file is byte-identical to FFmpeg's `yuv420p` (about 57,000 frames).
-- **Audio:** identical sample counts. The largest difference from FFmpeg's float output is 2.4e-7, against a tolerance of 1e-5 (one 16-bit step is 3.1e-5). The 16-bit PCM the player sends to the platform (logos and intro, 39.4 M samples) matches FFmpeg's `s16` conversion to within ±1.
+- **Audio:** identical sample counts, 16-bit samples within ±2 of FFmpeg's `s16le` (the tolerance). The float decoder this replaced was 2.4e-7 from FFmpeg's float output. The audio decoder is now fixed point, with no floating point at all (below), and its output is within ±1 of that decoder's, converted as FFmpeg converts: all 16 videos of `d2video.mpq`, 211 M samples, about 0.7% of them one step apart (rounding), none further. That comparison was made on the qemu ARM11 lane (`build/bink`), since neither the build machine nor the images have FFmpeg; `compare.sh` against FFmpeg itself has not been run since.
+
+**Why fixed point (issue #24).** On the console, going East in game (the Act II cinematic) brought the system down within seconds, nearly every time: the HOME Menu, the kernel, or one of the app's threads finding a 1 MiB section of its heap unmapped. The app had not unmapped anything (`[diag] address space` never changed). Builds that played the cinematic silent, or read its soundtrack without decoding it, or spent the decoder's time on integer work instead, never crashed. The one that decoded it (in float, on the game's thread) always did, with or without the DSP. The same video with sound from the main menu was fine. How floating point on that thread leads to the damage is not known; the decoder now does without it. Its tables (sine, quantiser steps) are in `bink_audio_tables.h`, generated once, and GCC is kept from moving 64-bit values through VFP registers.
 
 FFmpeg's decoder was read as a format reference and is used as the test oracle. No FFmpeg code is used. The format's constant tables (`bink_tables.cpp`) carry the same values as FFmpeg's `binkdata.h`, as any compatible decoder must (see `THIRD_PARTY_NOTICES.md`).
 
@@ -61,7 +63,7 @@ ARM11 instructions per frame, video and audio together, counted under qemu (`-on
 | 640x292, worst frames (scaled from qemu time) | ~13 M |
 | 640x480 logo | ~1.5 M |
 
-At 804 MHz and an assumed 0.5 to 0.6 instructions per cycle, that is about 7 ms for a busy frame and about 27 ms for the worst, against 41.7 ms per frame at 24 fps. No ARMv6 SIMD work was needed to reach the frame rate on this estimate.
+At 804 MHz and an assumed 0.5 to 0.6 instructions per cycle, that is about 7 ms for a busy frame and about 27 ms for the worst, against 41.7 ms per frame at 24 fps. No ARMv6 SIMD work was needed to reach the frame rate on this estimate. (Those counts are of the float audio decoder. The fixed-point one decodes the soundtracks in about 40% of its time on qemu-arm: 0.23 against 0.58 ms per 640x292 frame.)
 
 In Azahar the 3DS build plays the logos and the intro at a steady 24 fps with nothing dropped (decode 7.7 ms/frame average for 640x480, worst 20 ms). Azahar's speed is not hardware evidence.
 

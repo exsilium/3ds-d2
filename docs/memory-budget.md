@@ -505,3 +505,19 @@ What the app logs since then:
 - **When a cinematic opens and closes:** the same line, as `system at video open:` and `system at video close:`.
 - **A refused heap growth:** at once (from the 50 ms service call), `host heap: growth refused <n> times (first <x> B), room <r> KiB`. newlib's malloc grows the heap through `_sbrk_r`, which the game app links wrapped (`--wrap=_sbrk_r`), and returns NULL when that fails.
 - **A report to Sentry** carries `host_free_min_kib`, `heap_room_min_kib` and `heap_refused`.
+
+The memory was never the cause. One diagnostic build at a time (each on its own `diag/` branch, each going East until it crashed or passed three times):
+
+| Build | What it changed | Going East |
+| --- | --- | --- |
+| `19c706b9252b` | the `system:` lines (#55) | crashed (3DS-D2-Q: the kernel, while handing a CPU exception to the app's handler) |
+| `fda265d25bc4` | no CPU exception handler | crashed (3DS-D2-R: libctru's ndsp thread, its stack's section unmapped) |
+| `3ee496108740` | the JIT's data-cache sync by range (0x54), not Luma's whole-cache 0x92 | crashed (the GSP event thread, the same) |
+| `9c633450ebb6` | cinematics silent | 3/3 fine |
+| `b47a526c2e0f` | soundtrack decoded, never sent to the DSP | crashed (3DS-D2-V: the mixer thread, the same) |
+| `7fbe81968620` | every map/unmap/protect call and address-space change logged | crashed (3DS-D2-W): no such call, no change |
+| `60d7ede07898` | soundtrack read, not decoded | 3/3 fine |
+| `0fc4e3eb00ef` | the decoder in RunFast (the guest's FPSCR was RunFast already: `83000010`) | ended without a dump (3DS-D2-X) |
+| `7822fd1577fb` | 2 ms of integer work per packet in the decoder's place | 4/4 fine with 30 s of video |
+
+So the trigger was the soundtrack decoder's floating point on the game's thread, in game. Its memory use was clean (AddressSanitizer and UndefinedBehaviorSanitizer over the whole Act II file), and the heap was never short (`heap_refused` 0, 3 MiB free). The audio decoder is now fixed point ([cinematics.md](cinematics.md#decoder-correctness)). What links floating point to page tables found damaged across the system was not found.

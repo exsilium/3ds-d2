@@ -489,3 +489,19 @@ On the Linux lane (`fight.txt`, `ctr-n3`, virtual clock, `M4_NATIVE=late`, the a
 | the frames: units / blocks | | 3,584 / 3,904 KiB in 49 blocks (203 units asking 3,243) |
 
 The cache count drops because a DCC group's file bytes are no longer counted. The sprites decoded before the install (67 of 251 in the trace) still hold the pool system's blocks. Of the 184 decoded after it, `tools/sprite_trace.py --game` finds all 184 counted at the class the allocator predicts. This is a short fight with the cache half full and no evictions. The console session in #24 measures what partly used slabs cost once the cache churns, along with the governor's limit, the pool's free space and the cells decoded.
+
+### Going East: the HOME Menu or the kernel goes down (issue #24, 2026-11-01)
+
+Three times in four runs on build `2d5e1c8c7799`, travelling East from the Rogue Encampment stopped the console just as the Act II cinematic opened. It happened after 1 to 17 minutes of play, with or without HOME use or the profiler. Each run's log ends with `cinematic: 640x292, 4604 frames at 24/1 fps, sound on`, and no video frame reached the screen. Luma3DS saved a dump each time, and none was of the app's own code:
+
+- **3DS-D2-K and 3DS-D2-P:** the HOME Menu (`0004003000009802`) stopped itself at `pc 00136f28` (a breakpoint, IFSR 2), called from `lr 00231770`, with the same registers both times. The #6 dumps stop at the same `pc`, called from `00164200` after a failed open of the shared extdata `0xF000000B`.
+- **3DS-D2-M:** the kernel, in the app's process: a data abort in SVC mode at `ffff01c0`, writing to its own stack (`far` = `sp` = `ff564fe8`, DFSR `0x807`), a thread's kernel stack page not mapped.
+
+The same video played normally from the main menu's Cinematics screen. A build that logged each of the cinematic's first 150 turns (`diag/cinematic-crash`, A) went East without a crash, and so did one of the four runs of `2d5e1c8c7799`. The diagnostic build's log showed the system unchanged through the session (system region 81,592 KiB free, base 11,588, 7 threads, 23 memory blocks) and every DSP submission valid. The tight resource was the host heap: 3.9 MiB free when the Act II video opened, 1.8 MiB while it played. The video takes about 2.1 MiB of it, and the crashing runs had 2.3 to 3.6 MiB free at their last heartbeat.
+
+What the app logs since then:
+
+- **Every heartbeat:** `system: free KiB app <a> sys <s> base <b> linear <l> heap <h>, heap room <r> low <low>, heap refused <n> (first <x> B), threads ... blocks <m>`. Free memory in the three regions, the app's linear memory and host heap (`heap`: libctru's heap less what malloc holds), the room above the heap's top and its lowest since the last heartbeat, the requests to grow the heap that were refused, the app's kernel objects and the memory blocks of its address space.
+- **When a cinematic opens and closes:** the same line, as `system at video open:` and `system at video close:`.
+- **A refused heap growth:** at once (from the 50 ms service call), `host heap: growth refused <n> times (first <x> B), room <r> KiB`. newlib's malloc grows the heap through `_sbrk_r`, which the game app links wrapped (`--wrap=_sbrk_r`), and returns NULL when that fails.
+- **A report to Sentry** carries `host_free_min_kib`, `heap_room_min_kib` and `heap_refused`.

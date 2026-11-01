@@ -93,6 +93,7 @@ struct RunOptions {
     uint32_t trap_report = 0;                      // at exit, print the N most-called imports (stdout)
     uint32_t heartbeat_ms = 0;                     // log progress counters every N ms of guest time
     std::function<void()> heartbeat;               // after each heartbeat's line: the app's own counters
+    std::function<void(const char *)> video_event; // a cinematic "open" or "close" (the app logs its memory)
     bool profile = false;                          // the guest code profile from the start (set_profiling)
     // Registry DWORDs seeded under the game's settings key when absent (the
     // game's own Options menu still changes and saves them): the 3DS app picks

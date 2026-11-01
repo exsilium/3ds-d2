@@ -169,6 +169,16 @@ void LogSummary::feed(const char *line)
             f_.frames_to_pool = (uint32_t)v;
         return;
     }
+    uint64_t heap = 0, low = 0, refused = 0;
+    if (std::strstr(l, "system: free KiB ") && field(l, " heap ", heap) && field(l, " low ", low) &&
+        field(l, "heap refused ", refused)) {
+        const bool first = !f_.have_system;
+        f_.host_free_min_kib = first ? (uint32_t)heap : std::min(f_.host_free_min_kib, (uint32_t)heap);
+        f_.heap_room_min_kib = first ? (uint32_t)low : std::min(f_.heap_room_min_kib, (uint32_t)low);
+        f_.heap_refused = (uint32_t)refused;
+        f_.have_system = true;
+        return;
+    }
     uint64_t t = 0;
     if (std::strstr(l, "t=") && field(l, "t=", t) && std::strstr(l, " heap=")) {
         uint64_t v = 0;
@@ -323,6 +333,10 @@ std::string event_json(const Event &e)
                  ",\"sprite_frames_unused_peak_kib\":" + std::to_string(f.frames_unused_peak_kib) +
                  ",\"sprite_frames_over_256k\":" + std::to_string(f.frames_over_256k) +
                  ",\"sprite_frames_to_pool\":" + std::to_string(f.frames_to_pool);
+        if (f.have_system)
+            o += ",\"host_free_min_kib\":" + std::to_string(f.host_free_min_kib) +
+                 ",\"heap_room_min_kib\":" + std::to_string(f.heap_room_min_kib) +
+                 ",\"heap_refused\":" + std::to_string(f.heap_refused);
         o += "}";
     }
     o += "}";

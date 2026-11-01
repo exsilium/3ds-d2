@@ -70,6 +70,11 @@ public:
         // unit (partly used blocks), and by the end the groups over 256 KiB
         // they took (the C heap's before) and those they had no block for.
         uint32_t frames_held_peak_kib = 0, frames_unused_peak_kib = 0, frames_over_256k = 0, frames_to_pool = 0;
+        // The 3DS app's "system:" heartbeat lines (issue #24): the host
+        // heap's lowest free, the least room it had left to grow, and by
+        // the end the requests to grow it that were refused.
+        bool have_system = false;
+        uint32_t host_free_min_kib = 0, heap_room_min_kib = 0, heap_refused = 0;
     };
     Figures figures() const;
 

@@ -190,6 +190,29 @@ void __system_allocateHeaps(void)
 u32 __ctru_heap_size = 24u << 20;
 u32 __ctru_linear_heap_size = 1u << 20;
 #endif
+
+// The host heap's growth (issue #24): newlib's malloc takes more of libctru's
+// heap through _sbrk_r (linked with --wrap=_sbrk_r), and returns NULL when
+// that is refused. Kept here: the room left above the heap's top, its lowest
+// since the last heartbeat, and the refused requests. Called under malloc's
+// lock, so nothing here may allocate or log.
+extern char *fake_heap_end;
+void *__real__sbrk_r(struct _reent *r, ptrdiff_t incr);
+uint32_t g_heap_room = 0, g_heap_room_low = UINT32_MAX;
+uint32_t g_heap_refused = 0, g_heap_refused_first = 0;   // requests refused, the first one's size
+void *__wrap__sbrk_r(struct _reent *r, ptrdiff_t incr)
+{
+    void *p = __real__sbrk_r(r, incr);
+    if (p == (void *)-1) {
+        if (!g_heap_refused++)
+            g_heap_refused_first = (uint32_t)incr;
+        return p;
+    }
+    g_heap_room = (uint32_t)(fake_heap_end - ((char *)p + incr));
+    if (g_heap_room < g_heap_room_low)
+        g_heap_room_low = g_heap_room;
+    return p;
+}
 }
 
 namespace d2rt {
@@ -392,6 +415,65 @@ void logline(const char *s)
         std::fprintf(g_log, "%s\n", s);
         std::fflush(g_log);
     }
+}
+
+// What the system has left (issue #24: going East crashed the HOME Menu
+// once and the kernel once, with nothing from the app): free memory in the
+// three regions, the app's linear memory and host heap, the heap's growth,
+// the app's kernel objects and the memory blocks of its address space (one
+// kernel object per run of pages with the same state and permission).
+unsigned memory_blocks()
+{
+    unsigned n = 0;
+    u32 addr = 0;
+    while (addr < 0x40000000u && n < 100000) {
+        MemInfo mi;
+        PageInfo pi;
+        if (R_FAILED(svcQueryMemory(&mi, &pi, addr)) || !mi.size)
+            break;
+        n++;
+        addr = mi.base_addr + mi.size;
+    }
+    return n;
+}
+
+void system_line(char *out, size_t size, const char *what)
+{
+    const struct mallinfo mi = mallinfo();
+    s64 n[8] = {};
+    Handle rl;
+    if (R_SUCCEEDED(svcGetResourceLimit(&rl, CUR_PROCESS_HANDLE))) {
+        ResourceLimitType names[] = {RESLIMIT_THREAD, RESLIMIT_EVENT,        RESLIMIT_MUTEX,          RESLIMIT_SEMAPHORE,
+                                     RESLIMIT_TIMER,  RESLIMIT_SHAREDMEMORY, RESLIMIT_ADDRESSARBITER};
+        svcGetResourceLimitCurrentValues(n, rl, names, 7);
+        svcCloseHandle(rl);
+    }
+    const uint32_t low = g_heap_room_low == UINT32_MAX ? g_heap_room : g_heap_room_low;
+    std::snprintf(out, size,
+                  "[rt] system%s: free KiB app %u sys %u base %u linear %u heap %u, heap room %u low %u, heap refused "
+                  "%u (first %u B), threads %d events %d mutexes %d semaphores %d timers %d shmem %d arbiters %d, "
+                  "blocks %u",
+                  what, (unsigned)(osGetMemRegionFree(MEMREGION_APPLICATION) >> 10),
+                  (unsigned)(osGetMemRegionFree(MEMREGION_SYSTEM) >> 10),
+                  (unsigned)(osGetMemRegionFree(MEMREGION_BASE) >> 10), (unsigned)(linearSpaceFree() >> 10),
+                  (unsigned)((__ctru_heap_size - mi.uordblks) >> 10), (unsigned)(g_heap_room >> 10),
+                  (unsigned)(low >> 10), (unsigned)g_heap_refused, (unsigned)g_heap_refused_first, (int)n[0],
+                  (int)n[1], (int)n[2], (int)n[3], (int)n[4], (int)n[5], (int)n[6], memory_blocks());
+}
+
+// A refused heap growth, logged at once from the service call (every 50 ms),
+// not at the next heartbeat: a crash that follows may come sooner.
+void report_heap_refusals()
+{
+    static uint32_t reported = 0;
+    const uint32_t n = g_heap_refused;
+    if (n == reported)
+        return;
+    reported = n;
+    char line[160];
+    std::snprintf(line, sizeof line, "[rt] host heap: growth refused %u times (first %u B), room %u KiB",
+                  (unsigned)n, (unsigned)g_heap_refused_first, (unsigned)(g_heap_room >> 10));
+    logline(line);
 }
 
 // One of the heartbeat's lines: written with the rest at its end.
@@ -1624,6 +1706,10 @@ int main()
                       sc.used >> 10, sc.limit >> 10, sc.sprites, w.inserted, w.evicted, w.decodes, w.decode_ms);
         logline_held(line);
         profiler_heartbeat(m, sc);
+        char sys[320];
+        system_line(sys, sizeof sys, "");
+        logline_held(sys);
+        g_heap_room_low = UINT32_MAX;   // "low": since this heartbeat
         log_flush();   // the heartbeat's lines, in one write
     };
     // Sound through ds_emul into the DSP (ctr_audio.cpp), mixed on another core.
@@ -1652,6 +1738,11 @@ int main()
         game::install_automap_capture(c);   // the bottom screen's MAP tab
     };
     opt.video_audio = d2rt::audio::video_sink();
+    opt.video_event = [](const char *what) {
+        char sys[320];
+        system_line(sys, sizeof sys, std::strcmp(what, "open") ? " at video close" : " at video open");
+        logline(sys);
+    };
     opt.log = [](const char *s) {
         char line[600];
         std::snprintf(line, sizeof line, "[rt] %s", s);
@@ -1669,7 +1760,10 @@ int main()
     };
     opt.present = present;
     opt.poll_input = poll;
-    opt.service = [] { apt_service(); };
+    opt.service = [] {
+        apt_service();
+        report_heap_refusals();
+    };
     opt.io_start = start_io_thread;
     opt.io_wait = [] { LightEvent_Wait(&g_io_event); };
     opt.io_wake = [] { LightEvent_Signal(&g_io_event); };

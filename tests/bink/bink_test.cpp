@@ -2,12 +2,12 @@
 // FFmpeg writes for the same file, so the two can be compared byte for byte
 // (tests/bink/compare.sh):
 //
-//   bink_test <file.bik> [-v <out.yuv>] [-a <out.f32>] [-n <frames>]
+//   bink_test <file.bik> [-v <out.yuv>] [-a <out.s16>] [-n <frames>]
 //
 // -v: every frame as raw yuv420p, cropped to the picture size
 //     (ffmpeg -i f.bik -f rawvideo -pix_fmt yuv420p).
-// -a: the first audio track as interleaved 32-bit float
-//     (ffmpeg -i f.bik -map 0:a:0 -f f32le).
+// -a: the first audio track as interleaved 16-bit samples
+//     (ffmpeg -i f.bik -map 0:a:0 -f s16le).
 // Always prints the header and the decode time per frame (video, audio:
 // average and worst), which on the qemu ARM11 lane is the CPU-bound measure.
 #include "game/bink/bink_audio.h"
@@ -34,7 +34,7 @@ double now_ms()
 int main(int argc, char **argv)
 {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: %s <file.bik> [-v out.yuv] [-a out.f32] [-n frames]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <file.bik> [-v out.yuv] [-a out.s16] [-n frames]\n", argv[0]);
         return 2;
     }
     const char *yuv_path = nullptr, *pcm_path = nullptr;
@@ -67,7 +67,7 @@ int main(int argc, char **argv)
     FILE *pcm = pcm_path ? std::fopen(pcm_path, "wb") : nullptr;
     const uint32_t frames = limit && limit < h.frames ? limit : h.frames;
     double video_ms = 0, video_worst = 0, audio_ms = 0, audio_worst = 0;
-    std::vector<float> samples;
+    std::vector<int16_t> samples;
     int failures = 0;
     for (uint32_t i = 0; i < frames; i++) {
         bink::File::Packet p;
@@ -84,7 +84,7 @@ int main(int argc, char **argv)
             audio_ms += dt;
             audio_worst = dt > audio_worst ? dt : audio_worst;
             if (pcm)
-                std::fwrite(samples.data(), sizeof(float), samples.size(), pcm);
+                std::fwrite(samples.data(), sizeof(int16_t), samples.size(), pcm);
         }
         const double t0 = now_ms();
         if (!video.decode(p.video, p.video_size) && failures++ < 10)

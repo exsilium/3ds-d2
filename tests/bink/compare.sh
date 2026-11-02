@@ -51,18 +51,19 @@ c++ -std=gnu++17 -O2 -Wall -Wextra -Wno-unused-parameter -I"$ROOT/src" -o "$OUT/
 fail=0
 for f in "$SRC"/*.bik; do
     b="$(basename "$f" .bik)"
-    "$OUT/bink_test" "$f" -v "$OUT/ours.yuv" -a "$OUT/ours.f32" > "$OUT/$b.txt"
+    "$OUT/bink_test" "$f" -v "$OUT/ours.yuv" -a "$OUT/ours.s16" > "$OUT/$b.txt"
     ffmpeg -v error -i "$f" -map 0:v:0 -f rawvideo -pix_fmt yuv420p -y "$OUT/ref.yuv"
-    ffmpeg -v error -i "$f" -map 0:a:0 -f f32le -y "$OUT/ref.f32"
+    ffmpeg -v error -i "$f" -map 0:a:0 -f s16le -y "$OUT/ref.s16"
     if cmp -s "$OUT/ours.yuv" "$OUT/ref.yuv"; then video=identical; else video=DIFFERENT; fail=1; fi
-    audio="$(python3 -I - "$OUT/ours.f32" "$OUT/ref.f32" <<'EOF'
+    audio="$(python3 -I - "$OUT/ours.s16" "$OUT/ref.s16" <<'EOF'
 import array, sys
-a, b = array.array('f'), array.array('f')
+# The decoder is fixed point, FFmpeg's float: a step or two of rounding apart.
+a, b = array.array('h'), array.array('h')
 a.frombytes(open(sys.argv[1], 'rb').read())
 b.frombytes(open(sys.argv[2], 'rb').read())
-d = max((abs(x - y) for x, y in zip(a, b)), default=0.0)
-ok = len(a) == len(b) and d <= 1e-5
-print('%s (%d samples, max diff %.2g)' % ('ok' if ok else 'DIFFERENT', len(a), d))
+d = max((abs(x - y) for x, y in zip(a, b)), default=0)
+ok = len(a) == len(b) and d <= 2
+print('%s (%d samples, max diff %d)' % ('ok' if ok else 'DIFFERENT', len(a), d))
 EOF
 )"
     case "$audio" in ok*) ;; *) fail=1 ;; esac
@@ -70,5 +71,5 @@ EOF
     speed="$(sed -n 's/^video: \([0-9.]*\) ms.*/\1/p' "$OUT/$b.txt")"
     printf '%-24s %5s frames  video %-9s  audio %s  (%s ms/frame here)\n' "$b" "$frames" "$video" "$audio" "$speed"
 done
-rm -f "$OUT/ours.yuv" "$OUT/ref.yuv" "$OUT/ours.f32" "$OUT/ref.f32"
+rm -f "$OUT/ours.yuv" "$OUT/ref.yuv" "$OUT/ours.s16" "$OUT/ref.s16"
 [ "$fail" = 0 ] && echo "PASS: every frame byte-identical, audio within tolerance" || { echo "FAIL"; exit 1; }

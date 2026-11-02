@@ -117,6 +117,8 @@ The screen lists what would be sent:
 
 Save files and character names are never sent.
 
+In Sentry, reports are grouped by what happened, not by your description, so the same crash lands in one issue however it's described. The groups: a crash the app caught (the fault, and where in Game.exe); a Luma3DS dump (the crashed process and exception, and outside 3ds-d2 its address); a fatal error by its kind; a session that didn't end; a report you asked for. Your description goes with each report as its `note`.
+
 On a report's screen:
 
 - **A** sends it over Wi-Fi to the project's [Sentry](https://sentry.io) account. Sentry's ID for it is shown, and kept in the report's folder (`sent.txt`).

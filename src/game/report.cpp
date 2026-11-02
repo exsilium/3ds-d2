@@ -289,7 +289,93 @@ std::pair<std::string, std::string> exception_of(const std::string &line)
     return {"FATAL", line};
 }
 
+std::string hex32(uint32_t v)
+{
+    char s[12];
+    std::snprintf(s, sizeof s, "%08x", (unsigned)v);
+    return s;
+}
+
+// A tag's value: one line, at most Sentry's 200 characters, cut at a
+// character boundary (UTF-8).
+std::string tag_value(const std::string &s)
+{
+    std::string o;
+    for (char c : s)
+        o += (c == '\n' || c == '\r' || c == '\t') ? ' ' : c;
+    if (o.size() > 200) {
+        size_t n = 200;
+        while (n && ((unsigned char)o[n] & 0xC0) == 0x80)
+            n--;
+        o.resize(n);
+    }
+    return o;
+}
+
 }  // namespace
+
+const char *LumaDump::type_name() const
+{
+    static const char *const kNames[] = {"FIQ", "undefined instruction", "prefetch abort", "data abort"};
+    return type < 4 ? kNames[type] : "exception";
+}
+
+bool parse_luma_dump(const std::string &data, LumaDump &out)
+{
+    const auto u16 = [&](size_t at) { return (uint32_t)(uint8_t)data[at] | (uint32_t)(uint8_t)data[at + 1] << 8; };
+    const auto u32 = [&](size_t at) { return u16(at) | u16(at + 2) << 16; };
+    if (data.size() < 0x28 || u32(0) != 0xDEADC0DEu || u32(4) != 0xDEADCAFEu)
+        return false;
+    const uint32_t regs = u32(0x18), code = u32(0x1c), stack = u32(0x20), extra = u32(0x24);
+    if (regs < 20 * 4)
+        return false;
+    LumaDump d;
+    d.core = u16(0x0e);
+    d.type = u32(0x10);
+    // r0-r12, sp, lr, pc, cpsr, dfsr, ifsr, far, ...
+    d.pc = u32(0x28 + 15 * 4);
+    d.lr = u32(0x28 + 14 * 4);
+    d.fsr = u32(0x28 + (d.type == 3 ? 17 : 18) * 4);
+    d.far = u32(0x28 + 19 * 4);
+    const uint64_t at = 0x28ull + regs + code + stack;
+    if (extra >= 16 && at + 16 <= data.size()) {
+        const std::string name = data.substr((size_t)at, 8);
+        d.process = name.substr(0, name.find('\0'));
+        d.title = (uint64_t)u32((size_t)at + 8) | (uint64_t)u32((size_t)at + 12) << 32;
+    }
+    out = d;
+    return true;
+}
+
+std::vector<std::string> fingerprint_of(const Event &e)
+{
+    for (const std::string &l : e.crash_lines) {
+        if (l.compare(0, 7, "crash: ") != 0)
+            continue;
+        // The app's own handler caught it: the fault's kind, and the guest
+        // block it hit, if in translated code (Game.exe's addresses do not
+        // move between builds; the host's do).
+        const std::string kind = exception_of(l).first;
+        static const char kBlock[] = "in translated guest code, block ";
+        for (const std::string &g : e.crash_lines) {
+            const size_t at = g.find(kBlock);
+            if (at != std::string::npos)
+                return {"cpu-exception", kind, "guest " + g.substr(at + sizeof kBlock - 1, 8)};
+        }
+        return {"cpu-exception", kind, "host"};
+    }
+    if (e.have_dump) {
+        const LumaDump &d = e.dump;
+        if (d.process == "3ds-d2")   // its pc moves with every build
+            return {"luma-dump", d.process, d.type_name(), d.in_kernel() ? "kernel" : "app"};
+        return {"luma-dump", d.process.empty() ? "unknown" : d.process, d.type_name(), hex32(d.pc)};
+    }
+    if (!e.crash_lines.empty())
+        return {"fatal", exception_of(e.crash_lines[0]).first};
+    if (e.player_report)
+        return {"player-report"};
+    return {"session", e.reason};
+}
 
 std::string event_json(const Event &e)
 {
@@ -302,9 +388,26 @@ std::string event_json(const Event &e)
         o += ",\"release\":" + json_string(e.release);
     if (!e.dist.empty())
         o += ",\"dist\":" + json_string(e.dist);
-    // The player's words are the message; without them, the reason.
-    o += ",\"message\":{\"formatted\":" + json_string(e.message.empty() ? e.reason : e.message) + "}";
-    if (!e.crash_lines.empty()) {
+    // The title is what happened (the reason, or the exception below); the
+    // player's words go along as context (issue #61). They were the
+    // message, and every wording became an issue of its own in Sentry.
+    o += ",\"message\":{\"formatted\":" + json_string(e.reason) + "}";
+    const std::vector<std::string> fingerprint = fingerprint_of(e);
+    o += ",\"fingerprint\":[";
+    for (size_t i = 0; i < fingerprint.size(); i++)
+        o += (i ? "," : "") + json_string(fingerprint[i]);
+    o += "]";
+    const bool caught = std::any_of(e.crash_lines.begin(), e.crash_lines.end(),
+                                    [](const std::string &l) { return l.compare(0, 7, "crash: ") == 0; });
+    if (!caught && e.have_dump) {
+        const LumaDump &d = e.dump;
+        char value[160];
+        std::snprintf(value, sizeof value, "%s (title %016llx), core %u: pc %08x, lr %08x, far %08x, fsr %08x",
+                      d.process.empty() ? "unknown process" : d.process.c_str(), (unsigned long long)d.title,
+                      (unsigned)d.core, (unsigned)d.pc, (unsigned)d.lr, (unsigned)d.far, (unsigned)d.fsr);
+        o += ",\"exception\":{\"values\":[{\"type\":" + json_string(std::string("Luma3DS dump: ") + d.type_name()) +
+             ",\"value\":" + json_string(value) + "}]}";
+    } else if (!e.crash_lines.empty()) {
         // The first `crash:` line names the fault; otherwise the first line.
         size_t first = 0;
         for (size_t i = 0; i < e.crash_lines.size(); i++)
@@ -316,8 +419,13 @@ std::string event_json(const Event &e)
         o += ",\"exception\":{\"values\":[{\"type\":" + json_string(ex.first) + ",\"value\":" + json_string(ex.second) +
              "}]}";
     }
-    o += ",\"tags\":" + json_object(e.tags);
+    std::vector<std::pair<std::string, std::string>> tags = e.tags;
+    if (!e.note.empty())
+        tags.push_back({"note", tag_value(e.note)});   // searchable, and shown in the event list
+    o += ",\"tags\":" + json_object(tags);
     o += ",\"contexts\":{\"device\":" + json_object(e.device);
+    if (!e.note.empty())
+        o += ",\"report\":{\"type\":\"report\",\"note\":" + json_string(e.note) + "}";
     if (e.have_figures) {
         const LogSummary::Figures &f = e.figures;
         o += ",\"session\":{\"type\":\"session\",\"seconds\":" + std::to_string(f.seconds) +

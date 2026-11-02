@@ -652,11 +652,20 @@ bool build_envelope(const Host &host, const Offer &o, const game::report::Dsn &d
     if (!version.empty())
         e.release = "3ds-d2@" + version;
     e.dist = o.build;
-    e.message = o.note;
+    e.note = o.note;
+    e.player_report = asked;
     e.reason = "Session: " + o.reason + ".";
     e.crash_lines = o.log.crash_lines();
     e.figures = o.log.figures();
     e.have_figures = e.figures.seconds != 0;
+    // The first Luma3DS dump titles and groups a crash the app did not catch (issue #61).
+    for (const std::string &d : o.dumps) {
+        std::string bytes;
+        if (read_all(o.dir + "/" + d, bytes) && r::parse_luma_dump(bytes, e.dump)) {
+            e.have_dump = true;
+            break;
+        }
+    }
 
     u8 model = 0xFF, region = 0xFF;
     if (R_SUCCEEDED(cfguInit())) {

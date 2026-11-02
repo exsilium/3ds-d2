@@ -492,10 +492,10 @@ The cache count drops because a DCC group's file bytes are no longer counted. Th
 
 ### Going East: the HOME Menu or the kernel goes down (issue #24, 2026-11-01)
 
-Three times in four runs on build `2d5e1c8c7799`, travelling East from the Rogue Encampment stopped the console just as the Act II cinematic opened. It happened after 1 to 17 minutes of play, with or without HOME use or the profiler. Each run's log ends with `cinematic: 640x292, 4604 frames at 24/1 fps, sound on`, and no video frame reached the screen. Luma3DS saved a dump each time, and none was of the app's own code:
+Three times in four runs on build `2d5e1c8c7799`, travelling East from the Rogue Encampment stopped the console just as the Act II cinematic opened. It happened after 1 to 17 minutes of play, with or without HOME use or the profiler. Each run's log ends with `cinematic: 640x292, 4604 frames at 24/1 fps, sound on`, and no video frame reached the screen. Luma3DS saved a dump each time, and none was of the app's own code. (The reports are all in Sentry issue 3DS-D2-K, one event each: below by the first 8 characters of the event ID.)
 
-- **3DS-D2-K and 3DS-D2-P:** the HOME Menu (`0004003000009802`) stopped itself at `pc 00136f28` (a breakpoint, IFSR 2), called from `lr 00231770`, with the same registers both times. The #6 dumps stop at the same `pc`, called from `00164200` after a failed open of the shared extdata `0xF000000B`.
-- **3DS-D2-M:** the kernel, in the app's process: a data abort in SVC mode at `ffff01c0`, writing to its own stack (`far` = `sp` = `ff564fe8`, DFSR `0x807`), a thread's kernel stack page not mapped.
+- **Events `6efc39ff` and `139105eb`:** the HOME Menu (`0004003000009802`) stopped itself at `pc 00136f28` (a breakpoint, IFSR 2), called from `lr 00231770`, with the same registers both times. The #6 dumps stop at the same `pc`, called from `00164200` after a failed open of the shared extdata `0xF000000B`.
+- **Event `6b6866d9`:** the kernel, in the app's process: a data abort in SVC mode at `ffff01c0`, writing to its own stack (`far` = `sp` = `ff564fe8`, DFSR `0x807`), a thread's kernel stack page not mapped.
 
 The same video played normally from the main menu's Cinematics screen. A build that logged each of the cinematic's first 150 turns (`diag/cinematic-crash`, A) went East without a crash, and so did one of the four runs of `2d5e1c8c7799`. The diagnostic build's log showed the system unchanged through the session (system region 81,592 KiB free, base 11,588, 7 threads, 23 memory blocks) and every DSP submission valid. The tight resource was the host heap: 3.9 MiB free when the Act II video opened, 1.8 MiB while it played. The video takes about 2.1 MiB of it, and the crashing runs had 2.3 to 3.6 MiB free at their last heartbeat.
 
@@ -510,14 +510,14 @@ The memory was never the cause. One diagnostic build at a time (each on its own 
 
 | Build | What it changed | Going East |
 | --- | --- | --- |
-| `19c706b9252b` | the `system:` lines (#55) | crashed (3DS-D2-Q: the kernel, while handing a CPU exception to the app's handler) |
-| `fda265d25bc4` | no CPU exception handler | crashed (3DS-D2-R: libctru's ndsp thread, its stack's section unmapped) |
-| `3ee496108740` | the JIT's data-cache sync by range (0x54), not Luma's whole-cache 0x92 | crashed (the GSP event thread, the same) |
+| `19c706b9252b` | the `system:` lines (#55) | crashed (event `60052bcd`: the kernel, while handing a CPU exception to the app's handler) |
+| `fda265d25bc4` | no CPU exception handler | crashed (event `3c1db5ad`: libctru's ndsp thread, its stack's section unmapped) |
+| `3ee496108740` | the JIT's data-cache sync by range (0x54), not Luma's whole-cache 0x92 | crashed (event `3f71a63e`: the GSP event thread, the same) |
 | `9c633450ebb6` | cinematics silent | 3/3 fine |
-| `b47a526c2e0f` | soundtrack decoded, never sent to the DSP | crashed (3DS-D2-V: the mixer thread, the same) |
-| `7fbe81968620` | every map/unmap/protect call and address-space change logged | crashed (3DS-D2-W): no such call, no change |
+| `b47a526c2e0f` | soundtrack decoded, never sent to the DSP | crashed (event `f4b26192`: the mixer thread, the same) |
+| `7fbe81968620` | every map/unmap/protect call and address-space change logged | crashed (event `75017432`): no such call, no change |
 | `60d7ede07898` | soundtrack read, not decoded | 3/3 fine |
-| `0fc4e3eb00ef` | the decoder in RunFast (the guest's FPSCR was RunFast already: `83000010`) | ended without a dump (3DS-D2-X) |
+| `0fc4e3eb00ef` | the decoder in RunFast (the guest's FPSCR was RunFast already: `83000010`) | ended without a dump (event `ef8ac7ad`) |
 | `7822fd1577fb` | 2 ms of integer work per packet in the decoder's place | 4/4 fine with 30 s of video |
 
 So the trigger was the soundtrack decoder's floating point on the game's thread, in game. Its memory use was clean (AddressSanitizer and UndefinedBehaviorSanitizer over the whole Act II file), and the heap was never short (`heap_refused` 0, 3 MiB free). The audio decoder is now fixed point ([cinematics.md](cinematics.md#decoder-correctness)). What links floating point to page tables found damaged across the system was not found.

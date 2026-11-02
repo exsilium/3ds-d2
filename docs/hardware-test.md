@@ -91,7 +91,7 @@ Logs are on the SD card in `3ds/3ds-d2/logs/`: `game.log` for the runtime, and `
 | Heap at a chosen address (0x0D000000) | refused | heap at 0x08000000, its normal place |
 | Heap of "everything left" | refused above 95 MiB (`e0e01bfd`): the heap window ends at 0x0E000000 | steps down 4 MiB at a time; the 63 MiB layout fits |
 | `MEMOP_PROT` to RWX on JIT memory | rc 0, but `svcQueryMemory` still reports RW (3) | success = rc 0, the query is only logged |
-| Cache sync by address (0x54 / Luma 0x93) on those pages | kernel data abort: instruction-cache maintenance fault at the block's address | Luma's whole-cache SVCs (0x92 + 0x94) on hardware |
+| Cache sync by address (0x54 / Luma 0x93) on those pages | kernel data abort: instruction-cache maintenance fault at the block's address | the data cache by range through the stock 0x54, the instruction cache whole (Luma 0x94); Luma's whole-cache 0x92 only if 0x54 is refused |
 
 Translated code lives in a 16 MiB static pool in `.bss`. That keeps it out of the heap window and uses budget the heap cannot reach.
 

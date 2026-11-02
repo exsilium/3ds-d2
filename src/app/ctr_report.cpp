@@ -617,8 +617,9 @@ void session_window(const Offer &o, uint64_t &from, uint64_t &to)
 bool in_window(const ShotPair &p, uint64_t from, uint64_t to) { return from && p.time >= from && p.time <= to; }
 
 // What can be attached, newest first: the game's pairs still on the card,
-// and Luma3DS's taken during the session. Never the Camera album as such.
-std::vector<ShotPair> shot_choices(uint64_t from, uint64_t to)
+// and all of Luma3DS's (the session's are marked in the list). Never the
+// Camera album as such.
+std::vector<ShotPair> shot_choices()
 {
     std::string text;
     read_all(kShotList, text);
@@ -626,9 +627,8 @@ std::vector<ShotPair> shot_choices(uint64_t from, uint64_t to)
     for (const ShotPair &p : game::report::parse_shot_list(text))
         if (exists(p.top))
             out.push_back(p);
-    if (from)
-        for (const ShotPair &p : game::report::luma_pairs(kLumaShots, list_dir(kLumaShots), from, to))
-            out.push_back(p);
+    for (const ShotPair &p : game::report::luma_pairs(kLumaShots, list_dir(kLumaShots), 0, UINT64_MAX))
+        out.push_back(p);
     std::sort(out.begin(), out.end(), [](const ShotPair &a, const ShotPair &b) {
         return a.time != b.time ? a.time > b.time : a.ms > b.ms;
     });
@@ -692,7 +692,7 @@ void pick_shots(const Host &host, Offer &o)
 {
     uint64_t from, to;
     session_window(o, from, to);
-    const std::vector<ShotPair> all = shot_choices(from, to);
+    const std::vector<ShotPair> all = shot_choices();
     std::vector<ShotPair> chosen;
     for (const ShotPair &p : o.shots)   // those still on the card
         if (std::find(all.begin(), all.end(), p) != all.end())

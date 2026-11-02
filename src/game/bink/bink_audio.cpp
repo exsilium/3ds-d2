@@ -1,8 +1,9 @@
-// Bink audio decoder, RDFT variant (see bink_audio.h).
+// Bink audio decoder, RDFT variant, in fixed point (see bink_audio.h).
 #include "game/bink/bink_audio.h"
 
+#include "game/bink/bink_audio_tables.h"
+
 #include <algorithm>
-#include <cmath>
 #include <cstring>
 
 namespace bink {
@@ -16,12 +17,45 @@ const int kBandEdges[25] = {100,  200,  300,  400,  510,  630,  770,  920,  1080
 // Lengths (in groups of 8 coefficients) of a run sharing one bit width.
 const uint8_t kRunGroups[16] = {2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 32, 64};
 
-// A 29-bit float: 5-bit exponent, 23-bit mantissa, sign.
-float read_float(BitReader &br)
+constexpr uint64_t kInvSqrt2Q24 = 11863283;   // round(2^24 / sqrt(2))
+// A coefficient's bound: 8 times full scale, far above what a sound file
+// holds; a damaged packet's values stay short of 64-bit products overflowing.
+constexpr int64_t kLimit = (int64_t)1 << 28;
+
+// sin and cos of 2 pi a / 4096, Q30.
+int32_t sin_q30(int a)
 {
-    const int power = (int)br.bits(5);
-    const float f = std::ldexp((float)br.bits(23), power - 23);
-    return br.bit() ? -f : f;
+    a &= 4095;
+    if (a < 1024)
+        return kSinQ30[a];
+    if (a < 2048)
+        return kSinQ30[2048 - a];
+    if (a < 3072)
+        return -kSinQ30[a - 2048];
+    return -kSinQ30[4096 - a];
+}
+int32_t cos_q30(int a) { return sin_q30(a + 1024); }
+
+// v * 2^s, rounded to nearest when s < 0.
+int64_t shift_round(int64_t v, int s)
+{
+    return s >= 0 ? v * ((int64_t)1 << s) : (v + ((int64_t)1 << (-s - 1))) >> -s;
+}
+
+int32_t clamp_coeff(int64_t v) { return (int32_t)std::max(-kLimit, std::min(kLimit, v)); }
+
+// Sums wrap rather than overflow (only a damaged packet comes near).
+int32_t add(int32_t a, int32_t b) { return (int32_t)((uint32_t)a + (uint32_t)b); }
+int32_t sub(int32_t a, int32_t b) { return (int32_t)((uint32_t)a - (uint32_t)b); }
+
+// a * c - b * s and a * s + b * c with Q30 c and s: a rotation.
+int32_t rot_re(int32_t a, int32_t b, int32_t c, int32_t s)
+{
+    return (int32_t)(((int64_t)a * c - (int64_t)b * s + (1 << 29)) >> 30);
+}
+int32_t rot_im(int32_t a, int32_t b, int32_t c, int32_t s)
+{
+    return (int32_t)(((int64_t)a * s + (int64_t)b * c + (1 << 29)) >> 30);
 }
 
 }  // namespace
@@ -31,18 +65,28 @@ bool AudioDecoder::init(uint32_t rate, uint32_t channels, bool dct)
     release();
     if (dct || !rate || rate > 96000 || channels < 1 || channels > 2)
         return false;
-    rate_ = rate;
-    channels_ = channels;
     // Stereo is one interleaved signal at twice the rate, in frames twice as long.
     int bits = rate < 22050 ? 9 : rate < 44100 ? 10 : 11;
     if (channels == 2)
         bits++;
+    if (bits > 12)
+        return false;   // the sine table covers frames up to 4096
+    rate_ = rate;
+    channels_ = channels;
     const uint32_t signal_rate = rate * channels;
     frame_len_ = 1 << bits;
     overlap_ = frame_len_ / 16;
-    const float root = (float)(2.0 / (std::sqrt((double)frame_len_) * 32768.0));
-    for (int i = 0; i < 96; i++)   // steps of 0.6640 dB
-        quant_table_[i] = std::exp((float)i * 0.15289164787221953823f) * root;
+    overlap_shift_ = bits - 4;
+    // The format's scale, 2 / (sqrt(frame_len) * 32768) of a sample, is
+    // 2^(kFrac + 1) / sqrt(frame_len) in the signal's units.
+    raw_shift_ = kFrac + 1 - bits / 2;
+    raw_odd_ = bits & 1;
+    for (int i = 0; i < 96; i++) {   // steps of 0.6640 dB
+        int64_t q = (int64_t)(kExpQ40[i] >> 24);   // Q16
+        if (raw_odd_)
+            q = (int64_t)(((uint64_t)q * kInvSqrt2Q24 + (1u << 23)) >> 24);
+        quant_table_[i] = shift_round(q, raw_shift_);
+    }
     const int half = (int)((signal_rate + 1) / 2);
     for (bands_count_ = 1; bands_count_ < 25; bands_count_++)
         if (half <= kBandEdges[bands_count_ - 1])
@@ -53,22 +97,22 @@ bool AudioDecoder::init(uint32_t rate, uint32_t channels, bool dct)
     bands_[bands_count_] = frame_len_;
     first_ = true;
 
-    coeffs_.assign((size_t)frame_len_, 0.0f);
-    previous_.assign((size_t)overlap_, 0.0f);
+    coeffs_.assign((size_t)frame_len_, 0);
+    previous_.assign((size_t)overlap_, 0);
     const int m = frame_len_ / 2;
-    re_.assign((size_t)m, 0.0f);
-    im_.assign((size_t)m, 0.0f);
+    re_.assign((size_t)m, 0);
+    im_.assign((size_t)m, 0);
     cos_.resize((size_t)m / 2);
     sin_.resize((size_t)m / 2);
-    for (int j = 0; j < m / 2; j++) {
-        cos_[(size_t)j] = (float)std::cos(2.0 * M_PI * j / m);
-        sin_[(size_t)j] = (float)std::sin(2.0 * M_PI * j / m);
+    for (int j = 0; j < m / 2; j++) {   // 2 pi j / m
+        cos_[(size_t)j] = cos_q30(j * (4096 / m));
+        sin_[(size_t)j] = sin_q30(j * (4096 / m));
     }
     post_cos_.resize((size_t)m);
     post_sin_.resize((size_t)m);
-    for (int k = 0; k < m; k++) {
-        post_cos_[(size_t)k] = (float)std::cos(2.0 * M_PI * k / frame_len_);
-        post_sin_[(size_t)k] = (float)std::sin(2.0 * M_PI * k / frame_len_);
+    for (int k = 0; k < m; k++) {   // 2 pi k / frame_len
+        post_cos_[(size_t)k] = cos_q30(k * (4096 / frame_len_));
+        post_sin_[(size_t)k] = sin_q30(k * (4096 / frame_len_));
     }
     bitrev_.resize((size_t)m);
     for (int i = 0, lg = bits - 1; i < m; i++) {
@@ -84,8 +128,20 @@ void AudioDecoder::release()
 {
     rate_ = channels_ = 0;
     for (auto *v : {&coeffs_, &previous_, &cos_, &sin_, &post_cos_, &post_sin_, &re_, &im_})
-        std::vector<float>().swap(*v);
+        std::vector<int32_t>().swap(*v);
     std::vector<uint16_t>().swap(bitrev_);
+}
+
+// A raw spectral value, a 29-bit float (5-bit exponent, 23-bit mantissa,
+// sign), at the format's scale.
+int32_t AudioDecoder::read_raw(BitReader &br) const
+{
+    const int power = (int)br.bits(5);
+    uint64_t v = (uint64_t)br.bits(23) << 16;   // Q16
+    if (raw_odd_)
+        v = (v * kInvSqrt2Q24 + (1u << 23)) >> 24;
+    const int64_t x = clamp_coeff(shift_round(shift_round((int64_t)v, power - 23 + raw_shift_), -16));
+    return br.bit() ? -(int32_t)x : (int32_t)x;
 }
 
 // x[0..n) from its spectrum in x: x[0] = DC, x[1] = Nyquist, then (re, im)
@@ -93,72 +149,78 @@ void AudioDecoder::release()
 //   x[t] = 1/2 (X0 + (-1)^t X(n/2)) + sum_k (re_k cos(2 pi k t / n) + im_k sin(2 pi k t / n))
 // as one complex inverse FFT of n/2 points: the even samples come out as
 // its real part, the odd ones as its imaginary part.
-void AudioDecoder::inverse_rdft(float *x)
+void AudioDecoder::inverse_rdft(int32_t *x)
 {
     const int n = frame_len_, m = n / 2;
-    float *re = re_.data(), *im = im_.data();
+    int32_t *re = re_.data(), *im = im_.data();
     for (int k = 0; k < m; k++) {
         // Y_k = re_k - i im_k; A = Y_k + conj(Y_(m-k)); B = (Y_k - conj(Y_(m-k))) e^(2 pi i k / n).
-        float ar, ai, dr, di;
+        int32_t ar, ai, dr, di;
         if (k == 0) {
-            ar = x[0] + x[1], ai = 0.0f;
-            dr = x[0] - x[1], di = 0.0f;
+            ar = add(x[0], x[1]), ai = 0;
+            dr = sub(x[0], x[1]), di = 0;
         } else {
-            const float yr = x[2 * k], yi = -x[2 * k + 1];
-            const float zr = x[2 * (m - k)], zi = x[2 * (m - k) + 1];   // conj(Y_(m-k))
-            ar = yr + zr, ai = yi + zi;
-            dr = yr - zr, di = yi - zi;
+            const int32_t yr = x[2 * k], yi = sub(0, x[2 * k + 1]);
+            const int32_t zr = x[2 * (m - k)], zi = x[2 * (m - k) + 1];   // conj(Y_(m-k))
+            ar = add(yr, zr), ai = add(yi, zi);
+            dr = sub(yr, zr), di = sub(yi, zi);
         }
-        const float c = post_cos_[(size_t)k], s = post_sin_[(size_t)k];
-        const float br = dr * c - di * s, bi = dr * s + di * c;
+        const int32_t c = post_cos_[(size_t)k], s = post_sin_[(size_t)k];
+        const int32_t br = rot_re(dr, di, c, s), bi = rot_im(dr, di, c, s);
         const int at = bitrev_[(size_t)k];
-        re[at] = ar - bi;   // Z = A + iB
-        im[at] = ai + br;
+        re[at] = sub(ar, bi);   // Z = A + iB
+        im[at] = add(ai, br);
     }
     for (int len = 2; len <= m; len <<= 1) {
         const int half = len / 2, step = m / len;
         for (int i = 0; i < m; i += len)
             for (int j = 0; j < half; j++) {
-                const float wr = cos_[(size_t)(j * step)], wi = sin_[(size_t)(j * step)];
-                float *ur = re + i + j, *ui = im + i + j, *vr = ur + half, *vi = ui + half;
-                const float tr = *vr * wr - *vi * wi, ti = *vr * wi + *vi * wr;
-                *vr = *ur - tr, *vi = *ui - ti;
-                *ur += tr, *ui += ti;
+                const int32_t wr = cos_[(size_t)(j * step)], wi = sin_[(size_t)(j * step)];
+                int32_t *ur = re + i + j, *ui = im + i + j, *vr = ur + half, *vi = ui + half;
+                const int32_t tr = rot_re(*vr, *vi, wr, wi), ti = rot_im(*vr, *vi, wr, wi);
+                *vr = sub(*ur, tr), *vi = sub(*ui, ti);
+                *ur = add(*ur, tr), *ui = add(*ui, ti);
             }
     }
     for (int t = 0; t < m; t++) {
-        x[2 * t] = 0.5f * re[t];
-        x[2 * t + 1] = 0.5f * im[t];
+        x[2 * t] = re[t] >> 1;
+        x[2 * t + 1] = im[t] >> 1;
     }
 }
 
-bool AudioDecoder::decode_block(BitReader &br, std::vector<float> &out)
+bool AudioDecoder::decode_block(BitReader &br, std::vector<int16_t> &out)
 {
-    float *c = coeffs_.data();
-    const float root = quant_table_[0];
-    c[0] = read_float(br) * root;
-    c[1] = read_float(br) * root;
-    float quant[25];
+    int32_t *c = coeffs_.data();
+    c[0] = read_raw(br);
+    c[1] = read_raw(br);
+    // Steps, not their values: copying int64_t values, GCC goes through VFP
+    // registers, and this decoder keeps off the FPU altogether.
+    uint8_t quant[25];
     for (int i = 0; i < bands_count_; i++)
-        quant[i] = quant_table_[std::min<uint32_t>(br.bits(8), 95)];
+        quant[i] = (uint8_t)std::min<uint32_t>(br.bits(8), 95);
     int k = 0;
-    float q = quant[0];
+    int64_t q = quant_table_[quant[0]];
     for (int i = 2; i < frame_len_;) {
         int end = i + (br.bit() ? kRunGroups[br.bits(4)] * 8 : 8);
         end = std::min(end, frame_len_);
         const unsigned width = br.bits(4);
         if (!width) {
-            std::fill(c + i, c + end, 0.0f);
+            std::fill(c + i, c + end, 0);
             i = end;
             while (bands_[k] < i)
-                q = quant[k++];
+                q = quant_table_[quant[k++]];
             continue;
         }
         for (; i < end; i++) {
             if (bands_[k] == i)
-                q = quant[k++];
+                q = quant_table_[quant[k++]];
             const int v = (int)br.bits(width);
-            c[i] = v ? (br.bit() ? -q * (float)v : q * (float)v) : 0.0f;
+            if (!v) {
+                c[i] = 0;
+                continue;
+            }
+            const int32_t x = clamp_coeff(shift_round((int64_t)v * q, -16));
+            c[i] = br.bit() ? -x : x;
         }
     }
     if (br.overrun())
@@ -166,14 +228,20 @@ bool AudioDecoder::decode_block(BitReader &br, std::vector<float> &out)
     inverse_rdft(c);
     if (!first_)
         for (int i = 0; i < overlap_; i++)
-            c[i] = (previous_[(size_t)i] * (float)(overlap_ - i) + c[i] * (float)i) / (float)overlap_;
-    std::memcpy(previous_.data(), c + frame_len_ - overlap_, sizeof(float) * (size_t)overlap_);
+            c[i] = (int32_t)shift_round((int64_t)previous_[(size_t)i] * (overlap_ - i) + (int64_t)c[i] * i,
+                                        -overlap_shift_);
+    std::memcpy(previous_.data(), c + frame_len_ - overlap_, sizeof(int32_t) * (size_t)overlap_);
     first_ = false;
-    out.insert(out.end(), c, c + frame_len_ - overlap_);
+    const size_t at = out.size(), count = (size_t)(frame_len_ - overlap_);
+    out.resize(at + count);
+    for (size_t i = 0; i < count; i++) {
+        const int32_t s = (int32_t)shift_round(c[i], -kFrac);
+        out[at + i] = (int16_t)std::max<int32_t>(-32768, std::min<int32_t>(32767, s));
+    }
     return true;
 }
 
-bool AudioDecoder::decode(const uint8_t *data, size_t size, std::vector<float> &out)
+bool AudioDecoder::decode(const uint8_t *data, size_t size, std::vector<int16_t> &out)
 {
     if (!rate_ || size < 4)
         return false;

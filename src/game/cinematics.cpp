@@ -155,7 +155,6 @@ private:
     uint32_t next_read_ = 0, next_show_ = 0;
     bool decoded_ = false;       // frame next_show_ is decoded, waiting for its time
 
-    std::vector<float> decoded_audio_;
     std::vector<int16_t> pcm_;   // decoded, not yet taken by the platform
     size_t pcm_at_ = 0;
     uint64_t audio_written_ = 0; // frames given to the platform
@@ -168,7 +167,7 @@ private:
 
     // Statistics for the log.
     uint32_t shown_ = 0, dropped_ = 0;
-    double decode_ms_ = 0, decode_worst_ms_ = 0;
+    uint64_t decode_us_ = 0, decode_worst_us_ = 0;   // integers: no floating point on the game's thread (issue #24)
 };
 
 bool Session::open(const std::string &host, uint64_t offset)
@@ -202,15 +201,11 @@ bool Session::read_ahead()
     if (ring_count_ == kAhead || next_read_ >= frames_ || !file_.read_frame(next_read_, p))
         return false;
     if (audio_out_ && p.audio) {
-        decoded_audio_.clear();
-        if (audio_.decode(p.audio, p.audio_size, decoded_audio_)) {
-            pcm_.erase(pcm_.begin(), pcm_.begin() + (ptrdiff_t)pcm_at_);   // drop what the platform took
-            pcm_at_ = 0;
-            for (float s : decoded_audio_) {
-                const float v = s * 32768.0f;
-                pcm_.push_back((int16_t)(v >= 32767.0f ? 32767 : v <= -32768.0f ? -32768 : (int)(v + (v < 0 ? -0.5f : 0.5f))));
-            }
-        }
+        pcm_.erase(pcm_.begin(), pcm_.begin() + (ptrdiff_t)pcm_at_);   // drop what the platform took
+        pcm_at_ = 0;
+        const size_t had = pcm_.size();
+        if (!audio_.decode(p.audio, p.audio_size, pcm_))
+            pcm_.resize(had);   // a damaged packet: none of it
     }
     Queued &q = ring_[(ring_head_ + ring_count_) % kAhead];
     std::memcpy(q.data.data(), p.video, p.video_size);
@@ -247,9 +242,9 @@ bool Session::decode_next()
     Queued &q = ring_[ring_head_];
     const uint64_t t0 = wx86_now_us();   // host time: the guest clock may be virtual
     const bool ok = video_.decode(q.data.data(), q.size);
-    const double ms = (double)(wx86_now_us() - t0) / 1000.0;
-    decode_ms_ += ms;
-    decode_worst_ms_ = std::max(decode_worst_ms_, ms);
+    const uint64_t us = wx86_now_us() - t0;
+    decode_us_ += us;
+    decode_worst_us_ = std::max(decode_worst_us_, us);
     ring_head_ = (ring_head_ + 1) % kAhead;
     ring_count_--;
     return ok;
@@ -306,8 +301,10 @@ bool Session::poll_skip()
 int Session::finish(const char *how)
 {
     const uint32_t decoded = next_show_ + (decoded_ ? 1 : 0);
-    rt::logf("cinematic: %s at frame %u/%u: %u shown, %u dropped, decode %.2f ms/frame (worst %.2f)", how,
-             next_show_, frames_, shown_, dropped_, decoded ? decode_ms_ / decoded : 0.0, decode_worst_ms_);
+    const unsigned avg = decoded ? (unsigned)((decode_us_ / decoded + 5) / 10) : 0,   // hundredths of a ms
+        worst = (unsigned)((decode_worst_us_ + 5) / 10);
+    rt::logf("cinematic: %s at frame %u/%u: %u shown, %u dropped, decode %u.%02u ms/frame (worst %u.%02u)", how,
+             next_show_, frames_, shown_, dropped_, avg / 100, avg % 100, worst / 100, worst % 100);
     return -1;
 }
 

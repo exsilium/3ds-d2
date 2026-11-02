@@ -139,6 +139,8 @@ The oracle for the plan's M2 differential tests.
 | `armv7` | upstream as-is (ARMv7 + NEON) | `qemu-arm -cpu cortex-a9` (the Vita's CPU) | baseline |
 | `armv6` | the patch series in `tests/cpu/patches/armv6/` | `qemu-arm -cpu arm11mpcore` (the 3DS's CPU) | the port |
 
+Each variant is built in a work tree, `build/cpu/<variant>/winx86`: the submodule as commit `pristine`, then one commit per patch. Patches are edited there and written back with `make -C tests/cpu export VARIANT=armv6`. `tests/cpu/prepare.sh` prepares the tree again whenever the submodule's commit or the patch series changes (switching to a branch with other patches, a patch added, edited or removed), so a build always compiles its branch's series. It won't wipe a tree holding work that is not in the series (uncommitted changes, or commits not exported); it stops and says so. Before (#56), a tree was prepared once and kept, and a console-tested build carried a patch its branch didn't have.
+
 The ARM11 model faults on any ARMv7/NEON instruction, so an unported encoding cannot pass silently. **Acceptance criterion: the ARMv6 output is byte-identical to the ARMv7 baseline.** Run it with `scripts/docker.sh test cpu armv6`; a from-scratch build takes about a minute.
 
 **Status (2026-10-16): PASS.** All 8,187 cases are byte-identical to upstream on ARMv7, both in Box86's single-arena memory model (`guest + membase`, the model the 3DS uses).

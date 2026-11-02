@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Mon, 2 Nov 2026 07:56:29 +0000
+Subject: [PATCH] 3DS cache sync: the data cache by range through
+ svcFlushProcessDataCache
+
+Each newly translated block made the console clean and invalidate its
+whole data cache (Luma3DS custom SVC 0x92) and invalidate its whole
+instruction cache (0x94). The range variants were avoided because 0x93,
+the instruction-cache range invalidate, faults on the RWX code pages.
+
+The data side does not need the whole cache. The block is cleaned by
+range with the kernel stock svcFlushProcessDataCache (0x54); the
+instruction cache is still invalidated whole (0x94: an invalidate, with
+nothing to write back). On a New 3DS a sync went from about 90 us to
+about 25 us (ten sessions, about 22,000 syncs each), and it no longer
+cleans and invalidates every line of every process, as 0x92 did through
+the kernel range routine, entered past 0x54 own handler. 0x92 remains
+as the fallback if 0x54 is refused, logged once to stderr.
+---
+ src/dynarec86/shim/ctr/mman_ctr.c | 31 +++++++++++++++++++++++--------
+ 1 file changed, 23 insertions(+), 8 deletions(-)
+ mode change 100644 => 100755 src/dynarec86/shim/ctr/mman_ctr.c
+
+diff --git a/src/dynarec86/shim/ctr/mman_ctr.c b/src/dynarec86/shim/ctr/mman_ctr.c
+old mode 100644
+new mode 100755
+index aa9b406..890d03e
+--- a/src/dynarec86/shim/ctr/mman_ctr.c
++++ b/src/dynarec86/shim/ctr/mman_ctr.c
+@@ -262,8 +262,8 @@ static void svc_invalidate_entire_icache(void)
+ 
+ /* Cache maintenance counters (always on: one increment and two tick reads
+  * per newly translated block). A steady stream of these in play means the
+- * guest keeps getting retranslated, and on hardware every one flushes the
+- * whole L1 and L2. */
++ * guest keeps getting retranslated, and on hardware every one invalidates
++ * the whole instruction cache. */
+ uint32_t dyn86_ctr_cache_syncs = 0;
+ uint64_t dyn86_ctr_cache_sync_ticks = 0;
+ 
+@@ -272,12 +272,27 @@ void dyn86_ctr_clear_cache(void* beg, void* end)
+     dyn86_ctr_cache_syncs++;
+     if (!is_emulator()) {
+         const u64 t0 = svcGetSystemTick();
+-        /* New 3DS (Luma3DS): the range variants fault in the kernel on code
+-         * pages made RWX with MEMOP_PROT (data abort at the block's first
+-         * address, DFSR 0x804: instruction-cache maintenance fault; Luma dump
+-         * of 2026-10-17). The whole-cache ones need no translation. Their cost
+-         * is paid once per newly translated block, not per executed one. */
+-        svc_flush_entire_dcache();
++        /* New 3DS (Luma3DS): the instruction-cache range variant (0x93)
++         * faults in the kernel on code pages made RWX with MEMOP_PROT (data
++         * abort at the block's first address, DFSR 0x804: instruction-cache
++         * maintenance fault; Luma dump of 2026-10-17), so the instruction
++         * cache is invalidated whole (0x94: an invalidate, nothing to write
++         * back). The data cache is cleaned for the new block's range only,
++         * through the kernel's own svcFlushProcessDataCache (0x54): about
++         * 25 us a sync on the console, against about 90 us for Luma's
++         * whole-cache 0x92, which cleans and invalidates every line, other
++         * processes' included, and enters the kernel's range routine
++         * directly, past 0x54's own handler. 0x92 stays as the fallback
++         * should 0x54 refuse (logged once). The cost is paid once per newly
++         * translated block, not per executed one. */
++        u32 a = (u32)beg & ~31u, e = ((u32)end + 31u) & ~31u;
++        if (R_FAILED(svcFlushProcessDataCache(CUR_PROCESS_HANDLE, a, e - a))) {
++            static int said = 0;
++            if (!said++)
++                fprintf(stderr, "[mman] svcFlushProcessDataCache %08lx+%lx refused: whole data cache\n",
++                        (unsigned long)a, (unsigned long)(e - a));
++            svc_flush_entire_dcache();
++        }
+         svc_invalidate_entire_icache();
+         dyn86_ctr_cache_sync_ticks += svcGetSystemTick() - t0;
+         return;

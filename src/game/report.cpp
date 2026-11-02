@@ -347,6 +347,39 @@ bool parse_luma_dump(const std::string &data, LumaDump &out)
     return true;
 }
 
+std::string topic_text(const std::string &topic)
+{
+    std::string o;
+    bool space = false;
+    for (char c : topic) {
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+            space = !o.empty();
+            continue;
+        }
+        if (space)
+            o += ' ';
+        space = false;
+        o += c;
+    }
+    return o;
+}
+
+std::string topic_key(const std::string &topic)
+{
+    std::string o = topic_text(topic);
+    for (char &c : o)
+        if (c >= 'A' && c <= 'Z')
+            c = (char)(c - 'A' + 'a');
+    return o;
+}
+
+std::string player_title(const std::string &version, const std::string &topic)
+{
+    const std::string t = version.empty() ? "unknown version" : "v" + version;
+    const std::string shown = topic_text(topic);
+    return shown.empty() ? t : t + " " + shown;
+}
+
 std::vector<std::string> fingerprint_of(const Event &e)
 {
     for (const std::string &l : e.crash_lines) {
@@ -372,8 +405,13 @@ std::vector<std::string> fingerprint_of(const Event &e)
     }
     if (!e.crash_lines.empty())
         return {"fatal", exception_of(e.crash_lines[0]).first};
-    if (e.player_report)
-        return {"player-report"};
+    if (e.player_report) {
+        std::vector<std::string> f = {"player-report", e.version.empty() ? "unknown" : e.version};
+        const std::string key = topic_key(e.topic);
+        if (!key.empty())
+            f.push_back(key);
+        return f;
+    }
     return {"session", e.reason};
 }
 
@@ -388,10 +426,12 @@ std::string event_json(const Event &e)
         o += ",\"release\":" + json_string(e.release);
     if (!e.dist.empty())
         o += ",\"dist\":" + json_string(e.dist);
-    // The title is what happened (the reason, or the exception below); the
-    // player's words go along as context (issue #61). They were the
-    // message, and every wording became an issue of its own in Sentry.
-    o += ",\"message\":{\"formatted\":" + json_string(e.reason) + "}";
+    // The title is what happened (the reason, or the exception below), or for
+    // a player's report its version and topic; the player's words go along
+    // as context (issue #61). They were the message, and every wording
+    // became an issue of its own in Sentry.
+    o += ",\"message\":{\"formatted\":" + json_string(e.player_report ? player_title(e.version, e.topic) : e.reason) +
+         "}";
     const std::vector<std::string> fingerprint = fingerprint_of(e);
     o += ",\"fingerprint\":[";
     for (size_t i = 0; i < fingerprint.size(); i++)
@@ -422,10 +462,21 @@ std::string event_json(const Event &e)
     std::vector<std::pair<std::string, std::string>> tags = e.tags;
     if (!e.note.empty())
         tags.push_back({"note", tag_value(e.note)});   // searchable, and shown in the event list
+    const std::string topic = topic_text(e.topic);
+    if (!topic.empty())   // what the run was for: finds its crashes too (topic:#24)
+        tags.push_back({"topic", tag_value(topic)});
+    if (e.have_dump)   // 3ds-d2's own dumps group without it (it moves with each build)
+        tags.push_back({"dump_pc", hex32(e.dump.pc)});
     o += ",\"tags\":" + json_object(tags);
     o += ",\"contexts\":{\"device\":" + json_object(e.device);
-    if (!e.note.empty())
-        o += ",\"report\":{\"type\":\"report\",\"note\":" + json_string(e.note) + "}";
+    if (!e.note.empty() || !topic.empty()) {
+        o += ",\"report\":{\"type\":\"report\"";
+        if (!topic.empty())
+            o += ",\"topic\":" + json_string(topic);
+        if (!e.note.empty())
+            o += ",\"note\":" + json_string(e.note);
+        o += "}";
+    }
     if (e.have_figures) {
         const LogSummary::Figures &f = e.figures;
         o += ",\"session\":{\"type\":\"session\",\"seconds\":" + std::to_string(f.seconds) +

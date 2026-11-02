@@ -142,8 +142,9 @@ $(OUT)/game/ctr_screenshot.o: $(ROOT)/src/app/ctr_screenshot.cpp
 # Crash and session reports (issue #26): the build ID, the title version and
 # the Sentry DSN go into ctr_report.o only. report.cfg changes when they do,
 # so it is rebuilt then. Unless given, they are scripts/build-id.sh's ID (so
-# every build of other sources reports as its own), the CIA's title version,
-# and the project's DSN from packaging/cia/report.dsn; D2_REPORT_DSN= (empty)
+# every build of other sources reports as its own), the CIA's title version
+# as a -dev build (docker.sh passes scripts/version.sh's, which knows a release
+# by its tag; issue #61), and the project's DSN from packaging/cia/report.dsn; D2_REPORT_DSN= (empty)
 # builds an app that never offers or sends anything.
 # Both report objects are built for size: they never run during play, and
 # their code is resident all the same.
@@ -151,7 +152,7 @@ ifeq ($(origin BUILD_ID),undefined)
 BUILD_ID := $(or $(shell sh $(ROOT)/scripts/build-id.sh 2>/dev/null),unversioned)
 endif
 ifeq ($(origin D2_VERSION),undefined)
-D2_VERSION := $(or $(shell sed -n 's/^version=\([0-9.]*\).*/\1/p' $(ROOT)/scripts/package-cia.sh),0.0.0)
+D2_VERSION := $(or $(shell sed -n 's/^version=\([0-9.]*\).*/\1/p' $(ROOT)/scripts/package-cia.sh),0.0.0)-dev
 endif
 ifeq ($(origin D2_REPORT_DSN),undefined)
 D2_REPORT_DSN := $(shell tr -d '\r\n' < $(ROOT)/packaging/cia/report.dsn 2>/dev/null)

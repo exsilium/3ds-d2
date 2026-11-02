@@ -10,6 +10,7 @@
 //       report.txt             why there is a report (key=value)
 //       note.txt               the player's description
 //       topic.txt              the topic the player set on it, or it was sent with
+//       screenshots.txt        the screenshot pairs the player chose for it (issue #61)
 //       sent.txt / declined.txt  the player's answer (none yet: offered at start)
 //
 // A session that never wrote its closing line to game.log (a crash Luma3DS
@@ -49,6 +50,16 @@ bool post(const std::string &url, const std::string &headers, const std::string 
           std::string &answer, std::string &err);
 }
 
+namespace shot {   // ctr_screenshot.cpp
+struct Image {
+    uint32_t width = 0, height = 0;
+    std::vector<uint8_t> rgb;
+};
+// A JPEG or a BMP as RGB, scaled down to fit max_w x max_h (0: as it is).
+bool load(const std::string &path, uint32_t max_w, uint32_t max_h, Image &out, std::string &msg);
+bool to_jpeg(const Image &img, std::string &out, std::string &msg);
+}  // namespace shot
+
 #ifndef D2_BUILD_ID
 #define D2_BUILD_ID "unversioned"
 #endif
@@ -83,6 +94,11 @@ const char kLumaDumps[] = "sdmc:/luma/dumps/arm11";
 // after the version ("#24"), until they change it.
 const char kTopic[] = "sdmc:/3ds/3ds-d2/report-topic.txt";
 constexpr int kTopicMax = 40;   // characters
+// Screenshot pairs to offer (game/report.h): the game's list
+// (ctr_screenshot.cpp), and Luma3DS's folder.
+const char kShotList[] = "sdmc:/3ds/3ds-d2/screenshots/pairs.txt";
+const char kLumaShots[] = "sdmc:/luma/screenshots";
+constexpr uint64_t kShotMax = 8u << 20;   // a picture larger is not one of ours: left out
 const char kDsn[256] = D2_REPORT_DSN;
 constexpr int kKeepWaiting = 32;   // reports to send: older ones are removed (prune_reports)
 constexpr int kKeepAnswered = 8;   // sent, or not to be sent: older ones are removed
@@ -347,6 +363,7 @@ std::string kib(long bytes)
 struct Offer {
     std::string dir, reason, build, note;
     std::string topic;      // the player's part of the title (issue #61)
+    std::vector<game::report::ShotPair> shots;   // the screenshot pairs chosen (screenshots.txt)
     LogSummary log;
     std::vector<std::string> dumps;
     std::string state;      // "" (to send), "sent", "not sent"
@@ -366,22 +383,23 @@ std::string version_of(const Offer &o)
     return !o.log.version().empty() ? o.log.version() : o.build == D2_BUILD_ID ? std::string(D2_VERSION) : "";
 }
 
-// The bottom of every report screen: a message in rows 25-26 (wrapped, two
-// lines at most), and the buttons in rows 27-29, two to a row, each column's
+// The bottom of every report screen: a message in rows 24-25 (wrapped, two
+// lines at most), and the buttons in rows 26-29, two to a row, each column's
 // keys and labels lined up. Columns 0 and 25, labels of at most 16: nothing
 // reaches column 49, where the cursor would wrap (and the last row scroll).
+// What is above them ends by row 23.
 void draw_status(const std::string &text)
 {
     const std::vector<std::string> lines = wrap(text, 49);
     for (size_t i = 0; i < lines.size() && i < 2; i++)
-        std::printf("\x1b[%u;0H\x1b[33m%s\x1b[0m", (unsigned)(25 + i), lines[i].c_str());
+        std::printf("\x1b[%u;0H\x1b[33m%s\x1b[0m", (unsigned)(24 + i), lines[i].c_str());
 }
 
 void draw_keys(std::initializer_list<std::pair<const char *, const char *>> keys)
 {
     unsigned i = 0;
     for (const auto &k : keys) {
-        std::printf("\x1b[%u;%uH\x1b[33m%-7s\x1b[0m %.16s", 27 + i / 2, i % 2 ? 25u : 0u, k.first, k.second);
+        std::printf("\x1b[%u;%uH\x1b[33m%-7s\x1b[0m %.16s", 26 + i / 2, i % 2 ? 25u : 0u, k.first, k.second);
         i++;
     }
 }
@@ -440,6 +458,11 @@ void draw_offer(const Offer &o)
                     reads > (long)kFileTraceMax ? ", its start" : "");
     for (const std::string &d : o.dumps)
         std::printf(" %.48s\n", d.c_str());
+    if (!o.shots.empty())
+        std::printf(" \x1b[36m%u screenshot pair%s\x1b[0m (top and bottom screen)\n", (unsigned)o.shots.size(),
+                    o.shots.size() == 1 ? "" : "s");
+    else if (o.state != "sent")
+        std::printf(" \x1b[2mno screenshots (L: add up to %d pairs)\x1b[0m\n", game::report::kMaxShotPairs);
     std::printf(" build, version, model, region, firmware\n");
     const LogSummary::Figures f = o.log.figures();
     if (f.seconds)
@@ -450,9 +473,9 @@ void draw_offer(const Offer &o)
     if (note.empty() || o.note.empty()) {
         std::printf("\x1b[36m  %s\x1b[0m\n", o.state == "sent" ? "(none)" : "(none yet: Y to write one)");
     } else {
-        for (size_t i = 0; i < note.size() && i < 4; i++)
+        for (size_t i = 0; i < note.size() && i < 3; i++)
             std::printf("\x1b[36m  %s\x1b[0m\n", note[i].c_str());
-        if (note.size() > 4)
+        if (note.size() > 3)
             std::printf("\x1b[36m  ...\x1b[0m\n");
     }
     // The last action's outcome; once sent, Sentry's ID for it.
@@ -461,10 +484,10 @@ void draw_offer(const Offer &o)
         draw_keys({{"SELECT", "delete"}, {"B", "back to the list"}});
     else if (o.state.empty())
         draw_keys({{"A", "send"}, {"Y", "edit description"}, {"R", asked_for(o) ? "edit title" : "edit topic"},
-                   {"X", "don't send"}, {"SELECT", "delete"}, {"B", "back to the list"}});
+                   {"L", "screenshots"}, {"X", "don't send"}, {"SELECT", "delete"}, {"B", "back to the list"}});
     else
         draw_keys({{"A", "send"}, {"Y", "edit description"}, {"R", asked_for(o) ? "edit title" : "edit topic"},
-                   {"SELECT", "delete"}, {"B", "back to the list"}});
+                   {"L", "screenshots"}, {"SELECT", "delete"}, {"B", "back to the list"}});
 }
 
 // The game's own keyboard on the bottom screen: when the system's keyboard
@@ -570,6 +593,164 @@ void edit_topic(const Host &host, Offer &o)
     write_all(kTopic, o.topic);
     write_all(o.dir + "/topic.txt", o.topic);
     say(host, o.topic.empty() ? "report: no topic" : "report: topic " + printable(o.topic));
+}
+
+// ---- screenshots (issue #61) ---------------------------------------------------------
+
+using game::report::ShotPair;
+
+// The session's time by the console's clock: from its start line to the
+// last write of its game.log (a heartbeat every 10 s; a report's copy is
+// made at the session's end), with a minute's slack. {0, 0}: the log does
+// not say when it started.
+void session_window(const Offer &o, uint64_t &from, uint64_t &to)
+{
+    from = to = 0;
+    if (!o.log.start_time())
+        return;
+    from = o.log.start_time();
+    u64 mtime = 0;   // unix seconds, local time, as osGetTime
+    const bool known = R_SUCCEEDED(archive_getmtime((o.dir + "/game.log").c_str(), &mtime)) && mtime >= from;
+    to = (known ? (uint64_t)mtime : from + o.log.figures().seconds) + 60;
+}
+
+bool in_window(const ShotPair &p, uint64_t from, uint64_t to) { return from && p.time >= from && p.time <= to; }
+
+// What can be attached, newest first: the game's pairs still on the card,
+// and Luma3DS's taken during the session. Never the Camera album as such.
+std::vector<ShotPair> shot_choices(uint64_t from, uint64_t to)
+{
+    std::string text;
+    read_all(kShotList, text);
+    std::vector<ShotPair> out;
+    for (const ShotPair &p : game::report::parse_shot_list(text))
+        if (exists(p.top))
+            out.push_back(p);
+    if (from)
+        for (const ShotPair &p : game::report::luma_pairs(kLumaShots, list_dir(kLumaShots), from, to))
+            out.push_back(p);
+    std::sort(out.begin(), out.end(), [](const ShotPair &a, const ShotPair &b) {
+        return a.time != b.time ? a.time > b.time : a.ms > b.ms;
+    });
+    return out;
+}
+
+// One of a pair's pictures on the bottom screen, fitted and centred (the
+// game's 640x480 frame at half its size). False: there is none, or it
+// cannot be read.
+bool draw_preview(const ShotPair &p, bool bottom)
+{
+    uint16_t *fb = (uint16_t *)gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, nullptr, nullptr);
+    std::memset(fb, 0, 320 * 240 * sizeof(uint16_t));
+    const std::string &path = bottom ? p.bot : p.top;
+    shot::Image img;
+    std::string msg;
+    if (path.empty() || !shot::load(path, 320, 240, img, msg))
+        return false;
+    const uint32_t x0 = (320 - img.width) / 2, y0 = (240 - img.height) / 2;
+    for (uint32_t y = 0; y < img.height; y++) {
+        const uint8_t *s = img.rgb.data() + (size_t)y * img.width * 3;
+        for (uint32_t x = 0; x < img.width; x++, s += 3)   // the framebuffer: columns, bottom to top
+            fb[(size_t)(x0 + x) * 240 + (239 - (y0 + y))] =
+                (uint16_t)((s[0] >> 3) << 11 | (s[1] >> 2) << 5 | (s[2] >> 3));
+    }
+    return true;
+}
+
+constexpr size_t kPickRows = 20;   // rows 3..22
+
+void draw_picker(const std::vector<ShotPair> &all, const std::vector<ShotPair> &chosen, size_t sel, size_t first,
+                 uint64_t from, uint64_t to, const std::string &status, bool bottom)
+{
+    consoleSelect(&g_top);
+    consoleClear();
+    std::printf("\x1b[33m3ds-d2: screenshots for the report\x1b[0m\n");
+    std::printf("%u of at most %d pairs chosen. *: this session's\n\n", (unsigned)chosen.size(),
+                game::report::kMaxShotPairs);
+    if (all.empty())
+        for (const std::string &l :
+             wrap("No screenshots to offer. In the game, L+R+Select saves a pair (both screens). So does Luma3DS's "
+                  "menu (L+Down+Select), Take screenshot, while the game runs.",
+                  49))
+            std::printf("%s\n", l.c_str());
+    for (size_t i = first; i < all.size() && i < first + kPickRows; i++) {
+        const ShotPair &p = all[i];
+        const bool on = std::find(chosen.begin(), chosen.end(), p) != chosen.end();
+        std::printf("%s%c [%c] %s  %-7s %c\x1b[0m\n", on ? "\x1b[36m" : "", i == sel ? '>' : ' ', on ? 'x' : ' ',
+                    game::report::shot_time_text(p.time).c_str(), p.luma ? "Luma3DS" : "game",
+                    in_window(p, from, to) ? '*' : ' ');
+    }
+    draw_status(!status.empty() || all.empty() ? status
+                                               : std::string("Below: its ") + (bottom ? "bottom" : "top") + " screen.");
+    draw_keys({{"A", "choose"}, {"Y", bottom ? "show the top" : "show the bottom"}, {"Up/Down", "move"},
+               {"B", "done"}});
+}
+
+// The player picks the pairs to attach (none chosen to begin with); kept in
+// the report's screenshots.txt, oldest first.
+void pick_shots(const Host &host, Offer &o)
+{
+    uint64_t from, to;
+    session_window(o, from, to);
+    const std::vector<ShotPair> all = shot_choices(from, to);
+    std::vector<ShotPair> chosen;
+    for (const ShotPair &p : o.shots)   // those still on the card
+        if (std::find(all.begin(), all.end(), p) != all.end())
+            chosen.push_back(p);
+    size_t sel = 0, first = 0;
+    bool bottom = false, redraw = true, preview = true;
+    std::string status;
+    while (aptMainLoop()) {
+        if (preview && !all.empty()) {
+            if (!draw_preview(all[sel], bottom))
+                status = bottom && all[sel].bot.empty() ? "This pair has no bottom picture."
+                                                        : "This picture cannot be read.";
+            preview = false;
+            redraw = true;
+        }
+        if (redraw) {
+            draw_picker(all, chosen, sel, first, from, to, status, bottom);
+            redraw = false;
+        }
+        hidScanInput();
+        const u32 k = hidKeysDown();
+        if (k & KEY_B)
+            break;
+        if (!all.empty() && (k & (KEY_UP | KEY_DOWN | KEY_A | KEY_Y))) {
+            status.clear();
+            if ((k & KEY_DOWN) && sel + 1 < all.size()) {
+                sel++;
+                preview = true;
+            } else if ((k & KEY_UP) && sel > 0) {
+                sel--;
+                preview = true;
+            } else if (k & KEY_Y) {
+                bottom = !bottom;
+                preview = true;
+            } else if (k & KEY_A) {
+                const auto at = std::find(chosen.begin(), chosen.end(), all[sel]);
+                if (at != chosen.end())
+                    chosen.erase(at);
+                else if (chosen.size() < (size_t)game::report::kMaxShotPairs)
+                    chosen.push_back(all[sel]);
+                else
+                    status = "At most " + std::to_string(game::report::kMaxShotPairs) + " pairs: A on one unchooses it.";
+            }
+            if (sel < first)
+                first = sel;
+            else if (sel >= first + kPickRows)
+                first = sel - kPickRows + 1;
+            redraw = true;
+        }
+        present();
+    }
+    std::sort(chosen.begin(), chosen.end(), [](const ShotPair &a, const ShotPair &b) {
+        return a.time != b.time ? a.time < b.time : a.ms < b.ms;
+    });
+    o.shots = chosen;
+    write_all(o.dir + "/screenshots.txt", game::report::shot_list_text(chosen));
+    host.restore_bottom();
+    consoleSelect(&g_top);
 }
 
 // ---- sending ------------------------------------------------------------------------
@@ -696,6 +877,26 @@ void add_trace_item(Gzip &gz, const std::string &path)
     std::fclose(f);
 }
 
+// A screenshot as a JPEG attachment (issue #61): the game's as it is,
+// Luma3DS's BMP made one. Nothing if it is gone or cannot be read.
+void add_picture(Gzip &gz, const std::string &path, bool luma, const std::string &name)
+{
+    const long size = path.empty() ? 0 : file_size(path);
+    if (size <= 0 || (uint64_t)size > kShotMax)
+        return;
+    if (!luma) {
+        add_file_item(gz, path, name, "image/jpeg", kShotMax, kShotMax);
+        return;
+    }
+    shot::Image img;
+    std::string jpeg, msg;
+    if (!shot::load(path, 0, 0, img, msg) || !shot::to_jpeg(img, jpeg, msg))
+        return;
+    gz.add(game::report::attachment_header(name, "image/jpeg", jpeg.size()));
+    gz.add(jpeg);
+    gz.add("\n", 1);
+}
+
 bool build_envelope(const Host &host, const Offer &o, const game::report::Dsn &dsn, std::string &body)
 {
     namespace r = game::report;
@@ -763,6 +964,7 @@ bool build_envelope(const Host &host, const Offer &o, const game::report::Dsn &d
     if (system_s[0])
         e.tags.push_back({"firmware", system_s});
     e.device = {{"model", model_name(model)}, {"family", "Nintendo 3DS"}, {"arch", "armv6k"}};
+    e.screenshots = o.shots;
 
     Gzip gz;
     gz.add(r::envelope_head(dsn, e));
@@ -772,6 +974,11 @@ bool build_envelope(const Host &host, const Offer &o, const game::report::Dsn &d
     add_file_item(gz, o.dir + "/files.trc", "files.trc", "text/plain", kFileTraceMax, kFileTraceMax);
     for (const std::string &d : o.dumps)
         add_file_item(gz, o.dir + "/" + d, d, "application/octet-stream", kDumpMax, kDumpMax);
+    for (size_t i = 0; i < o.shots.size(); i++) {
+        const std::string n = "screenshot-" + std::to_string(i + 1);
+        add_picture(gz, o.shots[i].top, o.shots[i].luma, n + "-top.jpg");
+        add_picture(gz, o.shots[i].bot, o.shots[i].luma, n + "-bot.jpg");
+    }
     return gz.finish(body);
 }
 
@@ -798,7 +1005,9 @@ bool post(const Host &host, const game::report::Dsn &dsn, const std::string &bod
                                 dsn.key + ", sentry_client=3ds-d2/" D2_VERSION "\r\n";
     int status = 0;
     std::string answer, err;
+    const uint64_t t0 = osGetTime();
     const bool answered = tls::post(url, headers, body, status, answer, err);
+    const uint64_t took_ms = osGetTime() - t0;   // with screenshots, how long an upload takes (issue #61)
     if (!answered)
         msg = "Not sent: " + err + ".";
     else if (status != 200)
@@ -813,8 +1022,8 @@ bool post(const Host &host, const game::report::Dsn &dsn, const std::string &bod
         if (end != std::string::npos && end - id - 6 <= 32)
             event_id = printable(answer.substr(id + 6, end - id - 6));
     }
-    say(host, "report: " + url + " (" + std::to_string((body.size() + 1023) >> 10) + " KiB): " + msg +
-                  (event_id.empty() ? "" : " Event " + event_id + "."));
+    say(host, "report: " + url + " (" + std::to_string((body.size() + 1023) >> 10) + " KiB, " +
+                  std::to_string(took_ms) + " ms): " + msg + (event_id.empty() ? "" : " Event " + event_id + "."));
     return answered && status == 200;
 }
 
@@ -861,6 +1070,9 @@ Offer load_offer(const std::string &dir)
     if (!read_all(dir + "/topic.txt", o.topic) && !exists(dir + "/sent.txt"))
         read_all(kTopic, o.topic);
     o.topic = game::report::topic_text(o.topic);
+    std::string shots;
+    if (read_all(dir + "/screenshots.txt", shots))
+        o.shots = game::report::parse_shot_list(shots);
     summarize(dir + "/game.log", o.log);
     if (o.build.empty())
         o.build = o.log.build().empty() ? "unknown" : o.log.build();
@@ -935,6 +1147,9 @@ bool detail(const Host &host, const game::report::Dsn &dsn, const std::string &d
                 redraw = true;
             } else if ((k & KEY_R) && o.state != "sent") {
                 edit_topic(host, o);
+                redraw = true;
+            } else if ((k & KEY_L) && o.state != "sent") {
+                pick_shots(host, o);
                 redraw = true;
             } else if ((k & KEY_A) && o.state != "sent") {
                 o.status = "Sending...";

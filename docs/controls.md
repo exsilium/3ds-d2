@@ -83,9 +83,12 @@ On the Linux lane, `M4_BOTTOM=map|help|keys|zoom|info` picks the starting tab. T
 - **Where:** `sdmc:/DCIM/<NNN>NIN03/HNI_<NNNN>.JPG`, the folder and names the camera uses. The number is one past the highest in the newest folder. A folder holding 100 pictures moves on to the next one.
 - **What:** the game's own frame, not the 400×240 screen. In game that is 640×480, the camera's own photo size. Larger frames, such as the 800×600 menus, are scaled to fit 640×480. Cinematics keep their aspect ratio. The zoom setting makes no difference.
 - **File:** a baseline JPEG with an EXIF block, holding the date and a 160×120 thumbnail.
+- **The bottom screen too:** each screenshot is a pair. The bottom screen, as shown, goes to `sdmc:/3ds/3ds-d2/screenshots/<date>_<time>_bot.jpg` (320×240), not the album. The game lists its newest 16 pairs in `screenshots/pairs.txt`. When a pair drops off the list, its bottom picture is deleted; the album's picture stays.
 - **While saving:** the top screen holds the frame for a moment. The bottom screen then shows the path, or why saving failed.
 
-Rosalina's screenshot (Luma3DS menu) still works too. It saves both screens as BMPs in `/luma/screenshots/`.
+Rosalina's screenshot (Luma3DS menu, L + Down + Select, then *Take screenshot*) still works too. It saves both screens as BMPs in `/luma/screenshots/`, and it works while the game is suspended in the HOME Menu.
+
+Either kind can go with a [problem report](../README.md#problem-reports): **L** on the report's screen chooses up to 4 pairs.
 
 ## Problem reports
 

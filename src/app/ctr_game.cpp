@@ -228,8 +228,12 @@ struct Source {
     const uint32_t *palette;
     bool yuv;
     uint32_t display_height;
+    const uint16_t *fb565 = nullptr;
+    const uint8_t *rgb = nullptr;
 };
-bool save(const Source &src, std::string &msg);   // ctr_screenshot.cpp
+// ctr_screenshot.cpp: the frame, and the bottom screen as shown (RGB565, the
+// framebuffer's layout), as a pair.
+bool save(const Source &src, const uint16_t *bottom, std::string &msg);
 }  // namespace shot
 
 namespace report {   // ctr_report.cpp
@@ -281,6 +285,7 @@ game::SecondScreen g_ss;
 game::Osk g_osk;
 bool g_ss_active = false;    // the second screen owns the bottom framebuffer
 bool g_bottom_double = false; // render thread: the bottom screen is double-buffered (second screen)
+const uint16_t *g_bottom_shown = nullptr;   // render thread: then, the buffer it shows (screenshots)
 extern "C" const uint8_t default_font_bin[];   // libctru's console font: 8x8, 1 bpp, bit 7 leftmost
 int g_render_core = -1;                 // the core drawing frames (-1: the game's thread)
 volatile uint32_t g_frames_skipped = 0; // frames not shown: the previous one was still drawing
@@ -576,6 +581,7 @@ void console_again()
     if (g_bottom_double) {
         gfxSetDoubleBuffering(GFX_BOTTOM, false);
         g_bottom_double = false;
+        g_bottom_shown = nullptr;
         u16 *fb = (u16 *)gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, nullptr, nullptr);
         g_stats_con.frameBuffer = g_log_con.frameBuffer = fb;
     }
@@ -762,8 +768,15 @@ void save_staged_shot()
     st.shot = false;
     const uint64_t t0 = host_us();
     const shot::Source src{st.pixels.data(), st.width, st.height, st.palette, st.yuv, st.display_height};
+    // The bottom screen as shown (issue #61): the buffer last drawn by the
+    // second screen, or the text console's own. Read here, on the thread
+    // that draws it, before its next draw (into the other buffer).
+    const uint16_t *bottom = g_bottom_double ? g_bottom_shown
+                                             : (const uint16_t *)gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, nullptr, nullptr);
+    if (gfxGetScreenFormat(GFX_BOTTOM) != GSP_RGB565_OES)
+        bottom = nullptr;
     std::string msg;
-    const bool ok = shot::save(src, msg);
+    const bool ok = shot::save(src, bottom, msg);
     char ms[24];
     std::snprintf(ms, sizeof ms, ", %u ms", (unsigned)((host_us() - t0) / 1000));
     g_shot_msg = (ok ? "screenshot: " : "screenshot failed: ") + msg + (ok ? ms : "");
@@ -820,6 +833,7 @@ void draw_staged()
         uint16_t *bottom = (uint16_t *)gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, nullptr, nullptr);
         game::draw_bottom(bottom, st.bottom, st.pixels.data(), (int)st.width, (int)st.height, g_pal565,
                           default_font_bin);
+        g_bottom_shown = bottom;   // after the swap below
     }
     gfxFlushBuffers();
     swap_screens(bottom_drawn);

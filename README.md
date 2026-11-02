@@ -113,9 +113,17 @@ The screen lists what would be sent:
 - after a profiler run, the traces it wrote (`sprites.trc`, `files.trc`), and which measurements ran;
 - the build ID, version, CIA or 3dsx, where the game files are read from, the console model, region, system version and kernel version;
 - figures from the log: minutes played, frame rate in play, frames over 100 ms in play and the longest, memory peaks;
-- your description, if you write one: press **Y** to type it with the system keyboard.
+- your description, if you write one: press **Y** to type it with the system keyboard;
+- screenshots, if you choose any: press **L**.
 
 Save files and character names are never sent.
+
+**Screenshots.** **L** lists the screenshot pairs that can go with the report, newest first, and shows the selected one on the bottom screen (**Y** switches between its top and bottom picture). **A** chooses a pair, up to 4; none is chosen unless you do. Two kinds are offered:
+
+- the game's own (**L + R + Select** in the game, see [docs/controls.md](docs/controls.md#screenshots)): its newest 16 pairs, whenever taken;
+- Luma3DS's (its menu's *Take screenshot*), only those taken while the session ran, suspended in the HOME Menu included, so no other app's.
+
+The rest of the Camera album is never offered. A pair is sent as `screenshot-<n>-top.jpg` and `screenshot-<n>-bot.jpg` (Luma3DS's BMPs as JPEGs), and the report says when each was taken and from which file. Pairs marked `*` were taken during the report's session.
 
 In Sentry, reports are grouped by what happened, not by your description, so the same crash lands in one issue however it's described. The groups: a crash the app caught (the fault, and where in Game.exe); a Luma3DS dump (the crashed process and exception, and outside 3ds-d2 its address); a fatal error by its kind; a session that didn't end; a report you asked for, by its title. Your description goes with each report as its `note`.
 
@@ -126,6 +134,7 @@ On a report's screen:
 - **A** sends it over Wi-Fi to the project's [Sentry](https://sentry.io) account. Sentry's ID for it is shown, and kept in the report's folder (`sent.txt`).
 - **Y** writes or changes your description.
 - **R** sets the topic: the title's own part for a report you asked for, a tag for a crash.
+- **L** chooses screenshots to send with it.
 - **X** marks it as not to be sent (A still sends it later).
 - **SELECT** twice deletes the report and its files.
 - **B** goes back to the list of reports.

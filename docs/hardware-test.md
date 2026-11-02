@@ -8,7 +8,7 @@ scripts/docker.sh package-cia --slim ../3ds-d2-gamefiles/1.14d     # with the ga
 scripts/docker.sh package-cia --full ../3ds-d2-gamefiles/1.14d     # with every MPQ inside, ~2 GB
 ```
 
-The hardware build is `dist/cia/3ds-d2-<build-id>.cia`. It holds the app only and reads the game files from `sdmc:/3ds/3ds-d2/game/`, so a new build is a 2 MB install. The two bundled variants add `-slim` or `-full` to the name. A `.txt` next to each CIA lists its version, SHA-256 and the files inside. Every run checks the CIA's content, exheader and logo hashes with `ctrtool`, the same hashes the console's AM checks at the end of an install.
+The hardware build is `dist/cia/3ds-d2-<version>-<build-id>.cia`. It holds the app only and reads the game files from `sdmc:/3ds/3ds-d2/game/`, so a new build is a 2 MB install. The two bundled variants add `-slim` or `-full` to the name. A `.txt` next to each CIA lists its version, SHA-256 and the files inside. Every run checks the CIA's content, exheader and logo hashes with `ctrtool`, the same hashes the console's AM checks at the end of an install.
 
 The build ID is a hash of everything that goes into the CIA: `src/`, the build rules, the CPU backend's patch series and the packaging (`scripts/package-cia.sh`, `packaging/cia/`). The title version (`version=` in `scripts/package-cia.sh`, now 0.4.0) is what FBI and the HOME menu show.
 
@@ -70,7 +70,7 @@ Logs are on the SD card in `3ds/3ds-d2/logs/`: `game.log` for the runtime, and `
 - **Luma's crash screen.** Luma3DS shows the exception on screen and saves a dump to `luma/dumps/arm11/crash_dump_*.dmp` on the SD card. Decode it against the ELF saved next to that CIA:
 
   ```sh
-  python3 -I tools/luma_dump.py crash_dump_00000000.dmp dist/cia/3ds-d2-<id>.elf
+  python3 -I tools/luma_dump.py crash_dump_00000000.dmp dist/cia/3ds-d2-<version>-<id>.elf
   ```
 
   It prints the registers and the source line of the PC, the LR and every stack word that points into the app.

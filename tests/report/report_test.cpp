@@ -202,8 +202,32 @@ int main()
         Event p;
         p.player_report = true;
         p.note = std::string(250, 'x');
-        CHECK(fingerprint_of(p) == std::vector<std::string>({"player-report"}));
+        CHECK(fingerprint_of(p) == std::vector<std::string>({"player-report", "unknown"}));
         CHECK(event_json(p).find("\"note\":\"" + std::string(200, 'x') + "\"") != std::string::npos);   // the tag, cut
+        CHECK(event_json(p).find("\"message\":{\"formatted\":\"unknown version\"}") != std::string::npos);
+        // A player's report: titled and grouped by the version and their topic, never the note.
+        p.version = "0.4.0-dev";
+        CHECK(fingerprint_of(p) == std::vector<std::string>({"player-report", "0.4.0-dev"}));
+        CHECK(event_json(p).find("\"message\":{\"formatted\":\"v0.4.0-dev\"}") != std::string::npos);
+        CHECK(event_json(p).find("\"topic\"") == std::string::npos);
+        p.topic = "  Issue   #24 ";
+        CHECK(player_title(p.version, p.topic) == "v0.4.0-dev Issue #24");
+        CHECK(topic_key(p.topic) == "issue #24" && topic_key("issue #24") == topic_key("ISSUE  #24"));
+        CHECK(fingerprint_of(p) == std::vector<std::string>({"player-report", "0.4.0-dev", "issue #24"}));
+        j = event_json(p);
+        CHECK(j.find("\"message\":{\"formatted\":\"v0.4.0-dev Issue #24\"}") != std::string::npos);
+        CHECK(j.find("\"topic\":\"Issue #24\"") != std::string::npos);   // the tag
+        CHECK(j.find("\"report\":{\"type\":\"report\",\"topic\":\"Issue #24\",\"note\":") != std::string::npos);
+        p.version = "0.4.0";   // the release's own build: an issue of its own
+        CHECK(fingerprint_of(p) == std::vector<std::string>({"player-report", "0.4.0", "issue #24"}));
+        CHECK(player_title("0.4.0", " ") == "v0.4.0" && topic_key(" \t").empty());
+        // A crash keeps its grouping whatever the run was for; the topic is a tag.
+        e.topic = "#24";
+        CHECK(fingerprint_of(e) == std::vector<std::string>({"luma-dump", "3ds-d2", "data abort", "kernel"}));
+        j = event_json(e);
+        CHECK(j.find("\"message\":{\"formatted\":\"Session: crashed (Luma3DS dump).\"}") != std::string::npos);
+        CHECK(j.find("\"topic\":\"#24\"") != std::string::npos);
+        CHECK(j.find("\"dump_pc\":\"ffff01c0\"") != std::string::npos);
         Event u;
         u.reason = "Session: did not end normally (froze, or was switched off?).";
         CHECK(fingerprint_of(u) == std::vector<std::string>({"session", u.reason}));

@@ -123,7 +123,7 @@ Save files and character names are never sent.
 - the game's own (**L + R + Select** in the game, see [docs/controls.md](docs/controls.md#screenshots)): its newest 16 pairs, whenever taken;
 - Luma3DS's (its menu's *Take screenshot*, also usable while the game is suspended in the HOME Menu): all of them in `/luma/screenshots/`, from any session.
 
-The rest of the Camera album is never offered. A pair is sent as `screenshot-<n>-top.jpg` and `screenshot-<n>-bot.jpg` (Luma3DS's BMPs as JPEGs), and the report says when each was taken and from which file. Pairs marked `*` were taken during the report's session (suspended time included).
+The rest of the Camera album is never offered. A pair is sent as `screenshot-<n>a-top.jpg` and `screenshot-<n>b-bot.jpg` (named so Sentry lists the top first) (Luma3DS's BMPs as JPEGs), and the report says when each was taken and from which file. Pairs marked `*` were taken during the report's session (suspended time included).
 
 In Sentry, reports are grouped by what happened, not by your description, so the same crash lands in one issue however it's described. The groups: a crash the app caught (the fault, and where in Game.exe); a Luma3DS dump (the crashed process and exception, and outside 3ds-d2 its address); a fatal error by its kind; a session that didn't end; a report you asked for, by its title. Your description goes with each report as its `note`.
 

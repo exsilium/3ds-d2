@@ -296,7 +296,26 @@ int main(int argc, char **argv)
     // virtual clock must match line for line; a native replacement of game
     // code must not change a single one.
     static FILE *framehash = std::getenv("M4_FRAMEHASH") ? std::fopen(std::getenv("M4_FRAMEHASH"), "w") : nullptr;
-    opt.present = [save, shots](const rt::Frame &f) {
+    // The bottom screen as the console would show it now, as b<ms>.png.
+    auto save_bottom = [shots](uint64_t now, const uint8_t *frame, int fw, int fh, const uint16_t *pal) {
+        static uint16_t fb[320 * 240];
+        game::draw_bottom(fb, bottom_view, frame, fw, fh, pal, kCtruFont);
+        std::vector<uint8_t> rgb(320 * 240 * 3);
+        for (int y = 0; y < 240; y++)
+            for (int x = 0; x < 320; x++) {
+                const uint16_t c = fb[x * 240 + 239 - y];
+                uint8_t *o = &rgb[(y * 320 + x) * 3];
+                o[0] = (uint8_t)((c >> 11) << 3), o[1] = (uint8_t)(((c >> 5) & 63) << 2), o[2] = (uint8_t)((c & 31) << 3);
+            }
+        char name[32];
+        std::snprintf(name, sizeof name, "b%06llu.png", (unsigned long long)now);
+        png::write_rgb(shots + "/" + name, rgb.data(), 320, 240);
+    };
+    opt.video_event = [](const char *what) {
+        if (std::strcmp(what, "close") == 0)
+            second_screen.end_video();
+    };
+    opt.present = [save, save_bottom, shots](const rt::Frame &f) {
         if (f.yuv[0]) {
             // A cinematic's frame: hashed (Y, U, V) and kept for the screenshots.
             const uint32_t cw = (f.width + 1) / 2, ch = (f.height + 1) / 2;
@@ -318,11 +337,14 @@ int main(int argc, char **argv)
                 std::fprintf(framehash, "video %u %08x %ux%u\n", n++, h, f.width, f.height);
             }
             const uint64_t now = rt::now_ms();
+            second_screen.set_video(f.video_name, f.video_ms, f.video_length_ms);
+            second_screen.stage(bottom_view, now);
             if (shot_now) {
                 shot_now = false;
                 char name[32];
                 std::snprintf(name, sizeof name, "s%06llu.png", (unsigned long long)now);
                 save(name);
+                save_bottom(now, nullptr, (int)f.width, (int)f.height, nullptr);
             }
             if (now >= next_shot) {
                 char name[32];
@@ -403,23 +425,12 @@ int main(int argc, char **argv)
             char name[32];
             std::snprintf(name, sizeof name, "s%06llu.png", (unsigned long long)now);
             save(name);
-            // The bottom screen as the console would show it now.
-            static uint16_t fb[320 * 240];
             uint16_t pal[256];
             for (int i = 0; i < 256; i++) {
                 const uint32_t p = f.palette[i];
                 pal[i] = (uint16_t)((((p >> 16) & 0xFF) >> 3 << 11) | (((p >> 8) & 0xFF) >> 2 << 5) | ((p & 0xFF) >> 3));
             }
-            game::draw_bottom(fb, bottom_view, last_idx.data(), (int)f.width, (int)f.height, pal, kCtruFont);
-            std::vector<uint8_t> rgb(320 * 240 * 3);
-            for (int y = 0; y < 240; y++)
-                for (int x = 0; x < 320; x++) {
-                    const uint16_t c = fb[x * 240 + 239 - y];
-                    uint8_t *o = &rgb[(y * 320 + x) * 3];
-                    o[0] = (uint8_t)((c >> 11) << 3), o[1] = (uint8_t)(((c >> 5) & 63) << 2), o[2] = (uint8_t)((c & 31) << 3);
-                }
-            std::snprintf(name, sizeof name, "b%06llu.png", (unsigned long long)now);
-            png::write_rgb(shots + "/" + name, rgb.data(), 320, 240);
+            save_bottom(now, last_idx.data(), (int)f.width, (int)f.height, pal);
         }
         if (now >= next_shot) {
             char name[32];

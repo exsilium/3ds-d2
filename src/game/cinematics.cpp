@@ -113,7 +113,7 @@ bool find_video(const std::string &name, std::string &host, uint64_t &offset)
 
 class Session {
 public:
-    bool open(const std::string &host, uint64_t offset);
+    bool open(const std::string &name, const std::string &host, uint64_t offset);
     // One turn of the loop: milliseconds to sleep, or -1 when finished.
     int step();
     ~Session()
@@ -143,6 +143,7 @@ private:
     bool poll_skip();
     int finish(const char *how);
 
+    std::string name_;           // as the game asked for it
     bink::File file_;
     bink::VideoDecoder video_;
     bink::AudioDecoder audio_;
@@ -170,8 +171,9 @@ private:
     uint64_t decode_us_ = 0, decode_worst_us_ = 0;   // integers: no floating point on the game's thread (issue #24)
 };
 
-bool Session::open(const std::string &host, uint64_t offset)
+bool Session::open(const std::string &name, const std::string &host, uint64_t offset)
 {
+    name_ = name;
     if (!file_.open(host, offset))
         return false;
     const bink::Header &h = file_.header();
@@ -266,6 +268,9 @@ void Session::present()
     }
     // 640x146 and 640x240 are stored at half height and shown doubled.
     f.display_height = f.height <= 240 ? 2 * f.height : f.height;
+    f.video_name = name_.c_str();
+    f.video_ms = (uint32_t)(next_show_ * period_us_ / 1000);
+    f.video_length_ms = (uint32_t)(frames_ * period_us_ / 1000);
     rt::options().present(f);
     shown_++;
 }
@@ -377,7 +382,7 @@ uint32_t video_open(Cpu &c)
     if (rt::options().video_event)
         rt::options().video_event("open");
     g_session.reset(new Session);
-    if (!g_session->open(host, offset)) {
+    if (!g_session->open(name, host, offset)) {
         rt::logf("cinematic: cannot be decoded, skipped");
         g_session.reset();
         if (rt::options().video_event)

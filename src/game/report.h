@@ -125,6 +125,49 @@ struct LumaDump {
 };
 bool parse_luma_dump(const std::string &data, LumaDump &out);
 
+// ---- screenshots (issue #61) ---------------------------------------------------------
+//
+// A report can carry up to kMaxShotPairs screenshot pairs, each the top and
+// the bottom screen's picture, chosen by the player (none by default). Two
+// sources, and never the console's Camera album as such (the player's own
+// photos are in it):
+//  - the game's (L+R+Select): its frame, saved to the album, and the bottom
+//    screen, saved to the game's own folder. The game lists the pairs it saved
+//    (kShotList: the newest kKeepShotPairs), so only those are offered.
+//  - Luma3DS's (Rosalina menu, "Take screenshot"):
+//    sdmc:/luma/screenshots/<YYYY-MM-DD_HH-MM-SS.mmm>_top.bmp and _bot.bmp,
+//    offered when taken while the session ran (suspended in the HOME Menu
+//    included), so no other app's pictures.
+constexpr int kMaxShotPairs = 4, kKeepShotPairs = 16;
+
+struct ShotPair {
+    uint64_t time = 0;     // when taken, unix seconds by the console's clock (local time)
+    uint32_t ms = 0;       // and its milliseconds
+    std::string top, bot;  // the pictures' paths (bot may be empty: the game's, without one)
+    bool luma = false;     // Luma3DS's (BMP), else the game's (JPEG)
+    bool operator==(const ShotPair &o) const { return top == o.top; }
+};
+
+// The game's list, a line per pair, oldest first: "<time> <ms> <top> <bot>"
+// (a report's chosen pairs too: Luma3DS's are known by their .bmp).
+// add_shot appends a pair and drops the oldest beyond kKeepShotPairs, giving
+// back those dropped (their bottom pictures, the game's own files, go too).
+std::vector<ShotPair> parse_shot_list(const std::string &text);
+std::string shot_list_text(const std::vector<ShotPair> &pairs);
+std::vector<ShotPair> add_shot(std::vector<ShotPair> &list, const ShotPair &p);
+
+// Seconds since 1970 for a date and time (no time zone: the console's clock).
+uint64_t unix_time(int year, int month, int day, int hour, int minute, int second);
+// Luma3DS's pairs among a directory's file names: both pictures there, taken
+// within [from, to] (unix seconds); newest first. `dir` prefixes the paths.
+std::vector<ShotPair> luma_pairs(const std::string &dir, const std::vector<std::string> &names, uint64_t from,
+                                 uint64_t to);
+// "2026-11-02 14:02:31", as the picker shows a pair's time.
+std::string shot_time_text(uint64_t time);
+
+// A 24-bit BMP (Luma3DS's screenshots) as RGB rows, top row first.
+bool decode_bmp(const std::string &data, uint32_t &width, uint32_t &height, std::vector<uint8_t> &rgb);
+
 struct Event {
     std::string event_id;    // 32 lowercase hex digits
     uint64_t timestamp = 0;  // unix seconds, UTC; 0: when Sentry receives it (the console's
@@ -136,6 +179,9 @@ struct Event {
     std::string started;     // when the session started, by the console's clock (may be empty)
     std::string note;        // the player's description (may be empty): context, not the title (issue #61)
     std::string topic;       // the player's own part of the title ("#24"; may be empty), kept between reports
+    // The screenshot pairs attached, in order (screenshot-<n>a-top.jpg and
+    // <n>b-bot.jpg): where each came from, for the report context.
+    std::vector<ShotPair> screenshots;
     std::string reason;      // why there is a report, in a few words
     std::vector<std::pair<std::string, std::string>> tags;
     std::vector<std::pair<std::string, std::string>> device;   // contexts.device

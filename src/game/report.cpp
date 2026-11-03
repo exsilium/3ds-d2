@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <strings.h>
 
 namespace game {
 namespace report {
@@ -380,6 +381,141 @@ std::string player_title(const std::string &version, const std::string &topic)
     return shown.empty() ? t : t + " " + shown;
 }
 
+std::vector<ShotPair> parse_shot_list(const std::string &text)
+{
+    std::vector<ShotPair> out;
+    size_t at = 0;
+    while (at < text.size()) {
+        size_t end = text.find('\n', at);
+        if (end == std::string::npos)
+            end = text.size();
+        const std::string line = text.substr(at, end - at);
+        at = end + 1;
+        unsigned long long time = 0;
+        unsigned ms = 0;
+        char top[256], bot[256];
+        const int n = std::sscanf(line.c_str(), "%llu %u %255s %255s", &time, &ms, top, bot);
+        if (n < 3)
+            continue;
+        ShotPair p;
+        p.time = time;
+        p.ms = ms;
+        p.top = top;
+        p.bot = n == 4 && std::strcmp(bot, "-") != 0 ? bot : "";
+        p.luma = p.top.size() > 4 && strcasecmp(p.top.c_str() + p.top.size() - 4, ".bmp") == 0;
+        out.push_back(p);
+    }
+    return out;
+}
+
+std::string shot_list_text(const std::vector<ShotPair> &pairs)
+{
+    std::string o;
+    for (const ShotPair &p : pairs)
+        o += std::to_string(p.time) + " " + std::to_string(p.ms) + " " + p.top + " " + (p.bot.empty() ? "-" : p.bot) +
+             "\n";
+    return o;
+}
+
+std::vector<ShotPair> add_shot(std::vector<ShotPair> &list, const ShotPair &p)
+{
+    list.push_back(p);
+    std::vector<ShotPair> dropped;
+    if (list.size() > (size_t)kKeepShotPairs) {
+        const size_t n = list.size() - kKeepShotPairs;
+        dropped.assign(list.begin(), list.begin() + n);
+        list.erase(list.begin(), list.begin() + n);
+    }
+    return dropped;
+}
+
+uint64_t unix_time(int year, int month, int day, int hour, int minute, int second)
+{
+    // Days from 1970-01-01 (Howard Hinnant's days_from_civil).
+    const int y = year - (month <= 2);
+    const int era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = (unsigned)(y - era * 400);
+    const unsigned doy = (153 * (unsigned)(month + (month > 2 ? -3 : 9)) + 2) / 5 + (unsigned)day - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    const int64_t days = (int64_t)era * 146097 + (int64_t)doe - 719468;
+    return (uint64_t)(days * 86400 + hour * 3600 + minute * 60 + second);
+}
+
+std::string shot_time_text(uint64_t time)
+{
+    // civil_from_days, the inverse of the above.
+    const int64_t days = (int64_t)(time / 86400), z = days + 719468;
+    const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    const unsigned doe = (unsigned)(z - era * 146097);
+    const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const unsigned mp = (5 * doy + 2) / 153, d = doy - (153 * mp + 2) / 5 + 1, m = mp < 10 ? mp + 3 : mp - 9;
+    const int64_t y = (int64_t)yoe + era * 400 + (m <= 2);
+    const unsigned s = (unsigned)(time % 86400);
+    char b[64];
+    std::snprintf(b, sizeof b, "%04d-%02u-%02u %02u:%02u:%02u", (int)y, m, d, s / 3600, s / 60 % 60, s % 60);
+    return b;
+}
+
+std::vector<ShotPair> luma_pairs(const std::string &dir, const std::vector<std::string> &names, uint64_t from,
+                                 uint64_t to)
+{
+    std::vector<ShotPair> out;
+    for (const std::string &n : names) {
+        // YYYY-MM-DD_HH-MM-SS.mmm_top.bmp
+        int y, mo, d, h, mi, s, ms, used = 0;
+        if (n.size() != 31 || std::sscanf(n.c_str(), "%4d-%2d-%2d_%2d-%2d-%2d.%3d_top.bmp%n", &y, &mo, &d, &h, &mi,
+                                          &s, &ms, &used) != 7 || used != 31)
+            continue;
+        const std::string bot = n.substr(0, 24) + "bot.bmp";
+        if (std::find(names.begin(), names.end(), bot) == names.end())
+            continue;
+        ShotPair p;
+        p.time = unix_time(y, mo, d, h, mi, s);
+        p.ms = (uint32_t)ms;
+        if (p.time < from || p.time > to)
+            continue;
+        p.top = dir + "/" + n;
+        p.bot = dir + "/" + bot;
+        p.luma = true;
+        out.push_back(p);
+    }
+    std::sort(out.begin(), out.end(), [](const ShotPair &a, const ShotPair &b) {
+        return a.time != b.time ? a.time > b.time : a.ms > b.ms;
+    });
+    return out;
+}
+
+bool decode_bmp(const std::string &data, uint32_t &width, uint32_t &height, std::vector<uint8_t> &rgb)
+{
+    const auto u16 = [&](size_t at) { return (uint32_t)(uint8_t)data[at] | (uint32_t)(uint8_t)data[at + 1] << 8; };
+    const auto u32 = [&](size_t at) { return u16(at) | u16(at + 2) << 16; };
+    if (data.size() < 54 || data[0] != 'B' || data[1] != 'M' || u16(0x1c) != 24 || u32(0x1e) != 0)
+        return false;
+    const uint32_t offset = u32(0x0a), w = u32(0x12);
+    const int32_t hs = (int32_t)u32(0x16);
+    const uint32_t h = (uint32_t)(hs < 0 ? -hs : hs);
+    if (!w || !h || w > 4096 || h > 4096)
+        return false;
+    const size_t stride = ((size_t)w * 3 + 3) & ~(size_t)3;
+    if (offset > data.size() || data.size() - offset < stride * h)
+        return false;
+    rgb.resize((size_t)w * h * 3);
+    for (uint32_t y = 0; y < h; y++) {
+        // Bottom row first unless the height is negative.
+        const uint8_t *src = (const uint8_t *)data.data() + offset + stride * (hs < 0 ? y : h - 1 - y);
+        uint8_t *dst = rgb.data() + (size_t)y * w * 3;
+        for (uint32_t x = 0; x < w; x++) {
+            dst[3 * x] = src[3 * x + 2];
+            dst[3 * x + 1] = src[3 * x + 1];
+            dst[3 * x + 2] = src[3 * x];
+        }
+    }
+    width = w;
+    height = h;
+    return true;
+}
+
 std::vector<std::string> fingerprint_of(const Event &e)
 {
     for (const std::string &l : e.crash_lines) {
@@ -469,12 +605,20 @@ std::string event_json(const Event &e)
         tags.push_back({"dump_pc", hex32(e.dump.pc)});
     o += ",\"tags\":" + json_object(tags);
     o += ",\"contexts\":{\"device\":" + json_object(e.device);
-    if (!e.note.empty() || !topic.empty()) {
+    if (!e.note.empty() || !topic.empty() || !e.screenshots.empty()) {
         o += ",\"report\":{\"type\":\"report\"";
         if (!topic.empty())
             o += ",\"topic\":" + json_string(topic);
         if (!e.note.empty())
             o += ",\"note\":" + json_string(e.note);
+        // Which attachment is which picture: screenshot-<n>a-top.jpg and <n>b-bot.jpg.
+        for (size_t i = 0; i < e.screenshots.size(); i++) {
+            const ShotPair &p = e.screenshots[i];
+            const std::string n = "screenshot-" + std::to_string(i + 1);
+            o += ",\"" + n + "\":" +
+                 json_string(shot_time_text(p.time) + (p.luma ? ", Luma3DS: " : ", the game's: ") + p.top +
+                             (p.bot.empty() ? "" : " + " + p.bot));
+        }
         o += "}";
     }
     if (e.have_figures) {

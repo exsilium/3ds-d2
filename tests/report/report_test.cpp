@@ -232,6 +232,57 @@ int main()
         u.reason = "Session: did not end normally (froze, or was switched off?).";
         CHECK(fingerprint_of(u) == std::vector<std::string>({"session", u.reason}));
     }
+    {   // Screenshots (issue #61): the game's list, Luma3DS's pairs, BMPs, the report context.
+        CHECK(unix_time(1970, 1, 1, 0, 0, 0) == 0);
+        CHECK(unix_time(2026, 11, 2, 14, 2, 31) == 1793628151ull);
+        CHECK(shot_time_text(1793628151ull) == "2026-11-02 14:02:31");
+        CHECK(shot_time_text(unix_time(2028, 2, 29, 23, 59, 59)) == "2028-02-29 23:59:59");
+        std::vector<ShotPair> list;
+        for (int i = 0; i < kKeepShotPairs + 2; i++) {
+            ShotPair p;
+            p.time = 1793628000ull + i;
+            p.ms = 7;
+            p.top = "sdmc:/DCIM/101NIN03/HNI_" + std::to_string(1000 + i) + ".JPG";
+            p.bot = i == 3 ? "" : "sdmc:/3ds/3ds-d2/screenshots/" + std::to_string(i) + "_bot.jpg";
+            const std::vector<ShotPair> dropped = add_shot(list, p);
+            CHECK(dropped.size() == (i >= kKeepShotPairs ? 1u : 0u));
+        }
+        CHECK(list.size() == (size_t)kKeepShotPairs && list.front().time == 1793628002ull);
+        const std::vector<ShotPair> again = parse_shot_list(shot_list_text(list) + "garbage\n");
+        CHECK(again.size() == list.size() && again[1].top == list[1].top && again[1].bot.empty());
+        CHECK(again[0].time == 1793628002ull && again[0].ms == 7 && !again[0].luma);
+        // Luma3DS: both halves, within the session; _top_right and the menu's own shots are not pairs.
+        const std::vector<std::string> names = {
+            "2026-11-02_14-02-31.123_top.bmp", "2026-11-02_14-02-31.123_bot.bmp",
+            "2026-11-02_14-02-31.123_top_right.bmp", "2026-11-02_15-00-00.000_top.bmp",   // no bottom
+            "2026-11-02_14-05-00.500_top.bmp", "2026-11-02_14-05-00.500_bot.bmp",
+            "2026-11-01_09-00-00.000_top.bmp", "2026-11-01_09-00-00.000_bot.bmp",   // another day
+            "rosalina_menu_2026-11-02_14-03-00.000.bmp"};
+        const std::vector<ShotPair> luma =
+            luma_pairs("sdmc:/luma/screenshots", names, unix_time(2026, 11, 2, 14, 0, 0), unix_time(2026, 11, 2, 16, 0, 0));
+        CHECK(luma.size() == 2);
+        CHECK(luma[0].top == "sdmc:/luma/screenshots/2026-11-02_14-05-00.500_top.bmp");
+        CHECK(luma[0].bot == "sdmc:/luma/screenshots/2026-11-02_14-05-00.500_bot.bmp");
+        CHECK(luma[0].luma && luma[0].ms == 500 && luma[1].time == 1793628151ull);
+        CHECK(parse_shot_list(shot_list_text(luma))[1].luma);   // a report's chosen pairs: by their .bmp
+        // A 2x2 bottom-up BMP, rows padded to 4 bytes.
+        std::string bmp(54, '\0');
+        bmp[0] = 'B', bmp[1] = 'M', bmp[0x0a] = 54, bmp[0x12] = 2, bmp[0x16] = 2, bmp[0x1c] = 24;
+        bmp += std::string("\x01\x02\x03\x04\x05\x06\0\0", 8);   // the bottom row, BGR
+        bmp += std::string("\x0a\x0b\x0c\x0d\x0e\x0f\0\0", 8);   // the top row
+        uint32_t w = 0, h = 0;
+        std::vector<uint8_t> rgb;
+        CHECK(decode_bmp(bmp, w, h, rgb) && w == 2 && h == 2);
+        CHECK(rgb == std::vector<uint8_t>({0x0c, 0x0b, 0x0a, 0x0f, 0x0e, 0x0d, 3, 2, 1, 6, 5, 4}));
+        CHECK(!decode_bmp(bmp.substr(0, 60), w, h, rgb));
+        Event e;
+        e.event_id = "0123456789abcdef0123456789abcdef";
+        e.screenshots = {list.back(), luma[0]};
+        const std::string j = event_json(e);
+        CHECK(j.find("\"screenshot-1\":\"2026-11-02 14:00:17, the game's: sdmc:/DCIM/101NIN03/HNI_1017.JPG + "
+                     "sdmc:/3ds/3ds-d2/screenshots/17_bot.jpg\"") != std::string::npos);
+        CHECK(j.find("\"screenshot-2\":\"2026-11-02 14:05:00, Luma3DS: sdmc:/luma/screenshots/") != std::string::npos);
+    }
     {   // A v0.3.2 log: its own first and last lines.
         CHECK(feed("3ds-d2: Diablo II on the 3DS\nGame ended: exited=1 code=0 \n").closed());
         LogSummary s = feed("3ds-d2: Diablo II on the 3DS\n[rt] FATAL: out of guest memory\n");

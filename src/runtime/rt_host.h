@@ -35,6 +35,10 @@ struct Frame {
     // The height the picture is meant to have at its width: twice `height`
     // for a video stored at half height. Gives its aspect ratio.
     uint32_t display_height = 0;
+    // A cinematic's file name as the game asked for it, and where this frame
+    // is in it (ms from its start, and its length).
+    const char *video_name = nullptr;
+    uint32_t video_ms = 0, video_length_ms = 0;
 };
 
 // A cinematic's soundtrack, played by the platform beside the game's own

@@ -138,7 +138,7 @@ $(OUT)/game/ctr_audio.o: $(ROOT)/src/app/ctr_audio.cpp $(wildcard $(ROOT)/src/ru
 # Screenshots into the Camera album: libjpeg-turbo from the pinned image's portlibs.
 PORTLIBS := $(DEVKITPRO)/portlibs/3ds
 $(OUT)/game/ctr_screenshot.o: $(ROOT)/src/app/ctr_screenshot.cpp
-	@mkdir -p $(@D); $(CXX) $(CXXFLAGS) -O2 -I$(PORTLIBS)/include -c $< -o $@
+	@mkdir -p $(@D); $(CXX) $(CXXFLAGS) -O2 -I$(ROOT)/src -I$(PORTLIBS)/include -c $< -o $@
 # Crash and session reports (issue #26): the build ID, the title version and
 # the Sentry DSN go into ctr_report.o only. report.cfg changes when they do,
 # so it is rebuilt then. Unless given, they are scripts/build-id.sh's ID (so

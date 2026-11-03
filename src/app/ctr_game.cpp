@@ -792,6 +792,27 @@ void swap_screens(bool bottom_drawn)
         gfxScreenSwapBuffers(GFX_BOTTOM, false);
 }
 
+// The second screen's view, when staged to be drawn: true if it was.
+bool draw_staged_bottom()
+{
+    const Staged &st = g_staged;
+    if (!st.bottom_draw || st.bottom.kind == game::BottomView::kNone)
+        return false;
+    // Double-buffered from the second screen's first draw: drawn in the
+    // buffer not shown, so the screen never shows one half redrawn. Every
+    // draw covers the whole screen.
+    if (!g_bottom_double) {
+        gfxSetDoubleBuffering(GFX_BOTTOM, true);
+        g_bottom_double = true;
+    }
+    uint16_t *bottom = (uint16_t *)gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, nullptr, nullptr);
+    // A cinematic's view (kVideo) uses neither the frame nor the palette.
+    game::draw_bottom(bottom, st.bottom, st.yuv ? nullptr : st.pixels.data(), (int)st.width, (int)st.height, g_pal565,
+                      default_font_bin);
+    g_bottom_shown = bottom;   // after the swap
+    return true;
+}
+
 void draw_staged()
 {
     const Staged &st = g_staged;
@@ -802,8 +823,9 @@ void draw_staged()
                                     st.pixels.data() + (size_t)st.width * st.height + (size_t)cw * ch};
         const uint32_t strides[3] = {st.width, cw, cw};
         draw_yuv(top, planes, strides, st.width, st.height, st.display_height);
+        const bool bottom_drawn = draw_staged_bottom();
         gfxFlushBuffers();
-        swap_screens(false);
+        swap_screens(bottom_drawn);
         return;
     }
     for (int i = 0; i < 256; i++) {
@@ -821,20 +843,7 @@ void draw_staged()
         draw_window(top, f, st.cursor_x, st.cursor_y);
     else
         draw_stretched(top, f);
-    const bool bottom_drawn = st.bottom_draw && st.bottom.kind != game::BottomView::kNone;
-    if (bottom_drawn) {
-        // Double-buffered from the second screen's first draw: drawn in the
-        // buffer not shown, so the screen never shows one half redrawn.
-        // Every draw covers the whole screen.
-        if (!g_bottom_double) {
-            gfxSetDoubleBuffering(GFX_BOTTOM, true);
-            g_bottom_double = true;
-        }
-        uint16_t *bottom = (uint16_t *)gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, nullptr, nullptr);
-        game::draw_bottom(bottom, st.bottom, st.pixels.data(), (int)st.width, (int)st.height, g_pal565,
-                          default_font_bin);
-        g_bottom_shown = bottom;   // after the swap below
-    }
+    const bool bottom_drawn = draw_staged_bottom();
     gfxFlushBuffers();
     swap_screens(bottom_drawn);
 }
@@ -949,6 +958,17 @@ void stop_render_thread()
     g_render_thread = nullptr;
 }
 
+// The first frame, the game's or a video's: the bottom screen is the second
+// screen's from now on.
+void second_screen_active()
+{
+    if (g_ss_active)
+        return;
+    g_ss_active = true;
+    status("bottom screen: %s tab (tap the tabs to change)",
+           g_ss.tab() == game::BottomTab::Map && g_ss.map_help() ? "help" : game::bottom_tab_name(g_ss.tab()));
+}
+
 void present(const rt::Frame &f)
 {
     const uint64_t t0 = host_us();
@@ -981,6 +1001,11 @@ void present(const rt::Frame &f)
         st.height = f.height;
         st.display_height = f.display_height;
         st.shot = take_shot_request();
+        // The bottom screen: the video's panel (issue #59), also over the
+        // startup console for the logos before the game's first frame.
+        second_screen_active();
+        g_ss.set_video(f.video_name, f.video_ms, f.video_length_ms);
+        st.bottom_draw = g_ss.stage(st.bottom, rt::now_ms());
         st.pixels.resize((size_t)f.width * f.height + 2 * (size_t)cw * ch);
         uint8_t *o = st.pixels.data();
         for (int p = 0; p < 3; p++) {
@@ -1009,11 +1034,7 @@ void present(const rt::Frame &f)
         st.cursor_x = g_controls.cursor_x();
         st.cursor_y = g_controls.cursor_y();
         st.shot = take_shot_request();
-        if (!g_ss_active) {
-            g_ss_active = true;   // the game's first frame: the bottom screen is the second screen's from now on
-            status("bottom screen: %s tab (tap the tabs to change)",
-               g_ss.tab() == game::BottomTab::Map && g_ss.map_help() ? "help" : game::bottom_tab_name(g_ss.tab()));
-        }
+        second_screen_active();
         st.bottom_draw = g_ss.stage(st.bottom, rt::now_ms());
         if (st.bottom.kind == game::BottomView::kKeyboard)
             g_osk.clear_dirty();
@@ -1753,6 +1774,8 @@ int main()
     };
     opt.video_audio = d2rt::audio::video_sink();
     opt.video_event = [](const char *what) {
+        if (std::strcmp(what, "close") == 0)
+            g_ss.end_video();   // the tab as it was, with the game's next frame
         char sys[320];
         system_line(sys, sizeof sys, std::strcmp(what, "open") ? " at video close" : " at video open");
         logline(sys);

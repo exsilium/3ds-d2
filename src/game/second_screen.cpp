@@ -5,6 +5,7 @@
 #include "game/profiler.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -153,6 +154,8 @@ BottomView::Kind SecondScreen::shown_kind() const
 {
     if (osk_ && osk_->is_open())
         return BottomView::kKeyboard;
+    if (video_)
+        return BottomView::kVideo;
     switch (shown_tab()) {
     case BottomTab::Map: return help_ ? BottomView::kHelp : BottomView::kMap;
     case BottomTab::Keys: return BottomView::kKeys;
@@ -358,9 +361,10 @@ void SecondScreen::update(Pad &pad, const GameState &gs, int cursor_x, int curso
     const bool down = pad.touching && !prev_touch_, up = !pad.touching && prev_touch_;
     prev_touch_ = pad.touching;
 
-    if (kind == BottomView::kKeyboard || pad.touchpad) {
+    if (kind == BottomView::kKeyboard || kind == BottomView::kVideo || pad.touchpad) {
         // The keyboard has the touch screen (the platform gives it the
-        // touch); a scripted tap is the touchpad's.
+        // touch); a scripted tap is the touchpad's, and so is any touch
+        // during a video (a tap skips it).
         if (grip_ == Grip::Key || grip_ == Grip::Point)
             grip_ = Grip::None;
     } else {
@@ -489,7 +493,7 @@ void SecondScreen::update(Pad &pad, const GameState &gs, int cursor_x, int curso
     int nk = 0;
     if (grip_ == Grip::Key && pad.touching && !kKeys[key_].latch)
         pad.keys[nk++] = kKeys[key_].vk;
-    if (alt_latched_ && gs_.in_game && kind != BottomView::kKeyboard)
+    if (alt_latched_ && gs_.in_game && kind != BottomView::kKeyboard && kind != BottomView::kVideo)
         pad.keys[nk++] = VK_MENU;
     if (grip_ == Grip::Bar || grip_ == Grip::Key || grip_ == Grip::Point || grip_ == Grip::MapButton)
         pad.touching = false;
@@ -502,6 +506,60 @@ void SecondScreen::set_stats(std::vector<BottomView::Line> lines)
     stats_ = std::move(lines);
     if (shown_kind() == BottomView::kInfo || shown_kind() == BottomView::kKeyboard)
         dirty_ = true;
+}
+
+void SecondScreen::set_video(const char *file, uint32_t at_ms, uint32_t length_ms)
+{
+    if (!video_ || video_file_ != (file ? file : "")) {
+        video_file_ = file ? file : "";
+        video_title_ = video_title(video_file_);
+        dirty_ = true;
+    }
+    video_ = true;
+    video_s_ = at_ms / 1000;
+    video_length_s_ = length_ms / 1000;
+}
+
+void SecondScreen::end_video()
+{
+    if (!video_)
+        return;
+    video_ = false;
+    last_video_s_ = UINT32_MAX;
+    dirty_ = true;   // the tab as it was, with the game's next frame
+}
+
+std::string video_title(const std::string &file)
+{
+    // The name without its folders, extension and size ("640x292").
+    std::string s = file.substr(file.find_last_of("\\/") + 1);
+    if (const size_t dot = s.rfind('.'); dot != std::string::npos)
+        s.erase(dot);
+    size_t size = s.find_last_not_of("0123456789x") + 1;
+    while (size < s.size() && s[size] == 'x')
+        size++;
+    if (s.find('x', size) != std::string::npos)
+        s.erase(size);
+    while (!s.empty() && s.back() == '_')
+        s.pop_back();
+    std::string key = s;
+    for (char &c : key)
+        c = (char)std::tolower((unsigned char)c);
+    static const struct { const char *key, *title; } kTitles[] = {
+        {"new_bliz", "Blizzard Entertainment"},
+        {"bliznorth", "Blizzard North"},
+        {"d2intro", "Diablo II: the intro"},
+        {"act02start", "Act II"},
+        {"act03start", "Act III"},
+        {"act04start", "Act IV"},
+        {"act04end", "Diablo II: the ending"},
+        {"d2x_intro", "Lord of Destruction: the intro"},
+        {"d2x_out", "Lord of Destruction: the ending"},
+    };
+    for (const auto &t : kTitles)
+        if (key == t.key)
+            return t.title;
+    return s.empty() ? std::string("A cinematic") : s;
 }
 
 void SecondScreen::log(const char *s)
@@ -598,6 +656,14 @@ bool SecondScreen::stage(BottomView &v, uint64_t now_ms)
         }
         break;
     }
+    case BottomView::kVideo:
+        // Redrawn as the time shown changes: once a second.
+        v.video_title = video_title_;
+        v.video_s = video_s_;
+        v.video_length_s = video_length_s_;
+        redraw |= video_s_ != last_video_s_;
+        last_video_s_ = video_s_;
+        break;
     case BottomView::kNone:
         break;
     }
@@ -696,6 +762,26 @@ void draw_bottom(uint16_t *fb, const BottomView &v, const uint8_t *frame, int fw
             cv.text(k.x + (k.w - 8 * (int)k.label.size()) / 2, y0 + k.y + (k.h - 8) / 2, k.label.c_str(),
                     k.pressed ? rgb(255, 255, 255) : 0);
         }
+        return;
+    }
+    if (v.kind == BottomView::kVideo) {
+        // The whole screen: no tabs to tap while the touch screen skips.
+        const int h = 112, y = (SecondScreen::kHeight - h) / 2, bx = 40, bw = kW - 2 * bx;
+        cv.fill(0, 0, kW, SecondScreen::kHeight, kBg);
+        cv.fill(0, y, kW, h, kBarBg);
+        cv.fill(0, y, kW, 1, kHint);
+        cv.fill(0, y + h - 1, kW, 1, kHint);
+        cv.centred(0, y + 14, kW, "CINEMATIC", kHint);
+        cv.centred(0, y + 30, kW, v.video_title.c_str(), kGold);
+        const uint32_t len = v.video_length_s, at = std::min(v.video_s, len);
+        cv.fill(bx, y + 52, bw, 6, kBg);
+        if (len)
+            cv.fill(bx, y + 52, (int)(bw * at / len), 6, kGold);
+        char time[32];
+        std::snprintf(time, sizeof time, "%u:%02u / %u:%02u", (unsigned)(at / 60), (unsigned)(at % 60),
+                      (unsigned)(len / 60), (unsigned)(len % 60));
+        cv.centred(0, y + 66, kW, time, kBarText);
+        cv.centred(0, y + 90, kW, "A, B, Start or a tap: skip", kHint);
         return;
     }
     draw_bar(cv, v);

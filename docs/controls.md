@@ -108,7 +108,9 @@ The top screen shows [problem reports](../README.md#problem-reports) before the 
 
 ## Cinematics
 
-A, B, Start (Escape), R + Start (Enter) or a tap on the touchpad skips the video playing, as a key or click does on the PC. The press is held back until it is released, so it does not also act on the next screen. [cinematics.md](cinematics.md) explains the player.
+A, B, Start (Escape), R + Start (Enter) or a tap anywhere on the bottom screen skips the video playing, as a key or click does on the PC. The press is held back until it is released, so it does not also act on the next screen. [cinematics.md](cinematics.md) explains the player.
+
+While a video plays, the bottom screen shows its own panel instead of the tabs: the video's title, how far it has played, and how to skip it. The tab shown before comes back with the next screen.
 
 ## How input reaches the game
 

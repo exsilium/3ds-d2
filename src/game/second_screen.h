@@ -21,6 +21,10 @@
 //          touched directly. Tapping PANEL again with panels on both sides
 //          moves the cursor to the other side.
 // The on-screen keyboard (osk.h) takes the whole screen while it is open.
+// While a cinematic plays (issue #59), a panel of its own replaces the tabs:
+// the video's title, how far it has played, and how to skip it. The touch
+// screen is the touchpad meanwhile, so a tap anywhere skips the video. The
+// tab shown before comes back with the game's next frame.
 //
 // Touch: on the tab bar it picks a tab. In ZOOM and PANEL it points: the
 // cursor goes to the touched spot and follows the finger, a short tap is a
@@ -51,7 +55,7 @@ bool bottom_tab_from_name(const char *s, BottomTab &t);
 
 // Everything the bottom screen draws, taken on the game thread.
 struct BottomView {
-    enum Kind : uint8_t { kNone, kMap, kHelp, kKeys, kViewport, kInfo, kKeyboard };
+    enum Kind : uint8_t { kNone, kMap, kHelp, kKeys, kViewport, kInfo, kKeyboard, kVideo };
     struct Line {
         std::string text;
         uint16_t color;   // RGB565
@@ -79,7 +83,15 @@ struct BottomView {
     std::string osk_title;
     std::vector<Osk::KeyView> osk_keys;
     std::string note;   // a line over the area (kMap without a map)
+    // kVideo: its title, and where it is (whole seconds).
+    std::string video_title;
+    uint32_t video_s = 0, video_length_s = 0;
 };
+
+// A cinematic's title for the player, from its file name
+// ("data\local\video\act02start640x292.bik" -> "Act II"); one not known is
+// shown by its file name without the size and extension.
+std::string video_title(const std::string &file);
 
 class SecondScreen {
 public:
@@ -143,6 +155,11 @@ public:
 
     // The keyboard (osk.h), while it is open, replaces everything.
     void set_keyboard(const Osk *osk) { osk_ = osk; }
+    // A cinematic's frame (its file name, ms from its start, its length),
+    // and its end: the video's panel until then.
+    void set_video(const char *file, uint32_t at_ms, uint32_t length_ms);
+    void end_video();
+    bool video() const { return video_; }
     // INFO: the diagnostics lines (once a second) and the runtime's messages.
     void set_stats(std::vector<BottomView::Line> lines);
     void log(const char *s);
@@ -169,6 +186,11 @@ private:
     bool checklist_ = false;
     uint32_t profile_ = 1;            // profiler.h's kProfSprites until settings say otherwise
     const Osk *osk_ = nullptr;
+
+    // The cinematic playing.
+    bool video_ = false;
+    std::string video_file_, video_title_;
+    uint32_t video_s_ = 0, video_length_s_ = 0, last_video_s_ = UINT32_MAX;
 
     // The game.
     GameState gs_;

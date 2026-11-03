@@ -9,6 +9,7 @@
 //       crash_dump_*.dmp       Luma3DS's dumps saved during it (copies)
 //       report.txt             why there is a report (key=value)
 //       note.txt               the player's description
+//       topic.txt              the topic the player set on it, or it was sent with
 //       sent.txt / declined.txt  the player's answer (none yet: offered at start)
 //
 // A session that never wrote its closing line to game.log (a crash Luma3DS
@@ -78,6 +79,10 @@ using game::report::LogSummary;
 const char kReports[] = "sdmc:/3ds/3ds-d2/reports";
 const char kLogDir[] = "sdmc:/3ds/3ds-d2/logs";
 const char kLumaDumps[] = "sdmc:/luma/dumps/arm11";
+// The player's topic for their reports (issue #61): the title's own part,
+// after the version ("#24"), until they change it.
+const char kTopic[] = "sdmc:/3ds/3ds-d2/report-topic.txt";
+constexpr int kTopicMax = 40;   // characters
 const char kDsn[256] = D2_REPORT_DSN;
 constexpr int kKeepWaiting = 32;   // reports to send: older ones are removed (prune_reports)
 constexpr int kKeepAnswered = 8;   // sent, or not to be sent: older ones are removed
@@ -341,6 +346,7 @@ std::string kib(long bytes)
 
 struct Offer {
     std::string dir, reason, build, note;
+    std::string topic;      // the player's part of the title (issue #61)
     LogSummary log;
     std::vector<std::string> dumps;
     std::string state;      // "" (to send), "sent", "not sent"
@@ -348,6 +354,17 @@ struct Offer {
     std::string status;     // the last action's outcome
     bool confirm_delete = false;
 };
+
+// A report the player asked for (or a profiler run): titled by the version
+// and the player's topic. Any other report is titled by what happened.
+bool asked_for(const Offer &o) { return o.reason == "asked for by the player" || o.reason == "a profiler run"; }
+
+// The version the session was played on. A log from before 0.4.0 does not
+// say it: only if it is this build's is it known.
+std::string version_of(const Offer &o)
+{
+    return !o.log.version().empty() ? o.log.version() : o.build == D2_BUILD_ID ? std::string(D2_VERSION) : "";
+}
 
 // The bottom of every report screen: a message in rows 25-26 (wrapped, two
 // lines at most), and the buttons in rows 27-29, two to a row, each column's
@@ -383,9 +400,25 @@ void draw_offer(const Offer &o)
     consoleSelect(&g_top);
     consoleClear();
     if (o.state.empty())
-        std::printf("\x1b[33m3ds-d2: send a problem report?\x1b[0m\n\n");
+        std::printf("\x1b[33m3ds-d2: send a problem report?\x1b[0m\n");
     else
-        std::printf("\x1b[33m3ds-d2: a problem report (%s)\x1b[0m\n\n", o.state.c_str());
+        std::printf("\x1b[33m3ds-d2: a problem report (%s)\x1b[0m\n", o.state.c_str());
+    // A player's report: its title, the version faint (it is not the
+    // player's to change) and their topic. Any other: the topic only, a tag.
+    const std::string topic = printable(game::report::topic_text(o.topic));
+    if (asked_for(o)) {
+        const std::string fixed = game::report::player_title(version_of(o), "");
+        std::printf("Title: \x1b[2m%s\x1b[0m ", fixed.c_str());
+        const int room = 48 - 7 - (int)fixed.size() - 1;   // within the line, as draw_keys
+        if (!topic.empty())
+            std::printf("\x1b[36m%.*s\x1b[0m\n\n", room > 0 ? room : 0, topic.c_str());
+        else
+            std::printf("\x1b[2m%s\x1b[0m\n\n", o.state == "sent" ? "" : "(R: add a topic)");
+    } else if (!topic.empty()) {
+        std::printf("Topic: \x1b[36m%.41s\x1b[0m\n\n", topic.c_str());
+    } else {
+        std::printf("\n");
+    }
     for (const std::string &l : wrap("The session of build " + o.build + ": " + o.reason + ".", 49))
         std::printf("%s\n", l.c_str());
     if (!o.log.crash_lines().empty())
@@ -417,9 +450,9 @@ void draw_offer(const Offer &o)
     if (note.empty() || o.note.empty()) {
         std::printf("\x1b[36m  %s\x1b[0m\n", o.state == "sent" ? "(none)" : "(none yet: Y to write one)");
     } else {
-        for (size_t i = 0; i < note.size() && i < 5; i++)
+        for (size_t i = 0; i < note.size() && i < 4; i++)
             std::printf("\x1b[36m  %s\x1b[0m\n", note[i].c_str());
-        if (note.size() > 5)
+        if (note.size() > 4)
             std::printf("\x1b[36m  ...\x1b[0m\n");
     }
     // The last action's outcome; once sent, Sentry's ID for it.
@@ -427,15 +460,16 @@ void draw_offer(const Offer &o)
     if (o.state == "sent")
         draw_keys({{"SELECT", "delete"}, {"B", "back to the list"}});
     else if (o.state.empty())
-        draw_keys({{"A", "send"}, {"Y", "edit description"}, {"X", "don't send"}, {"SELECT", "delete"},
-                   {"B", "back to the list"}});
+        draw_keys({{"A", "send"}, {"Y", "edit description"}, {"R", asked_for(o) ? "edit title" : "edit topic"},
+                   {"X", "don't send"}, {"SELECT", "delete"}, {"B", "back to the list"}});
     else
-        draw_keys({{"A", "send"}, {"Y", "edit description"}, {"SELECT", "delete"}, {"B", "back to the list"}});
+        draw_keys({{"A", "send"}, {"Y", "edit description"}, {"R", asked_for(o) ? "edit title" : "edit topic"},
+                   {"SELECT", "delete"}, {"B", "back to the list"}});
 }
 
 // The game's own keyboard on the bottom screen: when the system's keyboard
 // cannot be started (osk.h's open_text).
-void osk_input(const Host &host, std::string &text)
+void osk_input(const Host &host, std::string &text, const char *label)
 {
     game::Osk osk;
     osk.open_text(&text);
@@ -464,7 +498,7 @@ void osk_input(const Host &host, std::string &text)
         if (osk.dirty()) {
             game::BottomView v;
             v.kind = game::BottomView::kKeyboard;
-            v.lines.push_back({"Your description (Start: done)", 0xFFE0});
+            v.lines.push_back({label, 0xFFE0});
             std::vector<std::string> lines = wrap(printable(text) + "_", 40);
             const size_t first = lines.size() > 11 ? lines.size() - 11 : 0;
             for (size_t i = first; i < lines.size(); i++)
@@ -500,10 +534,42 @@ void describe(const Host &host, Offer &o)
         const SwkbdResult r = swkbdGetResult(&kb);
         if (r == SWKBD_INVALID_INPUT || r == SWKBD_OUTOFMEM) {
             say(host, "report: the system keyboard did not start; the game's keyboard instead");
-            osk_input(host, o.note);
+            osk_input(host, o.note, "Your description (Start: done)");
         }
     }
     write_all(o.dir + "/note.txt", o.note);
+}
+
+// The player's part of the title (issue #61): one line, kept in kTopic for
+// every later report until changed, and in the report's own topic.txt.
+void edit_topic(const Host &host, Offer &o)
+{
+    const std::string fixed = game::report::player_title(version_of(o), "");
+    const std::string hint = asked_for(o) ? fixed + " ... (a topic, e.g. #24)" : "A topic, e.g. #24";
+    SwkbdState kb;
+    swkbdInit(&kb, SWKBD_TYPE_NORMAL, 2, kTopicMax);
+    swkbdSetHintText(&kb, hint.c_str());
+    swkbdSetInitialText(&kb, o.topic.c_str());
+    swkbdSetFeatures(&kb, SWKBD_DARKEN_TOP_SCREEN);
+    swkbdSetButton(&kb, SWKBD_BUTTON_LEFT, "Cancel", false);
+    swkbdSetButton(&kb, SWKBD_BUTTON_RIGHT, "OK", true);
+    std::vector<char> buf(4 * kTopicMax + 1);
+    const SwkbdButton b = swkbdInputText(&kb, buf.data(), buf.size());
+    if (b == SWKBD_BUTTON_RIGHT) {
+        o.topic = game::report::topic_text(buf.data());
+    } else if (b == SWKBD_BUTTON_NONE) {
+        const SwkbdResult r = swkbdGetResult(&kb);
+        if (r != SWKBD_INVALID_INPUT && r != SWKBD_OUTOFMEM)
+            return;
+        say(host, "report: the system keyboard did not start; the game's keyboard instead");
+        osk_input(host, o.topic, "The report's topic (Start: done)");
+        o.topic = game::report::topic_text(o.topic);
+    } else {
+        return;
+    }
+    write_all(kTopic, o.topic);
+    write_all(o.dir + "/topic.txt", o.topic);
+    say(host, o.topic.empty() ? "report: no topic" : "report: topic " + printable(o.topic));
 }
 
 // ---- sending ------------------------------------------------------------------------
@@ -641,22 +707,31 @@ bool build_envelope(const Host &host, const Offer &o, const game::report::Dsn &d
     if (o.log.start_time())
         e.started = clock_text(o.log.start_time());
     const bool crashed = o.reason.compare(0, 7, "crashed") == 0;
-    const bool asked = o.reason == "asked for by the player" || o.reason == "a profiler run";
+    const bool asked = asked_for(o);
     e.level = crashed ? "fatal" : asked ? "info" : "error";
-    // The release is the version the session was played on; its build is
-    // the dist (and the build_id tag), so a release gathers all its builds.
-    // A log from before 0.4.0 does not say its version: only if it is this
-    // build's is it known.
-    const std::string version =
-        !o.log.version().empty() ? o.log.version() : o.build == D2_BUILD_ID ? std::string(D2_VERSION) : "";
+    // The release is the version the session was played on ("0.4.0-dev"
+    // for any build but the release's own, issue #61); its build is the
+    // dist (and the build_id tag), so a release gathers all its builds.
+    const std::string version = version_of(o);
+    e.version = version;
     if (!version.empty())
         e.release = "3ds-d2@" + version;
     e.dist = o.build;
-    e.message = o.note;
+    e.note = o.note;
+    e.topic = o.topic;
+    e.player_report = asked;
     e.reason = "Session: " + o.reason + ".";
     e.crash_lines = o.log.crash_lines();
     e.figures = o.log.figures();
     e.have_figures = e.figures.seconds != 0;
+    // The first Luma3DS dump titles and groups a crash the app did not catch (issue #61).
+    for (const std::string &d : o.dumps) {
+        std::string bytes;
+        if (read_all(o.dir + "/" + d, bytes) && r::parse_luma_dump(bytes, e.dump)) {
+            e.have_dump = true;
+            break;
+        }
+    }
 
     u8 model = 0xFF, region = 0xFF;
     if (R_SUCCEEDED(cfguInit())) {
@@ -781,6 +856,11 @@ Offer load_offer(const std::string &dir)
     o.reason = kv_get(text, "reason");
     o.build = kv_get(text, "build");
     read_all(dir + "/note.txt", o.note);
+    // The topic set on this report, else (until sent) the one the player's
+    // reports carry.
+    if (!read_all(dir + "/topic.txt", o.topic) && !exists(dir + "/sent.txt"))
+        read_all(kTopic, o.topic);
+    o.topic = game::report::topic_text(o.topic);
     summarize(dir + "/game.log", o.log);
     if (o.build.empty())
         o.build = o.log.build().empty() ? "unknown" : o.log.build();
@@ -810,6 +890,7 @@ bool send(const Host &host, Offer &o, const game::report::Dsn &dsn, std::string 
     }
     if (!post(host, dsn, body, msg, event_id))
         return false;
+    write_all(o.dir + "/topic.txt", o.topic);   // as it was sent, whatever the next reports carry
     write_all(o.dir + "/sent.txt", "sent=" + std::to_string(unix_now()) + "\nevent_id=" + event_id + "\n");
     o.state = "sent";
     o.event_id = event_id;
@@ -851,6 +932,9 @@ bool detail(const Host &host, const game::report::Dsn &dsn, const std::string &d
                 return true;
             } else if ((k & KEY_Y) && o.state != "sent") {
                 describe(host, o);
+                redraw = true;
+            } else if ((k & KEY_R) && o.state != "sent") {
+                edit_topic(host, o);
                 redraw = true;
             } else if ((k & KEY_A) && o.state != "sent") {
                 o.status = "Sending...";

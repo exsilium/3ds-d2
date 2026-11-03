@@ -11,7 +11,7 @@
 #   scripts/docker.sh test m3            a PE32 through the Win32 runtime on the ARMv6 backend
 #   scripts/docker.sh test tls           the reports' TLS module under qemu-arm: a test event to Sentry (network)
 #   scripts/docker.sh package           release build -> dist/<build-id>/ with manifest
-#   scripts/docker.sh package-cia [<game-dir>]   the hardware build: dist/cia/3ds-d2-<build-id>.cia (~2 MB),
+#   scripts/docker.sh package-cia [<game-dir>]   the hardware build: dist/cia/3ds-d2-<version>-<build-id>.cia (~2 MB),
 #                                             reading the game files from sdmc:/3ds/3ds-d2/game/; with
 #                                             <game-dir> (or D2_GAME_DIR) its icon, banner and tune are the game's
 #   scripts/docker.sh package-cia --slim <game-dir>   ... with your 1.14d files inside (no video/music/speech)
@@ -173,13 +173,15 @@ package-cia)   # [<game-dir> | --slim|--full <game-dir>]: the game app (+ the us
     ensure_image ctrtools "$CTRTOOLS_IMAGE"
     saved_extra=("${RUN_EXTRA[@]}"); RUN_EXTRA=()
     run_in "$HOSTTEST_IMAGE" make -C tests/cpu VARIANT=armv6 lib >/dev/null     # the patched backend tree
-    # Reports (issue #26): the build ID and title version, and the Sentry
+    # Reports (issue #26): the build ID and version ("0.4.0-dev" unless built
+    # from its release tag: scripts/version.sh, issue #61), and the Sentry
     # project if D2_REPORT_DSN is set (even to nothing: no reports); otherwise
     # the Makefile takes packaging/cia/report.dsn.
-    report_vars=(BUILD_ID="$(build_id)" D2_VERSION="$(sed -n 's/^version=\([0-9.]*\).*/\1/p' "$ROOT/scripts/package-cia.sh")")
+    version="$(sh "$ROOT/scripts/version.sh")"
+    report_vars=(BUILD_ID="$(build_id)" D2_VERSION="$version")
     [ -n "${D2_REPORT_DSN+x}" ] && report_vars+=(D2_REPORT_DSN="$D2_REPORT_DSN")
     run_in "$TOOLCHAIN_IMAGE" make -s -j8 -C tests/cpu/ctr "${report_vars[@]}" ../../../build/cpu/ctr/3ds-d2-game-cia.elf ../../../build/cpu/ctr/tls.bin
-    RUN_EXTRA=("${saved_extra[@]}")
+    RUN_EXTRA=("${saved_extra[@]}" -e "D2_VERSION=$version")   # the CIA's name
     if [ -n "$art" ]; then   # the icon, banner model and tune (packaging/cia/game_art.py)
         ensure_image banner "$BANNER_IMAGE"
         mkdir -p "$ROOT/build/cia/game-art"

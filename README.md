@@ -69,7 +69,7 @@ If you set up your console with the 3ds.hacks.guide, you may have done this alre
 
 ### 3. Install the app
 
-Build the CIA as described under [Building the CIA](#building-the-cia), then install `3ds-d2-<build-id>.cia` with FBI. Either copy it to the SD card and pick it in FBI under *SD*, or use FBI's *Remote Install*. The HOME menu then shows a **3ds-d2** icon (title ID `000400000D2D3D00`).
+Build the CIA as described under [Building the CIA](#building-the-cia), then install `3ds-d2-<version>-<build-id>.cia` with FBI. Either copy it to the SD card and pick it in FBI under *SD*, or use FBI's *Remote Install*. The HOME menu then shows a **3ds-d2** icon (title ID `000400000D2D3D00`).
 
 The CIA holds only the app, about 2 MB. A new version is a quick reinstall over the old one, and the game files on the SD card stay where they are.
 
@@ -117,10 +117,15 @@ The screen lists what would be sent:
 
 Save files and character names are never sent.
 
+In Sentry, reports are grouped by what happened, not by your description, so the same crash lands in one issue however it's described. The groups: a crash the app caught (the fault, and where in Game.exe); a Luma3DS dump (the crashed process and exception, and outside 3ds-d2 its address); a fatal error by its kind; a session that didn't end; a report you asked for, by its title. Your description goes with each report as its `note`.
+
+A report you ask for (or a profiler run's) is titled by the version, which you can't change, and an optional topic you add with **R**: `v0.4.0` alone, or `v0.4.0 #24`. Reports with the same title are one Sentry issue; the topic ignores case and extra spaces. The topic is remembered (`/3ds/3ds-d2/report-topic.txt`) for every later report until you change it, and goes with crash reports too, as the `topic` tag, without changing how they group. Builds not made from a release's tag carry `-dev` in their version (`v0.4.0-dev`), in the CIA's name and in Sentry, so testing never mixes with a release's reports.
+
 On a report's screen:
 
 - **A** sends it over Wi-Fi to the project's [Sentry](https://sentry.io) account. Sentry's ID for it is shown, and kept in the report's folder (`sent.txt`).
 - **Y** writes or changes your description.
+- **R** sets the topic: the title's own part for a report you asked for, a tag for a crash.
 - **X** marks it as not to be sent (A still sends it later).
 - **SELECT** twice deletes the report and its files.
 - **B** goes back to the list of reports.
@@ -164,15 +169,15 @@ Everything builds inside Docker containers with a pinned toolchain (devkitARM, l
    On the first run this also builds the CIA tools image. It then compiles the CPU backend with this project's patches and the 3DS app, and packs the CIA. The last lines show the result:
 
    ```
-   cia: 3ds-d2-<build-id>.cia
+   cia: 3ds-d2-<version>-<build-id>.cia
    version: 0.4.0
    sha256: ...
    ```
 
 The output goes to `dist/cia/`:
-- `3ds-d2-<build-id>.cia`: the app to install (step 3 above).
-- `3ds-d2-<build-id>.elf`: the same code with debug symbols, for reading crash dumps (`tools/luma_dump.py`).
-- `3ds-d2-<build-id>.cia.txt`: version, size and SHA-256. To check that a copy on the SD card is intact, compare its SHA-256 with this file.
+- `3ds-d2-<version>-<build-id>.cia`: the app to install (step 3 above).
+- `3ds-d2-<version>-<build-id>.elf`: the same code with debug symbols, for reading crash dumps (`tools/luma_dump.py`).
+- `3ds-d2-<version>-<build-id>.cia.txt`: version, size and SHA-256. To check that a copy on the SD card is intact, compare its SHA-256 with this file.
 
 The build ID is a hash of everything that goes into the CIA, so the same sources always produce the same name, and any change gives a new one. Builds run without network access, and the game files never enter an image.
 
@@ -180,7 +185,7 @@ Two variants carry the game files inside the CIA itself instead of reading them 
 - `scripts/docker.sh package-cia --full <game-dir>`: all 12 files (~2 GB).
 - `scripts/docker.sh package-cia --slim <game-dir>`: without music, speech and cinematics (~850 MB, no sound).
 
-Every build, your own included, offers [problem reports](#problem-reports) to the project's Sentry, whose DSN is in `packaging/cia/report.dsn` (a public key that can only send events). Each report's release is the version the session was played on (`3ds-d2@<version>`), and its build ID is the release's `dist` and the `build_id` tag, so all builds of a version share one release in Sentry and reports from one build can still be filtered (`dist:<build ID>`). To send your reports to your own project instead, set its DSN when building: `D2_REPORT_DSN=https://<key>@<org>.ingest.sentry.io/<project> scripts/docker.sh package-cia ...` (`SENTRY_AUTH_TOKEN=<token> scripts/sentry-setup.sh [<org> [<project>]]` creates one and writes its DSN to that file). `D2_REPORT_DSN=` (empty) builds an app that never offers or sends anything. The console's own HTTPS cannot complete a handshake with Sentry's servers (they take only TLS 1.2 with SNI), so the app brings its own TLS: mbedTLS and the root certificates of Sentry's current and announced certificate authorities, built into a separate module (`src/tls/`, shipped as `tls.bin` in the RomFS). The module takes no memory during play. To send a report, the app loads it into executable memory (the way the JIT makes its code), sends over the console's sockets, and frees it again. `scripts/docker.sh test tls` loads the same module under qemu-arm and sends a test event to the project. An `http://` DSN (a relay that forwards to Sentry) is sent without the module.
+Every build, your own included, offers [problem reports](#problem-reports) to the project's Sentry, whose DSN is in `packaging/cia/report.dsn` (a public key that can only send events). Each report's release is the version the session was played on (`3ds-d2@<version>`, with `-dev` unless the build was made from the release's tag `v<version>` with nothing uncommitted: `scripts/version.sh`), and its build ID is the release's `dist` and the `build_id` tag, so all builds of a version share one release in Sentry and reports from one build can still be filtered (`dist:<build ID>`). To send your reports to your own project instead, set its DSN when building: `D2_REPORT_DSN=https://<key>@<org>.ingest.sentry.io/<project> scripts/docker.sh package-cia ...` (`SENTRY_AUTH_TOKEN=<token> scripts/sentry-setup.sh [<org> [<project>]]` creates one and writes its DSN to that file). `D2_REPORT_DSN=` (empty) builds an app that never offers or sends anything. The console's own HTTPS cannot complete a handshake with Sentry's servers (they take only TLS 1.2 with SNI), so the app brings its own TLS: mbedTLS and the root certificates of Sentry's current and announced certificate authorities, built into a separate module (`src/tls/`, shipped as `tls.bin` in the RomFS). The module takes no memory during play. To send a report, the app loads it into executable memory (the way the JIT makes its code), sends over the console's sockets, and frees it again. `scripts/docker.sh test tls` loads the same module under qemu-arm and sends a test event to the project. An `http://` DSN (a relay that forwards to Sentry) is sent without the module.
 
 More documentation:
 - [docs/build-and-run.md](docs/build-and-run.md): builds, tests and the Azahar emulator lanes.

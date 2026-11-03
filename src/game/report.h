@@ -179,8 +179,8 @@ struct Event {
     std::string started;     // when the session started, by the console's clock (may be empty)
     std::string note;        // the player's description (may be empty): context, not the title (issue #61)
     std::string topic;       // the player's own part of the title ("#24"; may be empty), kept between reports
-    // The screenshot pairs attached, in order (screenshot-<n>-top.jpg and
-    // -bot.jpg): where each came from, for the report context.
+    // The screenshot pairs attached, in order (screenshot-<n>a-top.jpg and
+    // <n>b-bot.jpg): where each came from, for the report context.
     std::vector<ShotPair> screenshots;
     std::string reason;      // why there is a report, in a few words
     std::vector<std::pair<std::string, std::string>> tags;

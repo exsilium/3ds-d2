@@ -611,7 +611,7 @@ std::string event_json(const Event &e)
             o += ",\"topic\":" + json_string(topic);
         if (!e.note.empty())
             o += ",\"note\":" + json_string(e.note);
-        // Which attachment is which picture: screenshot-<n>-top.jpg and -bot.jpg.
+        // Which attachment is which picture: screenshot-<n>a-top.jpg and <n>b-bot.jpg.
         for (size_t i = 0; i < e.screenshots.size(); i++) {
             const ShotPair &p = e.screenshots[i];
             const std::string n = "screenshot-" + std::to_string(i + 1);

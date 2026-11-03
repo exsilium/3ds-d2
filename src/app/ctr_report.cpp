@@ -974,10 +974,11 @@ bool build_envelope(const Host &host, const Offer &o, const game::report::Dsn &d
     add_file_item(gz, o.dir + "/files.trc", "files.trc", "text/plain", kFileTraceMax, kFileTraceMax);
     for (const std::string &d : o.dumps)
         add_file_item(gz, o.dir + "/" + d, d, "application/octet-stream", kDumpMax, kDumpMax);
+    // a/b: Sentry lists attachments by name, so a pair's top comes first.
     for (size_t i = 0; i < o.shots.size(); i++) {
         const std::string n = "screenshot-" + std::to_string(i + 1);
-        add_picture(gz, o.shots[i].top, o.shots[i].luma, n + "-top.jpg");
-        add_picture(gz, o.shots[i].bot, o.shots[i].luma, n + "-bot.jpg");
+        add_picture(gz, o.shots[i].top, o.shots[i].luma, n + "a-top.jpg");
+        add_picture(gz, o.shots[i].bot, o.shots[i].luma, n + "b-bot.jpg");
     }
     return gz.finish(body);
 }

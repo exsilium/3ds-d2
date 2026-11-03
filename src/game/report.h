@@ -110,22 +110,60 @@ struct Attachment {
     std::string filename, content_type, data;
 };
 
+// A Luma3DS ARM11 exception dump (luma/dumps/arm11/*.dmp; tools/luma_dump.py):
+// what a report is titled and grouped by. Layout per Luma3DS's dump header:
+// two magic words, version, processor and core, the exception type, total
+// size, then the sizes of the register, code, stack and additional-data
+// sections, which follow in that order (the process name and title ID last).
+struct LumaDump {
+    std::string process;   // "3ds-d2", "menu", ...
+    uint64_t title = 0;
+    uint32_t core = 0, type = 0;   // type: 0 FIQ, 1 undefined instruction, 2 prefetch abort, 3 data abort
+    uint32_t pc = 0, lr = 0, fsr = 0, far = 0;   // fsr: the DFSR for a data abort, else the IFSR
+    const char *type_name() const;
+    bool in_kernel() const { return pc >= 0xFFF00000u; }
+};
+bool parse_luma_dump(const std::string &data, LumaDump &out);
+
 struct Event {
     std::string event_id;    // 32 lowercase hex digits
     uint64_t timestamp = 0;  // unix seconds, UTC; 0: when Sentry receives it (the console's
                              // clock is local time, in no known zone)
     std::string level;       // "fatal" (a crash), "error", "info" (asked for by the player)
+    std::string version;     // the version the session was played on ("0.4.0", "0.4.0-dev"; "" unknown)
     std::string release;     // 3ds-d2@<version>
     std::string dist;        // the build ID: which build of the release
     std::string started;     // when the session started, by the console's clock (may be empty)
-    std::string message;     // the player's description (may be empty)
+    std::string note;        // the player's description (may be empty): context, not the title (issue #61)
+    std::string topic;       // the player's own part of the title ("#24"; may be empty), kept between reports
     std::string reason;      // why there is a report, in a few words
     std::vector<std::pair<std::string, std::string>> tags;
     std::vector<std::pair<std::string, std::string>> device;   // contexts.device
     std::vector<std::string> crash_lines;
+    LumaDump dump;           // the session's first Luma3DS dump, if have_dump
+    bool have_dump = false;
+    bool player_report = false;   // asked for by the player, or a profiler run
     LogSummary::Figures figures;
     bool have_figures = false;
 };
+
+// A player's report is titled by the version, which the player cannot
+// change, and the topic they add ("v0.4.0-dev #24"); reports with the same
+// title are one Sentry issue. topic_text: the topic on one line as typed, but
+// trimmed and with runs of spaces as one; topic_key: that in ASCII lowercase,
+// as the fingerprint takes it ("#24 " and "#24" are one issue).
+std::string player_title(const std::string &version, const std::string &topic);
+std::string topic_text(const std::string &topic);
+std::string topic_key(const std::string &topic);
+
+// What Sentry groups the event by (its `fingerprint`), from what happened,
+// never from the player's note (issue #61): a CPU exception by its kind and
+// the guest block it hit; a Luma3DS dump by process, exception and, outside
+// 3ds-d2 (whose addresses move with each build), its pc; a fatal error by
+// its kind; a session that did not end; a player's own report by its title.
+// The topic groups only a player's report: a crash keeps its own issue
+// whatever the run was for, and carries the topic as a tag.
+std::vector<std::string> fingerprint_of(const Event &e);
 
 // The event as Sentry's JSON.
 std::string event_json(const Event &e);

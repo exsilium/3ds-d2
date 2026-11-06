@@ -57,6 +57,13 @@ The diagnostics are on the bottom screen's INFO tab (tap INFO in the tab bar; [c
 
 To measure more, tap **profiler run** on INFO, tick what to measure and start the run (sprite trace, guest code profile, file-read trace, SD card benchmark). The session is then offered as a report with what the run wrote. There is no separate profiling build any more.
 
+The checklist's last row, **trace writes**, sets how the traces reach the SD card, and a tap steps it on, during a run too:
+- **buffered** (the default, as before): large writes as the buffers fill; a crash loses what they still hold, minutes of reads.
+- **every second**: what the traces hold is written out once a second.
+- **at once**: every record is written as it is made, so a crash loses nothing before it. This costs an SD card write per file read and per sprite use, so use it to chase a crash (issue #66), not to measure the frame rate.
+
+The setting is saved, logged as `profiler run: trace writes <buffered|second|now>`, and a report carries it as the `trace_writes` tag.
+
 Logs are on the SD card in `3ds/3ds-d2/logs/`: `game.log` for the runtime, and `stderr.txt` for the CPU backend, including its arena line. Saves and settings are in `3ds/3ds-d2/save/`. `python3 -I tools/session_report.py game.log` summarises a session from its heartbeats: the frame rate by game state, the slowest windows and what they were doing (sprite re-loads, new code, SD reads), memory over time (with the sprites' frames' blocks and units, issue #44), and the hitches (`prof hitch:` lines: frames by interval, the longest, sprites taken and let go of, the frame thread's read wait, frames not drawn, starved sound grains) with the slowest windows' causes.
 
 ## Things that differ from Azahar, and may fail first
@@ -148,7 +155,7 @@ Two more settings matter for these checks:
 - **`D2_NATIVE_CHECK=1`** runs the original next to the sprite cache's two natives (`SpriteCacheTouch`, `SpritePath`, issue #37) and the locked lookups (`LockedLookup`, `CurrentLookup`, issue #38) on every call they take, from trampolines in `.text`'s slack at `0x6cb7e0`, and logs any difference (`native check: ... differ`). Over `fight.txt`: 65,536 hits and 32,768 paths (the counts it logs at powers of two), none differ; 4,096 and 2,048 lookups, entry and lock state alike, none differ. With and without the lookups (`D2_NATIVE_MASK=0xfffff` against the default), all 4,332 frames of `fight.txt` hash the same. Unlike frame hashes, it doesn't depend on timing: removing guest instructions changes the scheduler's slices, so scripted input in the game world can land on another frame.
 - **`M4_SPRITE_FRAMES=0`** leaves the sprites' frames in the pool system, as the game does (issue #44; on the 3DS layouts they are otherwise in blocks of their own, `game::install_sprite_frames`). With `M4_NATIVE=late` the allocator is installed on arrival in the game world too. Over `fight.txt`, with and without it, all 4,705 frames hash the same. A sprite trace started before a late install says the frames are the pool system's (its header's flag is read when it starts).
 
-Scripts for these runs are in `tests/m4/scripts/` (`M4_SCRIPT="$(cat tests/m4/scripts/fight.txt)"`): `town-walk.txt` walks around the Rogue Encampment, and `fight.txt` crosses the bridge into Blood Moor and fights the quill rats there. The fight's route is the map the virtual clock gives. The same file works on the console as `sdmc:/3ds/3ds-d2/autoplay.txt`.
+Scripts for these runs are in `tests/m4/scripts/` (`M4_SCRIPT="$(cat tests/m4/scripts/fight.txt)"`): `town-walk.txt` walks around the Rogue Encampment, `fight.txt` crosses the bridge into Blood Moor and fights the quill rats there, and `act2-east.txt` takes a character that has finished Act I (`dist/save/BeforeCh1End`) to Warriv and East to Lut Gholein (issue #66). It finds Warriv in the game's units (`tapunit`, `src/game/d2_units.h`), so it does not depend on the frame rate. The fight's route is the map the virtual clock gives. The same file works on the console as `sdmc:/3ds/3ds-d2/autoplay.txt`.
 
 Example: the native light grid (`LightGrid`, mask bit 8), with the town walk script, `WX86_FAKETSC=1` and `M4_HASHMEM=0x7b0e68:0x4800`. Masks `0xff` and `0x1ff` give the same 2,372 frames, pixels and grid alike, over 185 distinct grid states.
 

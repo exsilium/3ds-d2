@@ -68,6 +68,10 @@ bool install_sprite_trace(d2rt::Cpu &c);
 bool sprite_trace_start(const char *path);
 void sprite_trace_stop();
 bool sprite_trace_on();
+// What the trace holds, written out now (issue #66: the platform's "every
+// second"); and each record written as it is made, or not. The game's thread.
+void sprite_trace_flush();
+void sprite_trace_each(bool on);
 
 // Each heartbeat while on: the cache, the pool and the counters, then the
 // file flushed.

@@ -1,5 +1,6 @@
 // See d2_state.h.
 #include "game/d2_state.h"
+#include "game/cinematics.h"
 
 #include "runtime/rt_host.h"
 
@@ -25,6 +26,7 @@ constexpr uint8_t kPanels[] = {0x01, 0x02, 0x04, 0x08, 0x09, 0x0C, 0x0E, 0x0F, 0
 GameState read_game_state()
 {
     GameState s;
+    s.video = cinematic_playing();
     uint8_t check = 0;
     if (!rt::guest_read(kCheckVa, &check, 1) || check != 0x55)
         return s;   // not the 1.14d layout: report nothing, the controls stay in cursor mode

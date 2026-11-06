@@ -18,6 +18,7 @@
 #   scripts/docker.sh package-cia --full <game-dir>   ... with every MPQ inside
 #     D2_REPORT_DSN=<Sentry DSN> scripts/docker.sh package-cia ...   crash reports offered to that project (issue #26);
 #                                             default packaging/cia/report.dsn (scripts/sentry-setup.sh), empty: none
+#   scripts/docker.sh game-3dsx          the game app as a .3dsx for Azahar (scripts/run-game-azahar.sh)
 #   scripts/docker.sh sdcard-folder <game-dir>   dist/sdcard/3ds/3ds-d2/game/ for that (copy once)
 #   scripts/docker.sh repro              two clean release builds must match byte-for-byte
 #   scripts/docker.sh shell [hosttest]   interactive shell in a build image
@@ -188,6 +189,13 @@ package-cia)   # [<game-dir> | --slim|--full <game-dir>]: the game app (+ the us
         run_in "$BANNER_IMAGE" python3 -I packaging/cia/game_art.py build/cia/art-src build/cia/game-art /opt/pycgfx
     fi
     run_in "$CTRTOOLS_IMAGE" sh scripts/package-cia.sh
+    ;;
+game-3dsx)   # the game app as a .3dsx for Azahar (scripts/run-game-azahar.sh): build/cpu/ctr/3ds-d2-game.3dsx
+    ensure_image hosttest "$HOSTTEST_IMAGE"
+    ensure_image toolchain "$TOOLCHAIN_IMAGE"
+    run_in "$HOSTTEST_IMAGE" make -C tests/cpu VARIANT=armv6 lib >/dev/null     # the patched backend tree
+    run_in "$TOOLCHAIN_IMAGE" make -s -j8 -C tests/cpu/ctr BUILD_ID="$(build_id)" D2_VERSION="$(sh "$ROOT/scripts/version.sh")"         ../../../build/cpu/ctr/3ds-d2-game.3dsx
+    echo "built build/cpu/ctr/3ds-d2-game.3dsx"
     ;;
 sdcard-folder)   # [--full] <game-dir>: dist/sdcard/3ds/3ds-d2/game/ to copy once to the SD card root
     full=0; [ "${1:-}" = --full ] && { full=1; shift; }

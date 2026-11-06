@@ -84,4 +84,5 @@ ok   rep_long             6/6
 ok   bsf_mem              6/6    
 ok   bsr_mem              6/6    
 ok   bsf_same             6/6    
-RESULT cpu.compare FAIL cases=8205 matching=8168 differing=37
+ok   bytemoves          200/200  
+RESULT cpu.compare FAIL cases=8405 matching=8368 differing=37

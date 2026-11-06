@@ -407,6 +407,11 @@ uint32_t video_step(Cpu &)
 
 }  // namespace
 
+bool cinematic_playing()
+{
+    return __atomic_load_n(&g_playing, __ATOMIC_RELAXED);
+}
+
 int install_cinematics(Cpu &c)
 {
     uint8_t expect[kLoopRoom], have[kLoopRoom];

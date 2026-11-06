@@ -138,6 +138,8 @@ void LogSummary::feed(const char *line)
                 if (!name.empty() && ("," + profiled_ + ",").find("," + name + ",") == std::string::npos)
                     profiled_ += (profiled_.empty() ? "" : ",") + name;
             }
+        else if (std::strncmp(l + run_len, "trace writes ", 13) == 0)
+            trace_writes_.assign(l + run_len + 13, std::strcspn(l + run_len + 13, " \r\n"));
         return;
     }
     uint64_t slow = 0, stalled = 0, longest = 0;

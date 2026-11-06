@@ -24,6 +24,7 @@ struct GameState {
     bool panel_open = false;  // a panel covers the world (the cursor is for it)
     uint32_t edit_focus = 0;  // the focused edit box (character name, chat...), 0 if none
     uint64_t ui = 0;          // in game: bit i set = UI table entry i is non-zero (i < 0x28)
+    bool video = false;       // a cinematic is playing (any layout)
 };
 
 // Cheap: a check byte and up to 42 dwords. Call once per input poll.

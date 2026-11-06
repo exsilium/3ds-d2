@@ -41,6 +41,7 @@
 #include "game/controls.h"
 #include "game/d2_state.h"
 #include "game/osk.h"
+#include "game/profiler.h"
 
 #include <cstdint>
 #include <string>
@@ -79,6 +80,7 @@ struct BottomView {
     bool profiling = false;           // kInfo: a profiler run is on (its button lit)
     bool checklist = false;           // kInfo: the profiler run's checklist instead of the lines
     uint32_t profile = 0;             // the checklist's ticks (profiler.h)
+    TraceWrites trace_writes = TraceWrites::Buffered;   // the checklist's last row
     // kKeyboard.
     std::string osk_title;
     std::vector<Osk::KeyView> osk_keys;
@@ -126,12 +128,17 @@ public:
     // (profiler.h), with the run's start/stop button where this one was and
     // a way back where the report's was. The platform starts and stops the
     // run's options at its heartbeat as profiling() says. Ticks are a
-    // setting; they do not change while a run is on.
+    // setting; they do not change while a run is on. Under them, how the
+    // traces are written (profiler.h's TraceWrites): a tap steps it on, a
+    // run on or not, and the platform applies it at once.
     static constexpr int kProfBtnX = 4, kProfBtnW = 156;
-    static constexpr int kProfRowY = kBarH + 20, kProfRowH = 40;
+    static constexpr int kProfRows = kProfileOptionCount + 1;
+    static constexpr int kProfRowY = kBarH + 20, kProfRowH = 36;
     bool profiling() const { return profiling_; }
     uint32_t profile_choice() const { return profile_; }
     void set_profile_choice(uint32_t bits);
+    TraceWrites trace_writes() const { return trace_writes_; }
+    void set_trace_writes(TraceWrites m);
     // The buttons' shortcuts (Select + D-pad): the next or previous tab
     // along the bar (PANEL too while a panel is open), MAP, and MAP's size
     // (both showing the map, not HELP). Not while the keyboard is open.
@@ -185,6 +192,7 @@ private:
     bool profiling_ = false;
     bool checklist_ = false;
     uint32_t profile_ = 1;            // profiler.h's kProfSprites until settings say otherwise
+    TraceWrites trace_writes_ = TraceWrites::Buffered;
     const Osk *osk_ = nullptr;
 
     // The cinematic playing.

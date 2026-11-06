@@ -346,7 +346,7 @@ ARMv6 patch 0022 makes the CPUID leaf-1 EDX bits a run-time setting (`wx86_set_c
 
 ### 9a. The game in Azahar (2026-10-17)
 
-`scripts/run-game-azahar.sh` builds `build/cpu/ctr/3ds-d2-game.3dsx` (`src/app/ctr_game.cpp`) and starts it in Azahar 2126.2 (New 3DS mode). The game reaches its main loop and the main menu at **25 fps** (the game's own cap) with Azahar at 101% speed. Controls: [controls.md](controls.md).
+`scripts/run-game-azahar.sh` builds the console's CIA (`src/app/ctr_game.cpp`), installs it in Azahar 2126.2 (New 3DS mode, Vulkan renderer) and starts it; `--3dsx` starts `build/cpu/ctr/3ds-d2-game.3dsx` instead. The game reaches its main loop and the main menu at **25 fps** (the game's own cap) with Azahar at 101% speed. Controls: [controls.md](controls.md).
 
 What it took:
 

@@ -963,6 +963,8 @@ bool build_envelope(const Host &host, const Offer &o, const game::report::Dsn &d
               {"app_version", D2_VERSION}};
     if (system_s[0])
         e.tags.push_back({"firmware", system_s});
+    if (!o.log.trace_writes().empty())
+        e.tags.push_back({"trace_writes", o.log.trace_writes()});   // how complete the traces are (issue #66)
     e.device = {{"model", model_name(model)}, {"family", "Nintendo 3DS"}, {"arch", "armv6k"}};
     e.screenshots = o.shots;
 

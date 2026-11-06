@@ -644,5 +644,18 @@ FX bsr_mem
 FX bsf_same
     bsf eax, eax
     ret
+# Byte moves within one register, in both encodings (issue #66: Diablo II's
+# `mov al, al` at 0x59bba5 aborted the ARMv6 backend's translation).
+FX bytemoves
+    .byte 0x8a, 0xc0    # mov al, al (8a /r)
+    .byte 0x88, 0xc9    # mov cl, cl (88 /r)
+    .byte 0x8a, 0xe0    # mov ah, al (8a /r)
+    add al, 0x11
+    .byte 0x88, 0xc4    # mov ah, al (88 /r)
+    .byte 0x88, 0xcd    # mov ch, cl (88 /r)
+    .byte 0x8a, 0xf6    # mov dh, dh (8a /r)
+    .byte 0x8a, 0xdf    # mov bl, bh (8a /r)
+    .byte 0x88, 0xd2    # mov dl, dl (88 /r)
+    ret
 
     .section .note.GNU-stack, "", @progbits

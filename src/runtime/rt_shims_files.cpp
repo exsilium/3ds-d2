@@ -756,6 +756,7 @@ size_t stream_write(Cpu &c, FILE *fp, uint32_t va, uint32_t n)
 // so each file is named once in it. RT_FILETRACE=1: stderr from the start.
 FILE *g_ftrace = std::getenv("RT_FILETRACE") ? stderr : nullptr;
 uint32_t g_ftrace_gen = 1;
+bool g_ftrace_each = false;   // set_file_trace_each
 
 void trace_read(RtFile &f, uint32_t n)
 {
@@ -765,6 +766,8 @@ void trace_read(RtFile &f, uint32_t n)
     }
     std::fprintf(g_ftrace, "read %llu %d %llu %u\n", (unsigned long long)(wx86_now_us() / 1000), f.fd,
                  (unsigned long long)f.pos, n);
+    if (g_ftrace_each)
+        std::fflush(g_ftrace);
 }
 
 // ReadFile on a cached file: from its position, into guest memory.
@@ -1177,6 +1180,8 @@ void set_file_trace(FILE *f)
     g_ftrace = f;
     g_ftrace_gen++;   // a new trace names its files again
 }
+
+void set_file_trace_each(bool on) { g_ftrace_each = on; }
 
 void start_async_io()
 {

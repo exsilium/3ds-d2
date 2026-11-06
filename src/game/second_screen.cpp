@@ -210,6 +210,14 @@ void SecondScreen::set_profile_choice(uint32_t bits)
     dirty_ = true;
 }
 
+void SecondScreen::set_trace_writes(TraceWrites m)
+{
+    if (m != trace_writes_)
+        settings_changed_ = true;
+    trace_writes_ = m;
+    dirty_ = true;
+}
+
 void SecondScreen::request(Controls::Bottom r)
 {
     switch (r) {
@@ -399,7 +407,7 @@ void SecondScreen::update(Pad &pad, const GameState &gs, int cursor_x, int curso
                 grip_ = Grip::MapButton;
                 key_ = 4;   // INFO's profiler run button (the checklist's start/stop)
             } else if (kind == BottomView::kInfo && checklist_ && pad.touch_y >= kProfRowY &&
-                       pad.touch_y < kProfRowY + kProfileOptionCount * kProfRowH) {
+                       pad.touch_y < kProfRowY + kProfRows * kProfRowH) {
                 grip_ = Grip::MapButton;
                 key_ = 5 + (pad.touch_y - kProfRowY) / kProfRowH;   // a row of the checklist
             } else {
@@ -462,6 +470,8 @@ void SecondScreen::update(Pad &pad, const GameState &gs, int cursor_x, int curso
             } else if (key_ == 4) {
                 profiling_ = !profiling_ && profile_ != 0;
                 dirty_ = true;
+            } else if (key_ == 5 + kProfileOptionCount) {
+                set_trace_writes(next_trace_writes(trace_writes_));   // a run on or not
             } else if (key_ >= 5) {
                 if (!profiling_)
                     set_profile_choice(profile_ ^ kProfileOptions[key_ - 5].bit);
@@ -638,6 +648,7 @@ bool SecondScreen::stage(BottomView &v, uint64_t now_ms)
             v.profiling = profiling_;
             v.checklist = checklist_;
             v.profile = profile_;
+            v.trace_writes = trace_writes_;
             const int rows = (kAreaH - kMapBtnH) / 8 - (int)stats_.size();
             const uint32_t n = log_head_ < (uint32_t)kLogLines ? log_head_ : (uint32_t)kLogLines;
             const uint32_t show = rows > 0 ? ((uint32_t)rows < n ? (uint32_t)rows : n) : 0;
@@ -868,6 +879,14 @@ void draw_bottom(uint16_t *fb, const BottomView &v, const uint8_t *frame, int fw
                 cv.fill(10, y + 2, 10, 10, ticked ? (v.profiling ? kHint : kGold) : kBg);
                 cv.text(32, y + 3, o.label, ink);
                 cv.text(32, y + 15, o.note, kHint);
+            }
+            {
+                // How the traces are written: no box, a tap steps it on;
+                // never greyed, it changes during a run too.
+                const TraceWritesInfo &w = trace_writes_info(v.trace_writes);
+                const int y = SecondScreen::kProfRowY + kProfileOptionCount * SecondScreen::kProfRowH + 8;
+                cv.text(32, y + 3, w.label, w.mode == TraceWrites::Buffered ? rgb(230, 220, 200) : kGold);
+                cv.text(32, y + 15, w.note, kHint);
             }
         } else {
             for (size_t i = 0; i < v.lines.size() && (int)i < (kAreaH - SecondScreen::kMapBtnH) / 8; i++)

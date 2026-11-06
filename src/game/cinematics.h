@@ -10,6 +10,9 @@ namespace game {
 
 int install_cinematics(d2rt::Cpu &c);
 
+// A cinematic is playing (from its open to its last frame or skip).
+bool cinematic_playing();
+
 }  // namespace game
 
 #endif

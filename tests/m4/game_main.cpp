@@ -21,6 +21,10 @@
 // M4_SPRITE_TRACE=<file> writes the sprite trace (game/sprite_trace.h) from
 // the first heartbeat on.
 //
+// M4_POOL_PIECES=1 logs the guest pool's free pieces and the spare's blocks
+// at every heartbeat (rt::log_pool_pieces; the console logs them at a take
+// from the spare), to compare a pool policy's fragmentation (issue #70).
+//
 // M4_SCRIPT drives game::Controls (the 3DS control scheme) with scripted pad
 // events (game::Autoplay, src/game/autoplay.h), ';'-separated, e.g.
 //   "20000 tap 400 307;26000 tap 400 290;32000 text Tester;34000 press R;..."
@@ -240,6 +244,9 @@ int main(int argc, char **argv)
             std::fprintf(stderr, "[rt] %s\n", frames);
         std::fprintf(stderr, "[rt] sprite cache %u/%u KiB, %u sprites, in %u, out %u, decoded %u in %u ms\n",
                      sc.used >> 10, sc.limit >> 10, sc.sprites, w.inserted, w.evicted, w.decodes, w.decode_ms);
+        static const bool pool_pieces = std::getenv("M4_POOL_PIECES") != nullptr;
+        if (pool_pieces)
+            rt::log_pool_pieces("heartbeat");
         // M4_SPRITE_TRACE=<file>: the sprite trace (sprite_trace.h), from the first heartbeat on.
         if (const char *trace = std::getenv("M4_SPRITE_TRACE")) {
             static bool tried = false;

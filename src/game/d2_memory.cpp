@@ -639,8 +639,12 @@ uint32_t frames_alloc(d2rt::Cpu &c)
     const uint32_t pool = c.read_u32(kPoolsOn) && ecx ? ecx : kPool;
     if (const uint32_t va = n ? g_frames->alloc(n, pool) : 0)
         return va;
-    if (g_frames_to_pool++ < 8)
+    if (g_frames_to_pool++ < 8) {
         rt::logf("sprite frames: %u bytes to the pool system", n);
+        // No block of that size in the pool: what its free space is in
+        // (issue #70; in 3DS-D2-10 these came with the spare's takes).
+        rt::log_pool_pieces("sprite frames to the pool system");
+    }
     // The bridge pops the return address and the three arguments from the
     // ESP set here, then goes to 0x40b430 with the call's own frame.
     c.set_reg(d2rt::R_ESP, c.reg(d2rt::R_ESP) - 16);

@@ -50,7 +50,9 @@ static const char kPlay[] =
     "[rt] prof hitch: frames 200, <=50ms 190, <=100ms 7, <=250ms 2, >250ms 1, longest 412 ms, sprites in 120 out 98, "
     "wait 830 ms, ready 200 ms, host 280 ms, heartbeat 15 ms, skipped 3, famine 0\n"
     "profiler run: stop\n"
+    "profiler run: trace writes second\n"
     "profiler run: start guest,files\n"
+    "profiler run: trace writes now\n"
     "[rt] sprite frames 5000/6400 KiB in 60 blocks, 700 units asking 4700 KiB, blocks taken 80 given 20, "
     "over 256 KiB 2, to the pool 0\n"
     "[rt] sprite frames 7000/7300 KiB in 70 blocks, 900 units asking 6600 KiB, blocks taken 95 given 25, "
@@ -87,6 +89,8 @@ int main()
         // Two profiler runs: their options once each, in order.
         CHECK(s.profiled() == "sprites,guest,files");
         CHECK(feed("session: start 1 build x\n").profiled().empty());
+        CHECK(s.trace_writes() == "now");   // the last one named; not an option
+        CHECK(feed("session: start 1 build x\n").trace_writes().empty());
         Event e;
         e.figures = f;
         e.have_figures = true;

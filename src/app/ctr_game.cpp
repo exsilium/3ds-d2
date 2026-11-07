@@ -213,6 +213,27 @@ void *__wrap__sbrk_r(struct _reent *r, ptrdiff_t incr)
         g_heap_room_low = g_heap_room;
     return p;
 }
+
+// The JIT's share of the host heap (issue #24, Sentry 3DS-D2-12). Box86's
+// records of translated blocks take the heap 64 KiB at a time as new code
+// is translated, and are never given back on their own: after 1 h 47 min
+// of new areas they had taken all but 48 KiB above the heap's top, and the
+// app's next C++ new (the profiler's report) found nothing and the game
+// ended in std::terminate. Box86 now asks before each new 64 KiB (for a
+// block's record only); refused, it evicts old blocks and reuses their
+// records. The reserve is the app's while the game runs: the heartbeat's
+// and the profiler's tables, the bottom screen's strings, the trace and
+// report buffers (tens of KiB each), with room for the heap's fragments
+// (the report's pictures at the game's end come after the guest arena is
+// given back). Under box86's allocator lock: may not log or allocate.
+constexpr size_t kHostHeapReserve = 1024u << 10;
+extern unsigned d2rt_meta_reserve_refusals;   // box86 (custommem.c): new blocks refused so
+int d2rt_meta_may_grow(size_t bytes)
+{
+    const struct mallinfo mi = mallinfo();
+    const size_t free = __ctru_heap_size > mi.uordblks ? __ctru_heap_size - mi.uordblks : 0;
+    return free >= bytes + kHostHeapReserve;
+}
 }
 
 namespace d2rt {
@@ -481,6 +502,29 @@ void report_heap_refusals()
     logline(line);
 }
 
+// The JIT held at the host heap's reserve (d2rt_meta_may_grow): logged the
+// first time, then at most once a minute while it goes on. From then on the
+// JIT evicts old blocks to translate new ones (its "JIT eviction" lines in
+// stderr.txt).
+void report_meta_reserve()
+{
+    static uint32_t reported = 0;
+    static uint64_t next_us = 0;
+    const uint32_t n = d2rt_meta_reserve_refusals;
+    const uint64_t now = host_us();
+    if (n == reported || (reported && now < next_us))
+        return;
+    reported = n;
+    next_us = now + 60000000;
+    const struct mallinfo mi = mallinfo();
+    char line[160];
+    std::snprintf(line, sizeof line,
+                  "[rt] host heap: JIT records held at the %u KiB reserve (%u refusals), heap %u KiB free, room %u KiB",
+                  (unsigned)(kHostHeapReserve >> 10), (unsigned)n, (unsigned)((__ctru_heap_size - mi.uordblks) >> 10),
+                  (unsigned)(g_heap_room >> 10));
+    logline(line);
+}
+
 // One of the heartbeat's lines: written with the rest at its end.
 void logline_held(const char *s)
 {
@@ -551,13 +595,26 @@ void on_cpu_exception(ERRF_ExceptionInfo *e, CpuRegisters *regs)
     resume_regs(frame, regs->cpsr, regs->lr);
 }
 
+// The render thread, once started (start_render_thread).
+Thread g_render_thread = nullptr;
+
 // A message for the screen: the startup console, or the INFO tab.
 void screen_message(const char *s)
 {
     if (g_ss_active)
         g_ss.log(s);
-    else
+    else {
         std::printf("%.*s\n", 39, s);   // the log window
+        // Until the render thread presents frames, on the screen at once:
+        // the console's text out of the CPU cache, and the bottom screen
+        // presented. The console shows memory as it is; Azahar shows a
+        // screen only once it is presented, and kept it black until the
+        // first frame.
+        if (!g_render_thread) {
+            gfxFlushBuffers();
+            gfxScreenSwapBuffers(GFX_BOTTOM, false);
+        }
+    }
 }
 
 void status(const char *fmt, ...)
@@ -742,7 +799,6 @@ struct Staged {
 Staged g_staged;
 LightEvent g_render_go;
 volatile bool g_render_busy = false, g_render_quit = false;
-Thread g_render_thread = nullptr;
 
 // Screenshots (L+R+Select): the request rides on the next staged frame, and
 // the thread that draws it saves it after drawing, so the picture is the one
@@ -801,11 +857,22 @@ bool draw_staged_bottom()
     // Double-buffered from the second screen's first draw: drawn in the
     // buffer not shown, so the screen never shows one half redrawn. Every
     // draw covers the whole screen.
-    if (!g_bottom_double) {
+    // The second buffer is linear memory; the .3dsx's 1 MiB linear heap may
+    // not have it (Azahar: a null buffer). Single-buffered then, as before.
+    static bool no_double = false;
+    if (!g_bottom_double && !no_double) {
         gfxSetDoubleBuffering(GFX_BOTTOM, true);
         g_bottom_double = true;
+        if (!gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, nullptr, nullptr)) {
+            gfxSetDoubleBuffering(GFX_BOTTOM, false);
+            g_bottom_double = false;
+            no_double = true;
+            logline("bottom screen: no linear memory for a second buffer, single-buffered");
+        }
     }
     uint16_t *bottom = (uint16_t *)gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, nullptr, nullptr);
+    if (!bottom)
+        return false;
     // A cinematic's view (kVideo) uses neither the frame nor the palette.
     game::draw_bottom(bottom, st.bottom, st.yuv ? nullptr : st.pixels.data(), (int)st.width, (int)st.height, g_pal565,
                       default_font_bin);
@@ -1078,6 +1145,8 @@ void load_settings()
             g_ss.set_map_help(std::atoi(value) != 0);
         else if (std::strncmp(line, "profile=", 8) == 0)   // the profiler run's checklist ("" = nothing ticked)
             g_ss.set_profile_choice(game::profile_bits(line + 8));
+        else if (std::strncmp(line, "tracewrites=", 12) == 0)   // ...and how its traces are written (issue #66)
+            g_ss.set_trace_writes(game::trace_writes_from_name(line + 12));
     }
     std::fclose(f);
     g_ss.take_settings_changed();
@@ -1086,9 +1155,10 @@ void load_settings()
 void save_settings()
 {
     if (FILE *f = std::fopen(kSettings, "w")) {
-        std::fprintf(f, "bottom=%s\nmapscale=%d\nmapms=%u\nmaphelp=%d\nprofile=%s\n", game::bottom_tab_name(g_ss.tab()),
-                     g_ss.map_scale(), (unsigned)g_ss.map_ms(), g_ss.map_help() ? 1 : 0,
-                     game::profile_names(g_ss.profile_choice()).c_str());
+        std::fprintf(f, "bottom=%s\nmapscale=%d\nmapms=%u\nmaphelp=%d\nprofile=%s\ntracewrites=%s\n",
+                     game::bottom_tab_name(g_ss.tab()), g_ss.map_scale(), (unsigned)g_ss.map_ms(),
+                     g_ss.map_help() ? 1 : 0, game::profile_names(g_ss.profile_choice()).c_str(),
+                     game::trace_writes_info(g_ss.trace_writes()).name);
         std::fclose(f);
     }
 }
@@ -1101,6 +1171,7 @@ void save_settings()
 u32 g_apt_thread = 0;   // the thread in aptMainLoop (the game's)
 bool g_storage_closed = false;
 void open_storage();
+void trace_writes_service();
 
 // A HOME round trip (issue #27): the press seen here, the suspend hook and
 // its parts, the return. Host clock, us; logged as one "home:" line when
@@ -1175,6 +1246,7 @@ void log_home_trip()
 bool apt_service()
 {
     svcGetThreadId(&g_apt_thread, CUR_THREAD_HANDLE);
+    trace_writes_service();
     // libctru takes the system's signals (the HOME press among them) on its
     // APT thread, priority 0x31 on core 0, below this thread (0x30), which
     // runs the game there and seldom blocks: a press waited seconds for it
@@ -1494,6 +1566,38 @@ void file_trace_stop()
     g_files_trace_buf = nullptr;
 }
 
+// How the traces reach the SD card (issue #66: a crash in game lost the
+// last minutes of both), as the checklist's last row says, from the service
+// call (every 50 ms, loads included) on the game's thread, the one that
+// writes the traces. A change applies at once and is logged as
+//   profiler run: trace writes <buffered|second|now>
+// (the first only if not buffered). Buffered changes nothing from before.
+game::TraceWrites g_trace_writes = game::TraceWrites::Buffered;
+uint64_t g_trace_written_us = 0;   // every second: the last write-out
+
+void trace_writes_service()
+{
+    const game::TraceWrites m = g_ss.trace_writes();
+    if (m != g_trace_writes) {
+        g_trace_writes = m;
+        const bool each = m == game::TraceWrites::AtOnce;
+        rt::set_file_trace_each(each);
+        game::sprite_trace_each(each);
+        char line[64];
+        std::snprintf(line, sizeof line, "%strace writes %s", game::kProfilerRunLine, game::trace_writes_info(m).name);
+        logline(line);
+    }
+    if (m != game::TraceWrites::EverySecond || g_storage_closed)   // the HOME menu has the SD card
+        return;
+    const uint64_t now = host_us();
+    if (now - g_trace_written_us < 1000000)
+        return;
+    g_trace_written_us = now;
+    if (g_files_trace)
+        std::fflush(g_files_trace);
+    game::sprite_trace_flush();
+}
+
 // The profiler run's options (profiler.h) to `want`: those no longer
 // wanted stopped, the new ones started. An option that does not start is
 // left out of the run, and said so.
@@ -1576,6 +1680,23 @@ void hitch_heartbeat(const game::SpriteCacheWindow &w)
 }
 
 }  // namespace
+
+// abort() (linked with --wrap=abort, issue #66). newlib's ends the app
+// through _exit, and libctru's exit frees the heaps while the app's other
+// threads still run on stacks in them: they fault on the unmapped pages, and
+// the console went down in the kernel (3DS-D2-11, where the JIT's ARMv6
+// bit-field check aborted on the game's arrival in Act II). Logged with its
+// caller instead, then the app stops at once: Luma3DS dumps the thread that
+// aborted, the heaps still mapped.
+extern "C" __attribute__((noreturn)) void __wrap_abort(void)
+{
+    char s[80];
+    std::snprintf(s, sizeof s, "FATAL: abort() called from %08lx", (unsigned long)__builtin_return_address(0));
+    logline(s);
+    svcBreak(USERBREAK_PANIC);
+    for (;;) {
+    }
+}
 
 #ifdef D2_CIA
 // The guest arena is carved out of the heap, 16 MiB-aligned, and the host
@@ -1722,12 +1843,16 @@ int main()
     opt.heartbeat_ms = 10000;
     opt.heartbeat = [] {
         // A request served from the spare had no other piece of the pool
-        // left: the cache goes down to its minimum.
+        // left: the cache goes down to its minimum, once per new take. What
+        // stays in the spare after it does not hold the cache there.
         const rt::MemoryReport m = rt::memory_report();
+        static uint32_t spare_takes_seen = 0;
+        const bool spare_taken = m.spare_takes != spare_takes_seen;
+        spare_takes_seen = m.spare_takes;
         if (m.spare_used || m.free < game::kCtrPoolRelease)
             game::request_pool_release();
         const game::SpriteCacheWindow w = game::sprite_cache_window(*g_guest_cpu);
-        game::govern_sprite_cache(*g_guest_cpu, m.free, m.spare_used, w.evicted, game::kCtrPoolReserve,
+        game::govern_sprite_cache(*g_guest_cpu, m.free, spare_taken, w.evicted, game::kCtrPoolReserve,
                                   game::kCtrSpriteCacheMin);
         g_sprite_window = w;
         hitch_heartbeat(w);   // before the sprite cache line, the window's last (tools/session_report.py)
@@ -1800,6 +1925,7 @@ int main()
     opt.service = [] {
         apt_service();
         report_heap_refusals();
+        report_meta_reserve();
     };
     opt.io_start = start_io_thread;
     opt.io_wait = [] { LightEvent_Wait(&g_io_event); };

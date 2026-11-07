@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Thu, 5 Nov 2026 15:01:24 +0000
+Subject: [PATCH] ARMv6 BFI: a byte register moved to itself, or to its other
+ half
+
+Box86's ARMv7 translation of MOV r8, r8 between two halves of one x86
+register emits BFI with the same register as destination and source.
+ARMv7 allows it; the ARMv6 BFI sequence has no temporary and aborted
+at translation time (armv6_bitfield_check). Diablo II's arrival in
+Act II runs `mov al, al` (8a c0 at 0x59bba5): the Linux lane aborted
+there, and on the console the abort ends the app with its threads
+still running (3ds-d2 issue #66).
+
+- ARMV6_BFI with rd == rn at lsb 0 is the identity: nothing emitted.
+- MOV Gb, Eb (0x8a) and MOV Eb, Gb (0x88) with the other half of the
+  same register (mov ah, al) extract the source into x14 first.
+
+Any other rd == rn insert still aborts at translation time.
+---
+ third_party/box86-dynarec/dynarec/arm_emitter_v6.h | 7 ++++++-
+ third_party/box86-dynarec/dynarec/dynarec_arm_00.c | 4 ++--
+ 2 files changed, 8 insertions(+), 3 deletions(-)
+ mode change 100644 => 100755 third_party/box86-dynarec/dynarec/arm_emitter_v6.h
+
+diff --git a/third_party/box86-dynarec/dynarec/arm_emitter_v6.h b/third_party/box86-dynarec/dynarec/arm_emitter_v6.h
+old mode 100644
+new mode 100755
+index 9235d9b..2b88f77
+--- a/third_party/box86-dynarec/dynarec/arm_emitter_v6.h
++++ b/third_party/box86-dynarec/dynarec/arm_emitter_v6.h
+@@ -118,9 +118,14 @@ static inline void armv6_bitfield_check(int rd, int rn, int lsb, int width)
+ }
+ 
+ // bfi rd, rn, #lsb, #width without a temporary: rotate the field to the top,
+-// clear it, OR in rn's low bits shifted to the top, rotate back.
++// clear it, OR in rn's low bits shifted to the top, rotate back. rd == rn at
++// lsb 0 inserts rd's own low bits where they already are: nothing to emit
++// (a byte register moved to itself, mov al, al: Diablo II's arrival in Act
++// II, 3ds-d2 issue #66). rd == rn at another lsb needs a temporary, which
++// the call site gives.
+ #define ARMV6_BFI(cond, rd, rn, lsb, width) do {                                       \
+         int _l = (lsb), _w = (width), _r = (_l + _w) & 31;                             \
++        if ((rd) == (rn) && _l == 0 && _w >= 1 && _w <= 32) break;                     \
+         armv6_bitfield_check(rd, rn, _l, _w);                                          \
+         if (_w == 32) { EMIT((cond) | 0x01a00000 | ((rd) << 12) | (rn)); break; }      \
+         if (_r) EMIT(ARMV6_SHIFT_gen(cond, rd, rd, ARMV6_ROR, _r));                    \
+diff --git a/third_party/box86-dynarec/dynarec/dynarec_arm_00.c b/third_party/box86-dynarec/dynarec/dynarec_arm_00.c
+index 55533ab..98098a6 100755
+--- a/third_party/box86-dynarec/dynarec/dynarec_arm_00.c
++++ b/third_party/box86-dynarec/dynarec/dynarec_arm_00.c
+@@ -1127,7 +1127,7 @@ uintptr_t dynarec00(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int ninst,
+             gd = (nextop&0x38)>>3;
+             gb2 = ((gd&4)>>2);
+             gb1 = xEAX+(gd&3);
+-            if(gb2) {
++            if(gb2 || (MODREG && xEAX+(nextop&3)==gb1 && (nextop&4))) {   // mov ah, al: the source apart from the destination (ARMv6 BFI)
+                 gd = x14;
+                 UXTB(gd, gb1, gb2);
+             } else {
+@@ -1168,7 +1168,7 @@ uintptr_t dynarec00(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int ninst,
+                     wback = (nextop&7);
+                     wb2 = (wback>>2);
+                     wback = xEAX+(wback&3);
+-                    if(wb2) {
++                    if(wb2 || (wback==gb1 && gb2)) {   // mov ah, al: the source apart from the destination (ARMv6 BFI)
+                         UXTB(x14, wback, wb2);
+                         ed = x14;
+                     } else {

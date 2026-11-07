@@ -70,8 +70,9 @@ M3OBJ := $(CPUOBJ) $(addprefix $(OUT)/rt/,$(RTFULL:.cpp=.o)) $(addprefix $(OUT)/
          $(OUT)/m3/ctr_main.o $(OUT)/runner/ctr_stubs.o $(OUT)/m3/m3test_exe.o
 
 # The game app (src/app/ctr_game.cpp): the same runtime plus the controls.
-# Its host heap's growth goes through ctr_game.cpp's __wrap__sbrk_r (issue #24).
-GAMELDFLAGS := -Wl,--wrap=_sbrk_r
+# Its host heap's growth goes through ctr_game.cpp's __wrap__sbrk_r (issue #24), and abort()
+# through its __wrap_abort (issue #66).
+GAMELDFLAGS := -Wl,--wrap=_sbrk_r -Wl,--wrap=abort
 GAMESRC := $(notdir $(wildcard $(ROOT)/src/game/*.cpp))
 BINKSRC := $(notdir $(wildcard $(ROOT)/src/game/bink/*.cpp))
 GAMEOBJ := $(CPUOBJ) $(addprefix $(OUT)/rt/,$(RTFULL:.cpp=.o)) $(addprefix $(OUT)/m3/,$(M3SRC:.cpp=.o)) \

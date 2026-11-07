@@ -57,6 +57,18 @@
 extern "C" {
 void dyn86_hotprof_reset(void);
 void dyn86_hotprof_dump(FILE *f, int top);
+size_t d2rt_box86_custommalloc_kb(void);
+extern unsigned d2rt_meta_reserve_refusals;
+
+// M4_META_CAP_KB=<n>: box86's block records held at n KiB, as the console's
+// host heap reserve holds them (ctr_game.cpp's d2rt_meta_may_grow, issue
+// #24): past it a new 64 KiB block for a record is refused, and the JIT
+// evicts old blocks to translate new ones. Unset: never refused.
+int d2rt_meta_may_grow(size_t bytes)
+{
+    static const long cap = std::getenv("M4_META_CAP_KB") ? std::atol(std::getenv("M4_META_CAP_KB")) : 0;
+    return cap <= 0 || (long)(d2rt_box86_custommalloc_kb() + (bytes >> 10)) <= cap;
+}
 }
 
 static bool shot_now = false;   // M4_SCRIPT "shot": save the next frame
@@ -215,9 +227,12 @@ int main(int argc, char **argv)
         const game::SpriteCacheWindow w = game::sprite_cache_window(*guest_cpu);
         if (ctr_layout) {
             const rt::MemoryReport m = rt::memory_report();
+            static uint32_t spare_takes_seen = 0;
+            const bool spare_taken = m.spare_takes != spare_takes_seen;
+            spare_takes_seen = m.spare_takes;
             if (m.spare_used || m.free < game::kCtrPoolRelease)
                 game::request_pool_release();
-            game::govern_sprite_cache(*guest_cpu, m.free, m.spare_used, w.evicted, reserve, game::kCtrSpriteCacheMin);
+            game::govern_sprite_cache(*guest_cpu, m.free, spare_taken, w.evicted, reserve, game::kCtrSpriteCacheMin);
         }
         const game::SpriteCacheStats sc = game::sprite_cache_stats(*guest_cpu);
         char frames[192];

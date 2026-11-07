@@ -521,3 +521,55 @@ The memory was never the cause. One diagnostic build at a time (each on its own 
 | `7822fd1577fb` | 2 ms of integer work per packet in the decoder's place | 4/4 fine with 30 s of video |
 
 So the trigger was the soundtrack decoder's floating point on the game's thread, in game. Its memory use was clean (AddressSanitizer and UndefinedBehaviorSanitizer over the whole Act II file), and the heap was never short (`heap_refused` 0, 3 MiB free). The audio decoder is now fixed point ([cinematics.md](cinematics.md#decoder-correctness)). What links floating point to page tables found damaged across the system was not found.
+
+### The JIT's records outgrow the host heap (issue #24, 3DS-D2-12, 2026-11-06)
+
+After 1 h 47 min of play with the profiler on (sprites, guest code, file reads), the game ended in the Rocky Waste: `FATAL: abort() called from 0055bfe0`. That address is `std::terminate`, and the registers held `std::bad_alloc`'s vtable. A C++ `new` in the heartbeat's guest-code report had found no memory. Growth of the heap was never refused (`heap refused 0`): newlib's malloc had used up the heap's window, not been refused more.
+
+Box86 keeps a record (`dynablock_t`) for every translated block, in its own 64 KiB blocks taken from the host heap (`meta=` on the heartbeat). They are freed only when their blocks are, and nothing frees blocks while the JIT pool has room (#23). Over the session:
+
+| t (s) | meta (KiB) | jitused (KiB) | host heap free (KiB) | room above the top (KiB) |
+| --- | --- | --- | --- | --- |
+| 260 | 2,240 | 7,575 | 2,004 | 776 |
+| 1,754 | 2,432 | 8,256 | 2,859 | 1,972 |
+| 3,032 | 3,584 | 12,099 | 1,508 | 588 |
+| 5,783 | 4,032 | 13,428 | 1,034 | 104 |
+| 6,362 | 4,096 | 13,744 | 941 | 48 |
+
+`meta=` grew by 1.6 MiB in the session's second hour. The rest of the host's use moved by 0.3 MiB. The profiler's own buffers come to about 200 KiB.
+
+What the app does since then:
+
+- **A reserve for the app:** before box86 takes a new 64 KiB block for a block's record, it asks the app (`d2rt_meta_may_grow`, patch 0058). The app refuses while less than **1 MiB** of host heap would be left. That covers what it allocates while the game runs: the heartbeat's and the profiler's tables, the bottom screen's strings, and the trace and report buffers, tens of KiB each. The report's pictures at the game's end come after the guest arena is given back.
+- **Refused, the JIT evicts:** the refusal takes box86's existing eviction path (D2Vita's: retire a wave of blocks from the jump tables, free them once no thread can still be in them, retranslate on demand), whose freed records are reused. Two fixes made it work under this port's cooperative scheduler: DynaRun leaves and retries on a refused record as it does on a refused translation (it killed the thread before), and it leaves as a preemption (`dyn86_bbreak`), because `CpuBox86::run()` takes a plain `quit` for the thread's end.
+- **Logged:** `host heap: JIT records held at the 1024 KiB reserve (<n> refusals), heap <h> KiB free, room <r> KiB` the first time, then at most once a minute while it goes on. The JIT's own `JIT eviction:` lines are in `stderr.txt`.
+- **Cinematics:** a video that cannot have its buffers (about 2 MiB) is skipped, `cinematic: no host memory for it, skipped`, instead of ending the game.
+
+On the Linux lane, `M4_META_CAP_KB=<n>` holds the records at n KiB to run the same path. At 1,280 KiB (the lane reaches about 2 MiB uncapped), `fight.txt` ran its whole route in the same 2,987 frames as without the cap, with 3,072 eviction rounds and 1.57 million blocks freed. `act2-east.txt` reached Act II with 6,144 rounds. No thread died and the use-after-free check found nothing. On the console the records would have reached the reserve after about 50 minutes of 3DS-D2-12's session, and grow slowly after that, so rounds should be rare. The cost per round on the console is still to be measured.
+
+
+### The cache held at its minimum: 1 frame per second in the Halls of the Dead (issue #24, 3DS-D2-10, 2026-11-07)
+
+Build `c082bfe0e4ff`, profiler on (sprites, guest code, file reads), 40 minutes into Act II. In the Halls of the Dead the game fell to 9 to 12 frames per 10 s and stayed there for three minutes, until the player saved and quit. The game did not crash. Sentry event `d8dbc19e41875bcce3636f4f11dfb3a5`.
+
+The heartbeats:
+
+| t (s) | frames / 10 s | cache used / limit (KiB) | pool free (KiB) | sprites in / 10 s | decode wait (ms) |
+| --- | --- | --- | --- | --- | --- |
+| 800 | | 12,834 / 4,096 | 4,968 | | the spare taken: limit to the minimum |
+| 990 | | | 14,623 | | the spare emptied: the first raise, 256 KiB |
+| 1,932 | 190 | 12,370 / 12,374 | 3,806 | 11 | 63 |
+| 2,190 | | / 4,096 | 5,233 | | the spare taken again (10 requests), 1,024 KiB of it still in use |
+| 2,252 | 14 | 4,093 / 4,096 | 11,899 | 592 | 4,899 |
+| 2,412 | 11 | 4,106 / 4,096 | 12,000 | 586 | 4,765 |
+
+The governor read "a request was served from the spare" from whether the spare *held* anything. So it set the minimum again on every heartbeat for as long as anything stayed in the spare. The first time, the spare emptied after 190 s. The second time, it never did. The cache sat at 4 MiB with 12 MiB of the pool free, and the area's working set was about 12 MiB. Each 10 s the game decoded about 550 sprites again (3.5 to 4.4 s of decoding) and its drawing thread waited for them for 4.5 to 5 s. Even after the first episode, raising the limit one 256 KiB step per heartbeat took 9 minutes (t = 990 to 1,542 s) to get from 4 to 12.8 MiB, with re-decodes all along.
+
+Memory was not short. The spare was taken because the pool was fragmented: 5.2 MiB free, but its largest piece was 801 KiB. The JIT's records (`meta=`) were at 3.7 MiB with 1.1 to 1.4 MiB of host heap free, just above the 1 MiB reserve, so 3DS-D2-12's limit had not acted yet.
+
+Changes:
+
+- **The spare cuts the cache once per new request.** The heartbeat compares the spare's count of requests with the last heartbeat's. A new one sets the cache to the minimum, as before. A request still sitting in the spare holds nothing back.
+- **Raises by half of what the pool has over the reserve**, in 256 KiB steps and at least one (it was one step per heartbeat). If the cache fills each raise, the pool still stays above the reserve. From the minimum with 12 MiB free, the limit reaches about 9.5 MiB (where the pool sits at the reserve, as before the cut) in five heartbeats, not 22.
+
+Not changed: the pool's fragmentation, which is what makes the spare necessary in the first place.

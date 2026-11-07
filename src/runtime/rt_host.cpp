@@ -1,6 +1,7 @@
 // See rt_host.h.
 #include "runtime/rt_host.h"
 #include "runtime/rt_layout.h"
+#include "runtime/pool_fit.h"
 
 #include "runtime/bridge.h"
 #include "runtime/ds_emul.h"
@@ -287,6 +288,16 @@ void pool_pieces(const char *why)
     log_va_owners();
 }
 
+// Whether a VirtualAlloc block of `bytes` fits in a free piece of the
+// pool, as GuestRegion::carve places it (pool_fit.h). Without a pool, the
+// VA region's largest piece with 64 KiB to spare.
+bool va_fits(uint32_t bytes)
+{
+    if (!g_pool_size)
+        return g_va.largest_free() >= bytes + 0xffff;
+    return pool_fits_top(g_pool.used_map(), g_pool.base(), g_pool_size, bytes, 0x10000);
+}
+
 // VirtualQuery support for WinVita's memory shims: report the arena regions.
 bool vquery(uint32_t addr, uint32_t &base, uint32_t &size, uint32_t &state, uint32_t &type, uint32_t &protect,
             uint32_t &allocbase)
@@ -320,8 +331,14 @@ const Layout &layout() { return *g_opt.layout; }
 wx86::GuestRegion &va_region() { return g_va; }
 uint32_t va_alloc(uint32_t bytes, uint32_t owner)
 {
-    // A free piece that large may still not hold it at the VA's alignment.
-    if (g_va.largest_free() < bytes + 0xffff)
+    // Only from a free piece of the pool: a request no piece holds would be
+    // served from the spare, which is kept for the game's own (issue #70).
+    // The test is the pool's own (guest_region.h, carve from the top): the
+    // block, rounded to 64 KiB, at the highest 64 KiB boundary that leaves
+    // it room in the piece. It asked for 64 KiB to spare before, and turned
+    // down two requests of 247 and 253 KiB with a 256 KiB piece free
+    // (3DS-D2-13); the game's pool system then took that piece for them.
+    if (!va_fits(bytes))
         return 0;
     va_owner_sync();   // the last VirtualAlloc's block takes its own owner first
     const uint32_t a = g_va.alloc(bytes);

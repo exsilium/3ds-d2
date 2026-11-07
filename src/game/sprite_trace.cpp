@@ -171,6 +171,15 @@ bool install_sprite_trace(d2rt::Cpu &c)
     });
     if (!g_flag || !use_native || !remove_native)
         return false;
+    // Served from inside the translated code, as the cache's own natives are
+    // (issue #72): through the Bridge's trap, the use hook cost 6.2 ms of a
+    // 59 ms fight frame on the console (3DS-D2-10, 2026-11-07), nearly all of
+    // it the call-out for uses the window then drops. Both natives only read
+    // guest memory and write to the trace's buffer: they neither call guest
+    // code nor wait. Armed before the stubs are written, so before either is
+    // translated.
+    c.set_inline_shim(use_native);
+    c.set_inline_shim(remove_native);
 
     // S+0  cmp byte [flag], 0; je S+20
     // S+9  push eax; push ecx; push edx; call use; pop edx; pop ecx; pop eax
@@ -213,7 +222,7 @@ bool install_sprite_trace(d2rt::Cpu &c)
     c.invalidate_code(kRemoveStub, sizeof r);
     c.invalidate_code(kUseAt, sizeof use_jump);
     c.invalidate_code(kRemoveAt, sizeof remove_jump);
-    rt::logf("sprite trace: stubs at %08x and %08x, off", kUseAt, kRemoveAt);
+    rt::logf("sprite trace: stubs at %08x and %08x (in line), off", kUseAt, kRemoveAt);
     return true;
 }
 

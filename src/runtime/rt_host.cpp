@@ -209,6 +209,84 @@ void log_va_owners()
     logf("%s", line.c_str());
 }
 
+// The pool's free space in pieces, and what sits in its spare (issue #70):
+// a request goes to the spare only when no free piece of the pool holds it,
+// and in a long session that happened with 10 MiB of the pool free. Two
+// lines and the VirtualAlloc owners; `why` says what asked for them. Reads
+// the regions' maps of used blocks, so only at a take or a fallback.
+void pool_pieces(const char *why)
+{
+    if (!g_pool_size)
+        return;
+    // The pool's free pieces: the gaps between its used blocks (the faces'
+    // blocks and the spare's record).
+    const uint32_t base = g_pool.base(), end = base + g_pool_size;
+    uint32_t total = 0, pieces = 0, slack = 0, slack_n = 0;
+    uint32_t n_by[4] = {}, kib_by[4] = {};   // < 64 KiB, < 256 KiB, < 1 MiB, the rest
+    std::vector<uint32_t> sizes;
+    uint32_t at = base;
+    for (const auto &u : g_pool.used_map()) {
+        if (u.first > at) {
+            const uint32_t sz = u.first - at;
+            total += sz;
+            pieces++;
+            sizes.push_back(sz);
+        }
+        at = std::max(at, u.first + u.second);
+    }
+    if (end > at) {
+        total += end - at;
+        pieces++;
+        sizes.push_back(end - at);
+    }
+    std::sort(sizes.rbegin(), sizes.rend());
+    // Gaps under 1 KiB are small heap blocks freed between live ones: room
+    // for small requests only, and many of them, so counted apart.
+    while (!sizes.empty() && sizes.back() < 1024) {
+        slack += sizes.back();
+        slack_n++;
+        pieces--;
+        sizes.pop_back();
+    }
+    for (uint32_t sz : sizes) {
+        const int k = sz < (64u << 10) ? 0 : sz < (256u << 10) ? 1 : sz < (1u << 20) ? 2 : 3;
+        n_by[k]++;
+        kib_by[k] += sz >> 10;
+    }
+    std::string line;
+    for (size_t i = 0; i < sizes.size() && i < 6; i++)
+        line += " " + std::to_string(sizes[i] >> 10);
+    logf("pool pieces (%s): %u KiB free in %u pieces, the largest%s KiB; under 64 KiB %u (%u KiB), 64-256 KiB %u (%u "
+         "KiB), 256 KiB-1 MiB %u (%u KiB), 1 MiB and more %u (%u KiB); %u gaps under 1 KiB (%u B)",
+         why, total >> 10, pieces, line.c_str(), n_by[0], kib_by[0], n_by[1], kib_by[1], n_by[2], kib_by[2], n_by[3],
+         kib_by[3], slack_n, slack);
+    if (!g_spare_size)
+        return;
+    // The blocks in the spare: each face's, by size; VirtualAlloc's with
+    // the guest code that asked for them.
+    const uint32_t s0 = g_spare.base(), s1 = s0 + g_spare_size;
+    va_owner_sync();
+    std::string heap, va;
+    uint32_t heap_n = 0, heap_kib = 0, va_n = 0, va_kib = 0;
+    for (auto it = g_heap.used_map().lower_bound(s0); it != g_heap.used_map().end() && it->first < s1; ++it) {
+        heap_kib += it->second >> 10;
+        if (heap_n++ < 8)
+            heap += " " + std::to_string((it->second + 1023) >> 10);
+    }
+    for (auto it = g_va.used_map().lower_bound(s0); it != g_va.used_map().end() && it->first < s1; ++it) {
+        va_kib += it->second >> 10;
+        if (va_n++ < 8) {
+            char item[40];
+            const auto o = g_va_owner.find(it->first);
+            std::snprintf(item, sizeof item, " %u by %08x", it->second >> 10, o != g_va_owner.end() ? o->second : 0);
+            va += item;
+        }
+    }
+    logf("pool spare holds: heap %u blocks %u KiB [%s ], VirtualAlloc %u blocks %u KiB [%s ]", heap_n, heap_kib,
+         heap.c_str(), va_n, va_kib, va.c_str());
+    log_va_owners();
+}
+
 // VirtualQuery support for WinVita's memory shims: report the arena regions.
 bool vquery(uint32_t addr, uint32_t &base, uint32_t &size, uint32_t &state, uint32_t &type, uint32_t &protect,
             uint32_t &allocbase)
@@ -501,6 +579,7 @@ int g_slice_tid = -1;          // the guest thread whose slice runs, -1 between 
 bool g_slice_sink = false;     // the scheduler reports its slices
 bool g_host_work = false;      // the heartbeat or the app's service runs
 uint64_t g_heartbeat_us = 0;   // the last heartbeat's length
+uint64_t g_prof_report_us = 0;   // of which the profile's lines (issue #71)
 // Its blocked time by where it waits from (the guest code it resumes in),
 // for the heartbeat's few largest.
 uint32_t g_frame_where = 0;
@@ -807,6 +886,7 @@ void check_time_limit(uint64_t ms)
         host_work(true);
         const uint64_t beat_t0 = wx86_now_us();
         prof_report(ms);
+        g_prof_report_us = wx86_now_us() - beat_t0;
 #ifdef __GLIBC__
         const size_t host_used = mallinfo2().uordblks;
 #else
@@ -828,6 +908,7 @@ void check_time_limit(uint64_t ms)
             g_spare_logged = g_pool.spare_takes();
             logf("pool spare: %u requests taken so far, %u of %u KiB in use, pool largest free %u KiB", g_spare_logged,
                  g_spare.cur() >> 10, g_spare_size >> 10, g_pool.largest_free() >> 10);
+            pool_pieces("spare taken");
         }
         if (g_opt.heartbeat)
             g_opt.heartbeat();
@@ -898,6 +979,8 @@ FrameThreadTimes frame_thread_times()
 }
 
 uint64_t last_heartbeat_us() { return g_heartbeat_us; }
+uint64_t last_prof_report_us() { return g_prof_report_us; }
+void log_pool_pieces(const char *why) { pool_pieces(why); }
 
 void count_lock_site(uint32_t ret) { g_lock_sites.count(ret); }
 

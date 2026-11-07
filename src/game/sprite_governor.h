@@ -11,9 +11,13 @@
 //
 // - lower only after two consecutive heartbeats short of the reserve, by the
 //   shortfall, from what the cache holds (not from its limit);
-// - raise in 256 KiB steps while the pool is a margin above the reserve and
-//   the cache is at its limit (raising a limit it does not reach would let it
-//   grow by megabytes at the next area before the pool shows it);
+// - raise while the pool is a margin above the reserve and the cache is at
+//   its limit (raising a limit it does not reach would let it grow by
+//   megabytes at the next area before the pool shows it), by half of what the
+//   pool has over the reserve, in 256 KiB steps and at least one: the cache
+//   filling the raise still leaves the pool above the reserve. One step per
+//   heartbeat took 9 minutes to bring the cache from the minimum back to
+//   12.8 MiB (2026-11-07, Act II);
 // - not below the working set: the most the cache held over the last 10
 //   minutes in a heartbeat where it had room and evicted nothing, unless the
 //   pool is more than kFloorSlack short of the reserve (a cache at its limit
@@ -27,7 +31,12 @@
 //   #31): in the next, 10 of 46 MiB were evictions decoded again. The
 //   bound wants judging again on a version 3 trace;
 // - a request served from the pool's spare means no other piece of the pool
-//   was left: the minimum at once.
+//   was left: the minimum at once, on the heartbeat that sees the new take.
+//   Only then: what stays in the spare afterwards says nothing of the pool.
+//   Held at the minimum for as long as the spare held anything, the cache
+//   stayed at 4 MiB with 12 MiB of the pool free, against a 12 MiB working
+//   set in the Halls of the Dead, and re-decoded 550 sprites per 10 s: the
+//   game ran at 1 frame per second until the player quit (2026-11-07).
 //
 // The first limit seen is the game's size for the cache; a limit other than
 // the one step() last returned means the game re-created the cache (between
@@ -51,7 +60,7 @@ public:
         uint32_t used;         // bytes of sprites it holds
         uint32_t evicted;      // sprites it let go of since the last beat
         uint32_t pool_free;    // the guest pool's free bytes
-        bool spare_used;       // a request was served from the pool's spare
+        bool spare_taken;      // a request was served from the pool's spare since the last beat
     };
 
     // The limit to set (== beat.limit: no change).

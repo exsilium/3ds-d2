@@ -213,6 +213,27 @@ void *__wrap__sbrk_r(struct _reent *r, ptrdiff_t incr)
         g_heap_room_low = g_heap_room;
     return p;
 }
+
+// The JIT's share of the host heap (issue #24, Sentry 3DS-D2-12). Box86's
+// records of translated blocks take the heap 64 KiB at a time as new code
+// is translated, and are never given back on their own: after 1 h 47 min
+// of new areas they had taken all but 48 KiB above the heap's top, and the
+// app's next C++ new (the profiler's report) found nothing and the game
+// ended in std::terminate. Box86 now asks before each new 64 KiB (for a
+// block's record only); refused, it evicts old blocks and reuses their
+// records. The reserve is the app's while the game runs: the heartbeat's
+// and the profiler's tables, the bottom screen's strings, the trace and
+// report buffers (tens of KiB each), with room for the heap's fragments
+// (the report's pictures at the game's end come after the guest arena is
+// given back). Under box86's allocator lock: may not log or allocate.
+constexpr size_t kHostHeapReserve = 1024u << 10;
+extern unsigned d2rt_meta_reserve_refusals;   // box86 (custommem.c): new blocks refused so
+int d2rt_meta_may_grow(size_t bytes)
+{
+    const struct mallinfo mi = mallinfo();
+    const size_t free = __ctru_heap_size > mi.uordblks ? __ctru_heap_size - mi.uordblks : 0;
+    return free >= bytes + kHostHeapReserve;
+}
 }
 
 namespace d2rt {
@@ -478,6 +499,29 @@ void report_heap_refusals()
     char line[160];
     std::snprintf(line, sizeof line, "[rt] host heap: growth refused %u times (first %u B), room %u KiB",
                   (unsigned)n, (unsigned)g_heap_refused_first, (unsigned)(g_heap_room >> 10));
+    logline(line);
+}
+
+// The JIT held at the host heap's reserve (d2rt_meta_may_grow): logged the
+// first time, then at most once a minute while it goes on. From then on the
+// JIT evicts old blocks to translate new ones (its "JIT eviction" lines in
+// stderr.txt).
+void report_meta_reserve()
+{
+    static uint32_t reported = 0;
+    static uint64_t next_us = 0;
+    const uint32_t n = d2rt_meta_reserve_refusals;
+    const uint64_t now = host_us();
+    if (n == reported || (reported && now < next_us))
+        return;
+    reported = n;
+    next_us = now + 60000000;
+    const struct mallinfo mi = mallinfo();
+    char line[160];
+    std::snprintf(line, sizeof line,
+                  "[rt] host heap: JIT records held at the %u KiB reserve (%u refusals), heap %u KiB free, room %u KiB",
+                  (unsigned)(kHostHeapReserve >> 10), (unsigned)n, (unsigned)((__ctru_heap_size - mi.uordblks) >> 10),
+                  (unsigned)(g_heap_room >> 10));
     logline(line);
 }
 
@@ -1799,12 +1843,16 @@ int main()
     opt.heartbeat_ms = 10000;
     opt.heartbeat = [] {
         // A request served from the spare had no other piece of the pool
-        // left: the cache goes down to its minimum.
+        // left: the cache goes down to its minimum, once per new take. What
+        // stays in the spare after it does not hold the cache there.
         const rt::MemoryReport m = rt::memory_report();
+        static uint32_t spare_takes_seen = 0;
+        const bool spare_taken = m.spare_takes != spare_takes_seen;
+        spare_takes_seen = m.spare_takes;
         if (m.spare_used || m.free < game::kCtrPoolRelease)
             game::request_pool_release();
         const game::SpriteCacheWindow w = game::sprite_cache_window(*g_guest_cpu);
-        game::govern_sprite_cache(*g_guest_cpu, m.free, m.spare_used, w.evicted, game::kCtrPoolReserve,
+        game::govern_sprite_cache(*g_guest_cpu, m.free, spare_taken, w.evicted, game::kCtrPoolReserve,
                                   game::kCtrSpriteCacheMin);
         g_sprite_window = w;
         hitch_heartbeat(w);   // before the sprite cache line, the window's last (tools/session_report.py)
@@ -1877,6 +1925,7 @@ int main()
     opt.service = [] {
         apt_service();
         report_heap_refusals();
+        report_meta_reserve();
     };
     opt.io_start = start_io_thread;
     opt.io_wait = [] { LightEvent_Wait(&g_io_event); };

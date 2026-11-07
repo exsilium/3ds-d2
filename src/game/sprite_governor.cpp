@@ -31,7 +31,7 @@ uint32_t SpriteGovernor::step(const Beat &b, uint32_t reserve, uint32_t min_limi
 
     const uint32_t top = game_limit_;
     uint32_t want = b.limit;
-    if (b.spare_used) {
+    if (b.spare_taken) {
         short_beats_ = 0;
         want = min_limit < top ? min_limit : top;
     } else if (b.pool_free < reserve) {
@@ -50,8 +50,12 @@ uint32_t SpriteGovernor::step(const Beat &b, uint32_t reserve, uint32_t min_limi
         }
     } else {
         short_beats_ = 0;
-        if (b.pool_free >= reserve + 2 * kStep && full && b.limit < top)
-            want = top - b.limit > kStep ? b.limit + kStep : top;
+        if (b.pool_free >= reserve + 2 * kStep && full && b.limit < top) {
+            uint32_t up = ((b.pool_free - reserve) / 2) & ~(kStep - 1);
+            if (up < kStep)
+                up = kStep;
+            want = top - b.limit > up ? b.limit + up : top;
+        }
     }
     last_ = want;
     return want;

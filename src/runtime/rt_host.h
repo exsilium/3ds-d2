@@ -286,6 +286,11 @@ void sleep_guest(uint32_t ms);
 // The guest's clock: the scheduler's (virtual or real), so GetTickCount, QPC,
 // Sleep and timed waits always agree.
 uint64_t now_ms();
+// now_ms as the game's GetTickCount sees it, without a clock read: the
+// slice's clock on the real clock (it moves at each slice), now_ms itself
+// on the virtual one. For code run per call in play (issue #72: a host
+// clock read costs ~1 us on the console).
+uint32_t tick_ms();
 // Closes the host side of every file the game has open (after the I/O
 // worker's queued reads), and opens them again where they were: for the
 // platform to let go of its storage while the app is suspended (the HOME

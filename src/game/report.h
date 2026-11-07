@@ -55,6 +55,10 @@ public:
     // every "profiler run: start" line, in the order first seen, comma
     // separated; "" without a run.
     const std::string &profiled() const { return profiled_; }
+    // How the traces were written (profiler.h's TraceWrites, issue #66): the
+    // last "profiler run: trace writes <name>" line's name; "" without one
+    // (buffered, as before).
+    const std::string &trace_writes() const { return trace_writes_; }
 
     struct Figures {
         uint32_t seconds = 0;          // the last heartbeat's game time
@@ -81,7 +85,7 @@ public:
 private:
     bool started_ = false, closed_ = false, in_game_ = false;
     uint64_t start_time_ = 0;
-    std::string build_, version_, profiled_;
+    std::string build_, version_, profiled_, trace_writes_;
     std::vector<std::string> crash_;
     uint32_t last_t_ = 0, last_frames_ = 0;
     bool have_beat_ = false;

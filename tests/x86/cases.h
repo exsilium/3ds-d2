@@ -50,7 +50,8 @@ enum { C_ARITH, C_SHIFT, C_DIV, C_IDIV, C_BITS, C_GEN, C_X87 };
     X(x87_trans, FL_ALL, C_X87) X(x87_80bit, FL_ALL, C_GEN) X(x87_status, FL_ALL, C_GEN) \
     X(x87_int64, FL_ALL, C_X87) X(x87_unaligned, FL_ALL, C_X87) X(x87_misc, FL_ALL, C_X87)              \
     X(lock_ops, FL_ALL, C_ARITH) X(rep_long, FL_ALL, C_GEN) \
-    X(bsf_mem, FL_ZF | FL_DF, C_BITS) X(bsr_mem, FL_ZF | FL_DF, C_BITS) X(bsf_same, FL_ZF | FL_DF, C_BITS)
+    X(bsf_mem, FL_ZF | FL_DF, C_BITS) X(bsr_mem, FL_ZF | FL_DF, C_BITS) X(bsf_same, FL_ZF | FL_DF, C_BITS) \
+    X(bytemoves, 0, C_ARITH)
 
 static const uint32_t x86_vals[] = {0x00000000, 0x00000001, 0x0000007f, 0x00008000, 0x7fffffff,
                                     0x80000000, 0xfffffffe, 0xffffffff, 0x12345678, 0x9abcdef0};

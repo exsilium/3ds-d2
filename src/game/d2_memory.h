@@ -58,9 +58,10 @@ uint32_t sprite_cache_taken();
 // evicts down to a lowered limit as it takes new sprites, and the memory it
 // lets go of stays in the game's pool system for its other data, which then
 // stops taking more of the guest pool. Call it once per heartbeat with the
-// pool's free bytes, whether a request was served from the pool's spare,
-// and sprite_cache_window's evictions. Logs each change; returns the limit
-// in force.
+// pool's free bytes, whether a request was served from the pool's spare
+// since the last call (not whether the spare still holds one), and
+// sprite_cache_window's evictions. Logs each change; returns the limit in
+// force.
 //
 // The reserve was 10 MiB with a 1 MiB spare. In 4 h 25 min of Act I
 // (2026-10-29) the pool then stayed at 6.5 to 9.9 MiB free for three and a
@@ -78,7 +79,7 @@ constexpr uint32_t kCtrPoolRelease = 10u << 20;
 // (rt::RunOptions::pool_spare): the heap blocks the console was refused at
 // the end of long sessions were 262 to 656 KiB.
 constexpr uint32_t kCtrPoolSpare = 2u << 20;
-uint32_t govern_sprite_cache(d2rt::Cpu &c, uint32_t pool_free, bool spare_used, uint32_t evicted, uint32_t reserve,
+uint32_t govern_sprite_cache(d2rt::Cpu &c, uint32_t pool_free, bool spare_taken, uint32_t evicted, uint32_t reserve,
                              uint32_t min_limit);
 
 // Makes the game's fatal exit, exit(-1) after an internal error (an

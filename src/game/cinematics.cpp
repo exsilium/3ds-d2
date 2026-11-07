@@ -51,6 +51,7 @@
 #include <algorithm>
 #include <cstring>
 #include <memory>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -381,9 +382,18 @@ uint32_t video_open(Cpu &c)
     }
     if (rt::options().video_event)
         rt::options().video_event("open");
-    g_session.reset(new Session);
-    if (!g_session->open(name, host, offset)) {
-        rt::logf("cinematic: cannot be decoded, skipped");
+    // The host heap can be short (issue #24: the JIT's records hold it down
+    // to a reserve in a long session, and a video takes about 2 MiB): a
+    // video that cannot have its buffers is skipped, not the game ended.
+    bool opened = false, no_memory = false;
+    try {
+        g_session.reset(new Session);
+        opened = g_session->open(name, host, offset);
+    } catch (const std::bad_alloc &) {
+        no_memory = true;
+    }
+    if (!opened) {
+        rt::logf(no_memory ? "cinematic: no host memory for it, skipped" : "cinematic: cannot be decoded, skipped");
         g_session.reset();
         if (rt::options().video_event)
             rt::options().video_event("close");
@@ -395,7 +405,12 @@ uint32_t video_open(Cpu &c)
 
 uint32_t video_step(Cpu &)
 {
-    const int ms = g_session ? g_session->step() : -1;
+    int ms = -1;
+    try {
+        ms = g_session ? g_session->step() : -1;
+    } catch (const std::bad_alloc &) {   // its sound's buffer could not grow: the video ends here
+        rt::logf("cinematic: no host memory to go on, ended");
+    }
     if (ms < 0) {
         g_session.reset();   // the decoder's memory goes with it
         g_playing = false;
@@ -406,6 +421,11 @@ uint32_t video_step(Cpu &)
 }
 
 }  // namespace
+
+bool cinematic_playing()
+{
+    return __atomic_load_n(&g_playing, __ATOMIC_RELAXED);
+}
 
 int install_cinematics(Cpu &c)
 {

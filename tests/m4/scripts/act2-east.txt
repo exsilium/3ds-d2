@@ -1,0 +1,22 @@
+# Act I to Act II (issue #66): the first character in the list into the
+# game, to Warriv in the Rogue Encampment, and Go East. For a character that
+# has finished Act I, such as dist/save/BeforeCh1End's (Linux lane: its save/
+# folder's contents as build/m4/write; Azahar: scripts/run-game-azahar.sh
+# --save dist/save/BeforeCh1End/save; the console: as sdmc:/3ds/3ds-d2/save).
+# Warriv is found where he is (tapunit reads the game's units), so it does
+# not depend on the frame rate or where he has wandered: the same file runs
+# on the lane, in Azahar and on the console as sdmc:/3ds/3ds-d2/autoplay.txt.
+#   M4_SCRIPT="$(cat tests/m4/scripts/act2-east.txt)"
+# The intro videos skipped as they start (a tap during one would skip it
+# instead of reaching the menu); the main menu takes clicks from ~25 s in Azahar.
+0 skipvideos
+# Single Player, then OK on the character list (tapped again until in game).
+35000 tap 400 307
+40000 tapuntil ingame 690 555
+# Warriv: walk to him and open his menu, then its second line, Go East.
+40500 tapunit warriv
+41000 tapmenu 2
+41500 wait act2
+# In Lut Gholein: who is near, and a screenshot.
+45000 units
+45000 shot

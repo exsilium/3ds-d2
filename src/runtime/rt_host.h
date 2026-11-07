@@ -199,6 +199,10 @@ void stop_async_io();
 // caller closes the file after that. The game's thread (the heartbeat).
 // RT_FILETRACE=1 traces to stderr from the start.
 void set_file_trace(FILE *f);
+// Each record written out to the file as it is made (fflush per read), for
+// a crash to lose nothing (issue #66); off, the file's buffer decides. The
+// game's thread.
+void set_file_trace_each(bool on);
 
 // The guest code profile (PROF_COUNTERS builds: prof.h): time in translated
 // code and in each shim, per guest thread, and EIP samples, logged with every

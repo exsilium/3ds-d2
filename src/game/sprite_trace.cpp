@@ -76,6 +76,7 @@ Seen *g_seen = nullptr;
 uint64_t g_start_ms = 0;
 bool g_started = false;   // the file has its header: later starts append
 uint32_t g_lost = 0;
+bool g_each = false;      // sprite_trace_each: every record written out at once
 
 void put_rel32(uint8_t *at, uint32_t insn_end, uint32_t target)
 {
@@ -92,6 +93,8 @@ void record(uint32_t type, uint32_t a, uint32_t b, uint32_t c)
     const uint32_t r[4] = {type << 28 | (elapsed_ms() & 0x0fffffffu), a, b, c};
     if (std::fwrite(r, sizeof r, 1, g_file) != 1)
         g_lost++;
+    else if (g_each)
+        std::fflush(g_file);
 }
 
 // FNV-1a over the record's lookup fields, +4 to +0x1c; never 0 (0: no
@@ -261,6 +264,14 @@ void sprite_trace_stop()
 }
 
 bool sprite_trace_on() { return g_file != nullptr; }
+
+void sprite_trace_flush()
+{
+    if (g_file)
+        std::fflush(g_file);
+}
+
+void sprite_trace_each(bool on) { g_each = on; }
 
 void sprite_trace_beat(const SpriteTraceBeat &b)
 {

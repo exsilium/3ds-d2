@@ -45,6 +45,53 @@ inline constexpr ProfileOptionInfo kProfileOptions[] = {
 inline constexpr int kProfileOptionCount = sizeof kProfileOptions / sizeof kProfileOptions[0];
 inline constexpr uint32_t kProfileAll = kProfSprites | kProfGuest | kProfFiles | kProfSdBench;
 
+// How the traces reach the SD card (issue #66): the checklist's last row,
+// which steps through these on a tap, a run on or not. Buffered is how the
+// traces were always written, in large writes as their buffers fill (the
+// sprite trace's also at each heartbeat), cheapest, and it loses what is
+// still in the buffers when the console goes down. Every second, the
+// platform writes out what the traces hold once a second; each record at
+// once, every record is written as it is made, so a crash loses nothing
+// before it, at an SD card write per file read and per sprite use.
+enum class TraceWrites : uint8_t { Buffered, EverySecond, AtOnce };
+
+struct TraceWritesInfo {
+    TraceWrites mode;
+    const char *name;    // settings.txt and game.log
+    const char *label;   // the checklist row (at most 26 columns)
+    const char *note;    // under it (at most 36)
+};
+
+inline constexpr TraceWritesInfo kTraceWrites[] = {
+    {TraceWrites::Buffered, "buffered", "trace writes: buffered", "as before; a crash loses the buffers"},
+    {TraceWrites::EverySecond, "second", "trace writes: every second", "a crash loses up to a second"},
+    {TraceWrites::AtOnce, "now", "trace writes: at once", "for crashes: each record; slower"},
+};
+inline constexpr int kTraceWritesCount = sizeof kTraceWrites / sizeof kTraceWrites[0];
+
+inline const TraceWritesInfo &trace_writes_info(TraceWrites m)
+{
+    for (const TraceWritesInfo &w : kTraceWrites)
+        if (w.mode == m)
+            return w;
+    return kTraceWrites[0];
+}
+
+// The mode named (settings.txt); Buffered for a name not known.
+inline TraceWrites trace_writes_from_name(const char *s)
+{
+    const size_t n = std::strcspn(s, " \r\n");
+    for (const TraceWritesInfo &w : kTraceWrites)
+        if (n == std::strlen(w.name) && std::strncmp(s, w.name, n) == 0)
+            return w.mode;
+    return TraceWrites::Buffered;
+}
+
+inline TraceWrites next_trace_writes(TraceWrites m)
+{
+    return kTraceWrites[((int)m + 1) % kTraceWritesCount].mode;
+}
+
 inline constexpr char kProfilerRunLine[] = "profiler run: ";
 
 // "sprites,guest": the options in `bits`, in checklist order ("" for none).

@@ -54,14 +54,18 @@ lib: $(SRC)/build-arm/libwinx86.a
 # Pristine copy of the pinned submodule as a git work tree (commit "pristine"),
 # then the variant's patch series applied as one commit per patch. Edit there,
 # commit, and `make export` writes the series back to patches/<variant>/.
+#
+# Prepared again whenever what it is made from changes (prepare.sh): the
+# inputs id is the submodule's commit and a hash of the patch series, kept in
+# $(OUT)/prepare.id, which is rewritten only when it differs. A build then
+# always compiles its branch's patches (issue #56), never a tree's leftovers.
 GIT := git -c safe.directory="*" -c user.name=3ds-d2 -c user.email=3ds-d2@localhost -c commit.gpgsign=false
-$(SRC)/.prepared:
-	@rm -rf $(SRC) && mkdir -p $(SRC)
-	@cd $(ROOT)/third_party/winx86 && $(GIT) archive HEAD | tar -x -C $(abspath $(SRC))
-	@cd $(SRC) && $(GIT) init -q && $(GIT) add -A && $(GIT) commit -q -m pristine && $(GIT) tag pristine
-	@for p in $(sort $(wildcard $(abspath patches/$(VARIANT))/*.patch)); do \
-	  echo "apply $$(basename $$p)"; (cd $(SRC) && $(GIT) am -q --keep-cr $$p) || exit 1; done
-	@touch $@
+PREPARE_ID = $(shell $(GIT) -C $(ROOT)/third_party/winx86 rev-parse HEAD)-$(shell \
+  cd patches/$(VARIANT) 2>/dev/null && sha256sum *.patch | sha256sum | cut -c1-16)
+$(OUT)/prepare.id: FORCE
+	@mkdir -p $(OUT); echo '$(PREPARE_ID)' | cmp -s - $@ || echo '$(PREPARE_ID)' > $@
+$(SRC)/.prepared: $(OUT)/prepare.id
+	@bash prepare.sh $(SRC) patches/$(VARIANT) $(ROOT)/third_party/winx86 '$(PREPARE_ID)'
 
 .PHONY: export
 export:

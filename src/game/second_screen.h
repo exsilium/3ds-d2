@@ -10,13 +10,21 @@
 //          weapon swap, show items, chat, close all)
 //   ZOOM   the frame at 1:1 around the cursor, readable text; touch points
 //          straight at the game
-//   INFO   the diagnostics (frame rate, memory) and the runtime's messages
+//   INFO   the diagnostics (frame rate, memory) and the runtime's messages;
+//          the button under them asks for a report of this session when the
+//          game ends (issue #26: nothing is collected or sent meanwhile), and
+//          the one beside it opens the profiler run's checklist (profiler.h):
+//          what to measure, and a button that starts and stops the run
 //   PANEL  offered while a panel is open (inventory, stash, shop, character,
 //          skills...), and shown by itself when one opens: the panel's half
 //          of the frame at 1:1 (D2's panels are 320 pixels wide at 640x480),
 //          touched directly. Tapping PANEL again with panels on both sides
 //          moves the cursor to the other side.
 // The on-screen keyboard (osk.h) takes the whole screen while it is open.
+// While a cinematic plays (issue #59), a panel of its own replaces the tabs:
+// the video's title, how far it has played, and how to skip it. The touch
+// screen is the touchpad meanwhile, so a tap anywhere skips the video. The
+// tab shown before comes back with the game's next frame.
 //
 // Touch: on the tab bar it picks a tab. In ZOOM and PANEL it points: the
 // cursor goes to the touched spot and follows the finger, a short tap is a
@@ -33,6 +41,7 @@
 #include "game/controls.h"
 #include "game/d2_state.h"
 #include "game/osk.h"
+#include "game/profiler.h"
 
 #include <cstdint>
 #include <string>
@@ -47,7 +56,7 @@ bool bottom_tab_from_name(const char *s, BottomTab &t);
 
 // Everything the bottom screen draws, taken on the game thread.
 struct BottomView {
-    enum Kind : uint8_t { kNone, kMap, kHelp, kKeys, kViewport, kInfo, kKeyboard };
+    enum Kind : uint8_t { kNone, kMap, kHelp, kKeys, kViewport, kInfo, kKeyboard, kVideo };
     struct Line {
         std::string text;
         uint16_t color;   // RGB565
@@ -67,11 +76,24 @@ struct BottomView {
     uint32_t keys_lit = 0;
     // kInfo, and the upper part of kKeyboard.
     std::vector<Line> lines;
+    bool report = false;              // kInfo: a report is asked for (its button lit)
+    bool profiling = false;           // kInfo: a profiler run is on (its button lit)
+    bool checklist = false;           // kInfo: the profiler run's checklist instead of the lines
+    uint32_t profile = 0;             // the checklist's ticks (profiler.h)
+    TraceWrites trace_writes = TraceWrites::Buffered;   // the checklist's last row
     // kKeyboard.
     std::string osk_title;
     std::vector<Osk::KeyView> osk_keys;
     std::string note;   // a line over the area (kMap without a map)
+    // kVideo: its title, and where it is (whole seconds).
+    std::string video_title;
+    uint32_t video_s = 0, video_length_s = 0;
 };
+
+// A cinematic's title for the player, from its file name
+// ("data\local\video\act02start640x292.bik" -> "Act II"); one not known is
+// shown by its file name without the size and extension.
+std::string video_title(const std::string &file);
 
 class SecondScreen {
 public:
@@ -98,6 +120,25 @@ public:
     static constexpr int kMsBtnX = 136, kMsBtnW = 84, kScaleBtnX = 224, kScaleBtnW = 56;
     static constexpr int kHelpBtnX = 284, kHelpBtnW = 36;
     bool take_settings_changed() { bool r = settings_changed_; settings_changed_ = false; return r; }
+    // INFO's button, in the same strip: a report of this session, offered
+    // when the game ends. The platform reads it then; until then it is a flag.
+    static constexpr int kReportBtnX = 164, kReportBtnW = 156;
+    bool report_requested() const { return report_; }
+    // And the profiler run's, left of it: the checklist, a row per option
+    // (profiler.h), with the run's start/stop button where this one was and
+    // a way back where the report's was. The platform starts and stops the
+    // run's options at its heartbeat as profiling() says. Ticks are a
+    // setting; they do not change while a run is on. Under them, how the
+    // traces are written (profiler.h's TraceWrites): a tap steps it on, a
+    // run on or not, and the platform applies it at once.
+    static constexpr int kProfBtnX = 4, kProfBtnW = 156;
+    static constexpr int kProfRows = kProfileOptionCount + 1;
+    static constexpr int kProfRowY = kBarH + 20, kProfRowH = 36;
+    bool profiling() const { return profiling_; }
+    uint32_t profile_choice() const { return profile_; }
+    void set_profile_choice(uint32_t bits);
+    TraceWrites trace_writes() const { return trace_writes_; }
+    void set_trace_writes(TraceWrites m);
     // The buttons' shortcuts (Select + D-pad): the next or previous tab
     // along the bar (PANEL too while a panel is open), MAP, and MAP's size
     // (both showing the map, not HELP). Not while the keyboard is open.
@@ -121,6 +162,11 @@ public:
 
     // The keyboard (osk.h), while it is open, replaces everything.
     void set_keyboard(const Osk *osk) { osk_ = osk; }
+    // A cinematic's frame (its file name, ms from its start, its length),
+    // and its end: the video's panel until then.
+    void set_video(const char *file, uint32_t at_ms, uint32_t length_ms);
+    void end_video();
+    bool video() const { return video_; }
     // INFO: the diagnostics lines (once a second) and the runtime's messages.
     void set_stats(std::vector<BottomView::Line> lines);
     void log(const char *s);
@@ -142,7 +188,17 @@ private:
     int map_scale_ = 1;
     uint32_t map_ms_ = 500;
     bool settings_changed_ = false;
+    bool report_ = false;
+    bool profiling_ = false;
+    bool checklist_ = false;
+    uint32_t profile_ = 1;            // profiler.h's kProfSprites until settings say otherwise
+    TraceWrites trace_writes_ = TraceWrites::Buffered;
     const Osk *osk_ = nullptr;
+
+    // The cinematic playing.
+    bool video_ = false;
+    std::string video_file_, video_title_;
+    uint32_t video_s_ = 0, video_length_s_ = 0, last_video_s_ = UINT32_MAX;
 
     // The game.
     GameState gs_;
@@ -192,6 +248,11 @@ private:
 // `font` is 8x8, 1 bpp, bit 7 leftmost (libctru's console font).
 void draw_bottom(uint16_t *fb, const BottomView &v, const uint8_t *frame, int fw, int fh, const uint16_t *pal565,
                  const uint8_t *font);
+
+// The panel shown while the HOME menu takes over (issue #27): the whole
+// screen, in the same layout, colours and font as draw_bottom. No
+// allocation and no file access: drawn while the storage is being closed.
+void draw_suspending(uint16_t *fb, const uint8_t *font);
 
 }  // namespace game
 

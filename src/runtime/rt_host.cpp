@@ -28,6 +28,7 @@
 extern "C" {
 #include "my_cpuid.h"
 size_t d2rt_box86_dynarec_kb(void);
+size_t d2rt_box86_dynarec_used_kb(void);
 size_t d2rt_box86_custommalloc_kb(void);
 size_t d2rt_box86_jmptbl_kb(void);
 int dyn86_intrin_report(char *out, unsigned cap);   // translation-time intrinsics: calls and served
@@ -50,6 +51,7 @@ extern uint64_t dyn86_ctr_cache_sync_ticks __attribute__((weak));
 #include <map>
 #include <memory>
 #include <set>
+#include <unordered_map>
 #include <vector>
 
 using namespace d2rt;
@@ -61,7 +63,7 @@ RunOptions g_opt;
 Bridge *g_br = nullptr;
 CooperativeScheduler *g_sched = nullptr;
 std::atomic<Cpu *> g_tick_cpu{nullptr};   // the CPU while the scheduler runs (profile_tick)
-uint32_t g_exe_base = 0;
+uint32_t g_exe_base = 0, g_exe_size = 0;
 bool g_exited = false;
 bool g_timed_out = false;
 Stats g_stats;
@@ -72,6 +74,77 @@ uint32_t g_exit_code = 0;
 thread_local bool t_runs_guest = false;
 bool g_in_service = false;
 uint64_t g_last_service_ms = 0;   // real clock (wx86_now_ms)
+uint64_t g_t0_ms = 0;   // real clock at run start: guest time starts at 0 in both modes
+// GetTickCount and timeGetTime as the in-line intrinsic serves them (issue
+// #39): on the real clock, the clock at the start of the current slice,
+// raised by every now_ms read in it, so it never runs behind a time the guest
+// got elsewhere (a message's). The scheduler's own clock moves only between
+// slices too. now_ms for each call cost three host clock reads and the frame
+// thread's sample, and the hottest caller, a unit's timer list (0x470c30),
+// runs for every unit in a fight. Written from host threads as well (now_ms),
+// hence the atomic.
+std::atomic<uint32_t> g_tick{0};
+// Calls counted by the caller's return address while profiling: an
+// open-addressed table, of which the heartbeat logs each window's busiest.
+// 32 bits: the windows' differences survive a wrap, and the ARM11 has no
+// 64-bit atomics without libatomic.
+struct CallSites {
+    static constexpr size_t kSlots = 1024;
+    std::atomic<uint32_t> unsited{0};   // table full
+    std::atomic<uint32_t> site[kSlots], calls[kSlots], mark[kSlots];
+
+    void count(uint32_t ret)
+    {
+        for (size_t k = 0, i = (ret * 2654435761u) >> 22; k < kSlots; k++, i = (i + 1) % kSlots) {
+            uint32_t s = site[i].load(std::memory_order_relaxed);
+            if (!s && site[i].compare_exchange_strong(s, ret, std::memory_order_relaxed))
+                s = ret;
+            if (s == ret) {
+                calls[i].fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+        }
+        unsited.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // Appends the window's 8 busiest (", by caller <ret>:<calls> ...") to
+    // `line` from `off`, and starts the next window.
+    void log_window(char *line, size_t off, size_t cap)
+    {
+        std::vector<std::pair<uint32_t, uint32_t>> top;   // calls, return address
+        for (size_t i = 0; i < kSlots; i++) {
+            const uint32_t s = site[i].load(std::memory_order_relaxed);
+            const uint32_t n = calls[i].load(std::memory_order_relaxed);
+            const uint32_t d = n - mark[i].load(std::memory_order_relaxed);
+            mark[i].store(n, std::memory_order_relaxed);
+            if (s && d)
+                top.push_back({d, s});
+        }
+        std::sort(top.begin(), top.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
+        const char *sep = ", by caller";
+        for (size_t i = 0; i < top.size() && i < 8 && off < cap; i++) {
+            off += std::snprintf(line + off, cap - off, "%s %08x:%u", sep, (unsigned)top[i].second,
+                                 (unsigned)top[i].first);
+            sep = "";
+        }
+        if (const uint32_t u = unsited.load(std::memory_order_relaxed); u && off < cap)
+            std::snprintf(line + off, cap - off, " (%u without a slot so far)", (unsigned)u);
+    }
+};
+// The in-line reads since the start, and while profiling by caller.
+std::atomic<uint32_t> g_tick_reads{0};
+CallSites g_tick_sites;
+// The lock calls by caller while profiling (count_lock_site).
+CallSites g_lock_sites;
+
+void raise_tick(uint64_t ms)
+{
+    const uint32_t v = (uint32_t)ms;
+    uint32_t cur = g_tick.load(std::memory_order_relaxed);
+    while ((int32_t)(v - cur) > 0 && !g_tick.compare_exchange_weak(cur, v, std::memory_order_relaxed))
+        ;
+}
+
 wx86::GuestRegion g_heap, g_va;
 // When the layout puts the heap and VirtualAlloc ranges side by side (all of
 // them do), both are faces of one pool: the heap grows up from its base, VA
@@ -167,6 +240,22 @@ void init_teb(Cpu &cpu, uint32_t teb, uint32_t stack_top, uint32_t stack_limit)
 const RunOptions &options() { return g_opt; }
 const Layout &layout() { return *g_opt.layout; }
 wx86::GuestRegion &va_region() { return g_va; }
+uint32_t va_alloc(uint32_t bytes, uint32_t owner)
+{
+    // A free piece that large may still not hold it at the VA's alignment.
+    if (g_va.largest_free() < bytes + 0xffff)
+        return 0;
+    va_owner_sync();   // the last VirtualAlloc's block takes its own owner first
+    const uint32_t a = g_va.alloc(bytes);
+    if (a)
+        g_va_owner[a] = owner;
+    return a;
+}
+void va_free(uint32_t va)
+{
+    g_va_owner.erase(va);
+    g_va.free(va);
+}
 Stats &stats() { return g_stats; }
 bool guest_read(uint32_t va, void *out, uint32_t n)
 {
@@ -345,7 +434,8 @@ MemoryReport memory_report()
     const uint32_t free = g_pool_size ? g_pool_size - g_pool.used_bytes() : L.heap_size + L.va_size - heap - va;
     return {heap, g_heap.peak(), L.heap_size, va, g_va.peak(), L.va_size, free, g_va.largest_free(),
             g_spare_size ? g_spare.used_bytes() : 0, g_spare_size ? g_pool.spare_takes() : 0,
-            (uint32_t)d2rt_box86_dynarec_kb(), (uint32_t)d2rt_box86_custommalloc_kb(), (uint32_t)d2rt_box86_jmptbl_kb()};
+            (uint32_t)d2rt_box86_dynarec_kb(), (uint32_t)d2rt_box86_dynarec_used_kb(),
+            (uint32_t)d2rt_box86_custommalloc_kb(), (uint32_t)d2rt_box86_jmptbl_kb()};
 }
 Bridge &bridge() { return *g_br; }
 uint32_t exe_base() { return g_exe_base; }
@@ -385,16 +475,173 @@ uint32_t guest_call(Cpu &c, uint32_t va, std::initializer_list<uint32_t> args)
 
 namespace {
 // What the last heartbeat interval cost. Always: scheduler idle time and the
-// console's cache maintenance. With PROF_COUNTERS (package-cia --prof): the
-// split between translated code and shims, the busiest shims, and an EIP
-// profile per guest thread (one sample per preempted slice), after which the
-// samples are reset so every interval is a profile of its own.
+// console's cache maintenance. While profiling (set_profiling): the split
+// between translated code and shims, the busiest shims, and an EIP profile
+// per guest thread (one sample per profile_tick, or per preempted slice
+// without a timer), after which the samples are reset so every interval is
+// a profile of its own.
+// Where the thread presenting frames spends its time (issue #31): the host
+// time between two samples on the scheduler's thread is charged to what that
+// thread was doing at the first of them: running, ready while another guest
+// thread runs, host work on its core (the scheduler between slices, the
+// heartbeat, the app's service), or blocked, by what it waits on (a Sleep is
+// blocked on nothing). Samples are taken at each slice's start and end (the
+// scheduler's slice sink), at each advance of the guest clock and from
+// now_ms, and around the host work. Without a slice sink, running and ready
+// are the thread's state at the sample, which charges a slice that starts
+// right after one to ready (issue #19: 3DS-D2-E).
+constexpr const char *kFrameKinds[] = {"run",    "ready",  "host",  "sleep", "critsec",
+                                       "event",  "fileio", "multi", "thread", "other"};
+constexpr size_t kFrameKindCount = sizeof kFrameKinds / sizeof kFrameKinds[0];
+enum : size_t { kFrameRun, kFrameReady, kFrameHost, kFrameSleep, kFrameWaits };
+uint64_t g_frame_us[kFrameKindCount] = {}, g_frame_mark[kFrameKindCount] = {};
+size_t g_frame_was = kFrameKindCount;   // what it was doing at the last sample (none yet)
+uint64_t g_frame_at = 0;
+int g_slice_tid = -1;          // the guest thread whose slice runs, -1 between slices
+bool g_slice_sink = false;     // the scheduler reports its slices
+bool g_host_work = false;      // the heartbeat or the app's service runs
+uint64_t g_heartbeat_us = 0;   // the last heartbeat's length
+// Its blocked time by where it waits from (the guest code it resumes in),
+// for the heartbeat's few largest.
+uint32_t g_frame_where = 0;
+std::map<uint32_t, uint64_t> g_frame_wait_at;
+
+// Where a blocked guest thread waits from: its saved EIP when that is in the
+// game's image, else (a shim's trap) the return address on its stack.
+uint32_t wait_site(const GuestThread &t)
+{
+    const uint32_t eip = t.ctx.eip;
+    if (eip >= g_exe_base && eip < g_exe_base + g_exe_size)
+        return eip;
+    Cpu *c = g_tick_cpu.load(std::memory_order_relaxed);
+    return c ? c->read_u32(t.ctx.gpr[R_ESP]) : eip;
+}
+
+size_t frame_thread_doing()
+{
+    const int id = g_stats.frame_thread;
+    GuestThread *t = id >= 0 && g_sched ? g_sched->thread_by_id((uint32_t)id) : nullptr;
+    if (!t)
+        return kFrameKindCount;
+    switch (t->state) {
+    case GuestThread::State::Running:
+    case GuestThread::State::Ready:
+        if (g_host_work)
+            return kFrameHost;
+        if (!g_slice_sink)
+            return t->state == GuestThread::State::Running ? kFrameRun : kFrameReady;
+        return g_slice_tid < 0 ? kFrameHost : g_slice_tid == id ? kFrameRun : kFrameReady;
+    case GuestThread::State::Blocked: break;
+    default: return kFrameKindCount;
+    }
+    g_frame_where = wait_site(*t);
+    if (!t->wait_obj)
+        return kFrameSleep;
+    const char *k = static_cast<Waitable *>(t->wait_obj)->kind();
+    for (size_t i = kFrameWaits; i + 1 < kFrameKindCount; i++)
+        if (std::strcmp(k, kFrameKinds[i]) == 0)
+            return i;
+    return kFrameKindCount - 1;
+}
+
+// The time since the last sample, charged to what the thread was doing.
+// Returns the real clock it read (wx86_now_us).
+uint64_t charge_frame_thread()
+{
+    const uint64_t us = wx86_now_us();
+    if (g_frame_was < kFrameKindCount && us > g_frame_at) {
+        g_frame_us[g_frame_was] += us - g_frame_at;
+        if (g_frame_was >= kFrameSleep)
+            g_frame_wait_at[g_frame_where] += us - g_frame_at;
+    }
+    g_frame_at = us;
+    return us;
+}
+
+void sample_frame_thread()
+{
+    charge_frame_thread();
+    g_frame_was = frame_thread_doing();
+}
+
+// The scheduler's slice sink (its thread).
+void on_slice(uint32_t tid, bool start)
+{
+    const uint64_t us = charge_frame_thread();
+    if (start && g_opt.real_clock)
+        raise_tick(us / 1000 - g_t0_ms);   // now_ms's value, from the clock read just made
+    g_slice_sink = true;
+    g_slice_tid = start ? (int)tid : -1;
+    g_frame_was = frame_thread_doing();
+}
+
+// Host work on the guest's core, from the scheduler's thread.
+void host_work(bool on)
+{
+    if (!t_runs_guest || !g_sched)
+        return;
+    charge_frame_thread();
+    g_host_work = on;
+    g_frame_was = frame_thread_doing();
+}
+
+void log_frame_thread()
+{
+    char line[256];
+    size_t off = std::snprintf(line, sizeof line, "prof frame thread %d:", g_stats.frame_thread);
+    for (size_t i = 0; i < kFrameKindCount && off < sizeof line; i++) {
+        off += std::snprintf(line + off, sizeof line - off, " %s %llu", kFrameKinds[i],
+                             (unsigned long long)((g_frame_us[i] - g_frame_mark[i]) / 1000));
+        g_frame_mark[i] = g_frame_us[i];
+    }
+    logf("%s ms", line);
+    // The sites it waited longest from (200 ms or more).
+    std::vector<std::pair<uint64_t, uint32_t>> top;
+    for (const auto &w : g_frame_wait_at)
+        if (w.second >= 200000)
+            top.push_back({w.second / 1000, w.first});
+    g_frame_wait_at.clear();
+    if (top.empty())
+        return;
+    std::sort(top.rbegin(), top.rend());
+    off = std::snprintf(line, sizeof line, "prof frame thread waits:");
+    for (size_t i = 0; i < top.size() && i < 6 && off < sizeof line; i++)
+        off += std::snprintf(line + off, sizeof line - off, " %08x:%llu", top[i].second,
+                             (unsigned long long)top[i].first);
+    logf("%s ms", line);
+}
+
 struct ProfMark {
     uint64_t ms, idle_ms, switches, sync_ticks;
     uint32_t syncs, frames;
     FileStats files;
     uint64_t run_ns = 0, trap_ns = 0, trap_calls = 0, waits = 0, waits_now = 0, cs = 0, cs_contended = 0, ticks = 0;
+    uint32_t tick_reads = 0;
+    LockCalls locks{};
 } g_mark{};
+
+// The in-line clock reads of the window, and while profiling the callers
+// that made the most (return address: reads), as tools/profile_report.py
+// reads them.
+void log_tick_reads(uint32_t reads)
+{
+    char line[256];
+    g_tick_sites.log_window(line, std::snprintf(line, sizeof line, "prof clock: %u reads in line", (unsigned)reads),
+                            sizeof line);
+    logf("%s", line);
+}
+
+// The window's lock calls (issue #48): served in line, through the shim, the
+// Enters that waited, and while profiling the callers that made the most.
+void log_lock_calls(const LockCalls &d)
+{
+    char line[256];
+    g_lock_sites.log_window(line,
+                            std::snprintf(line, sizeof line, "prof locks: %u in line, %u through the shim (%u waited)",
+                                          (unsigned)d.in_line, (unsigned)d.shim, (unsigned)d.waits),
+                            sizeof line);
+    logf("%s", line);
+}
 
 #ifdef PROF_COUNTERS
 struct ThreadProf { uint32_t tid, entry; uint64_t samples, blocks, run_ns = 0, trap_ns = 0, slices = 0; };
@@ -420,10 +667,15 @@ void prof_report(uint64_t ms)
     const uint64_t ticks = &dyn86_ctr_cache_sync_ticks ? dyn86_ctr_cache_sync_ticks : 0;
     ProfMark now{ms, g_sched ? g_sched->idle_ms_ : 0, g_sched ? g_sched->switches() : 0, ticks, syncs, g_stats.frames,
                  file_stats()};
+    now.tick_reads = g_tick_reads.load(std::memory_order_relaxed);
     logf("prof: %llu ms, frames %u, idle %llu ms, switches %llu, cache syncs %u (%llu us)",
          (unsigned long long)(now.ms - g_mark.ms), now.frames - g_mark.frames,
          (unsigned long long)(now.idle_ms - g_mark.idle_ms), (unsigned long long)(now.switches - g_mark.switches),
          now.syncs - g_mark.syncs, (unsigned long long)((now.sync_ticks - g_mark.sync_ticks) / 268u));   // 268 MHz tick
+    log_tick_reads(now.tick_reads - g_mark.tick_reads);
+    now.locks = lock_calls();
+    log_lock_calls({now.locks.in_line - g_mark.locks.in_line, now.locks.shim - g_mark.locks.shim,
+                    now.locks.waits - g_mark.locks.waits});
     if (dyn86_intrin_n) {
         char line[256];
         if (dyn86_intrin_report(line, sizeof line) > 0)
@@ -431,13 +683,16 @@ void prof_report(uint64_t ms)
     }
     const FileStats &f = now.files, &f0 = g_mark.files;
     logf("prof files: %llu reads (%llu async), %llu hits, %llu fills, %llu direct, %llu seeks; disk %llu reads %llu KiB in "
-         "%llu ms; cache %llu KiB",
+         "%llu ms; cache %llu KiB; waited %llu ms in %llu reads (frame thread %llu ms), stalled %llu ms",
          (unsigned long long)(f.calls - f0.calls), (unsigned long long)(f.async - f0.async),
          (unsigned long long)(f.hits - f0.hits),
          (unsigned long long)(f.fills - f0.fills), (unsigned long long)(f.direct - f0.direct),
          (unsigned long long)(f.seeks - f0.seeks), (unsigned long long)(f.disk_reads - f0.disk_reads),
          (unsigned long long)((f.disk_bytes - f0.disk_bytes) >> 10), (unsigned long long)((f.disk_us - f0.disk_us) / 1000),
-         (unsigned long long)(f.cache_bytes >> 10));
+         (unsigned long long)(f.cache_bytes >> 10), (unsigned long long)((f.wait_us - f0.wait_us) / 1000),
+         (unsigned long long)(f.waits - f0.waits), (unsigned long long)((f.wait_frame_us - f0.wait_frame_us) / 1000),
+         (unsigned long long)((f.stall_us - f0.stall_us) / 1000));
+    log_frame_thread();
 #ifdef PROF_COUNTERS
     now.run_ns = prof::run_ns;
     now.trap_ns = prof::trap_ns;
@@ -447,6 +702,10 @@ void prof_report(uint64_t ms)
     now.cs = prof::cs_enter;
     now.cs_contended = prof::cs_contended;
     now.ticks = prof::ticks();
+    if (!prof::on) {   // not profiling: nothing counted since the mark
+        g_mark = now;
+        return;
+    }
     logf("prof: run %llu ms (shims %llu ms in %llu calls), waits %llu (%llu immediate), cs %llu (%llu contended), "
          "samples %llu",
          (unsigned long long)((now.run_ns - g_mark.run_ns) / 1000000), (unsigned long long)((now.trap_ns - g_mark.trap_ns) / 1000000),
@@ -483,13 +742,38 @@ void prof_report(uint64_t ms)
              t.tid, t.entry, (unsigned long long)(t.run_ns / 1000000), (unsigned long long)(t.trap_ns / 1000000),
              (unsigned long long)t.slices, (unsigned long long)t.samples, (unsigned long long)t.blocks);
         Eips v;
+        prof::top_eips_tid(t.tid, -1, collect, &v);
         // Time samples spread over many EIPs: the busy threads get a longer list.
-        prof::top_eips_tid(t.tid, t.samples > 1000 ? 120 : 40, collect, &v);
-        for (size_t i = 0; i < v.size(); i += 20) {
-            char head[32];
-            std::snprintf(head, sizeof head, "prof eip t%u", t.tid);
-            log_eips(head, Eips(v.begin() + i, v.begin() + std::min(v.size(), i + 20)));
+        const bool busy = t.samples > 1000;
+        const size_t exact = std::min(v.size(), (size_t)(busy ? 120 : 40));
+        char head[32];
+        std::snprintf(head, sizeof head, "prof eip t%u", t.tid);
+        for (size_t i = 0; i < exact; i += 20)
+            log_eips(head, Eips(v.begin() + i, v.begin() + std::min(exact, i + 20)));
+        // The rest, folded into 64-byte buckets (issue #40): in a fight the
+        // time is spread over many functions, each too small for the exact
+        // list. The busiest buckets, then how many samples are in neither.
+        std::unordered_map<uint32_t, uint64_t> fold;
+        for (size_t i = exact; i < v.size(); i++)
+            fold[v[i].first & ~63u] += v[i].second;
+        std::vector<std::pair<uint64_t, uint32_t>> tail;   // hits, bucket
+        for (const auto &b : fold)
+            tail.push_back({b.second, b.first});
+        std::sort(tail.rbegin(), tail.rend());
+        const size_t listed = std::min(tail.size(), (size_t)(busy ? 480 : 60));
+        std::snprintf(head, sizeof head, "prof tail t%u", t.tid);
+        for (size_t i = 0; i < listed; i += 20) {
+            Eips chunk;
+            for (size_t j = i; j < listed && j < i + 20; j++)
+                chunk.push_back({tail[j].second, tail[j].first});
+            log_eips(head, chunk);
         }
+        uint64_t left = 0;
+        for (size_t i = listed; i < tail.size(); i++)
+            left += tail[i].first;
+        if (!tail.empty())
+            logf("prof tail t%u: %zu of %zu buckets, %llu samples left out", t.tid, listed, tail.size(),
+                 (unsigned long long)left);
     }
     Eips buckets;   // 64-byte buckets, all threads: hot loops spread over several EIPs
     prof::top_eips(40, collect, &buckets);
@@ -502,31 +786,44 @@ void prof_report(uint64_t ms)
 
 void check_time_limit(uint64_t ms)
 {
+    raise_tick(ms);
+    if (t_runs_guest && g_sched)
+        sample_frame_thread();
     if (g_opt.service && t_runs_guest && !g_in_service) {
         const uint64_t real = wx86_now_ms();
         if (real - g_last_service_ms >= 50) {
             g_in_service = true;
+            host_work(true);
             g_opt.service();
+            host_work(false);
             g_in_service = false;
             g_last_service_ms = wx86_now_ms();
         }
     }
     if (g_opt.heartbeat_ms && ms >= g_next_beat) {
         g_next_beat = ms + g_opt.heartbeat_ms;
+        // The heartbeat runs on the guest's core: the frame after it waits
+        // for all of it (last_heartbeat_us).
+        host_work(true);
+        const uint64_t beat_t0 = wx86_now_us();
         prof_report(ms);
 #ifdef __GLIBC__
         const size_t host_used = mallinfo2().uordblks;
 #else
         const size_t host_used = mallinfo().uordblks;
 #endif
+        // jit= is the code chunks opened (2 MiB steps), jitused= what the
+        // translated blocks in them hold now (issue #23). jitused= goes last:
+        // the parsers of older logs stop at host=.
         logf("t=%llus peeks=%u files=%u read=%lluKiB frames=%u heap=%u/%uKiB va=%u/%uKiB free=%uKiB jit=%u meta=%u jmptbl=%uKiB "
-             "host=%uKiB",
+             "host=%uKiB jitused=%uKiB",
              (unsigned long long)(ms / 1000), g_stats.peeks, g_stats.files_opened,
              (unsigned long long)(g_stats.bytes_read >> 10), g_stats.frames, g_heap.used_bytes() >> 10,
              g_heap.peak() >> 10, g_va.used_bytes() >> 10, g_va.peak() >> 10,
              (unsigned)((g_pool_size ? g_pool_size - g_pool.cur() : g_va.largest_free()) >> 10),
              (unsigned)d2rt_box86_dynarec_kb(),
-             (unsigned)d2rt_box86_custommalloc_kb(), (unsigned)d2rt_box86_jmptbl_kb(), (unsigned)(host_used >> 10));
+             (unsigned)d2rt_box86_custommalloc_kb(), (unsigned)d2rt_box86_jmptbl_kb(), (unsigned)(host_used >> 10),
+             (unsigned)d2rt_box86_dynarec_used_kb());
         if (g_spare_size && g_pool.spare_takes() != g_spare_logged) {
             g_spare_logged = g_pool.spare_takes();
             logf("pool spare: %u requests taken so far, %u of %u KiB in use, pool largest free %u KiB", g_spare_logged,
@@ -534,6 +831,8 @@ void check_time_limit(uint64_t ms)
         }
         if (g_opt.heartbeat)
             g_opt.heartbeat();
+        g_heartbeat_us = wx86_now_us() - beat_t0;
+        host_work(false);
     }
     if (g_opt.max_ms && ms >= g_opt.max_ms && !g_timed_out && g_sched) {
         g_timed_out = true;
@@ -541,7 +840,6 @@ void check_time_limit(uint64_t ms)
         g_sched->request_shutdown();
     }
 }
-uint64_t g_t0_ms = 0;   // real clock at run start: guest time starts at 0 in both modes
 }  // namespace
 
 void tail_call(Cpu &c, uint32_t va, uint32_t shim_argc, std::initializer_list<uint32_t> args)
@@ -562,15 +860,46 @@ void tail_call(Cpu &c, uint32_t va, uint32_t shim_argc, std::initializer_list<ui
     g_br->redirect_next(va);
 }
 
+bool set_profiling(bool on)
+{
+#ifdef PROF_COUNTERS
+    if (on && !prof::on)
+        prof::reset_samples();   // what an earlier run left: not this window's
+    if (on != prof::on)
+        logf("prof: guest code profile %s", on ? "on" : "off");
+    prof::on = on;
+    return true;
+#else
+    return !on;
+#endif
+}
+
 void profile_tick()
 {
 #ifdef PROF_COUNTERS
-    if (Cpu *c = g_tick_cpu.load(std::memory_order_acquire)) {
+    if (Cpu *c = g_tick_cpu.load(std::memory_order_acquire); c && prof::on) {
         prof::tick();
         c->nudge_thread_budget(nullptr);   // the cooperative scheduler's one emu: no registry walk
     }
 #endif
 }
+
+FrameThreadTimes frame_thread_times()
+{
+    FrameThreadTimes t;
+    t.run_ms = g_frame_us[kFrameRun] / 1000;
+    t.ready_ms = g_frame_us[kFrameReady] / 1000;
+    t.host_ms = g_frame_us[kFrameHost] / 1000;
+    uint64_t blocked = 0;
+    for (size_t i = kFrameWaits; i < kFrameKindCount; i++)
+        blocked += g_frame_us[i];
+    t.blocked_ms = blocked / 1000;
+    return t;
+}
+
+uint64_t last_heartbeat_us() { return g_heartbeat_us; }
+
+void count_lock_site(uint32_t ret) { g_lock_sites.count(ret); }
 
 uint64_t now_ms()
 {
@@ -671,6 +1000,9 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
 {
     RunResult res;
     g_opt = opt;
+#ifdef PROF_COUNTERS
+    prof::on = opt.profile;   // the backend counts by default: here, only when asked
+#endif
     if (g_opt.write_root.empty())
         g_opt.write_root = g_opt.data_root;
     const Layout &L = *g_opt.layout;
@@ -722,6 +1054,7 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
         return res;
     }
     g_exe_base = img->load_base();
+    g_exe_size = img->image_size();
     std::vector<uint8_t>().swap(exe);   // the image holds its own copy now
 
     // Guest memory: heap, VirtualAlloc arena, scratch, PEB and main TEB.
@@ -822,17 +1155,34 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
     // The game's clock reads, served in line from translated code (WinVita's
     // lock-free in-line intrinsic): no trap, no exit from the dynarec loop.
     // On the console a GetTickCount trap cost more than its body: ~10% of a
-    // town frame went to them. Same value as the shims (now_ms). Armed
+    // town frame went to them. The value is the slice's clock (g_tick): on
+    // the virtual clock, now_ms's own, which moves only between slices. Armed
     // before the game runs: a slot already translated can't be rewritten.
     static const char *const kClockImports[][2] = {{"KERNEL32.dll", "GetTickCount"}, {"WINMM.dll", "timeGetTime"}};
     for (const auto &imp : kClockImports) {
         const uint32_t slot = br->shim_trap_existing(imp[0], imp[1]);
         if (slot && cpu->set_intrinsic_nogil(slot, [](Cpu::IntrinFrame &f, uint32_t) {
-                f.eax = (uint32_t)now_ms();
+                if (!g_sched)
+                    f.eax = (uint32_t)now_ms();
+                else
+                    f.eax = g_opt.real_clock ? g_tick.load(std::memory_order_relaxed) : (uint32_t)g_sched->virt_ms();
                 f.pop = 0;
+                g_tick_reads.fetch_add(1, std::memory_order_relaxed);
+#ifdef PROF_COUNTERS
+                if (prof::on)
+                    g_tick_sites.count(f.ret);
+#endif
                 return true;
             }))
             logf("%s: served in line", imp[1]);
+    }
+    {
+        // What the per-call clock read cost (issue #39): 1000 reads, in us,
+        // are ns a read.
+        const uint64_t t0 = wx86_now_us();
+        for (int i = 0; i < 1000; i++)
+            (void)wx86_now_us();
+        logf("clock: a host clock read costs %llu ns", (unsigned long long)(wx86_now_us() - t0));
     }
     // The hottest other imports go through the bridge without leaving the
     // dynarec loop (WinVita's in-line shim path): same shim, no trap. Under
@@ -849,6 +1199,10 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
             cpu->set_inline_shim(slot);
             logf("%s: in line", imp[1]);
         }
+    // In front of the lock calls' in-line shims, the calls that neither wait
+    // nor wake anyone served lock-free, without the Bridge (issue #48).
+    if (install_lock_fast_path(*cpu, *br))
+        logf("EnterCriticalSection, LeaveCriticalSection: lock-free in line when uncontended");
     res.unresolved_imports = br->unresolved_count();
     res.loaded = true;
     logf("loaded %s at %08x entry %08x, %u unresolved import(s)", g_opt.exe_name.c_str(), g_exe_base,
@@ -873,6 +1227,7 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
         sched.set_virtual_tick_us(opt.virtual_tick_us);
     sched.set_max_switches(~0ull);   // runs end by exit or max_ms, never by a switch count
     sched.set_time_sink([](uint64_t ms) { check_time_limit(ms); });
+    sched.set_slice_sink(on_slice);
     wx86_set_scheduler(&sched);
     sched.set_main(img->entry_va(), L.main_stack + 0x200000 - 0x100, L.main_tib);
     g_tick_cpu.store(cpu, std::memory_order_release);

@@ -8,9 +8,9 @@ scripts/docker.sh package-cia --slim ../3ds-d2-gamefiles/1.14d     # with the ga
 scripts/docker.sh package-cia --full ../3ds-d2-gamefiles/1.14d     # with every MPQ inside, ~2 GB
 ```
 
-The hardware build is `dist/cia/3ds-d2-<build-id>.cia`. It holds the app only and reads the game files from `sdmc:/3ds/3ds-d2/game/`, so a new build is a 2 MB install. The two bundled variants add `-slim` or `-full` to the name. A `.txt` next to each CIA lists its version, SHA-256 and the files inside. Every run checks the CIA's content, exheader and logo hashes with `ctrtool`, the same hashes the console's AM checks at the end of an install.
+The hardware build is `dist/cia/3ds-d2-<version>-<build-id>.cia`. It holds the app only and reads the game files from `sdmc:/3ds/3ds-d2/game/`, so a new build is a 2 MB install. The two bundled variants add `-slim` or `-full` to the name. A `.txt` next to each CIA lists its version, SHA-256 and the files inside. Every run checks the CIA's content, exheader and logo hashes with `ctrtool`, the same hashes the console's AM checks at the end of an install.
 
-The build ID is a hash of everything that goes into the CIA: `src/`, the build rules, the CPU backend's patch series and the packaging (`scripts/package-cia.sh`, `packaging/cia/`). The title version (`version=` in `scripts/package-cia.sh`, now 0.3.2) is what FBI and the HOME menu show.
+The build ID is a hash of everything that goes into the CIA: `src/`, the build rules, the CPU backend's patch series and the packaging (`scripts/package-cia.sh`, `packaging/cia/`). The title version (`version=` in `scripts/package-cia.sh`, now 0.4.0) is what FBI and the HOME menu show.
 
 The game files on the SD card, once: copy `Game.exe` and the MPQs of your 1.14d install to `sdmc:/3ds/3ds-d2/game/`. `scripts/docker.sh sdcard-folder [--full] <game-dir>` prepares that folder in `dist/sdcard/3ds/3ds-d2/game/` (hard links, nothing copied). Copy `dist/sdcard/3ds` onto the SD card root. Sound needs the real music and speech archives, so use `--full` there (or copy the install as is).
 
@@ -53,8 +53,18 @@ The diagnostics are on the bottom screen's INFO tab (tap INFO in the tab bar; [c
 2. **draw ms/frame**: the CPU cost of scaling the frame to the top screen.
 3. **host heap** and **jit code / jmptbl** in town. Azahar measured 22 MiB used, of 34 MiB in the CIA build.
 4. A red **JIT MEMORY FULL** line, if it ever appears.
+5. **hitch** and **wait**: the last 10 s's frames over 100 and 250 ms and the longest, and what stops frames: the drawing thread's time blocked (`wait`, mostly on Storm's reads from the SD card), `ready` while another game thread runs, `host` work on its core (the scheduler, the heartbeat), and `hb`, the last heartbeat's length; on the `files` line, frames not drawn (`skip`) and sound starved (`fam`).
 
-Logs are on the SD card in `3ds/3ds-d2/logs/`: `game.log` for the runtime, and `stderr.txt` for the CPU backend, including its arena line. Saves and settings are in `3ds/3ds-d2/save/`.
+To measure more, tap **profiler run** on INFO, tick what to measure and start the run (sprite trace, guest code profile, file-read trace, SD card benchmark). The session is then offered as a report with what the run wrote. There is no separate profiling build any more.
+
+The checklist's last row, **trace writes**, sets how the traces reach the SD card, and a tap steps it on, during a run too:
+- **buffered** (the default, as before): large writes as the buffers fill; a crash loses what they still hold, minutes of reads.
+- **every second**: what the traces hold is written out once a second.
+- **at once**: every record is written as it is made, so a crash loses nothing before it. This costs an SD card write per file read and per sprite use, so use it to chase a crash (issue #66), not to measure the frame rate.
+
+The setting is saved, logged as `profiler run: trace writes <buffered|second|now>`, and a report carries it as the `trace_writes` tag.
+
+Logs are on the SD card in `3ds/3ds-d2/logs/`: `game.log` for the runtime, and `stderr.txt` for the CPU backend, including its arena line. Saves and settings are in `3ds/3ds-d2/save/`. `python3 -I tools/session_report.py game.log` summarises a session from its heartbeats: the frame rate by game state, the slowest windows and what they were doing (sprite re-loads, new code, SD reads), memory over time (with the sprites' frames' blocks and units, issue #44), and the hitches (`prof hitch:` lines: frames by interval, the longest, sprites taken and let go of, the frame thread's read wait, frames not drawn, starved sound grains) with the slowest windows' causes.
 
 ## Things that differ from Azahar, and may fail first
 
@@ -67,7 +77,7 @@ Logs are on the SD card in `3ds/3ds-d2/logs/`: `game.log` for the runtime, and `
 - **Luma's crash screen.** Luma3DS shows the exception on screen and saves a dump to `luma/dumps/arm11/crash_dump_*.dmp` on the SD card. Decode it against the ELF saved next to that CIA:
 
   ```sh
-  python3 -I tools/luma_dump.py crash_dump_00000000.dmp dist/cia/3ds-d2-<id>.elf
+  python3 -I tools/luma_dump.py crash_dump_00000000.dmp dist/cia/3ds-d2-<version>-<id>.elf
   ```
 
   It prints the registers and the source line of the PC, the LR and every stack word that points into the app.
@@ -88,7 +98,7 @@ Logs are on the SD card in `3ds/3ds-d2/logs/`: `game.log` for the runtime, and `
 | Heap at a chosen address (0x0D000000) | refused | heap at 0x08000000, its normal place |
 | Heap of "everything left" | refused above 95 MiB (`e0e01bfd`): the heap window ends at 0x0E000000 | steps down 4 MiB at a time; the 63 MiB layout fits |
 | `MEMOP_PROT` to RWX on JIT memory | rc 0, but `svcQueryMemory` still reports RW (3) | success = rc 0, the query is only logged |
-| Cache sync by address (0x54 / Luma 0x93) on those pages | kernel data abort: instruction-cache maintenance fault at the block's address | Luma's whole-cache SVCs (0x92 + 0x94) on hardware |
+| Cache sync by address (0x54 / Luma 0x93) on those pages | kernel data abort: instruction-cache maintenance fault at the block's address | the data cache by range through the stock 0x54, the instruction cache whole (Luma 0x94); Luma's whole-cache 0x92 only if 0x54 is refused |
 
 Translated code lives in a 16 MiB static pool in `.bss`. That keeps it out of the heap window and uses budget the heap cannot reach.
 
@@ -142,6 +152,10 @@ Checking a native routine: `M4_FRAMEHASH` on the virtual clock, `M4_NATIVE=0` ag
 Two more settings matter for these checks:
 - **`WX86_FAKETSC=1` once the script gives input in the game world** (walking, for example). Without it, `RDTSC` reads the host's clock. Then anything that changes the host's timing, even an extra hash, moves where the input lands, and the runs diverge for reasons unrelated to the change being checked.
 - **`M4_HASHMEM=<va>:<bytes>`** hashes a guest memory range with every frame, for native code whose result the pixels may not show. The light grid is `0x7b0e68:0x4800`.
+- **`D2_NATIVE_CHECK=1`** runs the original next to the sprite cache's two natives (`SpriteCacheTouch`, `SpritePath`, issue #37) and the locked lookups (`LockedLookup`, `CurrentLookup`, issue #38) on every call they take, from trampolines in `.text`'s slack at `0x6cb7e0`, and logs any difference (`native check: ... differ`). Over `fight.txt`: 65,536 hits and 32,768 paths (the counts it logs at powers of two), none differ; 4,096 and 2,048 lookups, entry and lock state alike, none differ. With and without the lookups (`D2_NATIVE_MASK=0xfffff` against the default), all 4,332 frames of `fight.txt` hash the same. Unlike frame hashes, it doesn't depend on timing: removing guest instructions changes the scheduler's slices, so scripted input in the game world can land on another frame.
+- **`M4_SPRITE_FRAMES=0`** leaves the sprites' frames in the pool system, as the game does (issue #44; on the 3DS layouts they are otherwise in blocks of their own, `game::install_sprite_frames`). With `M4_NATIVE=late` the allocator is installed on arrival in the game world too. Over `fight.txt`, with and without it, all 4,705 frames hash the same. A sprite trace started before a late install says the frames are the pool system's (its header's flag is read when it starts).
+
+Scripts for these runs are in `tests/m4/scripts/` (`M4_SCRIPT="$(cat tests/m4/scripts/fight.txt)"`): `town-walk.txt` walks around the Rogue Encampment, `fight.txt` crosses the bridge into Blood Moor and fights the quill rats there, and `act2-east.txt` takes a character that has finished Act I (`dist/save/BeforeCh1End`) to Warriv and East to Lut Gholein (issue #66). It finds Warriv in the game's units (`tapunit`, `src/game/d2_units.h`), so it does not depend on the frame rate. The fight's route is the map the virtual clock gives. The same file works on the console as `sdmc:/3ds/3ds-d2/autoplay.txt`.
 
 Example: the native light grid (`LightGrid`, mask bit 8), with the town walk script, `WX86_FAKETSC=1` and `M4_HASHMEM=0x7b0e68:0x4800`. Masks `0xff` and `0x1ff` give the same 2,372 frames, pixels and grid alike, over 185 distinct grid states.
 

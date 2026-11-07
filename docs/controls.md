@@ -60,7 +60,7 @@ The mapping lives in `src/game/controls.cpp`. It follows the ideas D2Vita proved
 | HELP | Shown in the MAP tab by **?**: the controls, one line per button or combination. The tab reads HELP and the corner button MAP; tapping either goes back to the map. **?** works before the game too, under "The map shows here in the game." On the first start (no `settings.txt` yet) the tab opens on HELP. | Touchpad, except the MAP button |
 | KEYS | 20 buttons: Skill 1–8 (F1–F8), Character, Inventory, Skills, Quests, Party, Merc, Map (Tab), Run/Walk, Swap (W), Items (Alt, latched: tap on, tap off), Chat (Enter), Close all (Space) | Presses the button: the key is held while you touch it |
 | ZOOM | The frame at 1:1 around the cursor: readable text and item details | Points at the game (below) |
-| INFO | The diagnostics: game time, fps, worst frame gap, draw time per frame, guest heap and VirtualAlloc use against their limits (with peaks), host heap, linear and application memory free, files and bytes read, then the latest runtime messages | Touchpad |
+| INFO | The diagnostics: game time, fps, worst frame gap, draw time per frame, guest heap and VirtualAlloc use against their limits (with peaks), host heap, linear and application memory free, files and bytes read, the last 10 s's hitches (frames over 100 and 250 ms, the longest; frames not drawn and sound starved; what held up the drawing thread: waiting, ready while another game thread ran, host work on its core, and the last heartbeat's length), then the latest runtime messages. **report a problem** at the bottom asks for a [problem report](../README.md#problem-reports) of this session when the game ends; tap it again to take that back. **profiler run** opens a checklist of what to measure: sprite trace, guest code profile (about 12% slower while on), file-read trace, SD card benchmark (a second's pause). Its last row, **trace writes**, steps through buffered, every second and at once on each tap, a run on or not ([hardware-test.md](hardware-test.md)). Tap the options, then **start the run**; the button stays lit (and the first line shows PROF) until **stop the run**. The ticks are remembered; they cannot change during a run. A session with a run is offered as a problem report when the game ends | Touchpad, except the buttons (and the checklist while it is open) |
 | PANEL | The open panel's half of the frame at 1:1. At 640×480 D2's panels are 320 pixels wide, the width of the screen. It scrolls to follow the cursor, and a bar on the right shows where you are. With panels on both sides (stash and inventory, shop and inventory), it shows the side the cursor is on. Tap PANEL again to move the cursor to the same spot on the other side. | Points at the game (below) |
 
 PANEL appears when a panel opens and is shown by itself. Choosing another tab hides it until another panel opens. When the panels close, the bottom screen goes back to your tab.
@@ -83,13 +83,34 @@ On the Linux lane, `M4_BOTTOM=map|help|keys|zoom|info` picks the starting tab. T
 - **Where:** `sdmc:/DCIM/<NNN>NIN03/HNI_<NNNN>.JPG`, the folder and names the camera uses. The number is one past the highest in the newest folder. A folder holding 100 pictures moves on to the next one.
 - **What:** the game's own frame, not the 400×240 screen. In game that is 640×480, the camera's own photo size. Larger frames, such as the 800×600 menus, are scaled to fit 640×480. Cinematics keep their aspect ratio. The zoom setting makes no difference.
 - **File:** a baseline JPEG with an EXIF block, holding the date and a 160×120 thumbnail.
+- **The bottom screen too:** each screenshot is a pair. The bottom screen, as shown, goes to `sdmc:/3ds/3ds-d2/screenshots/<date>_<time>_bot.jpg` (320×240), not the album. The game lists its newest 16 pairs in `screenshots/pairs.txt`. When a pair drops off the list, its bottom picture is deleted; the album's picture stays.
 - **While saving:** the top screen holds the frame for a moment. The bottom screen then shows the path, or why saving failed.
 
-Rosalina's screenshot (Luma3DS menu) still works too. It saves both screens as BMPs in `/luma/screenshots/`.
+Rosalina's screenshot (Luma3DS menu, L + Down + Select, then *Take screenshot*) still works too. It saves both screens as BMPs in `/luma/screenshots/`, and it works while the game is suspended in the HOME Menu.
+
+Either kind can go with a [problem report](../README.md#problem-reports): **L** on the report's screen chooses up to 4 pairs.
+
+## Problem reports
+
+The top screen shows [problem reports](../README.md#problem-reports) before the game starts (when reports wait to be sent, or with Select held while 3ds-d2 starts) and after it ends (when a report was made for that session).
+
+| Screen | Input | Action |
+| --- | --- | --- |
+| List | Up / Down, L / R | Choose a report; a page up or down |
+| List | A | Open the report |
+| List | X | Send every report waiting, oldest first; stops at the first that fails (no Wi-Fi), the rest wait |
+| List | Start | Go on (to the game, or out of the app after a session) |
+| Report | A | Send it; then its Sentry ID, and A to go on |
+| Report | Y | Write or change the description (the system keyboard; the game's own if that does not start) |
+| Report | X | Mark it as not to be sent |
+| Report | Select, twice | Delete the report and its files |
+| Report | B | Back to the list |
 
 ## Cinematics
 
-A, B, Start (Escape), R + Start (Enter) or a tap on the touchpad skips the video playing, as a key or click does on the PC. The press is held back until it is released, so it does not also act on the next screen. [cinematics.md](cinematics.md) explains the player.
+A, B, Start (Escape), R + Start (Enter) or a tap anywhere on the bottom screen skips the video playing, as a key or click does on the PC. The press is held back until it is released, so it does not also act on the next screen. [cinematics.md](cinematics.md) explains the player.
+
+While a video plays, the bottom screen shows its own panel instead of the tabs: the video's title, how far it has played, and how to skip it. The tab shown before comes back with the next screen.
 
 ## How input reaches the game
 
@@ -108,6 +129,8 @@ Two timing rules the game needs:
 On the Linux lane, `M4_SCRIPT` drives the same `game::Controls` with scripted pad events (`tests/m4/game_main.cpp`). The scripted run below goes from the main menu, through a new Barbarian, into the Rogue Encampment:
 
 `20000 tap 400 307; 26000 tap 400 290; 32000 text Tester; 34000 press R; 34100 press START; 34300 release START; 34400 release R`
+
+The events are listed in `src/game/autoplay.h`. Besides taps, buttons and text, a script can wait for a state (`ingame`, `menus`, `textfield`, `npcmenu`, `menuclosed`, `act1` to `act5`). `tapunit <npc>` clicks an NPC where it stands, read from the game's units (`warriv`, or a monstats class number), and keeps clicking until its menu opens. `tapmenu <line>` then picks a line of that menu, and `units` logs the units near the player. Every tap puts the cursor on its spot 300 ms before it presses, so a slow frame rate still sees the spot hovered. `skipvideos` presses A as each cinematic starts, which skips it. `tests/m4/scripts/act2-east.txt` uses them to go from Act I to Act II.
 
 ## On-screen keyboard
 

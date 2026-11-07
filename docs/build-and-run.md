@@ -18,8 +18,8 @@ scripts/docker.sh test m3          # PE32 fixture through the Win32 runtime (M3_
 scripts/docker.sh test m4 <game-dir> [guest-ms] [cmdline]   # the real Game.exe on the runtime; dir mounted read-only, shots in build/m4/shots
 # build/cpu/ctr/m3.3dsx (built with the CPU-lane apps) runs the same fixture in Azahar;
 # output: sdmc:/3ds/3ds-d2/m3/out.txt
-AZAHAR=/path/to/azahar scripts/run-game-azahar.sh [--install <dir with Game.exe + MPQs>]   # the game in Azahar (docs/controls.md)
-scripts/docker.sh package-cia [<game-dir>]   # the hardware build -> dist/cia/3ds-d2-<build-id>.cia; <game-dir>: the game's icon, banner and tune (docs/hardware-test.md)
+scripts/run-game-azahar.sh [--install <dir with Game.exe + MPQs>] [--save <save dir>] [--autoplay <script>] [--no-build | --cia <file> | --3dsx]   # the game in Azahar as the console's CIA, macOS/Linux/Windows (Git Bash); its own portable Azahar (scripts/fetch-azahar.sh, Vulkan); AZAHAR=, AZAHAR_SDMC= override discovery
+scripts/docker.sh package-cia [<game-dir>]   # the hardware build -> dist/cia/3ds-d2-<version>-<build-id>.cia; <game-dir>: the game's icon, banner and tune (docs/hardware-test.md)
 tests/bink/compare.sh <game-dir>   # the Bink decoder against FFmpeg on every cinematic (host: ffmpeg, python3, c++)
 scripts/docker.sh package          # release build -> dist/<build-id>/ + SHA256SUMS + manifest.json
 scripts/docker.sh repro            # two clean builds from different paths must match

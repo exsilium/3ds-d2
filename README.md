@@ -69,7 +69,7 @@ If you set up your console with the 3ds.hacks.guide, you may have done this alre
 
 ### 3. Install the app
 
-Build the CIA as described under [Building the CIA](#building-the-cia), then install `3ds-d2-<build-id>.cia` with FBI. Either copy it to the SD card and pick it in FBI under *SD*, or use FBI's *Remote Install*. The HOME menu then shows a **3ds-d2** icon (title ID `000400000D2D3D00`).
+Build the CIA as described under [Building the CIA](#building-the-cia), then install `3ds-d2-<version>-<build-id>.cia` with FBI. Either copy it to the SD card and pick it in FBI under *SD*, or use FBI's *Remote Install*. The HOME menu then shows a **3ds-d2** icon (title ID `000400000D2D3D00`).
 
 The CIA holds only the app, about 2 MB. A new version is a quick reinstall over the old one, and the game files on the SD card stay where they are.
 
@@ -102,6 +102,46 @@ Start 3ds-d2 from the HOME menu. The game appears on the top screen. The bottom 
 When the game asks for text, such as a character name, a keyboard opens on the bottom screen. Tap the keys. B deletes, Y is shift, Start confirms, Select closes it. R + Select opens the keyboard at any time. [docs/controls.md](docs/controls.md) has the full mapping.
 
 If the app shows "Game.exe not found", check the folder name and that `Game.exe` is inside `/3ds/3ds-d2/game/`.
+
+### Problem reports
+
+If 3ds-d2 crashes (Luma3DS shows its exception screen), the next start keeps that session's `game.log`, `stderr.txt` and the Luma3DS crash dump in `/3ds/3ds-d2/reports/<time>-<build>/` before anything is overwritten. The top screen then shows the report and asks whether to send it. It does the same after a session that ended on a fatal error, after a session in which you tapped **report a problem** at the bottom of the INFO tab, and after a session with a **profiler run** (INFO's other button: a checklist of measurements to run, see [docs/controls.md](docs/controls.md#bottom-screen)). The report is made only after the game has ended, never while you play.
+
+The screen lists what would be sent:
+
+- the whole `game.log` (a four-hour session writes about 1 MiB; only past 32 MiB is the middle left out), `stderr.txt`, and the Luma3DS dumps saved during the session, gzip-compressed for the upload;
+- after a profiler run, the traces it wrote (`sprites.trc`, `files.trc`), and which measurements ran;
+- the build ID, version, CIA or 3dsx, where the game files are read from, the console model, region, system version and kernel version;
+- figures from the log: minutes played, frame rate in play, frames over 100 ms in play and the longest, memory peaks;
+- your description, if you write one: press **Y** to type it with the system keyboard;
+- screenshots, if you choose any: press **L**.
+
+Save files and character names are never sent.
+
+**Screenshots.** **L** lists the screenshot pairs that can go with the report, newest first, and shows the selected one on the bottom screen (**Y** switches between its top and bottom picture). **A** chooses a pair, up to 4; none is chosen unless you do. Two kinds are offered:
+
+- the game's own (**L + R + Select** in the game, see [docs/controls.md](docs/controls.md#screenshots)): its newest 16 pairs, whenever taken;
+- Luma3DS's (its menu's *Take screenshot*, also usable while the game is suspended in the HOME Menu): all of them in `/luma/screenshots/`, from any session.
+
+The rest of the Camera album is never offered. A pair is sent as `screenshot-<n>a-top.jpg` and `screenshot-<n>b-bot.jpg` (named so Sentry lists the top first) (Luma3DS's BMPs as JPEGs), and the report says when each was taken and from which file. Pairs marked `*` were taken during the report's session (suspended time included).
+
+In Sentry, reports are grouped by what happened, not by your description, so the same crash lands in one issue however it's described. The groups: a crash the app caught (the fault, and where in Game.exe); a Luma3DS dump (the crashed process and exception, and outside 3ds-d2 its address); a fatal error by its kind; a session that didn't end; a report you asked for, by its title. Your description goes with each report as its `note`.
+
+A report you ask for (or a profiler run's) is titled by the version, which you can't change, and an optional topic you add with **R**: `v0.4.0` alone, or `v0.4.0 #24`. Reports with the same title are one Sentry issue; the topic ignores case and extra spaces. The topic is remembered (`/3ds/3ds-d2/report-topic.txt`) for every later report until you change it, and goes with crash reports too, as the `topic` tag, without changing how they group. Builds not made from a release's tag carry `-dev` in their version (`v0.4.0-dev`), in the CIA's name and in Sentry, so testing never mixes with a release's reports.
+
+On a report's screen:
+
+- **A** sends it over Wi-Fi to the project's [Sentry](https://sentry.io) account. Sentry's ID for it is shown, and kept in the report's folder (`sent.txt`).
+- **Y** writes or changes your description.
+- **R** sets the topic: the title's own part for a report you asked for, a tag for a crash.
+- **L** chooses screenshots to send with it.
+- **X** marks it as not to be sent (A still sends it later).
+- **SELECT** twice deletes the report and its files.
+- **B** goes back to the list of reports.
+
+Reports you don't send wait for later: playing without the internet (on a plane, say), each session's report stays on the SD card, and the next start with reports waiting shows the list of them. There, **X** sends every waiting report, oldest first, and **A** opens one to read, change, send or delete it; **START** goes on to the game. Hold **SELECT** while 3ds-d2 starts to open the list when nothing is waiting, for example to delete old reports.
+
+Nothing is sent unless you press A or X. Up to 32 reports wait to be sent; of those sent or marked not to be sent, the newest 8 stay. The folders are on the SD card, so you can also attach one to a GitHub issue yourself. Builds made without a Sentry project (`D2_REPORT_DSN=`, see [Building the CIA](#building-the-cia)) never ask and never send; they only keep a crashed session's files.
 
 ## Building the CIA
 
@@ -138,21 +178,23 @@ Everything builds inside Docker containers with a pinned toolchain (devkitARM, l
    On the first run this also builds the CIA tools image. It then compiles the CPU backend with this project's patches and the 3DS app, and packs the CIA. The last lines show the result:
 
    ```
-   cia: 3ds-d2-<build-id>.cia
-   version: 0.3.2
+   cia: 3ds-d2-<version>-<build-id>.cia
+   version: 0.4.0
    sha256: ...
    ```
 
 The output goes to `dist/cia/`:
-- `3ds-d2-<build-id>.cia`: the app to install (step 3 above).
-- `3ds-d2-<build-id>.elf`: the same code with debug symbols, for reading crash dumps (`tools/luma_dump.py`).
-- `3ds-d2-<build-id>.cia.txt`: version, size and SHA-256. To check that a copy on the SD card is intact, compare its SHA-256 with this file.
+- `3ds-d2-<version>-<build-id>.cia`: the app to install (step 3 above).
+- `3ds-d2-<version>-<build-id>.elf`: the same code with debug symbols, for reading crash dumps (`tools/luma_dump.py`).
+- `3ds-d2-<version>-<build-id>.cia.txt`: version, size and SHA-256. To check that a copy on the SD card is intact, compare its SHA-256 with this file.
 
 The build ID is a hash of everything that goes into the CIA, so the same sources always produce the same name, and any change gives a new one. Builds run without network access, and the game files never enter an image.
 
 Two variants carry the game files inside the CIA itself instead of reading them from the SD card. Such a CIA is for your own console only:
 - `scripts/docker.sh package-cia --full <game-dir>`: all 12 files (~2 GB).
 - `scripts/docker.sh package-cia --slim <game-dir>`: without music, speech and cinematics (~850 MB, no sound).
+
+Every build, your own included, offers [problem reports](#problem-reports) to the project's Sentry, whose DSN is in `packaging/cia/report.dsn` (a public key that can only send events). Each report's release is the version the session was played on (`3ds-d2@<version>`, with `-dev` unless the build was made from the release's tag `v<version>` with nothing uncommitted: `scripts/version.sh`), and its build ID is the release's `dist` and the `build_id` tag, so all builds of a version share one release in Sentry and reports from one build can still be filtered (`dist:<build ID>`). To send your reports to your own project instead, set its DSN when building: `D2_REPORT_DSN=https://<key>@<org>.ingest.sentry.io/<project> scripts/docker.sh package-cia ...` (`SENTRY_AUTH_TOKEN=<token> scripts/sentry-setup.sh [<org> [<project>]]` creates one and writes its DSN to that file). `D2_REPORT_DSN=` (empty) builds an app that never offers or sends anything. The console's own HTTPS cannot complete a handshake with Sentry's servers (they take only TLS 1.2 with SNI), so the app brings its own TLS: mbedTLS and the root certificates of Sentry's current and announced certificate authorities, built into a separate module (`src/tls/`, shipped as `tls.bin` in the RomFS). The module takes no memory during play. To send a report, the app loads it into executable memory (the way the JIT makes its code), sends over the console's sockets, and frees it again. `scripts/docker.sh test tls` loads the same module under qemu-arm and sends a test event to the project. An `http://` DSN (a relay that forwards to Sentry) is sent without the module.
 
 More documentation:
 - [docs/build-and-run.md](docs/build-and-run.md): builds, tests and the Azahar emulator lanes.

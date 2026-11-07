@@ -18,6 +18,9 @@
 // M4_VIDEO_WAV=<file> records their soundtrack, paced as a console would
 // play it.
 //
+// M4_SPRITE_TRACE=<file> writes the sprite trace (game/sprite_trace.h) from
+// the first heartbeat on.
+//
 // M4_SCRIPT drives game::Controls (the 3DS control scheme) with scripted pad
 // events (game::Autoplay, src/game/autoplay.h), ';'-separated, e.g.
 //   "20000 tap 400 307;26000 tap 400 290;32000 text Tester;34000 press R;..."
@@ -30,6 +33,8 @@
 #include "game/d2_native.h"
 #include "game/d2_state.h"
 #include "game/second_screen.h"
+#include "game/sprite_trace.h"
+#include "game/storm_reads.h"
 #include "runtime/rt_host.h"
 #include "ctru_font.h"
 #include "png.h"
@@ -162,14 +167,25 @@ int main(int argc, char **argv)
     if (const char *mb = std::getenv("M4_SPRITE_MB"))
         sprite_floor = (uint32_t)std::atoi(mb) << 20;
     static d2rt::Cpu *guest_cpu = nullptr;
+    static const bool sprite_frames = ctr && (!std::getenv("M4_SPRITE_FRAMES") || std::string(std::getenv("M4_SPRITE_FRAMES")) != "0");
     opt.install_native = [](d2rt::Cpu &c) {
         guest_cpu = &c;
         if (sprite_floor)
             game::set_sprite_cache_floor(c, sprite_floor);
+        game::install_sprite_cache_counter(c);
+        game::install_sprite_decode_timer(c);
+        game::install_sprite_trace(c);
+        // Storm serving a waiting caller first, as on the console (M4_STORM_PRIO=0: as the game does).
+        if (!std::getenv("M4_STORM_PRIO") || std::string(std::getenv("M4_STORM_PRIO")) != "0")
+            game::install_storm_read_priority(c);
         game::install_fatal_exit(c);
         if (ctr_layout) {
             game::install_pool_release(c);
             game::set_pool_block_size(c, game::kCtrPoolBlock);
+            // The sprites' frames in blocks of their own (M4_SPRITE_FRAMES=0: in the pool system, as the
+            // game does); with M4_NATIVE=late, from the arrival in the game world as well.
+            if (sprite_frames && !native_late)
+                game::install_sprite_frames(c);
         }
         if (native_late)
             g_cpu = &c;
@@ -196,15 +212,30 @@ int main(int argc, char **argv)
         static const uint32_t reserve = std::getenv("M4_POOL_RESERVE_MB")
                                             ? (uint32_t)std::atoi(std::getenv("M4_POOL_RESERVE_MB")) << 20
                                             : game::kCtrPoolReserve;
+        const game::SpriteCacheWindow w = game::sprite_cache_window(*guest_cpu);
         if (ctr_layout) {
             const rt::MemoryReport m = rt::memory_report();
-            const uint32_t pool_free = m.spare_used ? 0 : m.free;
-            if (pool_free < reserve)
+            if (m.spare_used || m.free < game::kCtrPoolRelease)
                 game::request_pool_release();
-            game::govern_sprite_cache(*guest_cpu, pool_free, reserve, game::kCtrSpriteCacheMin);
+            game::govern_sprite_cache(*guest_cpu, m.free, m.spare_used, w.evicted, reserve, game::kCtrSpriteCacheMin);
         }
         const game::SpriteCacheStats sc = game::sprite_cache_stats(*guest_cpu);
-        std::fprintf(stderr, "[rt] sprite cache %u/%u KiB, %u sprites\n", sc.used >> 10, sc.limit >> 10, sc.sprites);
+        char frames[192];
+        if (game::sprite_frames_line(frames, sizeof frames))
+            std::fprintf(stderr, "[rt] %s\n", frames);
+        std::fprintf(stderr, "[rt] sprite cache %u/%u KiB, %u sprites, in %u, out %u, decoded %u in %u ms\n",
+                     sc.used >> 10, sc.limit >> 10, sc.sprites, w.inserted, w.evicted, w.decodes, w.decode_ms);
+        // M4_SPRITE_TRACE=<file>: the sprite trace (sprite_trace.h), from the first heartbeat on.
+        if (const char *trace = std::getenv("M4_SPRITE_TRACE")) {
+            static bool tried = false;
+            if (!tried) {
+                tried = true;
+                game::sprite_trace_start(trace);
+            }
+            const rt::MemoryReport m = rt::memory_report();
+            game::sprite_trace_beat({sc.limit, sc.used, sc.sprites, m.free, m.spare_used ? 1u : 0u, m.largest_free,
+                                     game::sprite_cache_taken(), (uint32_t)game::dcc_cells_decoded(), 0});
+        }
     };
 
     std::vector<uint8_t> exe;
@@ -265,7 +296,26 @@ int main(int argc, char **argv)
     // virtual clock must match line for line; a native replacement of game
     // code must not change a single one.
     static FILE *framehash = std::getenv("M4_FRAMEHASH") ? std::fopen(std::getenv("M4_FRAMEHASH"), "w") : nullptr;
-    opt.present = [save, shots](const rt::Frame &f) {
+    // The bottom screen as the console would show it now, as b<ms>.png.
+    auto save_bottom = [shots](uint64_t now, const uint8_t *frame, int fw, int fh, const uint16_t *pal) {
+        static uint16_t fb[320 * 240];
+        game::draw_bottom(fb, bottom_view, frame, fw, fh, pal, kCtruFont);
+        std::vector<uint8_t> rgb(320 * 240 * 3);
+        for (int y = 0; y < 240; y++)
+            for (int x = 0; x < 320; x++) {
+                const uint16_t c = fb[x * 240 + 239 - y];
+                uint8_t *o = &rgb[(y * 320 + x) * 3];
+                o[0] = (uint8_t)((c >> 11) << 3), o[1] = (uint8_t)(((c >> 5) & 63) << 2), o[2] = (uint8_t)((c & 31) << 3);
+            }
+        char name[32];
+        std::snprintf(name, sizeof name, "b%06llu.png", (unsigned long long)now);
+        png::write_rgb(shots + "/" + name, rgb.data(), 320, 240);
+    };
+    opt.video_event = [](const char *what) {
+        if (std::strcmp(what, "close") == 0)
+            second_screen.end_video();
+    };
+    opt.present = [save, save_bottom, shots](const rt::Frame &f) {
         if (f.yuv[0]) {
             // A cinematic's frame: hashed (Y, U, V) and kept for the screenshots.
             const uint32_t cw = (f.width + 1) / 2, ch = (f.height + 1) / 2;
@@ -287,11 +337,14 @@ int main(int argc, char **argv)
                 std::fprintf(framehash, "video %u %08x %ux%u\n", n++, h, f.width, f.height);
             }
             const uint64_t now = rt::now_ms();
+            second_screen.set_video(f.video_name, f.video_ms, f.video_length_ms);
+            second_screen.stage(bottom_view, now);
             if (shot_now) {
                 shot_now = false;
                 char name[32];
                 std::snprintf(name, sizeof name, "s%06llu.png", (unsigned long long)now);
                 save(name);
+                save_bottom(now, nullptr, (int)f.width, (int)f.height, nullptr);
             }
             if (now >= next_shot) {
                 char name[32];
@@ -372,23 +425,12 @@ int main(int argc, char **argv)
             char name[32];
             std::snprintf(name, sizeof name, "s%06llu.png", (unsigned long long)now);
             save(name);
-            // The bottom screen as the console would show it now.
-            static uint16_t fb[320 * 240];
             uint16_t pal[256];
             for (int i = 0; i < 256; i++) {
                 const uint32_t p = f.palette[i];
                 pal[i] = (uint16_t)((((p >> 16) & 0xFF) >> 3 << 11) | (((p >> 8) & 0xFF) >> 2 << 5) | ((p & 0xFF) >> 3));
             }
-            game::draw_bottom(fb, bottom_view, last_idx.data(), (int)f.width, (int)f.height, pal, kCtruFont);
-            std::vector<uint8_t> rgb(320 * 240 * 3);
-            for (int y = 0; y < 240; y++)
-                for (int x = 0; x < 320; x++) {
-                    const uint16_t c = fb[x * 240 + 239 - y];
-                    uint8_t *o = &rgb[(y * 320 + x) * 3];
-                    o[0] = (uint8_t)((c >> 11) << 3), o[1] = (uint8_t)(((c >> 5) & 63) << 2), o[2] = (uint8_t)((c & 31) << 3);
-                }
-            std::snprintf(name, sizeof name, "b%06llu.png", (unsigned long long)now);
-            png::write_rgb(shots + "/" + name, rgb.data(), 320, 240);
+            save_bottom(now, last_idx.data(), (int)f.width, (int)f.height, pal);
         }
         if (now >= next_shot) {
             char name[32];
@@ -419,6 +461,8 @@ int main(int argc, char **argv)
             in_game_since = now;
             if (g_cpu)
                 game::install_d2_native(*g_cpu);
+            if (g_cpu && sprite_frames)
+                game::install_sprite_frames(*g_cpu);
         }
         if (in_game_since && !reset_done && now - in_game_since > 10000 && std::getenv("WX86_HOTPROF")) {
             dyn86_hotprof_reset();
@@ -473,7 +517,9 @@ int main(int argc, char **argv)
         };
     }
 #ifdef PROF_COUNTERS
-    // M4_PROF: the time-based profile sampler, as on the console (2 ms).
+    // M4_PROF: the guest code profile from the start, with the time-based
+    // sampler, as on the console (2 ms).
+    opt.profile = true;
     static std::atomic<bool> sampler_stop{false};
     std::thread sampler([] {
         while (!sampler_stop.load()) {
@@ -483,6 +529,7 @@ int main(int argc, char **argv)
     });
 #endif
     rt::RunResult r = rt::run_exe(std::move(exe), opt);
+    game::sprite_trace_stop();
     if (io_thread.joinable())
         io_thread.join();
 #ifdef PROF_COUNTERS

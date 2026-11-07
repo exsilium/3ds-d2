@@ -139,6 +139,8 @@ The oracle for the plan's M2 differential tests.
 | `armv7` | upstream as-is (ARMv7 + NEON) | `qemu-arm -cpu cortex-a9` (the Vita's CPU) | baseline |
 | `armv6` | the patch series in `tests/cpu/patches/armv6/` | `qemu-arm -cpu arm11mpcore` (the 3DS's CPU) | the port |
 
+Each variant is built in a work tree, `build/cpu/<variant>/winx86`: the submodule as commit `pristine`, then one commit per patch. Patches are edited there and written back with `make -C tests/cpu export VARIANT=armv6`. `tests/cpu/prepare.sh` prepares the tree again whenever the submodule's commit or the patch series changes (switching to a branch with other patches, a patch added, edited or removed), so a build always compiles its branch's series. It won't wipe a tree holding work that is not in the series (uncommitted changes, or commits not exported); it stops and says so. Before (#56), a tree was prepared once and kept, and a console-tested build carried a patch its branch didn't have.
+
 The ARM11 model faults on any ARMv7/NEON instruction, so an unported encoding cannot pass silently. **Acceptance criterion: the ARMv6 output is byte-identical to the ARMv7 baseline.** Run it with `scripts/docker.sh test cpu armv6`; a from-scratch build takes about a minute.
 
 **Status (2026-10-16): PASS.** All 8,187 cases are byte-identical to upstream on ARMv7, both in Box86's single-arena memory model (`guest + membase`, the model the 3DS uses).
@@ -318,7 +320,7 @@ The game's own log reports the environment the runtime presents:
 | --- | --- |
 | `rt_host.cpp` | `run_exe` with a configurable `Layout` (`kTestLayout` 32 MiB, `kGameLayout` 128 MiB), CPUID setting, time limit, heartbeat counters, once-per-name log of unimplemented imports, frame `present` callback |
 | `rt_shims_files.cpp` | one drive `C:\` = the game directory. Reads take `write_root` before the read-only `data_root`; writes always go to `write_root` (a data file opened for update is copied up first). Case-insensitive names: free on FAT, a cached directory listing on Linux. Find, attributes, directories, INI files, file mapping (a copy in the VirtualAlloc region, written back if writable), temp names, volume info. `ReadFile`/`WriteFile` move bytes directly between the stream and the arena. |
-| `rt_shims_kernel32.cpp` | modules: the exe; PE DLLs from disk, with DllMain run; system DLLs as pseudo-handles whose `GetProcAddress` returns shim traps; the 1.13 split DLLs refused. Also critical sections (on WinVita's engine table), TLS in the TEB, wall time (a fixed epoch under the virtual clock, for lockstep runs), resources walked in guest memory, toolhelp, process and debug calls. |
+| `rt_shims_kernel32.cpp` | modules: the exe; PE DLLs from disk, with DllMain run; system DLLs as pseudo-handles whose `GetProcAddress` returns shim traps; the 1.13 split DLLs refused. Also critical sections (on WinVita's engine table; an Enter or Leave that neither waits nor wakes anyone is served lock-free from translated code, issue #48), TLS in the TEB, wall time (a fixed epoch under the virtual clock, for lockstep runs), resources walked in guest memory, toolhelp, process and debug calls. |
 | `rt_shims_advapi32.cpp` | an in-memory registry shared by all roots. The install keys are seeded to match the drive layout. It persists to `write_root/registry.txt` only when a value changes, which spares the SD card. |
 | `rt_shims_user32.cpp` | window activation on `ShowWindow` (the game needs `WM_ACTIVATEAPP`), virtual-key state fed by `rt::set_key`, a single-buffer `wsprintfA` for its per-frame UI text, clipboard, monitor and placement |
 | `rt_shims_misc.cpp` | GDI DIB sections, DC selection, color tables and blits feeding `present`. Bink/Smack fail to open (unused: cinematics are played natively, [cinematics.md](cinematics.md)). Signature checks report "not signed". Also `timeGetTime` and `SHGetFolderPathA`. |
@@ -344,7 +346,7 @@ ARMv6 patch 0022 makes the CPUID leaf-1 EDX bits a run-time setting (`wx86_set_c
 
 ### 9a. The game in Azahar (2026-10-17)
 
-`scripts/run-game-azahar.sh` builds `build/cpu/ctr/3ds-d2-game.3dsx` (`src/app/ctr_game.cpp`) and starts it in Azahar 2126.2 (New 3DS mode). The game reaches its main loop and the main menu at **25 fps** (the game's own cap) with Azahar at 101% speed. Controls: [controls.md](controls.md).
+`scripts/run-game-azahar.sh` builds the console's CIA (`src/app/ctr_game.cpp`), installs it in Azahar 2126.2 (New 3DS mode, Vulkan renderer) and starts it; `--3dsx` starts `build/cpu/ctr/3ds-d2-game.3dsx` instead. The game reaches its main loop and the main menu at **25 fps** (the game's own cap) with Azahar at 101% speed. Controls: [controls.md](controls.md).
 
 What it took:
 

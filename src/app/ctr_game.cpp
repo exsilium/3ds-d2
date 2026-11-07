@@ -3,7 +3,8 @@
 //
 //   sdmc:/3ds/3ds-d2/game/   Game.exe and the MPQs (read-only, the user's copy)
 //   sdmc:/3ds/3ds-d2/save/   everything the game writes (saves, settings, registry)
-//   sdmc:/3ds/3ds-d2/logs/   game.log (runtime diagnostics)
+//   sdmc:/3ds/3ds-d2/logs/   game.log (runtime diagnostics), a profiler run's traces
+//   sdmc:/3ds/3ds-d2/reports/  a crashed or reported session's files (ctr_report.cpp)
 //
 // Display: the game draws an 800x600 8-bit frame. The top screen shows all of
 // it stretched over the full 400x240 (2:1 across, 2.5:1 down, filtered), or a
@@ -28,7 +29,11 @@
 #include "game/d2_native.h"
 #include "game/d2_state.h"
 #include "game/osk.h"
+#include "game/profiler.h"
 #include "game/second_screen.h"
+#include "game/sprite_trace.h"
+#include "game/storm_reads.h"
+#include "runtime/ds_emul.h"
 #include "runtime/rt_host.h"
 
 #include <3ds.h>
@@ -39,6 +44,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <malloc.h>
 #include <string>
 #include <sys/stat.h>
@@ -109,10 +115,13 @@ void *d2rt_jmptbl_alloc(size_t n)
 // the backend when it maps it (mman_ctr.c): newlib's memalign needs the
 // arena's size + 16 MiB of contiguous heap, which the 95 MiB heap only has
 // before Game.exe and the rest of the startup take their share.
-static void *g_arena;
+// Given back to the heap once the game has ended (give_back_arena), for the
+// report's sockets; munmap still keeps the block's address for the app then,
+// so that a late unmap does not free it a second time.
+static void *g_arena, *g_arena_block;
 static size_t g_arena_size;
 void *dyn86_ctr_arena_take(size_t len) { return g_arena && len <= g_arena_size ? g_arena : NULL; }
-int dyn86_ctr_arena_release(void *p) { return p && p == g_arena; }
+int dyn86_ctr_arena_release(void *p) { return p && p == g_arena_block; }
 void d2rt_jmptbl_free(void *p)
 {
     const u32 a = (u32)p;
@@ -181,6 +190,29 @@ void __system_allocateHeaps(void)
 u32 __ctru_heap_size = 24u << 20;
 u32 __ctru_linear_heap_size = 1u << 20;
 #endif
+
+// The host heap's growth (issue #24): newlib's malloc takes more of libctru's
+// heap through _sbrk_r (linked with --wrap=_sbrk_r), and returns NULL when
+// that is refused. Kept here: the room left above the heap's top, its lowest
+// since the last heartbeat, and the refused requests. Called under malloc's
+// lock, so nothing here may allocate or log.
+extern char *fake_heap_end;
+void *__real__sbrk_r(struct _reent *r, ptrdiff_t incr);
+uint32_t g_heap_room = 0, g_heap_room_low = UINT32_MAX;
+uint32_t g_heap_refused = 0, g_heap_refused_first = 0;   // requests refused, the first one's size
+void *__wrap__sbrk_r(struct _reent *r, ptrdiff_t incr)
+{
+    void *p = __real__sbrk_r(r, incr);
+    if (p == (void *)-1) {
+        if (!g_heap_refused++)
+            g_heap_refused_first = (uint32_t)incr;
+        return p;
+    }
+    g_heap_room = (uint32_t)(fake_heap_end - ((char *)p + incr));
+    if (g_heap_room < g_heap_room_low)
+        g_heap_room_low = g_heap_room;
+    return p;
+}
 }
 
 namespace d2rt {
@@ -196,9 +228,30 @@ struct Source {
     const uint32_t *palette;
     bool yuv;
     uint32_t display_height;
+    const uint16_t *fb565 = nullptr;
+    const uint8_t *rgb = nullptr;
 };
-bool save(const Source &src, std::string &msg);   // ctr_screenshot.cpp
+// ctr_screenshot.cpp: the frame, and the bottom screen as shown (RGB565, the
+// framebuffer's layout), as a pair.
+bool save(const Source &src, const uint16_t *bottom, std::string &msg);
 }  // namespace shot
+
+namespace report {   // ctr_report.cpp
+struct Host {
+    PrintConsole *log;
+    void (*message)(const char *);
+    void (*restore_bottom)();
+    const char *app;
+    const char *game_files;
+};
+std::string start_line();
+const char *closed_line();
+std::string keep_unclosed_session();
+std::string keep_session(const char *reason);
+bool enabled();
+bool offer_one(const Host &host, const std::string &dir);
+bool offer_pending(const Host &host);
+}  // namespace report
 
 namespace {
 
@@ -207,7 +260,9 @@ const char kGameDir[] = "sdmc:/3ds/3ds-d2/game";
 const char kRomfsGameDir[] = "romfs:/game";   // the CIA carries the game files in its RomFS
 const char kSaveDir[] = "sdmc:/3ds/3ds-d2/save";
 const char kLogDir[] = "sdmc:/3ds/3ds-d2/logs";
-const char kSettings[] = "sdmc:/3ds/3ds-d2/settings.txt";   // the bottom screen's tab and map size
+const char kTracePath[] = "sdmc:/3ds/3ds-d2/logs/sprites.trc";   // the profiler run's sprite trace (issue #18)
+const char kFileTracePath[] = "sdmc:/3ds/3ds-d2/logs/files.trc";  // ...and its file-read trace (issue #21)
+const char kSettings[] = "sdmc:/3ds/3ds-d2/settings.txt";   // the bottom screen's tab and map size, the profiler checklist
 
 FILE *g_log = nullptr;
 game::Controls g_controls;
@@ -230,9 +285,17 @@ game::SecondScreen g_ss;
 game::Osk g_osk;
 bool g_ss_active = false;    // the second screen owns the bottom framebuffer
 bool g_bottom_double = false; // render thread: the bottom screen is double-buffered (second screen)
+const uint16_t *g_bottom_shown = nullptr;   // render thread: then, the buffer it shows (screenshots)
 extern "C" const uint8_t default_font_bin[];   // libctru's console font: 8x8, 1 bpp, bit 7 leftmost
 int g_render_core = -1;                 // the core drawing frames (-1: the game's thread)
 volatile uint32_t g_frames_skipped = 0; // frames not shown: the previous one was still drawing
+d2rt::Cpu *g_guest_cpu = nullptr;       // the game's CPU, from install_native on
+game::SpriteCacheWindow g_sprite_window{};   // the sprite cache in the last heartbeat's 10 s
+// The profiler run (game/profiler.h), switched at the heartbeat.
+uint32_t g_prof_on = 0;        // its options running
+uint32_t g_prof_refused = 0;   // options that would not start: not again in this run
+uint32_t g_prof_used = 0;      // options that ran: the session's report is offered for them
+std::string g_bench_path;      // the SD card benchmark's file (the game's d2data.mpq)
 game::Autoplay g_autoplay;
 bool g_autoplay_on = false;   // sdmc:/3ds/3ds-d2/autoplay.txt, until the first physical input
 
@@ -245,6 +308,29 @@ struct Timing {
     uint32_t total_frames = 0;
 } g_timing;
 
+// The hitch counters (issue #19), per heartbeat window: the intervals
+// between presents by length, and the longest, from the timestamp present()
+// takes anyway. The heartbeat adds what else stopped frames (sprites taken
+// and let go of; the frame thread's time blocked, ready while another guest
+// thread ran, and waiting on host work; the heartbeat before, whose length
+// the frame after it waited; frames not drawn; the mixer's starved grains),
+// logs the window as "prof hitch:" and starts the next. Both on the game's
+// thread.
+struct Hitches {
+    uint32_t frames[4] = {};   // intervals of <=50, <=100, <=250, >250 ms
+    uint32_t longest_ms = 0;
+};
+Hitches g_hitch;   // the window so far
+struct HitchWindow {
+    Hitches h;
+    uint32_t wait_ms = 0, ready_ms = 0, host_ms = 0, heartbeat_ms = 0, skipped = 0, famine = 0;
+} g_hitch_last;    // the last whole window: INFO shows it
+struct HitchMark {
+    rt::FrameThreadTimes frame;
+    uint32_t skipped = 0;
+    unsigned long long famine = 0;
+} g_hitch_mark;
+
 uint64_t host_us() { return svcGetSystemTick() / (SYSCLOCK_ARM11 / 1000000); }
 
 inline uint16_t rgb565(uint32_t r, uint32_t g, uint32_t b) { return (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)); }
@@ -255,14 +341,9 @@ void show_stats(float fps, float draw_ms, float worst_ms)
     const struct mallinfo mi = mallinfo();
     const uint64_t t = rt::now_ms() / 1000;
     const rt::Stats &st = rt::stats();
-    char line[11][48];
-#ifdef PROF_COUNTERS
-    const char *build = "  PROF";   // the profiling build (package-cia --prof)
-#else
-    const char *build = "";
-#endif
+    char line[13][48];
     std::snprintf(line[0], 48, "3ds-d2  game time %02u:%02u:%02u%s", (unsigned)(t / 3600), (unsigned)(t / 60 % 60),
-                  (unsigned)(t % 60), build);
+                  (unsigned)(t % 60), g_prof_on ? "  PROF" : "");   // a profiler run
     std::snprintf(line[1], 48, "fps %5.1f   worst frame gap %6.1f ms", fps, worst_ms);
     std::snprintf(line[2], 48, "draw %5.2f ms c%d skip %u frames %u", draw_ms, g_render_core < 0 ? 0 : g_render_core,
                   (unsigned)g_frames_skipped, (unsigned)g_timing.total_frames);
@@ -271,18 +352,31 @@ void show_stats(float fps, float draw_ms, float worst_ms)
     std::snprintf(line[4], 48, "guest va   %6u pk %6u big  %6u", m.va_used >> 10, m.va_peak >> 10,
                   m.largest_free >> 10);
     std::snprintf(line[5], 48, "host heap  %6u/%6u KiB", (unsigned)(mi.uordblks >> 10), (unsigned)(__ctru_heap_size >> 10));
-    std::snprintf(line[6], 48, "linear free %5u KiB", (unsigned)(linearSpaceFree() >> 10));
-    std::snprintf(line[7], 48, "app free    %5u KiB", (unsigned)(osGetMemRegionFree(MEMREGION_APPLICATION) >> 10));
+    std::snprintf(line[6], 48, "linear free %5u  app free %5u KiB", (unsigned)(linearSpaceFree() >> 10),
+                  (unsigned)(osGetMemRegionFree(MEMREGION_APPLICATION) >> 10));
+    // The sprite cache (issue #18): its size, and the last heartbeat's
+    // sprites taken and let go of, per 10 s.
+    const game::SpriteCacheStats sc = g_guest_cpu ? game::sprite_cache_stats(*g_guest_cpu) : game::SpriteCacheStats{};
+    std::snprintf(line[7], 48, "sprites %5u/%5u in %4u out %4u", sc.used >> 10, sc.limit >> 10,
+                  g_sprite_window.inserted, g_sprite_window.evicted);
     const bool jit_full = dyn86_jit_allocfail != 0;   // translated code no longer fits: the game will stall
     if (jit_full)
         std::snprintf(line[8], 48, "JIT MEMORY FULL code %u jmptbl %u", m.jit_code_kb, m.jmptbl_kb);
     else
-        std::snprintf(line[8], 48, " jit code %5u meta %5u jmptbl %5u", m.jit_code_kb, m.jit_meta_kb, m.jmptbl_kb);
-    std::snprintf(line[9], 48, "files %3u  read %5u MiB", st.files_opened, (unsigned)(st.bytes_read >> 20));
-    std::snprintf(line[10], 48, "top: %s%s", g_zoom ? "1:1 zoom (Select)" : "whole frame (Select: zoom)",
+        std::snprintf(line[8], 48, "jit %5u/%5u meta %5u jmptbl %5u", m.jit_used_kb, m.jit_code_kb, m.jit_meta_kb,
+                      m.jmptbl_kb);   // jit: held by blocks / chunks opened (issue #23)
+    // The hitch counters (issue #19), the last heartbeat's 10 s.
+    const HitchWindow &hw = g_hitch_last;
+    std::snprintf(line[9], 48, "files %3u read %4u MiB skip %3u fam %3u", st.files_opened,
+                  (unsigned)(st.bytes_read >> 20), (unsigned)hw.skipped, (unsigned)hw.famine);
+    std::snprintf(line[10], 48, "hitch >100ms %3u >250ms %3u max %5u ms", (unsigned)(hw.h.frames[2] + hw.h.frames[3]),
+                  (unsigned)hw.h.frames[3], (unsigned)hw.h.longest_ms);
+    std::snprintf(line[11], 48, "wait %4u ready %4u host %4u hb %4u", (unsigned)hw.wait_ms, (unsigned)hw.ready_ms,
+                  (unsigned)hw.host_ms, (unsigned)hw.heartbeat_ms);
+    std::snprintf(line[12], 48, "top: %s%s", g_zoom ? "1:1 zoom (Select)" : "whole frame (Select: zoom)",
                   g_autoplay_on ? "  AUTO" : "");
     std::vector<game::BottomView::Line> lines;
-    for (int i = 0; i < 11; i++) {
+    for (int i = 0; i < 13; i++) {
         line[i][40] = 0;   // 40 columns
         const uint16_t c = i == 0 ? rgb565(255, 220, 90) : (i == 8 && jit_full) ? rgb565(255, 60, 60) : rgb565(255, 255, 255);
         lines.push_back({line[i], c});
@@ -308,12 +402,90 @@ void update_stats()
     g_timing.worst_gap_us = 0;
 }
 
+// game.log, buffered: a line is written to the SD card at once, unless it
+// is one of the heartbeat's, which go together at its end (log_flush). A
+// write per line cost the frame after the heartbeat about 10 ms a line, 300
+// ms with the guest code profile's (issue #19: 3DS-D2-E).
+char g_log_buf[16 << 10];
+
+void log_flush()
+{
+    if (g_log)
+        std::fflush(g_log);
+}
+
 void logline(const char *s)
 {
     if (g_log) {
         std::fprintf(g_log, "%s\n", s);
         std::fflush(g_log);
     }
+}
+
+// What the system has left (issue #24: going East crashed the HOME Menu
+// once and the kernel once, with nothing from the app): free memory in the
+// three regions, the app's linear memory and host heap, the heap's growth,
+// the app's kernel objects and the memory blocks of its address space (one
+// kernel object per run of pages with the same state and permission).
+unsigned memory_blocks()
+{
+    unsigned n = 0;
+    u32 addr = 0;
+    while (addr < 0x40000000u && n < 100000) {
+        MemInfo mi;
+        PageInfo pi;
+        if (R_FAILED(svcQueryMemory(&mi, &pi, addr)) || !mi.size)
+            break;
+        n++;
+        addr = mi.base_addr + mi.size;
+    }
+    return n;
+}
+
+void system_line(char *out, size_t size, const char *what)
+{
+    const struct mallinfo mi = mallinfo();
+    s64 n[8] = {};
+    Handle rl;
+    if (R_SUCCEEDED(svcGetResourceLimit(&rl, CUR_PROCESS_HANDLE))) {
+        ResourceLimitType names[] = {RESLIMIT_THREAD, RESLIMIT_EVENT,        RESLIMIT_MUTEX,          RESLIMIT_SEMAPHORE,
+                                     RESLIMIT_TIMER,  RESLIMIT_SHAREDMEMORY, RESLIMIT_ADDRESSARBITER};
+        svcGetResourceLimitCurrentValues(n, rl, names, 7);
+        svcCloseHandle(rl);
+    }
+    const uint32_t low = g_heap_room_low == UINT32_MAX ? g_heap_room : g_heap_room_low;
+    std::snprintf(out, size,
+                  "[rt] system%s: free KiB app %u sys %u base %u linear %u heap %u, heap room %u low %u, heap refused "
+                  "%u (first %u B), threads %d events %d mutexes %d semaphores %d timers %d shmem %d arbiters %d, "
+                  "blocks %u",
+                  what, (unsigned)(osGetMemRegionFree(MEMREGION_APPLICATION) >> 10),
+                  (unsigned)(osGetMemRegionFree(MEMREGION_SYSTEM) >> 10),
+                  (unsigned)(osGetMemRegionFree(MEMREGION_BASE) >> 10), (unsigned)(linearSpaceFree() >> 10),
+                  (unsigned)((__ctru_heap_size - mi.uordblks) >> 10), (unsigned)(g_heap_room >> 10),
+                  (unsigned)(low >> 10), (unsigned)g_heap_refused, (unsigned)g_heap_refused_first, (int)n[0],
+                  (int)n[1], (int)n[2], (int)n[3], (int)n[4], (int)n[5], (int)n[6], memory_blocks());
+}
+
+// A refused heap growth, logged at once from the service call (every 50 ms),
+// not at the next heartbeat: a crash that follows may come sooner.
+void report_heap_refusals()
+{
+    static uint32_t reported = 0;
+    const uint32_t n = g_heap_refused;
+    if (n == reported)
+        return;
+    reported = n;
+    char line[160];
+    std::snprintf(line, sizeof line, "[rt] host heap: growth refused %u times (first %u B), room %u KiB",
+                  (unsigned)n, (unsigned)g_heap_refused_first, (unsigned)(g_heap_room >> 10));
+    logline(line);
+}
+
+// One of the heartbeat's lines: written with the rest at its end.
+void logline_held(const char *s)
+{
+    if (g_log)
+        std::fprintf(g_log, "%s\n", s);
 }
 
 // ---- CPU exceptions (issue #5) --------------------------------------------------------
@@ -379,13 +551,26 @@ void on_cpu_exception(ERRF_ExceptionInfo *e, CpuRegisters *regs)
     resume_regs(frame, regs->cpsr, regs->lr);
 }
 
+// The render thread, once started (start_render_thread).
+Thread g_render_thread = nullptr;
+
 // A message for the screen: the startup console, or the INFO tab.
 void screen_message(const char *s)
 {
     if (g_ss_active)
         g_ss.log(s);
-    else
+    else {
         std::printf("%.*s\n", 39, s);   // the log window
+        // Until the render thread presents frames, on the screen at once:
+        // the console's text out of the CPU cache, and the bottom screen
+        // presented. The console shows memory as it is; Azahar shows a
+        // screen only once it is presented, and kept it black until the
+        // first frame.
+        if (!g_render_thread) {
+            gfxFlushBuffers();
+            gfxScreenSwapBuffers(GFX_BOTTOM, false);
+        }
+    }
 }
 
 void status(const char *fmt, ...)
@@ -409,6 +594,7 @@ void console_again()
     if (g_bottom_double) {
         gfxSetDoubleBuffering(GFX_BOTTOM, false);
         g_bottom_double = false;
+        g_bottom_shown = nullptr;
         u16 *fb = (u16 *)gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, nullptr, nullptr);
         g_stats_con.frameBuffer = g_log_con.frameBuffer = fb;
     }
@@ -430,6 +616,8 @@ extern "C" void d2_ctr_progress_hook(const char *msg)
     std::printf("\x1b[31m%s\x1b[0m\n", msg);
     logline(msg);
     std::printf("Logs: sdmc:/3ds/3ds-d2/logs/. START: exit\n");
+    if (report::enabled())
+        std::printf("A report is offered at the next start.\n");
     while (aptMainLoop()) {
         hidScanInput();
         if (hidKeysDown() & KEY_START)
@@ -567,7 +755,6 @@ struct Staged {
 Staged g_staged;
 LightEvent g_render_go;
 volatile bool g_render_busy = false, g_render_quit = false;
-Thread g_render_thread = nullptr;
 
 // Screenshots (L+R+Select): the request rides on the next staged frame, and
 // the thread that draws it saves it after drawing, so the picture is the one
@@ -593,8 +780,15 @@ void save_staged_shot()
     st.shot = false;
     const uint64_t t0 = host_us();
     const shot::Source src{st.pixels.data(), st.width, st.height, st.palette, st.yuv, st.display_height};
+    // The bottom screen as shown (issue #61): the buffer last drawn by the
+    // second screen, or the text console's own. Read here, on the thread
+    // that draws it, before its next draw (into the other buffer).
+    const uint16_t *bottom = g_bottom_double ? g_bottom_shown
+                                             : (const uint16_t *)gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, nullptr, nullptr);
+    if (gfxGetScreenFormat(GFX_BOTTOM) != GSP_RGB565_OES)
+        bottom = nullptr;
     std::string msg;
-    const bool ok = shot::save(src, msg);
+    const bool ok = shot::save(src, bottom, msg);
     char ms[24];
     std::snprintf(ms, sizeof ms, ", %u ms", (unsigned)((host_us() - t0) / 1000));
     g_shot_msg = (ok ? "screenshot: " : "screenshot failed: ") + msg + (ok ? ms : "");
@@ -610,6 +804,38 @@ void swap_screens(bool bottom_drawn)
         gfxScreenSwapBuffers(GFX_BOTTOM, false);
 }
 
+// The second screen's view, when staged to be drawn: true if it was.
+bool draw_staged_bottom()
+{
+    const Staged &st = g_staged;
+    if (!st.bottom_draw || st.bottom.kind == game::BottomView::kNone)
+        return false;
+    // Double-buffered from the second screen's first draw: drawn in the
+    // buffer not shown, so the screen never shows one half redrawn. Every
+    // draw covers the whole screen.
+    // The second buffer is linear memory; the .3dsx's 1 MiB linear heap may
+    // not have it (Azahar: a null buffer). Single-buffered then, as before.
+    static bool no_double = false;
+    if (!g_bottom_double && !no_double) {
+        gfxSetDoubleBuffering(GFX_BOTTOM, true);
+        g_bottom_double = true;
+        if (!gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, nullptr, nullptr)) {
+            gfxSetDoubleBuffering(GFX_BOTTOM, false);
+            g_bottom_double = false;
+            no_double = true;
+            logline("bottom screen: no linear memory for a second buffer, single-buffered");
+        }
+    }
+    uint16_t *bottom = (uint16_t *)gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, nullptr, nullptr);
+    if (!bottom)
+        return false;
+    // A cinematic's view (kVideo) uses neither the frame nor the palette.
+    game::draw_bottom(bottom, st.bottom, st.yuv ? nullptr : st.pixels.data(), (int)st.width, (int)st.height, g_pal565,
+                      default_font_bin);
+    g_bottom_shown = bottom;   // after the swap
+    return true;
+}
+
 void draw_staged()
 {
     const Staged &st = g_staged;
@@ -620,8 +846,9 @@ void draw_staged()
                                     st.pixels.data() + (size_t)st.width * st.height + (size_t)cw * ch};
         const uint32_t strides[3] = {st.width, cw, cw};
         draw_yuv(top, planes, strides, st.width, st.height, st.display_height);
+        const bool bottom_drawn = draw_staged_bottom();
         gfxFlushBuffers();
-        swap_screens(false);
+        swap_screens(bottom_drawn);
         return;
     }
     for (int i = 0; i < 256; i++) {
@@ -639,19 +866,7 @@ void draw_staged()
         draw_window(top, f, st.cursor_x, st.cursor_y);
     else
         draw_stretched(top, f);
-    const bool bottom_drawn = st.bottom_draw && st.bottom.kind != game::BottomView::kNone;
-    if (bottom_drawn) {
-        // Double-buffered from the second screen's first draw: drawn in the
-        // buffer not shown, so the screen never shows one half redrawn.
-        // Every draw covers the whole screen.
-        if (!g_bottom_double) {
-            gfxSetDoubleBuffering(GFX_BOTTOM, true);
-            g_bottom_double = true;
-        }
-        uint16_t *bottom = (uint16_t *)gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, nullptr, nullptr);
-        game::draw_bottom(bottom, st.bottom, st.pixels.data(), (int)st.width, (int)st.height, g_pal565,
-                          default_font_bin);
-    }
+    const bool bottom_drawn = draw_staged_bottom();
     gfxFlushBuffers();
     swap_screens(bottom_drawn);
 }
@@ -690,10 +905,9 @@ void start_render_thread()
                                                    : "game thread (no second core)");
 }
 
-#ifdef PROF_COUNTERS
 // The time-based profile sampler (rt::profile_tick): every 2 ms, from core 2
 // at a priority above the drawing and the mixer, so its period holds while
-// core 0 runs the game.
+// core 0 runs the game. Only during a profiler run's guest code profile.
 Thread g_sampler = nullptr;
 volatile bool g_sampler_stop = false;
 
@@ -707,6 +921,9 @@ void sampler_main(void *)
 
 void start_sampler()
 {
+    if (g_sampler)
+        return;
+    g_sampler_stop = false;
     s32 prio = 0x30;
     svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
     g_sampler = threadCreate(sampler_main, nullptr, 4 * 1024, prio - 3, g_render_core >= 0 ? g_render_core : 2, false);
@@ -722,7 +939,6 @@ void stop_sampler()
     threadFree(g_sampler);
     g_sampler = nullptr;
 }
-#endif
 
 // Asynchronous file reads (RunOptions::io_start): the runtime's I/O worker on
 // the second core, above the drawing, so a finished SD read reaches the
@@ -765,11 +981,29 @@ void stop_render_thread()
     g_render_thread = nullptr;
 }
 
+// The first frame, the game's or a video's: the bottom screen is the second
+// screen's from now on.
+void second_screen_active()
+{
+    if (g_ss_active)
+        return;
+    g_ss_active = true;
+    status("bottom screen: %s tab (tap the tabs to change)",
+           g_ss.tab() == game::BottomTab::Map && g_ss.map_help() ? "help" : game::bottom_tab_name(g_ss.tab()));
+}
+
 void present(const rt::Frame &f)
 {
     const uint64_t t0 = host_us();
-    if (g_timing.last_present_us && t0 - g_timing.last_present_us > g_timing.worst_gap_us)
-        g_timing.worst_gap_us = t0 - g_timing.last_present_us;
+    if (g_timing.last_present_us) {
+        const uint64_t gap = t0 - g_timing.last_present_us;
+        if (gap > g_timing.worst_gap_us)
+            g_timing.worst_gap_us = gap;
+        const uint32_t ms = (uint32_t)(gap / 1000);
+        g_hitch.frames[ms <= 50 ? 0 : ms <= 100 ? 1 : ms <= 250 ? 2 : 3]++;
+        if (ms > g_hitch.longest_ms)
+            g_hitch.longest_ms = ms;
+    }
     g_timing.last_present_us = t0;
     if (!f.yuv[0]) {   // a cinematic's size is not the game's: the cursor keeps the game's frame
         g_controls.set_frame((int)f.width, (int)f.height);
@@ -790,6 +1024,11 @@ void present(const rt::Frame &f)
         st.height = f.height;
         st.display_height = f.display_height;
         st.shot = take_shot_request();
+        // The bottom screen: the video's panel (issue #59), also over the
+        // startup console for the logos before the game's first frame.
+        second_screen_active();
+        g_ss.set_video(f.video_name, f.video_ms, f.video_length_ms);
+        st.bottom_draw = g_ss.stage(st.bottom, rt::now_ms());
         st.pixels.resize((size_t)f.width * f.height + 2 * (size_t)cw * ch);
         uint8_t *o = st.pixels.data();
         for (int p = 0; p < 3; p++) {
@@ -818,11 +1057,7 @@ void present(const rt::Frame &f)
         st.cursor_x = g_controls.cursor_x();
         st.cursor_y = g_controls.cursor_y();
         st.shot = take_shot_request();
-        if (!g_ss_active) {
-            g_ss_active = true;   // the game's first frame: the bottom screen is the second screen's from now on
-            status("bottom screen: %s tab (tap the tabs to change)",
-               g_ss.tab() == game::BottomTab::Map && g_ss.map_help() ? "help" : game::bottom_tab_name(g_ss.tab()));
-        }
+        second_screen_active();
         st.bottom_draw = g_ss.stage(st.bottom, rt::now_ms());
         if (st.bottom.kind == game::BottomView::kKeyboard)
             g_osk.clear_dirty();
@@ -864,6 +1099,10 @@ void load_settings()
             g_ss.set_map_ms((uint32_t)std::atoi(value));
         else if (std::sscanf(line, "maphelp=%31s", value) == 1)
             g_ss.set_map_help(std::atoi(value) != 0);
+        else if (std::strncmp(line, "profile=", 8) == 0)   // the profiler run's checklist ("" = nothing ticked)
+            g_ss.set_profile_choice(game::profile_bits(line + 8));
+        else if (std::strncmp(line, "tracewrites=", 12) == 0)   // ...and how its traces are written (issue #66)
+            g_ss.set_trace_writes(game::trace_writes_from_name(line + 12));
     }
     std::fclose(f);
     g_ss.take_settings_changed();
@@ -872,8 +1111,10 @@ void load_settings()
 void save_settings()
 {
     if (FILE *f = std::fopen(kSettings, "w")) {
-        std::fprintf(f, "bottom=%s\nmapscale=%d\nmapms=%u\nmaphelp=%d\n", game::bottom_tab_name(g_ss.tab()),
-                     g_ss.map_scale(), (unsigned)g_ss.map_ms(), g_ss.map_help() ? 1 : 0);
+        std::fprintf(f, "bottom=%s\nmapscale=%d\nmapms=%u\nmaphelp=%d\nprofile=%s\ntracewrites=%s\n",
+                     game::bottom_tab_name(g_ss.tab()), g_ss.map_scale(), (unsigned)g_ss.map_ms(),
+                     g_ss.map_help() ? 1 : 0, game::profile_names(g_ss.profile_choice()).c_str(),
+                     game::trace_writes_info(g_ss.trace_writes()).name);
         std::fclose(f);
     }
 }
@@ -886,12 +1127,101 @@ void save_settings()
 u32 g_apt_thread = 0;   // the thread in aptMainLoop (the game's)
 bool g_storage_closed = false;
 void open_storage();
+void trace_writes_service();
+
+// A HOME round trip (issue #27): the press seen here, the suspend hook and
+// its parts, the return. Host clock, us; logged as one "home:" line when
+// the storage is open again.
+struct HomeTrip {
+    uint64_t seen = 0, panel = 0, hook = 0, hook_exit = 0, restore = 0;
+    uint64_t render_wait = 0, storage = 0, reopen = 0;
+    bool panel_up = false;   // the "Suspending" panel is on the bottom screen: drawn once a press
+} g_home;
+
+void wait_render_idle()
+{
+    while (__atomic_load_n(&g_render_busy, __ATOMIC_ACQUIRE))
+        svcSleepThread(1000000);
+}
+
+// The HOME button was pressed: the jump to the HOME menu takes ~5 s before
+// the screens change, with the game's last frame up. The bottom screen says
+// why, until the HOME menu has the screens. Drawn into the bottom's other
+// buffer, so the screen as it was is one swap away on the way back. Only
+// once the second screen is double-buffered (not over the startup console,
+// which nothing would redraw). The top screen keeps the game's frame.
+void show_suspending()
+{
+    g_home.panel_up = true;
+    if (!g_bottom_double)
+        return;
+    wait_render_idle();   // no new frame starts meanwhile: only this thread (present) starts them
+    gspWaitForVBlank1();  // the last frame's swap has taken: one swap per screen per frame
+    uint16_t *fb = (uint16_t *)gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, nullptr, nullptr);
+    game::draw_suspending(fb, default_font_bin);
+    gfxFlushBuffers();
+    gfxScreenSwapBuffers(GFX_BOTTOM, false);
+    gspWaitForVBlank1();  // on the glass before libctru takes the screens
+    g_home.panel = host_us();
+}
+
+// Back from the HOME menu (or the jump did not happen): the bottom screen
+// as it was, in the buffer behind the panel, and the second screen redraws
+// it with the next frame anyway (apt_hook). At once: during a load or a
+// cinematic no frame draws the bottom screen.
+void hide_suspending()
+{
+    g_home.panel_up = false;
+    if (!g_home.panel)
+        return;
+    wait_render_idle();
+    gfxScreenSwapBuffers(GFX_BOTTOM, false);
+}
+
+// For example "home: seen +0 ms, panel +21, hook +40, render wait 0,
+// storage 120, restore after 8.2 s, reopen 35 ms". "seen -": the suspend
+// came without the press seen here first; "panel -": none drawn.
+void log_home_trip()
+{
+    const HomeTrip &h = g_home;
+    if (!h.hook)
+        return;   // no suspend: nothing to time
+    const uint64_t t0 = h.seen ? h.seen : h.hook;
+    char panel[16] = "-";
+    if (h.panel)
+        std::snprintf(panel, sizeof panel, "+%u", (unsigned)((h.panel - t0) / 1000));
+    char line[160];
+    std::snprintf(line, sizeof line,
+                  "home: seen %s ms, panel %s, hook +%u, render wait %u, storage %u, restore after %.1f s, reopen %u ms",
+                  h.seen ? "+0" : "-", panel, (unsigned)((h.hook - t0) / 1000), (unsigned)(h.render_wait / 1000),
+                  (unsigned)(h.storage / 1000), h.restore ? (double)(h.restore - h.hook_exit) / 1e6 : 0.0,
+                  (unsigned)(h.reopen / 1000));
+    logline(line);
+}
 
 bool apt_service()
 {
     svcGetThreadId(&g_apt_thread, CUR_THREAD_HANDLE);
-    if (aptMainLoop())
+    trace_writes_service();
+    // libctru takes the system's signals (the HOME press among them) on its
+    // APT thread, priority 0x31 on core 0, below this thread (0x30), which
+    // runs the game there and seldom blocks: a press waited seconds for it
+    // before aptShouldJumpToHome() said so (issue #27). Block for a moment so
+    // it runs; with no signal pending it stays asleep.
+    svcSleepThread(1000);
+    if (!g_home.panel_up && aptShouldJumpToHome()) {
+        g_home = HomeTrip{};
+        g_home.seen = host_us();
+        show_suspending();
+    }
+    if (aptMainLoop()) {
+        if (g_home.panel_up || g_home.hook) {
+            hide_suspending();
+            log_home_trip();
+            g_home = HomeTrip{};
+        }
         return true;
+    }
     if (g_storage_closed)
         open_storage();   // closed from the HOME menu: the game may still write on its way out
     rt::request_exit(0);
@@ -905,6 +1235,14 @@ bool apt_service()
 // the way out and opened again on the way back.
 bool g_romfs = false;          // the CIA's RomFS is mounted
 std::string g_log_path;
+
+FILE *open_log(const char *mode)
+{
+    FILE *f = std::fopen(g_log_path.c_str(), mode);
+    if (f)
+        std::setvbuf(f, g_log_buf, _IOFBF, sizeof g_log_buf);
+    return f;
+}
 
 void close_storage()
 {
@@ -926,7 +1264,7 @@ void open_storage()
     if (g_romfs)
         g_romfs = R_SUCCEEDED(romfsInit());
     if (!g_log_path.empty())
-        g_log = std::fopen(g_log_path.c_str(), "a");
+        g_log = open_log("a");
     rt::resume_files();
 }
 
@@ -943,16 +1281,31 @@ void apt_hook(APT_HookType type, void *)
     u32 thread = 0;
     svcGetThreadId(&thread, CUR_THREAD_HANDLE);
     const bool game_thread = thread == g_apt_thread;
-    if (type == APTHOOK_ONRESTORE || type == APTHOOK_ONWAKEUP)
+    if (type == APTHOOK_ONRESTORE || type == APTHOOK_ONWAKEUP) {
         g_ss.invalidate();   // the HOME menu or sleep drew over the bottom screen
-    if (type == APTHOOK_ONRESTORE && g_storage_closed && game_thread)
-        open_storage();
+        g_timing.last_present_us = 0;   // the time away is not a frame (worst gap, hitches)
+    }
+    if (type == APTHOOK_ONRESTORE && game_thread) {
+        g_home.restore = host_us();
+        if (g_storage_closed) {
+            open_storage();
+            g_home.reopen = host_us() - g_home.restore;
+        }
+    }
     if (type != APTHOOK_ONSUSPEND && type != APTHOOK_ONSLEEP)
         return;
-    while (__atomic_load_n(&g_render_busy, __ATOMIC_ACQUIRE))
-        svcSleepThread(1000000);
-    if (type == APTHOOK_ONSUSPEND && game_thread && !g_storage_closed)
-        close_storage();
+    const bool home = type == APTHOOK_ONSUSPEND && game_thread;
+    if (home)
+        g_home.hook = host_us();
+    wait_render_idle();
+    if (home) {
+        const uint64_t t = host_us();
+        g_home.render_wait = t - g_home.hook;
+        if (!g_storage_closed)
+            close_storage();
+        g_home.hook_exit = host_us();
+        g_home.storage = g_home.hook_exit - t;
+    }
 }
 
 void poll()
@@ -1057,11 +1410,11 @@ bool read_file(const std::string &path, std::vector<uint8_t> &out)
     return ok;
 }
 
-#ifdef PROF_COUNTERS
 // The SD card's cost model, for sizing the game-file read cache
 // (rt_shims_files.cpp): reads of each size at scattered offsets of an MPQ,
 // as the game reads them. Time per read = per-call overhead + size /
-// bandwidth; two sizes give both.
+// bandwidth; two sizes give both. A profiler run's option: about a second
+// of the game stopped while it reads.
 void sd_benchmark(const std::string &path)
 {
     const int fd = ::open(path.c_str(), O_RDONLY);
@@ -1091,7 +1444,36 @@ void sd_benchmark(const std::string &path)
     }
     ::close(fd);
 }
+
+// game.log's last line: the session ended in order (report.h). A log
+// without it is a crash, offered as a report at the next start.
+void close_log()
+{
+    logline(report::closed_line());
+    if (g_log)
+        std::fclose(g_log);
+    g_log = nullptr;
+}
+
+// The game files' flavour, for reports: the SD card's, or the CIA's own
+// with the cinematics (full) or empty stand-ins for them (slim).
+const char *game_files(const std::string &dir)
+{
+    if (dir != kRomfsGameDir)
+        return "sdcard";
+    struct stat st;
+    return stat((dir + "/d2video.mpq").c_str(), &st) == 0 && st.st_size > (1 << 20) ? "romfs-full" : "romfs-slim";
+}
+
+report::Host report_host(const std::string &game_dir)
+{
+#ifdef D2_CIA
+    const char *app = "cia";
+#else
+    const char *app = "3dsx";
 #endif
+    return {&g_log_con, [](const char *s) { status("%s", s); }, console_again, app, game_files(game_dir)};
+}
 
 void wait_for_start()
 {
@@ -1106,9 +1488,171 @@ void wait_for_start()
     }
 }
 
+// The file-read trace's file, and its buffer: the game reads in small
+// pieces, and the SD card wants few large writes. A second run in the same
+// session goes on in the same file.
+FILE *g_files_trace = nullptr;
+char *g_files_trace_buf = nullptr;
+bool g_files_traced = false;
+
+bool file_trace_start()
+{
+    constexpr size_t kBuffer = 32 * 1024;
+    g_files_trace_buf = (char *)std::malloc(kBuffer);
+    g_files_trace = g_files_trace_buf ? std::fopen(kFileTracePath, g_files_traced ? "a" : "w") : nullptr;
+    if (!g_files_trace) {
+        std::free(g_files_trace_buf);
+        g_files_trace_buf = nullptr;
+        return false;
+    }
+    std::setvbuf(g_files_trace, g_files_trace_buf, _IOFBF, kBuffer);
+    g_files_traced = true;
+    rt::set_file_trace(g_files_trace);
+    return true;
+}
+
+void file_trace_stop()
+{
+    if (!g_files_trace)
+        return;
+    rt::set_file_trace(nullptr);
+    std::fclose(g_files_trace);
+    std::free(g_files_trace_buf);
+    g_files_trace = nullptr;
+    g_files_trace_buf = nullptr;
+}
+
+// How the traces reach the SD card (issue #66: a crash in game lost the
+// last minutes of both), as the checklist's last row says, from the service
+// call (every 50 ms, loads included) on the game's thread, the one that
+// writes the traces. A change applies at once and is logged as
+//   profiler run: trace writes <buffered|second|now>
+// (the first only if not buffered). Buffered changes nothing from before.
+game::TraceWrites g_trace_writes = game::TraceWrites::Buffered;
+uint64_t g_trace_written_us = 0;   // every second: the last write-out
+
+void trace_writes_service()
+{
+    const game::TraceWrites m = g_ss.trace_writes();
+    if (m != g_trace_writes) {
+        g_trace_writes = m;
+        const bool each = m == game::TraceWrites::AtOnce;
+        rt::set_file_trace_each(each);
+        game::sprite_trace_each(each);
+        char line[64];
+        std::snprintf(line, sizeof line, "%strace writes %s", game::kProfilerRunLine, game::trace_writes_info(m).name);
+        logline(line);
+    }
+    if (m != game::TraceWrites::EverySecond || g_storage_closed)   // the HOME menu has the SD card
+        return;
+    const uint64_t now = host_us();
+    if (now - g_trace_written_us < 1000000)
+        return;
+    g_trace_written_us = now;
+    if (g_files_trace)
+        std::fflush(g_files_trace);
+    game::sprite_trace_flush();
+}
+
+// The profiler run's options (profiler.h) to `want`: those no longer
+// wanted stopped, the new ones started. An option that does not start is
+// left out of the run, and said so.
+void profiler_switch(uint32_t want)
+{
+    const uint32_t stop = g_prof_on & ~want, start = want & ~g_prof_on;
+    if (stop & game::kProfSprites)
+        game::sprite_trace_stop();
+    if (stop & game::kProfGuest) {
+        rt::set_profiling(false);
+        stop_sampler();
+    }
+    if (stop & game::kProfFiles)
+        file_trace_stop();
+    g_prof_on &= ~stop;
+    uint32_t refused = 0;
+    if ((start & game::kProfSprites) && !game::sprite_trace_start(kTracePath))
+        refused |= game::kProfSprites;
+    if (start & game::kProfGuest) {
+        if (rt::set_profiling(true))
+            start_sampler();
+        else
+            refused |= game::kProfGuest;
+    }
+    if ((start & game::kProfFiles) && !file_trace_start())
+        refused |= game::kProfFiles;
+    if (start & game::kProfSdBench)
+        sd_benchmark(g_bench_path);   // once, as the run starts
+    if (refused)
+        status("profiler run: could not start %s", game::profile_names(refused).c_str());
+    g_prof_refused |= refused;
+    g_prof_on |= start & ~refused;
+    g_prof_used |= start & ~refused;
+    char line[96];
+    std::snprintf(line, sizeof line, "%s%s%s", game::kProfilerRunLine, g_prof_on ? "start " : "stop",
+                  game::profile_names(g_prof_on).c_str());
+    logline(line);
+}
+
+// The profiler run, at the heartbeat: on and off as INFO's checklist says;
+// the sprite trace's beat, with the cache and the pool.
+void profiler_heartbeat(const rt::MemoryReport &m, const game::SpriteCacheStats &sc)
+{
+    if (!g_ss.profiling())
+        g_prof_refused = 0;
+    const uint32_t want = g_ss.profiling() ? g_ss.profile_choice() & ~g_prof_refused : 0;
+    if (want != g_prof_on)
+        profiler_switch(want);
+    if (g_prof_on & game::kProfSprites)
+        game::sprite_trace_beat({sc.limit, sc.used, sc.sprites, m.free, m.spare_used ? 1u : 0u, m.largest_free,
+                                 game::sprite_cache_taken(), (uint32_t)game::dcc_cells_decoded(),
+                                 g_timing.total_frames});
+}
+
+// The hitch counters' window (issue #19), at the heartbeat: logged, kept
+// for INFO, and the next one started.
+void hitch_heartbeat(const game::SpriteCacheWindow &w)
+{
+    HitchMark now{rt::frame_thread_times(), g_frames_skipped, d2rt::dsound::famine_count()};
+    HitchWindow &hw = g_hitch_last;
+    hw.h = g_hitch;
+    hw.wait_ms = (uint32_t)(now.frame.blocked_ms - g_hitch_mark.frame.blocked_ms);
+    hw.ready_ms = (uint32_t)(now.frame.ready_ms - g_hitch_mark.frame.ready_ms);
+    hw.host_ms = (uint32_t)(now.frame.host_ms - g_hitch_mark.frame.host_ms);
+    hw.heartbeat_ms = (uint32_t)(rt::last_heartbeat_us() / 1000);
+    hw.skipped = now.skipped - g_hitch_mark.skipped;
+    hw.famine = (uint32_t)(now.famine - g_hitch_mark.famine);
+    g_hitch_mark = now;
+    g_hitch = Hitches{};
+    char line[256];
+    std::snprintf(line, sizeof line,
+                  "[rt] prof hitch: frames %u, <=50ms %u, <=100ms %u, <=250ms %u, >250ms %u, longest %u ms, "
+                  "sprites in %u out %u, wait %u ms, ready %u ms, host %u ms, heartbeat %u ms, skipped %u, famine %u",
+                  (unsigned)(hw.h.frames[0] + hw.h.frames[1] + hw.h.frames[2] + hw.h.frames[3]),
+                  (unsigned)hw.h.frames[0], (unsigned)hw.h.frames[1], (unsigned)hw.h.frames[2],
+                  (unsigned)hw.h.frames[3], (unsigned)hw.h.longest_ms, w.inserted, w.evicted, (unsigned)hw.wait_ms,
+                  (unsigned)hw.ready_ms, (unsigned)hw.host_ms, (unsigned)hw.heartbeat_ms, (unsigned)hw.skipped,
+                  (unsigned)hw.famine);
+    logline_held(line);
+}
+
 }  // namespace
 
-static d2rt::Cpu *g_guest_cpu = nullptr;   // the game's CPU, from install_native on
+// abort() (linked with --wrap=abort, issue #66). newlib's ends the app
+// through _exit, and libctru's exit frees the heaps while the app's other
+// threads still run on stacks in them: they fault on the unmapped pages, and
+// the console went down in the kernel (3DS-D2-11, where the JIT's ARMv6
+// bit-field check aborted on the game's arrival in Act II). Logged with its
+// caller instead, then the app stops at once: Luma3DS dumps the thread that
+// aborted, the heaps still mapped.
+extern "C" __attribute__((noreturn)) void __wrap_abort(void)
+{
+    char s[80];
+    std::snprintf(s, sizeof s, "FATAL: abort() called from %08lx", (unsigned long)__builtin_return_address(0));
+    logline(s);
+    svcBreak(USERBREAK_PANIC);
+    for (;;) {
+    }
+}
 
 #ifdef D2_CIA
 // The guest arena is carved out of the heap, 16 MiB-aligned, and the host
@@ -1125,11 +1669,23 @@ static const rt::Layout *reserve_arena()
     };
     for (const rt::Layout *L : candidates) {
         if (L && (g_arena = memalign(16u << 20, L->span))) {
+            g_arena_block = g_arena;
             g_arena_size = L->span;
             return L;
         }
     }
     return nullptr;
+}
+
+// After rt::run_exe returns nothing touches the guest arena again (the I/O
+// and render threads are joined, the second screen is off), and it is plain
+// read-write heap. Without it the heap is nearly full at the game's end, too
+// full for the 1 MiB socket buffer a report needs (issue #30).
+static void give_back_arena()
+{
+    std::free(g_arena);
+    g_arena = nullptr;
+    g_arena_size = 0;
 }
 #endif
 
@@ -1150,12 +1706,20 @@ int main()
     mkdir(kRoot, 0777);
     mkdir(kSaveDir, 0777);
     mkdir(kLogDir, 0777);
+    // The last session's logs, if it never closed, move to a report folder
+    // before this session's replace them.
+    const std::string kept = report::keep_unclosed_session();
+    std::remove(kTracePath);   // the last session's, if it closed (its report has its own copy)
+    std::remove(kFileTracePath);
     g_log_path = std::string(kLogDir) + "/game.log";
-    g_log = std::fopen(g_log_path.c_str(), "w");
+    g_log = open_log("w");
     std::freopen((std::string(kLogDir) + "/stderr.txt").c_str(), "w", stderr);
     // The main thread's handler is the default for the others; the guest runs here.
     threadOnException(on_cpu_exception, g_exc_stack + sizeof g_exc_stack, WRITE_DATA_TO_HANDLER_STACK);
     status("3ds-d2: Diablo II on the 3DS");
+    logline(report::start_line().c_str());
+    if (!kept.empty())
+        status("The last session did not end normally. Its logs: %s", kept.c_str() + std::strlen(kRoot) + 1);
     status("heap %u KiB at %08lx, linear %u KiB, app memory %u KiB", (unsigned)(__ctru_heap_size >> 10),
            (unsigned long)__ctru_heap, (unsigned)(__ctru_linear_heap_size >> 10),
            (unsigned)(osGetMemRegionSize(MEMREGION_APPLICATION) >> 10));
@@ -1177,17 +1741,23 @@ int main()
         game_dir = kRomfsGameDir;
     status("app memory %u KiB, game files: %s",
            (unsigned)(osGetMemRegionSize(MEMREGION_APPLICATION) >> 10), game_dir.c_str());
+    // Reports not answered yet (the last session's crash, or one kept for
+    // later), before the game takes the memory.
+    if (!report::offer_pending(report_host(game_dir))) {
+        close_log();
+        gfxExit();
+        return 0;
+    }
     if (exe.empty() && !read_file(game_dir + "/Game.exe", exe)) {
         status("Game.exe not found in %s.", kGameDir);
         status("Copy Game.exe (1.14d) and the .mpq files there.");
+        close_log();
         wait_for_start();
         gfxExit();
         return 1;
     }
     status("Game.exe: %u bytes. Starting...", (unsigned)exe.size());
-#ifdef PROF_COUNTERS
-    sd_benchmark(game_dir + "/d2data.mpq");
-#endif
+    g_bench_path = game_dir + "/d2data.mpq";
 
     load_settings();
     {
@@ -1203,6 +1773,7 @@ int main()
 #ifdef D2_CIA
     if (!arena_layout) {
         status("Only %u KiB of heap: the game needs at least 87 MiB.", (unsigned)(__ctru_heap_size >> 10));
+        close_log();
         wait_for_start();
         gfxExit();
         return 1;
@@ -1230,15 +1801,28 @@ int main()
         // A request served from the spare had no other piece of the pool
         // left: the cache goes down to its minimum.
         const rt::MemoryReport m = rt::memory_report();
-        const uint32_t pool_free = m.spare_used ? 0 : m.free;
-        if (pool_free < game::kCtrPoolReserve)
+        if (m.spare_used || m.free < game::kCtrPoolRelease)
             game::request_pool_release();
-        game::govern_sprite_cache(*g_guest_cpu, pool_free, game::kCtrPoolReserve, game::kCtrSpriteCacheMin);
+        const game::SpriteCacheWindow w = game::sprite_cache_window(*g_guest_cpu);
+        game::govern_sprite_cache(*g_guest_cpu, m.free, m.spare_used, w.evicted, game::kCtrPoolReserve,
+                                  game::kCtrSpriteCacheMin);
+        g_sprite_window = w;
+        hitch_heartbeat(w);   // before the sprite cache line, the window's last (tools/session_report.py)
         const game::SpriteCacheStats sc = game::sprite_cache_stats(*g_guest_cpu);
-        char line[96];
-        std::snprintf(line, sizeof line, "[rt] sprite cache %u/%u KiB, %u sprites", sc.used >> 10, sc.limit >> 10,
-                      sc.sprites);
-        logline(line);
+        char line[208], frames[192];
+        if (game::sprite_frames_line(frames, sizeof frames)) {
+            std::snprintf(line, sizeof line, "[rt] %s", frames);
+            logline_held(line);
+        }
+        std::snprintf(line, sizeof line, "[rt] sprite cache %u/%u KiB, %u sprites, in %u, out %u, decoded %u in %u ms",
+                      sc.used >> 10, sc.limit >> 10, sc.sprites, w.inserted, w.evicted, w.decodes, w.decode_ms);
+        logline_held(line);
+        profiler_heartbeat(m, sc);
+        char sys[320];
+        system_line(sys, sizeof sys, "");
+        logline_held(sys);
+        g_heap_room_low = UINT32_MAX;   // "low": since this heartbeat
+        log_flush();   // the heartbeat's lines, in one write
     };
     // Sound through ds_emul into the DSP (ctr_audio.cpp), mixed on another core.
     setenv("WX86_SON", "vita", 1);   // ds_emul's name for the console's realtime sink
@@ -1248,22 +1832,39 @@ int main()
     // Memory (issue #15): a smaller sprite cache, the game's fatal exit
     // ending the run at once, and the cache's fill after each heartbeat;
     // the pool systems' empty blocks given back when the pool runs short,
-    // and their blocks 128 KiB instead of 512 KiB.
+    // and their blocks 128 KiB instead of 512 KiB; the sprites' frames in
+    // blocks of their own, in finer classes (issue #44).
     opt.install_native = [](d2rt::Cpu &c) {
         g_guest_cpu = &c;
         game::set_sprite_cache_floor(c, game::kCtrSpriteCacheFloor);
+        game::install_sprite_cache_counter(c);
+        game::install_sprite_decode_timer(c);
+        game::install_sprite_trace(c);
+        game::install_storm_read_priority(c);
         game::install_fatal_exit(c);
         game::install_pool_release(c);
         game::set_pool_block_size(c, game::kCtrPoolBlock);
+        game::install_sprite_frames(c);
         game::install_d2_native(c);
         game::install_cinematics(c);
         game::install_automap_capture(c);   // the bottom screen's MAP tab
     };
     opt.video_audio = d2rt::audio::video_sink();
+    opt.video_event = [](const char *what) {
+        if (std::strcmp(what, "close") == 0)
+            g_ss.end_video();   // the tab as it was, with the game's next frame
+        char sys[320];
+        system_line(sys, sizeof sys, std::strcmp(what, "open") ? " at video close" : " at video open");
+        logline(sys);
+    };
     opt.log = [](const char *s) {
         char line[600];
         std::snprintf(line, sizeof line, "[rt] %s", s);
-        logline(line);
+        // The heartbeat's own lines wait for its end (log_flush).
+        if (std::strncmp(s, "t=", 2) == 0 || std::strncmp(s, "prof", 4) == 0)
+            logline_held(line);
+        else
+            logline(line);
         // Heartbeats: the panel shows those numbers.
         // The sound engine's "[son]" diagnostics (WinVita writes them in
         // French) go to game.log only.
@@ -1273,7 +1874,10 @@ int main()
     };
     opt.present = present;
     opt.poll_input = poll;
-    opt.service = [] { apt_service(); };
+    opt.service = [] {
+        apt_service();
+        report_heap_refusals();
+    };
     opt.io_start = start_io_thread;
     opt.io_wait = [] { LightEvent_Wait(&g_io_event); };
     opt.io_wake = [] { LightEvent_Signal(&g_io_event); };
@@ -1282,14 +1886,10 @@ int main()
 
     start_render_thread();
     aptHook(&g_apt_cookie, apt_hook, nullptr);
-#ifdef PROF_COUNTERS
-    start_sampler();
-#endif
     rt::RunResult r = rt::run_exe(std::move(exe), opt);
     join_io_thread();
-#ifdef PROF_COUNTERS
-    stop_sampler();
-#endif
+    if (g_prof_on)
+        profiler_switch(0);   // a run still on: its traces closed, in time for the report
     aptUnhook(&g_apt_cookie);
     stop_render_thread();
     console_again();   // the game's end shows on the console, as before the second screen
@@ -1301,8 +1901,25 @@ int main()
         status("Diablo II ran out of memory (%u requests refused, see game.log).", rt::stats().alloc_failures);
     else if (game::fatal_exit_caller())
         status("Diablo II stopped on an internal error at %08lx.", (unsigned long)game::fatal_exit_caller());
-    if (g_log)
-        std::fclose(g_log);
+    // A report (issue #26), now that the game's memory is free: for an
+    // error, or because the player asked for one on the INFO tab.
+    const char *why = !r.loaded                    ? "the game did not start"
+                      : rt::stats().alloc_failures ? "ran out of memory"
+                      : game::fatal_exit_caller()  ? "stopped on an internal error"
+                      : g_ss.report_requested()    ? "asked for by the player"
+                      : g_prof_used                ? "a profiler run"
+                                                   : nullptr;
+    close_log();
+#ifdef D2_CIA
+    give_back_arena();
+#endif
+    if (why && report::enabled()) {
+        const std::string dir = report::keep_session(why);
+        if (!report::offer_one(report_host(game_dir), dir)) {
+            gfxExit();   // closing: offered again at the next start
+            return 0;
+        }
+    }
     wait_for_start();
     gfxExit();
     return 0;

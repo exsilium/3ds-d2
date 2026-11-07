@@ -18,6 +18,19 @@
 // NIN03 folder; a full folder (100 pictures, as the camera keeps them) starts
 // the next folder at HNI_0001. The file is written under a temporary name and
 // renamed, so the album never sees half a picture.
+//
+// Each screenshot is a pair (issue #61): with the frame, the bottom screen as
+// shown, 320x240, into the game's own folder (kShotDir, not the album), and
+// both in the game's list of pairs (game/report.h), from which a problem
+// report can attach them. The list keeps the newest 16; the bottom pictures
+// of older pairs are removed with them (the album's are the player's).
+//
+// The report's side: any of these pictures, or Luma3DS's BMP screenshots,
+// read back as RGB (scaled down to fit, for its preview) and made a JPEG.
+#include "game/report.h"
+
+#include <3ds.h>
+
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -40,9 +53,19 @@ struct Source {
     const uint32_t *palette;    // 0x00RRGGBB; indexed frames only
     bool yuv;
     uint32_t display_height;    // cinematics: the height the picture is meant to have
+    const uint16_t *fb565 = nullptr;   // instead: the bottom screen's framebuffer (RGB565, 240x320 rotated)
+    const uint8_t *rgb = nullptr;      // instead: RGB triplets, rows top first
 };
 
-bool save(const Source &src, std::string &msg);
+// A picture read back for a report: RGB triplets, rows top first.
+struct Image {
+    uint32_t width = 0, height = 0;
+    std::vector<uint8_t> rgb;
+};
+
+bool save(const Source &src, const uint16_t *bottom, std::string &msg);
+bool load(const std::string &path, uint32_t max_w, uint32_t max_h, Image &out, std::string &msg);
+bool to_jpeg(const Image &img, std::string &out, std::string &msg);
 
 namespace {
 
@@ -51,6 +74,8 @@ constexpr int kThumbW = 160, kThumbH = 120;      // the EXIF thumbnail (DCF)
 constexpr int kQuality = 92, kThumbQuality = 80;
 constexpr int kPerFolder = 100;
 const char kDcim[] = "sdmc:/DCIM";
+const char kShotDir[] = "sdmc:/3ds/3ds-d2/screenshots";
+const char kShotList[] = "sdmc:/3ds/3ds-d2/screenshots/pairs.txt";
 
 // ---- sampling ---------------------------------------------------------------------
 
@@ -59,6 +84,20 @@ inline uint8_t clamp8(int v) { return (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v); 
 // The RGB of source pixel (x, y).
 void rgb_at(const Source &s, uint32_t x, uint32_t y, int &r, int &g, int &b)
 {
+    if (s.fb565) {   // column x, bottom to top
+        const uint16_t p = s.fb565[(size_t)x * 240 + (239 - y)];
+        r = ((p >> 11) & 0x1F) * 255 / 31;
+        g = ((p >> 5) & 0x3F) * 255 / 63;
+        b = (p & 0x1F) * 255 / 31;
+        return;
+    }
+    if (s.rgb) {
+        const uint8_t *p = s.rgb + ((size_t)y * s.width + x) * 3;
+        r = p[0];
+        g = p[1];
+        b = p[2];
+        return;
+    }
     if (!s.yuv) {
         const uint32_t p = s.palette[s.pixels[(size_t)y * s.width + x]];
         r = (p >> 16) & 0xFF;
@@ -164,7 +203,7 @@ bool encode(const Source &s, int ow, int oh, int quality, FILE *file, const std:
     c.in_color_space = JCS_RGB;
     jpeg_set_defaults(&c);
     jpeg_set_quality(&c, quality, TRUE);
-    c.write_JFIF_header = FALSE;   // EXIF in its place
+    c.write_JFIF_header = file && !app1;   // a file without EXIF in its place is a plain JFIF
     jpeg_start_compress(&c, TRUE);
     if (app1)
         jpeg_write_marker(&c, JPEG_APP0 + 1, app1->data(), (unsigned)app1->size());
@@ -352,9 +391,173 @@ bool next_path(std::string &dir, std::string &path)
     return true;
 }
 
+// Writes the picture at w x h to `path` as a JPEG (EXIF `app1` first, if
+// given), under a temporary name renamed at the end.
+bool write_jpeg(const Source &src, int w, int h, const std::vector<uint8_t> *app1, const std::string &path,
+                const std::string &tmp, std::string &msg)
+{
+    FILE *f = std::fopen(tmp.c_str(), "wb");
+    if (!f) {
+        msg = "cannot write " + tmp;
+        return false;
+    }
+    const bool ok = encode(src, w, h, kQuality, f, app1, nullptr, msg);
+    const bool closed = std::fclose(f) == 0;
+    if (!ok || !closed || std::rename(tmp.c_str(), path.c_str()) != 0) {
+        std::remove(tmp.c_str());
+        if (ok)
+            msg = "cannot write " + path;
+        return false;
+    }
+    return true;
+}
+
+bool read_file(const std::string &path, std::string &out)
+{
+    FILE *f = std::fopen(path.c_str(), "rb");
+    if (!f)
+        return false;
+    char buf[4096];
+    out.clear();
+    while (size_t n = std::fread(buf, 1, sizeof buf, f))
+        out.append(buf, n);
+    std::fclose(f);
+    return true;
+}
+
+// The bottom screen as shown (if `fb`), beside the frame: its own JPEG, and
+// the pair in the game's list. False (the frame is saved all the same) if
+// either could not be written.
+bool save_bottom(const uint16_t *fb, const std::string &top, std::string &msg)
+{
+    // Named by the time, as Luma3DS names its own: 2026-11-02_14-02-31.123_bot.jpg.
+    const uint64_t now_ms = osGetTime();   // ms since 1900, local time
+    game::report::ShotPair p;
+    p.time = now_ms / 1000 - 2208988800ull;
+    p.ms = (uint32_t)(now_ms % 1000);
+    std::string name = game::report::shot_time_text(p.time);
+    name[10] = '_';
+    name[13] = name[16] = '-';
+    char ms[8];
+    std::snprintf(ms, sizeof ms, ".%03u", (unsigned)p.ms);
+    mkdir(kShotDir, 0777);
+    p.top = top;
+    bool ok = true;
+    if (fb) {
+        p.bot = std::string(kShotDir) + "/" + name + ms + "_bot.jpg";
+        Source src{};
+        src.width = 320;
+        src.height = 240;
+        src.fb565 = fb;
+        if (!write_jpeg(src, 320, 240, nullptr, p.bot, std::string(kShotDir) + "/bot.tmp", msg)) {
+            p.bot.clear();
+            ok = false;
+        }
+    }
+    std::string text;
+    read_file(kShotList, text);
+    std::vector<game::report::ShotPair> list = game::report::parse_shot_list(text);
+    for (const game::report::ShotPair &old : game::report::add_shot(list, p))
+        if (!old.bot.empty())
+            std::remove(old.bot.c_str());
+    text = game::report::shot_list_text(list);
+    FILE *f = std::fopen(kShotList, "wb");
+    if (!f || std::fwrite(text.data(), 1, text.size(), f) != text.size()) {
+        if (f)
+            std::fclose(f);
+        msg = "cannot write the list of screenshots";
+        return false;
+    }
+    std::fclose(f);
+    return ok;
+}
+
+// The decompressor's errors, as the compressor's.
+bool load_jpeg(const std::string &data, uint32_t max_w, uint32_t max_h, Image &out, std::string &msg)
+{
+    jpeg_decompress_struct d;
+    JpegError err;
+    d.err = jpeg_std_error(&err.mgr);
+    err.mgr.error_exit = jpeg_fail;
+    if (setjmp(err.jump)) {
+        jpeg_destroy_decompress(&d);
+        msg = err.text;
+        return false;
+    }
+    jpeg_create_decompress(&d);
+    jpeg_mem_src(&d, (const unsigned char *)data.data(), (unsigned long)data.size());
+    jpeg_read_header(&d, TRUE);
+    d.out_color_space = JCS_RGB;
+    // libjpeg's own scaling (1/2, 1/4, 1/8) to the largest that fits: the
+    // game's 640x480 frame is the bottom screen's 320x240 at 1/2.
+    d.scale_num = 1;
+    d.scale_denom = 1;
+    while (max_w && max_h && d.scale_denom < 8 &&
+           (d.image_width / d.scale_denom > max_w || d.image_height / d.scale_denom > max_h))
+        d.scale_denom *= 2;
+    jpeg_start_decompress(&d);
+    out.width = d.output_width;
+    out.height = d.output_height;
+    out.rgb.resize((size_t)out.width * out.height * 3);
+    while (d.output_scanline < d.output_height) {
+        JSAMPROW row = out.rgb.data() + (size_t)d.output_scanline * out.width * 3;
+        jpeg_read_scanlines(&d, &row, 1);
+    }
+    jpeg_finish_decompress(&d);
+    jpeg_destroy_decompress(&d);
+    return true;
+}
+
 }  // namespace
 
-bool save(const Source &src, std::string &msg)
+bool load(const std::string &path, uint32_t max_w, uint32_t max_h, Image &out, std::string &msg)
+{
+    std::string data;
+    if (!read_file(path, data)) {
+        msg = "cannot read " + path;
+        return false;
+    }
+    if (data.size() >= 2 && data[0] == 'B' && data[1] == 'M') {
+        if (!game::report::decode_bmp(data, out.width, out.height, out.rgb)) {
+            msg = "not a 24-bit BMP: " + path;
+            return false;
+        }
+    } else if (!load_jpeg(data, max_w, max_h, out, msg)) {
+        return false;
+    }
+    if (!max_w || !max_h || (out.width <= max_w && out.height <= max_h))
+        return true;
+    // Still too large (a BMP, or past 1/8): averaged down to fit.
+    Source src{};
+    src.width = out.width;
+    src.height = out.height;
+    src.rgb = out.rgb.data();
+    int w, h;
+    fit(src, (int)max_w, (int)max_h, w, h);
+    Image small;
+    small.width = (uint32_t)w;
+    small.height = (uint32_t)h;
+    small.rgb.resize((size_t)w * h * 3);
+    for (int y = 0; y < h; y++)
+        scaled_row(src, w, h, y, small.rgb.data() + (size_t)y * w * 3);
+    out = std::move(small);
+    return true;
+}
+
+bool to_jpeg(const Image &img, std::string &out, std::string &msg)
+{
+    Source src{};
+    src.width = img.width;
+    src.height = img.height;
+    src.rgb = img.rgb.data();
+    std::vector<uint8_t> bytes;
+    if (!encode(src, (int)img.width, (int)img.height, kQuality, nullptr, nullptr, &bytes, msg))
+        return false;
+    out.assign(bytes.begin(), bytes.end());
+    return true;
+}
+
+bool save(const Source &src, const uint16_t *bottom, std::string &msg)
 {
     if (!src.pixels || !src.width || !src.height || (!src.yuv && !src.palette)) {
         msg = "no frame";
@@ -373,23 +576,15 @@ bool save(const Source &src, std::string &msg)
         msg = "DCIM is full";
         return false;
     }
-    const std::string tmp = dir + "/HNI_TEMP.TMP";
-    FILE *f = std::fopen(tmp.c_str(), "wb");
-    if (!f) {
-        msg = "cannot write " + tmp;
+    if (!write_jpeg(src, w, h, &app1, path, dir + "/HNI_TEMP.TMP", msg))
         return false;
-    }
-    const bool ok = encode(src, w, h, kQuality, f, &app1, nullptr, msg);
-    const bool closed = std::fclose(f) == 0;
-    if (!ok || !closed || std::rename(tmp.c_str(), path.c_str()) != 0) {
-        std::remove(tmp.c_str());
-        if (ok)
-            msg = "cannot write " + path;
-        return false;
-    }
     char info[32];
     std::snprintf(info, sizeof info, " (%dx%d)", w, h);
-    msg = path + info;
+    std::string why;
+    if (!save_bottom(bottom, path, why))
+        msg = path + info + ", but " + why;
+    else
+        msg = path + info + (bottom ? " and the bottom screen" : ", no bottom screen");
     return true;
 }
 

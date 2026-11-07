@@ -2,8 +2,10 @@
 #include "game/second_screen.h"
 
 #include "game/automap.h"
+#include "game/profiler.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -152,6 +154,8 @@ BottomView::Kind SecondScreen::shown_kind() const
 {
     if (osk_ && osk_->is_open())
         return BottomView::kKeyboard;
+    if (video_)
+        return BottomView::kVideo;
     switch (shown_tab()) {
     case BottomTab::Map: return help_ ? BottomView::kHelp : BottomView::kMap;
     case BottomTab::Keys: return BottomView::kKeys;
@@ -194,6 +198,23 @@ void SecondScreen::set_map_help(bool on)
     if (on != help_)
         settings_changed_ = true;
     help_ = on;
+    dirty_ = true;
+}
+
+void SecondScreen::set_profile_choice(uint32_t bits)
+{
+    bits &= kProfileAll;
+    if (bits != profile_)
+        settings_changed_ = true;
+    profile_ = bits;
+    dirty_ = true;
+}
+
+void SecondScreen::set_trace_writes(TraceWrites m)
+{
+    if (m != trace_writes_)
+        settings_changed_ = true;
+    trace_writes_ = m;
     dirty_ = true;
 }
 
@@ -348,9 +369,10 @@ void SecondScreen::update(Pad &pad, const GameState &gs, int cursor_x, int curso
     const bool down = pad.touching && !prev_touch_, up = !pad.touching && prev_touch_;
     prev_touch_ = pad.touching;
 
-    if (kind == BottomView::kKeyboard || pad.touchpad) {
+    if (kind == BottomView::kKeyboard || kind == BottomView::kVideo || pad.touchpad) {
         // The keyboard has the touch screen (the platform gives it the
-        // touch); a scripted tap is the touchpad's.
+        // touch); a scripted tap is the touchpad's, and so is any touch
+        // during a video (a tap skips it).
         if (grip_ == Grip::Key || grip_ == Grip::Point)
             grip_ = Grip::None;
     } else {
@@ -377,6 +399,17 @@ void SecondScreen::update(Pad &pad, const GameState &gs, int cursor_x, int curso
                        map_button(pad.touch_x, pad.touch_y, kind == BottomView::kMap && gs_.in_game) >= 0) {
                 grip_ = Grip::MapButton;
                 key_ = map_button(pad.touch_x, pad.touch_y, kind == BottomView::kMap && gs_.in_game);
+            } else if (kind == BottomView::kInfo && pad.touch_y >= kMapBtnY && pad.touch_x >= kReportBtnX) {
+                grip_ = Grip::MapButton;
+                key_ = 3;   // INFO's report button (the checklist's way back)
+            } else if (kind == BottomView::kInfo && pad.touch_y >= kMapBtnY && pad.touch_x >= kProfBtnX &&
+                       pad.touch_x < kProfBtnX + kProfBtnW) {
+                grip_ = Grip::MapButton;
+                key_ = 4;   // INFO's profiler run button (the checklist's start/stop)
+            } else if (kind == BottomView::kInfo && checklist_ && pad.touch_y >= kProfRowY &&
+                       pad.touch_y < kProfRowY + kProfRows * kProfRowH) {
+                grip_ = Grip::MapButton;
+                key_ = 5 + (pad.touch_y - kProfRowY) / kProfRowH;   // a row of the checklist
             } else {
                 grip_ = Grip::Pad;
             }
@@ -422,7 +455,27 @@ void SecondScreen::update(Pad &pad, const GameState &gs, int cursor_x, int curso
         if (up && grip_ == Grip::MapButton && moved_ <= kTapSlop) {
             // A tap: the size switches; the refresh steps through its
             // choices; the corner one switches between the map and HELP.
-            if (key_ == 2) {
+            // INFO's ask for a report, or take the request back; its
+            // profiler run's checklist, where the ticks change only between
+            // runs, and a run starts only with something ticked.
+            if (key_ == 3 && checklist_) {
+                checklist_ = false;
+                dirty_ = true;
+            } else if (key_ == 3) {
+                report_ = !report_;
+                dirty_ = true;
+            } else if (key_ == 4 && !checklist_) {
+                checklist_ = true;
+                dirty_ = true;
+            } else if (key_ == 4) {
+                profiling_ = !profiling_ && profile_ != 0;
+                dirty_ = true;
+            } else if (key_ == 5 + kProfileOptionCount) {
+                set_trace_writes(next_trace_writes(trace_writes_));   // a run on or not
+            } else if (key_ >= 5) {
+                if (!profiling_)
+                    set_profile_choice(profile_ ^ kProfileOptions[key_ - 5].bit);
+            } else if (key_ == 2) {
                 set_map_help(!help_);
             } else if (key_ == 0) {
                 set_map_scale(map_scale_ == 1 ? 2 : 1);
@@ -432,7 +485,7 @@ void SecondScreen::update(Pad &pad, const GameState &gs, int cursor_x, int curso
                     i++;
                 set_map_ms(kMapMs[(i + 1) % (sizeof kMapMs / sizeof kMapMs[0])]);
             }
-            settings_changed_ = true;
+            settings_changed_ |= key_ < 3;
         }
         if (up)
             grip_ = Grip::None;
@@ -450,7 +503,7 @@ void SecondScreen::update(Pad &pad, const GameState &gs, int cursor_x, int curso
     int nk = 0;
     if (grip_ == Grip::Key && pad.touching && !kKeys[key_].latch)
         pad.keys[nk++] = kKeys[key_].vk;
-    if (alt_latched_ && gs_.in_game && kind != BottomView::kKeyboard)
+    if (alt_latched_ && gs_.in_game && kind != BottomView::kKeyboard && kind != BottomView::kVideo)
         pad.keys[nk++] = VK_MENU;
     if (grip_ == Grip::Bar || grip_ == Grip::Key || grip_ == Grip::Point || grip_ == Grip::MapButton)
         pad.touching = false;
@@ -463,6 +516,60 @@ void SecondScreen::set_stats(std::vector<BottomView::Line> lines)
     stats_ = std::move(lines);
     if (shown_kind() == BottomView::kInfo || shown_kind() == BottomView::kKeyboard)
         dirty_ = true;
+}
+
+void SecondScreen::set_video(const char *file, uint32_t at_ms, uint32_t length_ms)
+{
+    if (!video_ || video_file_ != (file ? file : "")) {
+        video_file_ = file ? file : "";
+        video_title_ = video_title(video_file_);
+        dirty_ = true;
+    }
+    video_ = true;
+    video_s_ = at_ms / 1000;
+    video_length_s_ = length_ms / 1000;
+}
+
+void SecondScreen::end_video()
+{
+    if (!video_)
+        return;
+    video_ = false;
+    last_video_s_ = UINT32_MAX;
+    dirty_ = true;   // the tab as it was, with the game's next frame
+}
+
+std::string video_title(const std::string &file)
+{
+    // The name without its folders, extension and size ("640x292").
+    std::string s = file.substr(file.find_last_of("\\/") + 1);
+    if (const size_t dot = s.rfind('.'); dot != std::string::npos)
+        s.erase(dot);
+    size_t size = s.find_last_not_of("0123456789x") + 1;
+    while (size < s.size() && s[size] == 'x')
+        size++;
+    if (s.find('x', size) != std::string::npos)
+        s.erase(size);
+    while (!s.empty() && s.back() == '_')
+        s.pop_back();
+    std::string key = s;
+    for (char &c : key)
+        c = (char)std::tolower((unsigned char)c);
+    static const struct { const char *key, *title; } kTitles[] = {
+        {"new_bliz", "Blizzard Entertainment"},
+        {"bliznorth", "Blizzard North"},
+        {"d2intro", "Diablo II: the intro"},
+        {"act02start", "Act II"},
+        {"act03start", "Act III"},
+        {"act04start", "Act IV"},
+        {"act04end", "Diablo II: the ending"},
+        {"d2x_intro", "Lord of Destruction: the intro"},
+        {"d2x_out", "Lord of Destruction: the ending"},
+    };
+    for (const auto &t : kTitles)
+        if (key == t.key)
+            return t.title;
+    return s.empty() ? std::string("A cinematic") : s;
 }
 
 void SecondScreen::log(const char *s)
@@ -535,8 +642,14 @@ bool SecondScreen::stage(BottomView &v, uint64_t now_ms)
     case BottomView::kKeyboard: {
         v.lines = stats_;
         if (kind == BottomView::kInfo) {
-            // The newest messages under the statistics, as many as fit.
-            const int rows = kAreaH / 8 - (int)stats_.size();
+            // The newest messages under the statistics, as many as fit
+            // above the report button.
+            v.report = report_;
+            v.profiling = profiling_;
+            v.checklist = checklist_;
+            v.profile = profile_;
+            v.trace_writes = trace_writes_;
+            const int rows = (kAreaH - kMapBtnH) / 8 - (int)stats_.size();
             const uint32_t n = log_head_ < (uint32_t)kLogLines ? log_head_ : (uint32_t)kLogLines;
             const uint32_t show = rows > 0 ? ((uint32_t)rows < n ? (uint32_t)rows : n) : 0;
             for (uint32_t i = log_head_ - show; i < log_head_; i++)
@@ -554,6 +667,14 @@ bool SecondScreen::stage(BottomView &v, uint64_t now_ms)
         }
         break;
     }
+    case BottomView::kVideo:
+        // Redrawn as the time shown changes: once a second.
+        v.video_title = video_title_;
+        v.video_s = video_s_;
+        v.video_length_s = video_length_s_;
+        redraw |= video_s_ != last_video_s_;
+        last_video_s_ = video_s_;
+        break;
     case BottomView::kNone:
         break;
     }
@@ -654,6 +775,26 @@ void draw_bottom(uint16_t *fb, const BottomView &v, const uint8_t *frame, int fw
         }
         return;
     }
+    if (v.kind == BottomView::kVideo) {
+        // The whole screen: no tabs to tap while the touch screen skips.
+        const int h = 112, y = (SecondScreen::kHeight - h) / 2, bx = 40, bw = kW - 2 * bx;
+        cv.fill(0, 0, kW, SecondScreen::kHeight, kBg);
+        cv.fill(0, y, kW, h, kBarBg);
+        cv.fill(0, y, kW, 1, kHint);
+        cv.fill(0, y + h - 1, kW, 1, kHint);
+        cv.centred(0, y + 14, kW, "CINEMATIC", kHint);
+        cv.centred(0, y + 30, kW, v.video_title.c_str(), kGold);
+        const uint32_t len = v.video_length_s, at = std::min(v.video_s, len);
+        cv.fill(bx, y + 52, bw, 6, kBg);
+        if (len)
+            cv.fill(bx, y + 52, (int)(bw * at / len), 6, kGold);
+        char time[32];
+        std::snprintf(time, sizeof time, "%u:%02u / %u:%02u", (unsigned)(at / 60), (unsigned)(at % 60),
+                      (unsigned)(len / 60), (unsigned)(len % 60));
+        cv.centred(0, y + 66, kW, time, kBarText);
+        cv.centred(0, y + 90, kW, "A, B, Start or a tap: skip", kHint);
+        return;
+    }
     draw_bar(cv, v);
     switch (v.kind) {
     case BottomView::kMap:
@@ -724,12 +865,66 @@ void draw_bottom(uint16_t *fb, const BottomView &v, const uint8_t *frame, int fw
     }
     case BottomView::kInfo:
         cv.fill(0, kBarH, kW, kAreaH, kBg);
-        for (size_t i = 0; i < v.lines.size() && (int)i < kAreaH / 8; i++)
-            cv.text(0, kBarH + 1 + (int)i * 8, v.lines[i].text.c_str(), v.lines[i].color);
+        if (v.checklist) {
+            // The profiler run's options: a box, its name, and under it what
+            // it writes and costs; greyed while the run is on.
+            cv.text(4, kBarH + 6, v.profiling ? "PROFILER RUN: on, until stopped" : "PROFILER RUN: tap what to measure",
+                    kGold);
+            for (int i = 0; i < kProfileOptionCount; i++) {
+                const ProfileOptionInfo &o = kProfileOptions[i];
+                const int y = SecondScreen::kProfRowY + i * SecondScreen::kProfRowH + 8;
+                const bool ticked = (v.profile & o.bit) != 0;
+                const uint16_t ink = v.profiling ? kHint : rgb(230, 220, 200);
+                cv.fill(8, y, 14, 14, ink);
+                cv.fill(10, y + 2, 10, 10, ticked ? (v.profiling ? kHint : kGold) : kBg);
+                cv.text(32, y + 3, o.label, ink);
+                cv.text(32, y + 15, o.note, kHint);
+            }
+            {
+                // How the traces are written: no box, a tap steps it on;
+                // never greyed, it changes during a run too.
+                const TraceWritesInfo &w = trace_writes_info(v.trace_writes);
+                const int y = SecondScreen::kProfRowY + kProfileOptionCount * SecondScreen::kProfRowH + 8;
+                cv.text(32, y + 3, w.label, w.mode == TraceWrites::Buffered ? rgb(230, 220, 200) : kGold);
+                cv.text(32, y + 15, w.note, kHint);
+            }
+        } else {
+            for (size_t i = 0; i < v.lines.size() && (int)i < (kAreaH - SecondScreen::kMapBtnH) / 8; i++)
+                cv.text(0, kBarH + 1 + (int)i * 8, v.lines[i].text.c_str(), v.lines[i].color);
+        }
+        if (v.checklist) {
+            draw_map_button(cv, SecondScreen::kReportBtnX, SecondScreen::kReportBtnW, "back to INFO");
+        } else if (v.report) {
+            const int x = SecondScreen::kReportBtnX, w = SecondScreen::kReportBtnW, y = SecondScreen::kMapBtnY;
+            cv.fill(x + 1, y + 1, w - 2, SecondScreen::kMapBtnH - 2, kGold);
+            cv.centred(x, y + 4, w, "report at the end", kBg);
+        } else {
+            draw_map_button(cv, SecondScreen::kReportBtnX, SecondScreen::kReportBtnW, "report a problem");
+        }
+        if (v.profiling) {
+            const int x = SecondScreen::kProfBtnX, w = SecondScreen::kProfBtnW, y = SecondScreen::kMapBtnY;
+            cv.fill(x + 1, y + 1, w - 2, SecondScreen::kMapBtnH - 2, kGold);
+            cv.centred(x, y + 4, w, v.checklist ? "stop the run" : "profiling", kBg);
+        } else {
+            draw_map_button(cv, SecondScreen::kProfBtnX, SecondScreen::kProfBtnW,
+                            !v.checklist ? "profiler run" : v.profile ? "start the run" : "nothing ticked");
+        }
         break;
     default:
         break;
     }
+}
+
+void draw_suspending(uint16_t *fb, const uint8_t *font)
+{
+    const Canvas cv{fb, font};
+    const int h = 64, y = (SecondScreen::kHeight - h) / 2;
+    cv.fill(0, 0, kW, SecondScreen::kHeight, kBg);
+    cv.fill(0, y, kW, h, kBarBg);
+    cv.fill(0, y, kW, 1, kHint);
+    cv.fill(0, y + h - 1, kW, 1, kHint);
+    cv.centred(0, y + 18, kW, "Suspending...", kGold);
+    cv.centred(0, y + 38, kW, "The HOME menu opens in a few seconds.", kBarText);
 }
 
 }  // namespace game

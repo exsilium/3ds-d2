@@ -3,7 +3,7 @@
 # inside the ctrtools image, started by `scripts/docker.sh package-cia
 # [--slim|--full <game-dir>]`. D2_CIA_MODE:
 #   sdcard  (default) the app alone, ~2 MB: it reads the game files from
-#           sdmc:/3ds/3ds-d2/game/ (copied there once). dist/cia/3ds-d2-<id>.cia
+#           sdmc:/3ds/3ds-d2/game/ (copied there once). dist/cia/3ds-d2-<version>-<id>.cia
 #   slim    with the user's Game.exe, d2data, d2exp, d2char, d2sfx and patch_d2
 #           in its RomFS; the cinematic, music and speech archives become empty
 #           MPQs (the game only checks that they exist). ~0.8 GB. ...-slim.cia
@@ -21,9 +21,7 @@
 # needs the SMDH's extendedbanner flag.
 set -eu
 cd /work
-# D2_CIA_PROF=1: the profiling build (built into build/cpu/ctr-prof).
-prof="${D2_CIA_PROF:-0}"
-if [ "$prof" = 1 ]; then elf=build/cpu/ctr-prof/3ds-d2-game-cia.elf; else elf=build/cpu/ctr/3ds-d2-game-cia.elf; fi
+elf=build/cpu/ctr/3ds-d2-game-cia.elf
 [ -f "$elf" ] || { echo "package-cia.sh: $elf missing" >&2; exit 1; }
 mode="${D2_CIA_MODE:-sdcard}"
 romfs=build/cia/romfs
@@ -50,10 +48,15 @@ slim|full)
     ;;
 *) echo "package-cia.sh: unknown mode $mode" >&2; exit 1 ;;
 esac
+# The TLS module for problem reports (src/tls/tls_module.h): loaded from the
+# RomFS only to send one, never kept in memory.
+tls="$(dirname "$elf")/tls.bin"
+[ -f "$tls" ] || { echo "package-cia.sh: $tls missing" >&2; exit 1; }
+cp "$tls" "$romfs/tls.bin"
 
 work=build/cia
 out=dist/cia
-version=0.3.2   # the title version FBI and the HOME menu show (major.minor.micro)
+version=0.4.0   # the title version FBI and the HOME menu show (major.minor.micro)
 mkdir -p "$out"
 python3 -I packaging/cia/make_art.py "$work"   # the drawn art, and a silent banner.wav
 smdh_flags=visible,allow3d,recordusage   # bannertool's default
@@ -77,8 +80,10 @@ bannertool makesmdh -s "3ds-d2" -l "Diablo II LoD 1.14d on the n3DS" -p "https:/
     -i "$work/icon.png" -o "$work/icon.icn" >/dev/null
 
 id="$(sh scripts/build-id.sh 2>/dev/null || echo unversioned)"
-case "$mode" in sdcard) cia="$out/3ds-d2-$id.cia" ;; *) cia="$out/3ds-d2-$id-$mode.cia" ;; esac
-[ "$prof" = 1 ] && cia="${cia%.cia}-prof.cia"
+# The name says the version reports carry: "0.4.0-dev" unless built from the
+# release tag (docker.sh passes scripts/version.sh's; issue #61).
+name="3ds-d2-${D2_VERSION:-$version-dev}-$id"
+case "$mode" in sdcard) cia="$out/$name.cia" ;; *) cia="$out/$name-$mode.cia" ;; esac
 size="$(du -shL "$romfs" | cut -f1)"
 echo "packing $cia ($mode, RomFS $size)..."
 IFS=. read -r v_major v_minor v_micro <<EOF_VERSION
@@ -98,10 +103,9 @@ echo "hashes verified (content, exheader, logo)"
 cp "$elf" "${cia%.cia}.elf"   # the exact code of this CIA: decodes its crash dumps (tools/luma_dump.py)
 {
     echo "cia: $(basename "$cia")"
-    echo "version: $version"
+    echo "version: ${D2_VERSION:-$version-dev} (title version $version)"
     echo "mode: $mode"
     echo "art: $art (SMDH flags $smdh_flags)"
-    [ "$prof" = 1 ] && echo "build: profiling (PROF_COUNTERS)"
     echo "size: $(stat -c %s "$cia")"
     echo "sha256: $(sha256sum "$cia" | cut -d' ' -f1)"
     if [ "$mode" != sdcard ]; then

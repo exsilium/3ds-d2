@@ -1,0 +1,155 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Sat, 31 Oct 2026 18:28:50 +0000
+Subject: [PATCH] sync: a lock-free intrinsic in front of an in-line shim; a
+ 64-line section cache
+
+set_intrinsic_nogil keeps an in-line shim's tag (bit 0): a declined call
+then takes the Bridge in line, as before the lock-free intrinsic was armed,
+instead of leaving the dynarec loop. Room for 8 such intrinsics (4: the
+two clock reads and the two lock calls fill it).
+
+wx86_crit_for / wx86_crit_lookup: a direct-mapped cache of 64 lines in
+front of the map, in place of the single-entry MRU, which code alternating
+between two sections (a table's lock and an entry's) missed on every call.
+---
+ src/runtime/cpu.h          |  4 +++-
+ src/runtime/cpu_box86.cpp  | 16 +++++++++++-----
+ src/runtime/guest_sync.cpp | 24 +++++++++++++++++-------
+ src/runtime/guest_sync.h   |  7 ++++---
+ 4 files changed, 35 insertions(+), 16 deletions(-)
+
+diff --git a/src/runtime/cpu.h b/src/runtime/cpu.h
+index d779377..a77b4cd 100644
+--- a/src/runtime/cpu.h
++++ b/src/runtime/cpu.h
+@@ -286,7 +286,9 @@ struct Cpu {
+     // pop = bytes of arguments to pop, returns true; the backend then sets
+     // EAX/ESP/EIP) or DECLINES WITHOUT ANY SIDE EFFECT (returns false), in
+     // which case the call continues exactly as before: GIL, then the regular
+-    // intrinsic (set_intrinsic) or the Bridge. Only reached from the in-line
++    // intrinsic (set_intrinsic) or the Bridge — in line, without leaving the
++    // dynarec loop, when the slot was made an in-line shim (set_inline_shim)
++    // before this call. Only reached from the in-line
+     // path: a trap that reaches run()'s dispatch (D2_INTRINLINE=0, slot
+     // translated before arming) keeps the GIL path. Returns false when the
+     // backend cannot arm it (no in-line path), so the caller can say so.
+diff --git a/src/runtime/cpu_box86.cpp b/src/runtime/cpu_box86.cpp
+index 0aa76d3..c96dead 100644
+--- a/src/runtime/cpu_box86.cpp
++++ b/src/runtime/cpu_box86.cpp
+@@ -1177,8 +1177,10 @@ public:
+     void set_inline_shim(uint32_t va) override { inline_stub(va, 1u); }
+     void set_cur_guest_thread(void* t) override { E().dyn86_guest_thread = t; }
+     // D2_FASTSYNC (cpu.h): tag bit 1 on the in-line stub = "try the lock-free
+-    // intrinsic before the GIL". The slot must already be a regular intrinsic
+-    // (set_intrinsic): a decline falls through to it, under the GIL.
++    // intrinsic before the GIL". A decline falls through to the slot's
++    // regular intrinsic (set_intrinsic), under the GIL, or, on a slot already
++    // made an in-line shim (set_inline_shim, tag bit 0, kept), to the Bridge
++    // without leaving the dynarec loop.
+     bool set_intrinsic_nogil(uint32_t va, IntrinNoGilFn fn) override {
+         if (!va || !fn || !dyn86_intrinline || !trap_mapped_ || va < trap_lo_ || va >= trap_hi_) return false;
+         if (getDB(va)) return false;                 // already translated: the stub can no longer be rewritten
+@@ -1186,7 +1188,11 @@ public:
+         for (; i < nogil_n_; ++i) if (nogil_va_[i] == va) break;
+         if (i == nogil_n_) { if (nogil_n_ >= kNoGilMax) return false; ++nogil_n_; }
+         nogil_va_[i] = va; nogil_fn_[i] = fn;
+-        inline_stub(va, 2u);
++        const uint8_t* b = (const uint8_t*)H(va);
++        const uint32_t w = (uint32_t)(uintptr_t)&dyn86_intrin_wrap;
++        uint32_t tag = 0;
++        if (b[0] == 0xCC && b[1] == 'S' && b[2] == 'C' && std::memcmp(b + 3, &w, 4) == 0) std::memcpy(&tag, b + 7, 4);
++        inline_stub(va, 2u | (tag & 1u));
+         return true;
+     }
+     // Called by dyn86_intrin_wrap from translated code, on the guest thread,
+@@ -1202,7 +1208,7 @@ public:
+             // no side effect: drop the tag and take the regular path below.
+             slot &= ~(uintptr_t)2u;
+             if (self && !self->no_intrinsics_) {
+-                const uint32_t va = (uint32_t)slot;
++                const uint32_t va = (uint32_t)slot & ~1u;   // bit 0: an in-line shim's, for a decline
+                 for (uint32_t i = 0; i < self->nogil_n_; ++i) {
+                     if (self->nogil_va_[i] != va) continue;
+                     const uint32_t esp = emu->regs[R_ESP].dword[0];
+@@ -1776,7 +1782,7 @@ private:
+     // D2_FASTSYNC: lock-free intrinsics tried before the GIL (in-line path
+     // only, see set_intrinsic_nogil). Written once at install, before any
+     // guest thread runs; read-only afterwards.
+-    static constexpr uint32_t kNoGilMax = 4;
++    static constexpr uint32_t kNoGilMax = 8;
+     uint32_t      nogil_n_ = 0;
+     uint32_t      nogil_va_[kNoGilMax] = {};
+     IntrinNoGilFn nogil_fn_[kNoGilMax] = {};
+diff --git a/src/runtime/guest_sync.cpp b/src/runtime/guest_sync.cpp
+index 3030954..a3f8b82 100644
+--- a/src/runtime/guest_sync.cpp
++++ b/src/runtime/guest_sync.cpp
+@@ -28,23 +28,32 @@ uint32_t wx86_handle_next_id(){ return g_nextObj++; }
+ 
+ // ---- Critical sections --------------------------------------------------------
+ static std::map<uint32_t,WxCrit*> g_crits;
+-static uint32_t g_csLastVa = 0;
+-static WxCrit*  g_csLastK  = nullptr;
++// Direct-mapped cache in front of g_crits (guest_sync.h). A line is the
++// section's address times a Fibonacci constant, top 6 bits: sections are
++// 24 bytes and up, often in arrays, and the multiply spreads those strides.
++// Same threading as the map: one guest thread at a time (cooperative), or
++// under the GIL.
++static constexpr uint32_t kCsLines = 64;
++static uint32_t g_csVa[kCsLines];
++static WxCrit*  g_csK[kCsLines];
++static inline uint32_t cs_line(uint32_t cs){ return (cs * 0x9E3779B1u) >> 26; }
+ 
+ WxCrit* wx86_crit_for(uint32_t cs){
+-    if(cs==g_csLastVa && g_csLastK) return g_csLastK;
++    const uint32_t l = cs_line(cs);
++    if(g_csVa[l]==cs && g_csK[l]) return g_csK[l];
+     auto it = g_crits.find(cs);
+     WxCrit* k;
+     if(it!=g_crits.end()) k = it->second;
+     else { k = new WxCrit(); k->va = cs; g_crits[cs] = k; }
+-    g_csLastVa = cs; g_csLastK = k;
++    g_csVa[l] = cs; g_csK[l] = k;
+     return k;
+ }
+ WxCrit* wx86_crit_lookup(uint32_t cs){
+-    if(cs==g_csLastVa && g_csLastK) return g_csLastK;
++    const uint32_t l = cs_line(cs);
++    if(g_csVa[l]==cs && g_csK[l]) return g_csK[l];
+     auto it = g_crits.find(cs);
+     if(it==g_crits.end()) return nullptr;
+-    g_csLastVa = cs; g_csLastK = it->second;
++    g_csVa[l] = cs; g_csK[l] = it->second;
+     return it->second;
+ }
+ 
+@@ -72,7 +81,8 @@ void wx86_crit_each_held(void (*fn)(uint32_t,uint32_t,int,void*), void* ud){
+ 
+ void wx86_crit_forget(uint32_t cs){
+     g_crits.erase(cs);
+-    if(g_csLastVa==cs){ g_csLastVa = 0; g_csLastK = nullptr; }   // invalidate MRU cache
++    const uint32_t l = cs_line(cs);
++    if(g_csVa[l]==cs){ g_csVa[l] = 0; g_csK[l] = nullptr; }   // invalidate its cache line
+ }
+ 
+ // ---- Observer ------------------------------------------------------------
+diff --git a/src/runtime/guest_sync.h b/src/runtime/guest_sync.h
+index 2c9b625..028361f 100644
+--- a/src/runtime/guest_sync.h
++++ b/src/runtime/guest_sync.h
+@@ -156,9 +156,10 @@ unsigned          wx86_handle_count();
+ uint32_t          wx86_handle_next_id();
+ 
+ // ---- Critical sections --------------------------------------------------------
+-// Single-entry MRU cache: critical-section access is highly repetitive (the
+-// same section taken and released back-to-back), so this skips the map
+-// lookup in the common case.
++// A direct-mapped cache (64 lines, by address) in front of the map:
++// critical-section access is highly repetitive, but code often alternates
++// between a few sections (a table's lock and an entry's), which a
++// single-entry MRU misses on every call.
+ WxCrit* wx86_crit_for(uint32_t cs_va);      // creates if absent
+ WxCrit* wx86_crit_lookup(uint32_t cs_va);   // does not create; nullptr if unknown
+ void    wx86_crit_forget(uint32_t cs_va);

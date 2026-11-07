@@ -35,6 +35,10 @@ struct Frame {
     // The height the picture is meant to have at its width: twice `height`
     // for a video stored at half height. Gives its aspect ratio.
     uint32_t display_height = 0;
+    // A cinematic's file name as the game asked for it, and where this frame
+    // is in it (ms from its start, and its length).
+    const char *video_name = nullptr;
+    uint32_t video_ms = 0, video_length_ms = 0;
 };
 
 // A cinematic's soundtrack, played by the platform beside the game's own
@@ -93,6 +97,8 @@ struct RunOptions {
     uint32_t trap_report = 0;                      // at exit, print the N most-called imports (stdout)
     uint32_t heartbeat_ms = 0;                     // log progress counters every N ms of guest time
     std::function<void()> heartbeat;               // after each heartbeat's line: the app's own counters
+    std::function<void(const char *)> video_event; // a cinematic "open" or "close" (the app logs its memory)
+    bool profile = false;                          // the guest code profile from the start (set_profiling)
     // Registry DWORDs seeded under the game's settings key when absent (the
     // game's own Options menu still changes and saves them): the 3DS app picks
     // cheaper video settings than a PC's defaults.
@@ -142,9 +148,23 @@ struct Stats {
     uint64_t bytes_read = 0;
     uint32_t dib_sections = 0;
     uint32_t frames = 0;         // blits of a DIB section to the window
+    int frame_thread = -1;       // the guest thread that blitted the last one
     uint32_t alloc_failures = 0; // guest heap or VirtualAlloc requests refused
 };
 Stats &stats();
+// Where the thread presenting frames has spent its time since the start (ms),
+// as the heartbeat's "prof frame thread" line splits it: running, ready
+// while another guest thread runs, waiting on host work on its core (the
+// scheduler between slices, the heartbeat, the app's service), and blocked
+// on a guest object (a Sleep left out). The scheduler's thread.
+struct FrameThreadTimes {
+    uint64_t run_ms = 0, ready_ms = 0, host_ms = 0, blocked_ms = 0;
+};
+FrameThreadTimes frame_thread_times();
+// How long the last heartbeat took (us): the runtime's lines and
+// RunOptions::heartbeat, on the guest's core, so the frame after it waited
+// as long. The scheduler's thread.
+uint64_t last_heartbeat_us();
 
 // The read cache of game files (rt_shims_files.cpp): cumulative counters,
 // reported per interval with the heartbeat.
@@ -157,6 +177,14 @@ struct FileStats {
     uint64_t disk_reads = 0, disk_bytes = 0, disk_us = 0;   // file system reads by the cache
     uint64_t cache_bytes = 0; // block memory held now (freed with its handle)
     uint64_t async = 0;       // reads handed to the I/O worker, the guest thread waiting
+    // Time the game waited on the file system (issue #31): a guest thread
+    // waiting on the I/O worker as a guest wait, the other threads running
+    // (from the read's submission to the waiter waking; wait_frame_us those
+    // of the thread presenting frames, whose frames stop meanwhile); and
+    // reads ReadFile completed before returning, every guest thread stopped
+    // (an OVERLAPPED read, a full request pool, or synchronous reads).
+    uint64_t waits = 0, wait_us = 0, wait_frame_us = 0;
+    uint64_t stall_us = 0;
 };
 const FileStats &file_stats();
 // The asynchronous reads' worker (RunOptions::io_start): started and stopped
@@ -164,10 +192,30 @@ const FileStats &file_stats();
 void start_async_io();
 void stop_async_io();
 
-// Time-based profile sampling (PROF_COUNTERS builds; a no-op otherwise): a
-// host timer thread calls this at a fixed period, on another core. It ends
-// the running guest thread's slice at its next translated block, and the
-// scheduler samples where it stopped. Safe from any thread, at any time.
+// The game's reads of read-only game files, one line each, for replaying the
+// read cache's policy offline (issue #21): "file <fd> <size> <path>" the
+// first time a file is read in this trace, then "read <ms> <fd> <pos> <n>"
+// per ReadFile, cached or not, synchronous or not. nullptr stops it; the
+// caller closes the file after that. The game's thread (the heartbeat).
+// RT_FILETRACE=1 traces to stderr from the start.
+void set_file_trace(FILE *f);
+// Each record written out to the file as it is made (fflush per read), for
+// a crash to lose nothing (issue #66); off, the file's buffer decides. The
+// game's thread.
+void set_file_trace_each(bool on);
+
+// The guest code profile (PROF_COUNTERS builds: prof.h): time in translated
+// code and in each shim, per guest thread, and EIP samples, logged with every
+// heartbeat ("prof: run", "prof shims", "prof thread", "prof eip", "prof tail"). Off, it
+// costs a branch per shim call and per slice. Starts as RunOptions::profile
+// says. Returns false, changing nothing, in a build without the counters.
+// The game's thread (the heartbeat).
+bool set_profiling(bool on);
+
+// Time-based profile sampling: while profiling, a host timer thread calls
+// this at a fixed period, on another core. It ends the running guest
+// thread's slice at its next translated block, and the scheduler samples
+// where it stopped. Safe from any thread, at any time.
 void profile_tick();
 
 // Guest memory use, for on-screen diagnostics (walks the allocators: call it
@@ -181,7 +229,8 @@ struct MemoryReport {
     // RunOptions::pool_spare: bytes in use in it, and requests it has served.
     uint32_t spare_used, spare_takes;
     // Host memory of the CPU backend (0 when the build does not count it):
-    uint32_t jit_code_kb;    // translated ARM code
+    uint32_t jit_code_kb;    // translated ARM code: the 2 MiB chunks opened for it
+    uint32_t jit_used_kb;    // of those, what the translated blocks hold now
     uint32_t jit_meta_kb;    // block descriptors and the rest of its own allocator
     uint32_t jmptbl_kb;      // jump tables: 256 KiB per 64 KiB of guest code that ever ran
 };
@@ -248,6 +297,12 @@ uint32_t write_cstr(d2rt::Cpu &c, uint32_t va, uint32_t cap, const std::string &
 
 // The VirtualAlloc region (file mapping views come from it too).
 wx86::GuestRegion &va_region();
+// A block of it for native code, as VirtualAlloc would give the guest one
+// (not zeroed), owned by `owner` in the "VirtualAlloc by caller" lines; 0
+// when the pool has no free piece that large (tried only when it has one,
+// so no "va full" is logged or counted for it). And its return.
+uint32_t va_alloc(uint32_t bytes, uint32_t owner);
+void va_free(uint32_t va);
 
 // Guest paths (rt_shims_files.cpp). A guest path ("C:\\Data\\x.mpq",
 // "data\\x.mpq", "/x") becomes a host path under write_root or data_root.
@@ -280,6 +335,18 @@ bool hook_function(d2rt::Cpu &c, uint32_t va, const uint8_t *expect, uint32_t n,
 uint32_t native_entry(const char *name, uint32_t stack_args, std::function<uint32_t(d2rt::Cpu &)> fn);
 
 void install_kernel32(d2rt::Bridge &br);
+// The lock calls (EnterCriticalSection, LeaveCriticalSection) since the
+// start, from rt_shims_kernel32.cpp: served lock-free in line, through the
+// shim, and the Enters among those that waited. The profiler's windows log
+// them (issue #48), the callers by return address while profiling
+// (count_lock_site, rt_host.cpp).
+struct LockCalls { uint32_t in_line = 0, shim = 0, waits = 0; };
+LockCalls lock_calls();
+void count_lock_site(uint32_t ret);
+// Serves the lock calls that neither wait nor wake anyone lock-free, in
+// front of their in-line shims: armed after set_inline_shim, before the
+// game runs. False if the backend has no lock-free path.
+bool install_lock_fast_path(d2rt::Cpu &cpu, d2rt::Bridge &br);
 void install_advapi32(d2rt::Bridge &br);
 void install_misc(d2rt::Bridge &br);
 void install_net(d2rt::Bridge &br);

@@ -511,6 +511,7 @@ struct RtFile : Waitable {
     // Closed by suspend_files: fp's position to come back to.
     bool suspended = false;
     long fp_pos = 0;
+    uint32_t traced = 0;             // the file trace (set_file_trace) that named it
     RtFile() { g_files.push_back(this); }
     ~RtFile() override
     {
@@ -544,10 +545,21 @@ struct IoRequest : Waitable {
     uint8_t *dst = nullptr;
     uint32_t n = 0;
     std::atomic<int> state{0};   // 0 free, 1 queued, 2 done; the waiter's acquire frees it
+    uint64_t wait_from_us = 0;   // a guest wait on it: when the read was queued (0: not one)
+    int waiter = -1;             // and the waiting thread
     bool try_acquire(GuestThread *) override
     {
         int done = 2;
-        return state.compare_exchange_strong(done, 0, std::memory_order_acq_rel);
+        if (!state.compare_exchange_strong(done, 0, std::memory_order_acq_rel))
+            return false;
+        if (wait_from_us) {
+            const uint64_t us = wx86_now_us() - wait_from_us;
+            g_file_stats.waits++;
+            g_file_stats.wait_us += us;
+            if (waiter == stats().frame_thread)
+                g_file_stats.wait_frame_us += us;            wait_from_us = 0;
+        }
+        return true;
     }
     bool ready(GuestThread *) override { return state.load(std::memory_order_acquire) == 2; }
     uint32_t result() const override { return 1; }   // ReadFile's TRUE
@@ -740,14 +752,27 @@ size_t stream_write(Cpu &c, FILE *fp, uint32_t va, uint32_t n)
     return std::fwrite(tmp.data(), 1, n, fp);
 }
 
+// The file trace (set_file_trace): where it goes, and which trace this is,
+// so each file is named once in it. RT_FILETRACE=1: stderr from the start.
+FILE *g_ftrace = std::getenv("RT_FILETRACE") ? stderr : nullptr;
+uint32_t g_ftrace_gen = 1;
+bool g_ftrace_each = false;   // set_file_trace_each
+
+void trace_read(RtFile &f, uint32_t n)
+{
+    if (f.traced != g_ftrace_gen) {
+        f.traced = g_ftrace_gen;
+        std::fprintf(g_ftrace, "file %d %llu %s\n", f.fd, (unsigned long long)f.size, f.host.c_str());
+    }
+    std::fprintf(g_ftrace, "read %llu %d %llu %u\n", (unsigned long long)(wx86_now_us() / 1000), f.fd,
+                 (unsigned long long)f.pos, n);
+    if (g_ftrace_each)
+        std::fflush(g_ftrace);
+}
+
 // ReadFile on a cached file: from its position, into guest memory.
 uint32_t cached_read(Cpu &c, RtFile &f, uint32_t va, uint32_t n)
 {
-    // RT_FILETRACE=1: every read on stderr ("ftrace <fd> <pos> <n>"), for
-    // sizing the cache against the game's real access pattern.
-    static const bool trace = std::getenv("RT_FILETRACE") != nullptr;
-    if (trace)
-        std::fprintf(stderr, "ftrace %d %llu %u\n", f.fd, (unsigned long long)f.pos, n);
     if (!n)
         return 0;
     uint32_t got;
@@ -1150,6 +1175,14 @@ uint32_t module_file_name(Cpu &c, uint32_t module, uint32_t buf, uint32_t size)
 
 const FileStats &file_stats() { return g_file_stats; }
 
+void set_file_trace(FILE *f)
+{
+    g_ftrace = f;
+    g_ftrace_gen++;   // a new trace names its files again
+}
+
+void set_file_trace_each(bool on) { g_ftrace_each = on; }
+
 void start_async_io()
 {
     g_io_quit = false;
@@ -1226,6 +1259,8 @@ void install_files(Bridge &br)
             // and the new position are known at once.
             if (ov)   // OVERLAPPED: the offset is in the structure; completes synchronously
                 f->pos = c.read_u32(ov + 8);
+            if (g_ftrace)
+                trace_read(*f, n);
             std::vector<uint8_t> tmp;
             uint8_t *dst = static_cast<uint8_t *>(c.hostptr(buf, n));
             if (!dst) {
@@ -1234,10 +1269,15 @@ void install_files(Bridge &br)
             }
             if (!f->cache->try_read(f->pos, dst, n, got)) {
                 got = f->pos < f->size ? (uint32_t)std::min<uint64_t>(n, f->size - f->pos) : 0;
+                const uint64_t t0 = wx86_now_us();
                 IoRequest *r;
                 while (!(r = io_submit(f->cache.get(), f->pos, dst, n)))
                     io_pause();   // every request in flight
                 if (!ov && tmp.empty()) {
+                    const uint64_t t1 = wx86_now_us();
+                    g_file_stats.stall_us += t1 - t0;
+                    r->waiter = wx86_sched()->current_id();
+                    r->wait_from_us = t1;
                     f->pos += got;
                     stats().bytes_read += got;
                     g_file_stats.async++;
@@ -1248,6 +1288,7 @@ void install_files(Bridge &br)
                 while (r->state.load(std::memory_order_acquire) != 2)
                     io_pause();
                 r->state.store(0, std::memory_order_release);   // free the request
+                g_file_stats.stall_us += wx86_now_us() - t0;
             }
             if (!tmp.empty() && got)
                 c.write(buf, tmp.data(), got);
@@ -1255,7 +1296,11 @@ void install_files(Bridge &br)
         } else if (f->cache) {
             if (ov)   // OVERLAPPED: the offset is in the structure; completes synchronously
                 f->pos = c.read_u32(ov + 8);
+            if (g_ftrace)
+                trace_read(*f, n);
+            const uint64_t disk_us = g_file_stats.disk_us;
             got = cached_read(c, *f, buf, n);
+            g_file_stats.stall_us += g_file_stats.disk_us - disk_us;   // synchronous: the disk time is the stall
         } else {
             if (ov)
                 std::fseek(f->fp, (long)c.read_u32(ov + 8), SEEK_SET);

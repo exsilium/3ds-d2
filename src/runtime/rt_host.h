@@ -165,6 +165,10 @@ FrameThreadTimes frame_thread_times();
 // RunOptions::heartbeat, on the guest's core, so the frame after it waited
 // as long. The scheduler's thread.
 uint64_t last_heartbeat_us();
+// Logs the guest pool's free pieces, the blocks in its spare and the
+// VirtualAlloc owners (issue #70). The heartbeat calls it when a request
+// has been served from the spare; `why` names the caller in the line.
+void log_pool_pieces(const char *why);
 
 // The read cache of game files (rt_shims_files.cpp): cumulative counters,
 // reported per interval with the heartbeat.

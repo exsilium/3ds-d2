@@ -1858,6 +1858,7 @@ int main()
     opt.cpuid_edx = rt::kCpuidNoSimd;
     opt.total_phys_mb = 64;   // the game's own 24 MiB sprite-cache floor
     opt.pool_spare = game::kCtrPoolSpare;
+    opt.pool_large = game::kCtrPoolLarge;
     // Cheaper video defaults than a PC's (the game's Options menu still
     // changes them): 640x480 in game (36% fewer pixels to draw, and exactly
     // 2:1 down to the 240-line screen), low lighting, no blended shadows, no

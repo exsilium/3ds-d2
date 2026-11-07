@@ -158,6 +158,11 @@ uint32_t g_pool_size = 0;   // 0: separate ranges
 // and the takes from it the heartbeat has logged.
 wx86::GuestRegion g_spare;
 uint32_t g_spare_size = 0, g_spare_logged = 0;
+// RunOptions::pool_large: a block of the VirtualAlloc face, carved up by
+// va_alloc for its large blocks only.
+wx86::GuestRegion g_large;
+uint32_t g_large_base = 0, g_large_size = 0, g_large_takes = 0, g_large_missed = 0;
+bool in_large(uint32_t va) { return g_large_size && va - g_large_base < g_large_size; }
 
 // VirtualAlloc blocks by the guest code that allocated them (the return
 // address of its VirtualAlloc call), so an allocation failure can say who
@@ -208,6 +213,18 @@ void log_va_owners()
         line += item;
     }
     logf("%s", line.c_str());
+}
+
+// What the large-block zone holds (RunOptions::pool_large), by size.
+void log_large_zone()
+{
+    if (!g_large_size)
+        return;
+    std::string blocks;
+    for (const auto &u : g_large.used_map())
+        blocks += " " + std::to_string(u.second >> 10);
+    logf("pool large zone: %u of %u KiB in use [%s ], largest free %u KiB, %u blocks served, %u not", g_large.cur() >> 10,
+         g_large_size >> 10, blocks.c_str(), g_large.largest_free() >> 10, g_large_takes, g_large_missed);
 }
 
 // The pool's free space in pieces, and what sits in its spare (issue #70):
@@ -261,6 +278,7 @@ void pool_pieces(const char *why)
          "KiB), 256 KiB-1 MiB %u (%u KiB), 1 MiB and more %u (%u KiB); %u gaps under 1 KiB (%u B)",
          why, total >> 10, pieces, line.c_str(), n_by[0], kib_by[0], n_by[1], kib_by[1], n_by[2], kib_by[2], n_by[3],
          kib_by[3], slack_n, slack);
+    log_large_zone();
     if (!g_spare_size)
         return;
     // The blocks in the spare: each face's, by size; VirtualAlloc's with
@@ -338,6 +356,19 @@ uint32_t va_alloc(uint32_t bytes, uint32_t owner)
     // it room in the piece. It asked for 64 KiB to spare before, and turned
     // down two requests of 247 and 253 KiB with a 256 KiB piece free
     // (3DS-D2-13); the game's pool system then took that piece for them.
+    // A large block from the zone kept for them, if it has room; else from
+    // the pool as any other.
+    if (g_large_size && bytes > g_opt.pool_large_min) {
+        // The owners map holds the zone as one block of its own (the first
+        // block in it has the zone's address): its blocks are not recorded.
+        if (const uint32_t a = g_large.alloc(bytes)) {
+            g_large_takes++;
+            return a;
+        }
+        if (g_large_missed++ < 8)
+            logf("pool large zone: %u KiB does not fit (%u of %u KiB in use), from the pool", (bytes + 1023) >> 10,
+                 g_large.cur() >> 10, g_large_size >> 10);
+    }
     if (!va_fits(bytes))
         return 0;
     va_owner_sync();   // the last VirtualAlloc's block takes its own owner first
@@ -348,6 +379,10 @@ uint32_t va_alloc(uint32_t bytes, uint32_t owner)
 }
 void va_free(uint32_t va)
 {
+    if (in_large(va)) {
+        g_large.free(va);
+        return;
+    }
     g_va_owner.erase(va);
     g_va.free(va);
 }
@@ -526,9 +561,13 @@ MemoryReport memory_report()
     const Layout &L = layout();
     const uint32_t heap = g_heap.used_bytes(), va = g_va.used_bytes();
     // The pool's own count holds the spare whole, and not the blocks in it.
+    // The large-block zone is one VirtualAlloc block to the pool, so its
+    // free bytes are not in `free`: the governor keeps its reserve in the
+    // rest of the pool, as before the zone.
+    const uint32_t large_used = g_large_size ? g_large.used_bytes() : 0;
     const uint32_t free = g_pool_size ? g_pool_size - g_pool.used_bytes() : L.heap_size + L.va_size - heap - va;
     return {heap, g_heap.peak(), L.heap_size, va, g_va.peak(), L.va_size, free, g_va.largest_free(),
-            g_spare_size ? g_spare.used_bytes() : 0, g_spare_size ? g_pool.spare_takes() : 0,
+            g_spare_size ? g_spare.used_bytes() : 0, g_spare_size ? g_pool.spare_takes() : 0, large_used, g_large_size,
             (uint32_t)d2rt_box86_dynarec_kb(), (uint32_t)d2rt_box86_dynarec_used_kb(),
             (uint32_t)d2rt_box86_custommalloc_kb(), (uint32_t)d2rt_box86_jmptbl_kb()};
 }
@@ -927,6 +966,11 @@ void check_time_limit(uint64_t ms)
                  g_spare.cur() >> 10, g_spare_size >> 10, g_pool.largest_free() >> 10);
             pool_pieces("spare taken");
         }
+        static uint32_t large_logged = 0;
+        if (g_large_size && g_large_takes != large_logged) {
+            large_logged = g_large_takes;
+            log_large_zone();
+        }
         if (g_opt.heartbeat)
             g_opt.heartbeat();
         g_heartbeat_us = wx86_now_us() - beat_t0;
@@ -1197,6 +1241,19 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
             if (g_pool.set_spare(g_spare, g_opt.pool_spare, 0x10000))
                 g_spare_size = g_spare.largest_free();   // all of it, still unused
             logf("pool spare: %u KiB%s", g_opt.pool_spare >> 10, g_spare_size ? "" : " does not fit, none");
+        }
+        g_large_size = g_large_base = g_large_takes = g_large_missed = 0;
+        if (g_opt.pool_large) {
+            const uint32_t bytes = (g_opt.pool_large + 0xffff) & ~0xffffu;
+            if (const uint32_t a = g_va.alloc(bytes)) {
+                g_large = wx86::GuestRegion();
+                g_large.init(a, bytes, 0x10000, "large");
+                g_large_base = a;
+                g_large_size = bytes;
+                g_va_owner[a] = 0x1a26e;   // "VirtualAlloc by caller": the zone itself
+            }
+            logf("pool large zone: %u KiB for blocks over %u KiB%s", bytes >> 10, g_opt.pool_large_min >> 10,
+                 g_large_size ? "" : ": does not fit, none");
         }
     } else {
         g_heap.init(L.heap_base, L.heap_size, 16, "heap");

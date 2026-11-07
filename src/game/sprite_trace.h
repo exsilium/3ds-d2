@@ -48,7 +48,9 @@
 #ifndef D2_GAME_SPRITE_TRACE_H
 #define D2_GAME_SPRITE_TRACE_H
 
+#include <cstddef>
 #include <cstdint>
+#include <cstdio>
 
 namespace d2rt { struct Cpu; }
 
@@ -66,6 +68,12 @@ bool install_sprite_trace(d2rt::Cpu &c);
 // appended to after a stop (one trace per run, on one clock). False if the
 // stubs are not installed, or the file or its buffers could not be had.
 bool sprite_trace_start(const char *path);
+// The platform's stream in front of the trace's file (the console's SD card
+// writer, issue #71): given the file and the trace's 64 KiB buffer, returns
+// the stream to write to, or null for stdio's buffer as before. Set before
+// a start.
+using SpriteTraceWrap = FILE *(*)(FILE *file, char *buffer, size_t bytes);
+void sprite_trace_set_wrap(SpriteTraceWrap wrap);
 void sprite_trace_stop();
 bool sprite_trace_on();
 // What the trace holds, written out now (issue #66: the platform's "every

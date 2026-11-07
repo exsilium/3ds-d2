@@ -76,6 +76,7 @@ Seen *g_seen = nullptr;
 uint64_t g_start_ms = 0;
 bool g_started = false;   // the file has its header: later starts append
 uint32_t g_lost = 0;
+SpriteTraceWrap g_wrap = nullptr;   // sprite_trace_set_wrap
 bool g_each = false;      // sprite_trace_each: every record written out at once
 
 void put_rel32(uint8_t *at, uint32_t insn_end, uint32_t target)
@@ -242,7 +243,10 @@ bool sprite_trace_start(const char *path)
         g_seen = nullptr;
         return false;
     }
-    std::setvbuf(g_file, g_buffer, _IOFBF, kFileBuffer);
+    if (FILE *w = g_wrap ? g_wrap(g_file, g_buffer, kFileBuffer) : nullptr)
+        g_file = w;   // its own buffer: g_buffer, freed after the stream is closed
+    else
+        std::setvbuf(g_file, g_buffer, _IOFBF, kFileBuffer);
     g_lost = 0;
     if (!again) {
         g_started = true;
@@ -281,6 +285,8 @@ void sprite_trace_flush()
 }
 
 void sprite_trace_each(bool on) { g_each = on; }
+
+void sprite_trace_set_wrap(SpriteTraceWrap wrap) { g_wrap = wrap; }
 
 void sprite_trace_beat(const SpriteTraceBeat &b)
 {

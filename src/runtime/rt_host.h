@@ -165,6 +165,9 @@ FrameThreadTimes frame_thread_times();
 // RunOptions::heartbeat, on the guest's core, so the frame after it waited
 // as long. The scheduler's thread.
 uint64_t last_heartbeat_us();
+// Of that, the guest code profile's and the other profile lines (us;
+// issue #71). 0 while the profiler is off.
+uint64_t last_prof_report_us();
 // Logs the guest pool's free pieces, the blocks in its spare and the
 // VirtualAlloc owners (issue #70). The heartbeat calls it when a request
 // has been served from the spare; `why` names the caller in the line.

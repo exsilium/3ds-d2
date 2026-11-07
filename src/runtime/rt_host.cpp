@@ -579,6 +579,7 @@ int g_slice_tid = -1;          // the guest thread whose slice runs, -1 between 
 bool g_slice_sink = false;     // the scheduler reports its slices
 bool g_host_work = false;      // the heartbeat or the app's service runs
 uint64_t g_heartbeat_us = 0;   // the last heartbeat's length
+uint64_t g_prof_report_us = 0;   // of which the profile's lines (issue #71)
 // Its blocked time by where it waits from (the guest code it resumes in),
 // for the heartbeat's few largest.
 uint32_t g_frame_where = 0;
@@ -885,6 +886,7 @@ void check_time_limit(uint64_t ms)
         host_work(true);
         const uint64_t beat_t0 = wx86_now_us();
         prof_report(ms);
+        g_prof_report_us = wx86_now_us() - beat_t0;
 #ifdef __GLIBC__
         const size_t host_used = mallinfo2().uordblks;
 #else
@@ -977,6 +979,7 @@ FrameThreadTimes frame_thread_times()
 }
 
 uint64_t last_heartbeat_us() { return g_heartbeat_us; }
+uint64_t last_prof_report_us() { return g_prof_report_us; }
 void log_pool_pieces(const char *why) { pool_pieces(why); }
 
 void count_lock_site(uint32_t ret) { g_lock_sites.count(ret); }

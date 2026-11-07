@@ -1845,6 +1845,7 @@ int main()
         // A request served from the spare had no other piece of the pool
         // left: the cache goes down to its minimum, once per new take. What
         // stays in the spare after it does not hold the cache there.
+        const uint64_t t0 = rt::now_us();
         const rt::MemoryReport m = rt::memory_report();
         static uint32_t spare_takes_seen = 0;
         const bool spare_taken = m.spare_takes != spare_takes_seen;
@@ -1854,6 +1855,7 @@ int main()
         const game::SpriteCacheWindow w = game::sprite_cache_window(*g_guest_cpu);
         game::govern_sprite_cache(*g_guest_cpu, m.free, spare_taken, w.evicted, game::kCtrPoolReserve,
                                   game::kCtrSpriteCacheMin);
+        const uint64_t t1 = rt::now_us();
         g_sprite_window = w;
         hitch_heartbeat(w);   // before the sprite cache line, the window's last (tools/session_report.py)
         const game::SpriteCacheStats sc = game::sprite_cache_stats(*g_guest_cpu);
@@ -1865,12 +1867,30 @@ int main()
         std::snprintf(line, sizeof line, "[rt] sprite cache %u/%u KiB, %u sprites, in %u, out %u, decoded %u in %u ms",
                       sc.used >> 10, sc.limit >> 10, sc.sprites, w.inserted, w.evicted, w.decodes, w.decode_ms);
         logline_held(line);
+        const uint64_t t2 = rt::now_us();
         profiler_heartbeat(m, sc);
+        const uint64_t t3 = rt::now_us();
         char sys[320];
         system_line(sys, sizeof sys, "");
         logline_held(sys);
         g_heap_room_low = UINT32_MAX;   // "low": since this heartbeat
+        const uint64_t t4 = rt::now_us();
         log_flush();   // the heartbeat's lines, in one write
+        // Where the heartbeat's time went (issue #71): with the profiler on,
+        // about 240 ms against 30 without, and three of 3-4 s in a 3 h
+        // session. Every heartbeat while profiling, else only a long one.
+        // Written with the next lines: its own write is in it.
+        const uint64_t t5 = rt::now_us();
+        const uint64_t prof = rt::last_prof_report_us();
+        const uint64_t total = prof + (t5 - t0);
+        if (g_prof_on || total >= 100000) {
+            auto ms = [](uint64_t us) { return (unsigned)((us + 500) / 1000); };
+            std::snprintf(line, sizeof line,
+                          "[rt] heartbeat steps: total %u ms; profile lines %u, memory %u, cache lines %u, sprite trace %u, "
+                          "system %u, write %u",
+                          ms(total), ms(prof), ms(t1 - t0), ms(t2 - t1), ms(t3 - t2), ms(t4 - t3), ms(t5 - t4));
+            logline_held(line);
+        }
     };
     // Sound through ds_emul into the DSP (ctr_audio.cpp), mixed on another core.
     setenv("WX86_SON", "vita", 1);   // ds_emul's name for the console's realtime sink

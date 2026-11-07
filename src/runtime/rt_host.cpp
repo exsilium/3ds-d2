@@ -1008,6 +1008,13 @@ uint64_t now_ms()
     return ms;
 }
 
+uint32_t tick_ms()
+{
+    if (!g_sched)
+        return (uint32_t)now_ms();
+    return g_opt.real_clock ? g_tick.load(std::memory_order_relaxed) : (uint32_t)g_sched->virt_ms();
+}
+
 uint64_t now_us()
 {
     if (g_opt.real_clock || !g_sched)

@@ -112,6 +112,7 @@ test)
     report) run_in "$HOSTTEST_IMAGE" make -C tests/report run ;;   # game.log summary and Sentry envelope
     governor) run_in "$HOSTTEST_IMAGE" make -C tests/governor run ;;   # the sprite cache governor's policy
     frames) run_in "$HOSTTEST_IMAGE" make -C tests/frames run ;;   # the allocator of the sprite cache's frames
+    pool) run_in "$HOSTTEST_IMAGE" make -C tests/pool run ;;   # where the pool's VirtualAlloc face fits a block without the spare
     tls)  # the TLS module (tls.bin) loaded as on the console: one test event to Sentry, an untrusted server refused
         ensure_image toolchain "$TOOLCHAIN_IMAGE"
         run_in "$TOOLCHAIN_IMAGE" make -s -C tests/cpu/ctr ../../../build/cpu/ctr/tls.bin
@@ -123,7 +124,7 @@ test)
         RUN_EXTRA=(-v "$(host_path "$(cd "$2" && pwd)"):/game:ro")
         for v in M4_LAYOUT M4_VIRTUAL_CLOCK M4_SCRIPT M4_BOTTOM RT_MSGLOG M4_PHYS_MB M4_FAST M4_QEMU_FLAGS WX86_SON WX86_SONDUMP WX86_SONMAXS WX86_HOTPROF D2_NOLINK M4_FRAMEHASH M4_NATIVE D2_NATIVE_MASK M4_DUMPFRAME M4_VIDEO M4_VIDEO_WAV M4_PROF RT_FILETRACE M4_HASHMEM WX86_FAKETSC M4_ASYNCIO M4_SPRITE_MB M4_POOL_RESERVE_MB M4_POOL_SPARE_KB M4_SPRITE_TRACE M4_STORM_PRIO D2_NATIVE_CHECK M4_SPRITE_FRAMES M4_META_CAP_KB D2_JITEVICT M4_POOL_PIECES; do [ -n "${!v:-}" ] && RUN_EXTRA+=(-e "$v=${!v}"); done
         run_in "$HOSTTEST_IMAGE" make "${make_args[@]}" ;;
-    *)    die "test host | test x86 [golden] | test cpu [armv7|armv6] | test m3 | test report | test governor | test frames | test tls | test m4 <game-dir>" ;;
+    *)    die "test host | test x86 [golden] | test cpu [armv7|armv6] | test m3 | test report | test governor | test frames | test pool | test tls | test m4 <game-dir>" ;;
     esac
     ;;
 package)

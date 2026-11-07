@@ -24,6 +24,13 @@
 // M4_POOL_PIECES=1 logs the guest pool's free pieces and the spare's blocks
 // at every heartbeat (rt::log_pool_pieces; the console logs them at a take
 // from the spare), to compare a pool policy's fragmentation (issue #70).
+// M4_POOL_BALLAST_MB=<n> takes n MiB of the pool's VirtualAlloc face at the
+// first heartbeat and keeps it: a smaller pool, so that a short script runs
+// the governor into its reserve as hours of play do on the console.
+// M4_POOL_LARGE_KB=<n> sizes the pool's large-block zone (0: none; the 3DS
+// layouts' own otherwise) and M4_POOL_LARGE_MIN_KB=<n> what goes there:
+// the fight has no sprite frames over 256 KiB, so 64 sends it the frames'
+// own blocks of 128-256 KiB.
 //
 // M4_SCRIPT drives game::Controls (the 3DS control scheme) with scripted pad
 // events (game::Autoplay, src/game/autoplay.h), ';'-separated, e.g.
@@ -160,9 +167,14 @@ int main(int argc, char **argv)
     if (ctr) {
         opt.total_phys_mb = 64;
         opt.pool_spare = game::kCtrPoolSpare;
+        opt.pool_large = game::kCtrPoolLarge;
     }
     if (const char *kb = std::getenv("M4_POOL_SPARE_KB"))   // another spare (0: none)
         opt.pool_spare = (uint32_t)std::atoi(kb) << 10;
+    if (const char *kb = std::getenv("M4_POOL_LARGE_KB"))   // another large-block zone (0: none)
+        opt.pool_large = (uint32_t)std::atoi(kb) << 10;
+    if (const char *kb = std::getenv("M4_POOL_LARGE_MIN_KB"))   // blocks over this go there (256: the console's)
+        opt.pool_large_min = (uint32_t)std::atoi(kb) << 10;
     if (const char *mb = std::getenv("M4_PHYS_MB"))   // override the RAM the game is told about
         opt.total_phys_mb = (uint32_t)std::atoi(mb);
     opt.virtual_tick_us = 250;   // used only under M4_VIRTUAL_CLOCK
@@ -245,6 +257,15 @@ int main(int argc, char **argv)
         std::fprintf(stderr, "[rt] sprite cache %u/%u KiB, %u sprites, in %u, out %u, decoded %u in %u ms\n",
                      sc.used >> 10, sc.limit >> 10, sc.sprites, w.inserted, w.evicted, w.decodes, w.decode_ms);
         static const bool pool_pieces = std::getenv("M4_POOL_PIECES") != nullptr;
+        if (const char *mb = std::getenv("M4_POOL_BALLAST_MB")) {
+            static bool taken = false;
+            if (!taken) {
+                taken = true;
+                const uint32_t bytes = (uint32_t)std::atoi(mb) << 20;
+                const uint32_t va = bytes ? rt::va_alloc(bytes, 0xba11a57) : 0;
+                std::fprintf(stderr, "[rt] pool ballast: %u KiB at %08x\n", bytes >> 10, va);
+            }
+        }
         if (pool_pieces)
             rt::log_pool_pieces("heartbeat");
         // M4_SPRITE_TRACE=<file>: the sprite trace (sprite_trace.h), from the first heartbeat on.

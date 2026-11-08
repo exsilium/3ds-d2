@@ -82,6 +82,14 @@ struct RunOptions {
     // one) kept back in one contiguous block, for a request that fits
     // nowhere else once the pool's free space has gone to pieces (0: none).
     uint32_t pool_spare = 0;
+    // Bytes of the pool (a multiple of 64 KiB) set aside for va_alloc's
+    // blocks over pool_large_min, before the faces allocate (0: none): blocks
+    // that large found no piece of a long session's pool, whose free space
+    // had gone to 64-256 KiB pieces, and took the spare (issue #70). Only
+    // they go there, so nothing smaller can cut it up; and the game's heap
+    // blocks over pool_large_min that no free piece of the pool holds.
+    uint32_t pool_large = 0;
+    uint32_t pool_large_min = 256u << 10;
     // CPUID leaf-1 EDX reported to the guest; 0 keeps the backend's default
     // (FPU CMOV MMX FXSR SSE SSE2). The 3DS reports kCpuidNoSimd: the game
     // then takes its x87/integer paths instead of SSE code the ARM11 emulates.
@@ -235,6 +243,9 @@ struct MemoryReport {
     uint32_t free, largest_free;
     // RunOptions::pool_spare: bytes in use in it, and requests it has served.
     uint32_t spare_used, spare_takes;
+    // RunOptions::pool_large: bytes in use in it, and its size. The zone is
+    // used space to `free` and `largest_free`.
+    uint32_t large_used, large_size;
     // Host memory of the CPU backend (0 when the build does not count it):
     uint32_t jit_code_kb;    // translated ARM code: the 2 MiB chunks opened for it
     uint32_t jit_used_kb;    // of those, what the translated blocks hold now
@@ -286,6 +297,11 @@ void sleep_guest(uint32_t ms);
 // The guest's clock: the scheduler's (virtual or real), so GetTickCount, QPC,
 // Sleep and timed waits always agree.
 uint64_t now_ms();
+// now_ms as the game's GetTickCount sees it, without a clock read: the
+// slice's clock on the real clock (it moves at each slice), now_ms itself
+// on the virtual one. For code run per call in play (issue #72: a host
+// clock read costs ~1 us on the console).
+uint32_t tick_ms();
 // Closes the host side of every file the game has open (after the I/O
 // worker's queued reads), and opens them again where they were: for the
 // platform to let go of its storage while the app is suspended (the HOME
@@ -307,7 +323,9 @@ wx86::GuestRegion &va_region();
 // A block of it for native code, as VirtualAlloc would give the guest one
 // (not zeroed), owned by `owner` in the "VirtualAlloc by caller" lines; 0
 // when the pool has no free piece that large (tried only when it has one,
-// so no "va full" is logged or counted for it). And its return.
+// so no "va full" is logged or counted for it). A block over
+// RunOptions::pool_large_min comes from the pool's large-block zone when
+// that has room. And its return.
 uint32_t va_alloc(uint32_t bytes, uint32_t owner);
 void va_free(uint32_t va);
 

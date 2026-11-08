@@ -76,7 +76,7 @@ GAMELDFLAGS := -Wl,--wrap=_sbrk_r -Wl,--wrap=abort
 GAMESRC := $(notdir $(wildcard $(ROOT)/src/game/*.cpp))
 BINKSRC := $(notdir $(wildcard $(ROOT)/src/game/bink/*.cpp))
 GAMEOBJ := $(CPUOBJ) $(addprefix $(OUT)/rt/,$(RTFULL:.cpp=.o)) $(addprefix $(OUT)/m3/,$(M3SRC:.cpp=.o)) \
-           $(addprefix $(OUT)/game/,$(GAMESRC:.cpp=.o)) $(addprefix $(OUT)/game/bink/,$(BINKSRC:.cpp=.o)) $(OUT)/game/ctr_game.o $(OUT)/game/ctr_audio.o $(OUT)/game/ctr_screenshot.o $(OUT)/game/ctr_report.o $(OUT)/game/ctr_tls.o $(OUT)/runner/ctr_stubs.o
+           $(addprefix $(OUT)/game/,$(GAMESRC:.cpp=.o)) $(addprefix $(OUT)/game/bink/,$(BINKSRC:.cpp=.o)) $(OUT)/game/ctr_game.o $(OUT)/game/ctr_audio.o $(OUT)/game/ctr_screenshot.o $(OUT)/game/ctr_writer.o $(OUT)/game/ctr_report.o $(OUT)/game/ctr_tls.o $(OUT)/runner/ctr_stubs.o
 
 .PHONY: all clean FORCE
 
@@ -130,11 +130,14 @@ $(OUT)/game/%.o: $(ROOT)/src/game/%.cpp $(wildcard $(ROOT)/src/game/*.h) $(wildc
 # The Bink decoder: hot integer code, built for speed like the blitters.
 $(OUT)/game/bink/%.o: $(ROOT)/src/game/bink/%.cpp $(wildcard $(ROOT)/src/game/bink/*.h)
 	@mkdir -p $(@D); $(CXX) $(CXXFLAGS) -O2 -I$(ROOT)/src -c $< -o $@
-$(OUT)/game/ctr_game.o: $(ROOT)/src/app/ctr_game.cpp $(wildcard $(ROOT)/src/game/*.h) $(wildcard $(ROOT)/src/runtime/rt_*.h)
+$(OUT)/game/ctr_game.o: $(ROOT)/src/app/ctr_game.cpp $(ROOT)/src/app/ctr_writer.h $(wildcard $(ROOT)/src/game/*.h) $(wildcard $(ROOT)/src/runtime/rt_*.h)
 	@mkdir -p $(@D); $(CXX) $(CXXFLAGS) -O2 -I$(ROOT)/src -c $< -o $@
 # The CIA flavour: the same objects, with the app built for the New 3DS's
 # extended memory mode and its RomFS (scripts/package-cia.sh packs it).
 $(OUT)/game/ctr_audio.o: $(ROOT)/src/app/ctr_audio.cpp $(wildcard $(ROOT)/src/runtime/rt_*.h)
+	@mkdir -p $(@D); $(CXX) $(CXXFLAGS) -O2 -I$(ROOT)/src -c $< -o $@
+# The SD card's writer thread (issue #71).
+$(OUT)/game/ctr_writer.o: $(ROOT)/src/app/ctr_writer.cpp $(ROOT)/src/app/ctr_writer.h
 	@mkdir -p $(@D); $(CXX) $(CXXFLAGS) -O2 -I$(ROOT)/src -c $< -o $@
 # Screenshots into the Camera album: libjpeg-turbo from the pinned image's portlibs.
 PORTLIBS := $(DEVKITPRO)/portlibs/3ds

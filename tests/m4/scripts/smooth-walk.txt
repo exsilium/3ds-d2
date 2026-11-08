@@ -1,6 +1,7 @@
 # Smoothness while walking (frame pacing): the first character in the list
 # into the game, a profiler run with the frame trace only, then 90 s of
-# walking loops round the town the character is in, no fights. For a
+# walking loops round the town the character is in, no fights; a panel the
+# walk clicks open (an NPC's menu) is closed with START. For a
 # character such as dist/save/BeforeCh1End's (the Rogue Encampment) or
 # DuringCh2Mid's (Lut Gholein); the trace is logs/frames.trc, read with
 # tools/frame_report.py. Azahar:
@@ -10,6 +11,7 @@
 35000 tap 400 307
 40000 tapuntil ingame 690 555
 40500 profile frames
+40500 closepanels
 # 5 s standing still first: the trace's baseline.
 47000 circle 120 0
 51000 circle 0 120

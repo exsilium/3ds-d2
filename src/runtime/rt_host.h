@@ -192,7 +192,17 @@ void frame_thread_us(uint64_t out[kFrameThreadKinds]);
 // Of its ready time, us by the guest thread that ran meanwhile (ids 0-15),
 // and a guest thread's entry point (0: none), to name it.
 void frame_thread_ready_by(uint64_t out[16]);
+// Its longest wait on a guest object (a Sleep left out) since the last call:
+// the us, the site it waited from (wait_site: the game's code), and for a
+// critical section the guest thread that owned it (else 0), and the return
+// addresses into the game on its EBP chain (0: fewer). Clears them.
+constexpr size_t kWaitFrom = 4;
+uint64_t frame_thread_wait_top(uint32_t &site, uint32_t &owner, uint32_t from[kWaitFrom]);
 uint32_t guest_thread_entry(uint32_t tid);
+// The running guest thread is the one presenting frames (stats().frame_thread);
+// the running guest thread's id (-1: none).
+bool on_frame_thread();
+int current_thread_id();
 // A native's work on the I/O worker (the second core) while the guest
 // thread that called it waits, as a file read does: the other guest threads
 // run meanwhile. `job` gets `args` (at most 8, captured from the guest's
@@ -233,6 +243,9 @@ struct FileStats {
     // (an OVERLAPPED read, a full request pool, or synchronous reads).
     uint64_t waits = 0, wait_us = 0, wait_frame_us = 0;
     uint64_t stall_us = 0;
+    // Jobs on the I/O worker (offload_job): how many, their time running
+    // there, those past 5 ms, and their time queued behind other requests.
+    uint64_t jobs = 0, job_us = 0, job_long = 0, job_queued_us = 0;
 };
 const FileStats &file_stats();
 // The asynchronous reads' worker (RunOptions::io_start): started and stopped

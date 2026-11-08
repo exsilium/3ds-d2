@@ -552,11 +552,19 @@ struct IoRequest : Waitable {
     uint32_t (*job)(const uint32_t *) = nullptr;
     uint32_t args[8] = {};
     uint32_t job_result = 0;
+    uint64_t job_queued_us = 0, job_start_us = 0, job_end_us = 0;   // the worker's clock marks
     bool try_acquire(GuestThread *) override
     {
         int done = 2;
         if (!state.compare_exchange_strong(done, 0, std::memory_order_acq_rel))
             return false;
+        if (job) {   // the stats here, on the game's core: the worker only marks the times
+            const uint64_t run = job_end_us - job_start_us;
+            g_file_stats.jobs++;
+            g_file_stats.job_us += run;
+            g_file_stats.job_long += run > 5000;
+            g_file_stats.job_queued_us += job_start_us > job_queued_us ? job_start_us - job_queued_us : 0;   // the cores' clocks differ a little
+        }
         if (wait_from_us) {
             const uint64_t us = wx86_now_us() - wait_from_us;
             g_file_stats.waits++;
@@ -590,7 +598,9 @@ void io_worker_main()
         }
         IoRequest *r = g_io_ring[t % kIoMax];
         if (r->job) {
+            r->job_start_us = wx86_now_us();
             r->job_result = r->job(r->args);
+            r->job_end_us = wx86_now_us();
         } else {
             r->cache->read(r->pos, r->dst, r->n);
             r->cache->inflight.fetch_sub(1, std::memory_order_acq_rel);
@@ -637,6 +647,7 @@ IoRequest *io_submit_job(uint32_t (*job)(const uint32_t *), const uint32_t *args
         for (size_t i = 0; i < n && i < 8; i++)
             r.args[i] = args[i];
         r.wait_from_us = 0;
+        r.job_queued_us = wx86_now_us();
         r.state.store(1, std::memory_order_relaxed);
         wx86_host_pending(1);
         const uint32_t h = g_io_head.load(std::memory_order_relaxed);

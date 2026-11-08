@@ -162,6 +162,7 @@ uint32_t g_spare_size = 0, g_spare_logged = 0;
 // va_alloc for its large blocks only.
 wx86::GuestRegion g_large;
 uint32_t g_large_base = 0, g_large_size = 0, g_large_takes = 0, g_large_missed = 0;
+uint32_t g_large_heap = 0;   // of g_large_takes: the heap's blocks (heap_alloc)
 bool in_large(uint32_t va) { return g_large_size && va - g_large_base < g_large_size; }
 
 // VirtualAlloc blocks by the guest code that allocated them (the return
@@ -223,8 +224,9 @@ void log_large_zone()
     std::string blocks;
     for (const auto &u : g_large.used_map())
         blocks += " " + std::to_string(u.second >> 10);
-    logf("pool large zone: %u of %u KiB in use [%s ], largest free %u KiB, %u blocks served, %u not", g_large.cur() >> 10,
-         g_large_size >> 10, blocks.c_str(), g_large.largest_free() >> 10, g_large_takes, g_large_missed);
+    logf("pool large zone: %u of %u KiB in use [%s ], largest free %u KiB, %u blocks served (%u heap), %u not",
+         g_large.cur() >> 10, g_large_size >> 10, blocks.c_str(), g_large.largest_free() >> 10, g_large_takes,
+         g_large_heap, g_large_missed);
 }
 
 // The pool's free space in pieces, and what sits in its spare (issue #70):
@@ -314,6 +316,69 @@ bool va_fits(uint32_t bytes)
     if (!g_pool_size)
         return g_va.largest_free() >= bytes + 0xffff;
     return pool_fits_top(g_pool.used_map(), g_pool.base(), g_pool_size, bytes, 0x10000);
+}
+
+// The game's heap, through the large-block zone (issue #70). Its blocks over
+// pool_large_min come and go at area loads (282-533 KiB in 3DS-D2-15). One
+// that no free piece of the pool held took the spare: six times in 53 min,
+// and each take cut the sprite cache to 4 MiB, a 1-2 s hitch while it
+// filled again. Such a block now takes the zone first, as the sprite frames
+// do. Only then: a heap block the pool holds stays there, so long-lived ones
+// do not keep the zone from the frames.
+uint32_t heap_alloc(uint32_t n)
+{
+    if (g_large_size && g_pool_size && n > g_opt.pool_large_min &&
+        !pool_fits_bottom(g_pool.used_map(), g_pool.base(), g_pool_size, n, 16))
+        if (const uint32_t a = g_large.alloc(n)) {
+            g_large_takes++;
+            g_large_heap++;
+            return a;
+        }
+    return g_heap.alloc(n);
+}
+bool heap_free(uint32_t a) { return in_large(a) ? g_large.free(a) : g_heap.free(a); }
+uint32_t heap_size(uint32_t a) { return in_large(a) ? g_large.size_of(a) : g_heap.size_of(a); }
+
+// WinVita's heap shims (win32_shims_memory.cpp) again, through heap_alloc:
+// registered after them, these win.
+void install_heap(Bridge &br)
+{
+    auto K = [&](const char *name, uint32_t argc, std::function<uint32_t(Cpu &)> fn) {
+        Shim s;
+        s.argc = argc;
+        s.stdcall_cleanup = true;
+        s.tag = std::string("KERNEL32.dll!") + name;
+        s.fn = std::move(fn);
+        br.register_shim("KERNEL32.dll", name, s);
+    };
+    K("HeapAlloc", 3, [](Cpu &c) {
+        const uint32_t n = c.arg(2), a = heap_alloc(n);
+        if (a && (c.arg(1) & 0x8u))   // HEAP_ZERO_MEMORY
+            wx86_gzero(c, a, n);
+        return a;
+    });
+    K("HeapReAlloc", 4, [](Cpu &c) {
+        const uint32_t old = c.arg(2), n = c.arg(3), a = heap_alloc(n);
+        if (old && a) {
+            const uint32_t osz = heap_size(old), cp = osz && osz < n ? osz : n;
+            void *dhp = c.hostptr(a, cp), *shp = c.hostptr(old, cp);
+            if (dhp && shp) {
+                c.invalidate_code(a, cp);
+                std::memcpy(dhp, shp, cp);
+            } else {
+                std::vector<uint8_t> tmp(cp, 0);
+                c.read(old, tmp.data(), cp);
+                c.write(a, tmp.data(), cp);
+            }
+            heap_free(old);
+        }
+        return a;
+    });
+    K("HeapFree", 3, [](Cpu &c) {
+        heap_free(c.arg(2));
+        return 1u;
+    });
+    K("HeapSize", 3, [](Cpu &c) { return heap_size(c.arg(2)); });
 }
 
 // VirtualQuery support for WinVita's memory shims: report the arena regions.
@@ -1247,7 +1312,7 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
                 g_spare_size = g_spare.largest_free();   // all of it, still unused
             logf("pool spare: %u KiB%s", g_opt.pool_spare >> 10, g_spare_size ? "" : " does not fit, none");
         }
-        g_large_size = g_large_base = g_large_takes = g_large_missed = 0;
+        g_large_size = g_large_base = g_large_takes = g_large_missed = g_large_heap = 0;
         if (g_opt.pool_large) {
             const uint32_t bytes = (g_opt.pool_large + 0xffff) & ~0xffffu;
             if (const uint32_t a = g_va.alloc(bytes)) {
@@ -1276,6 +1341,7 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
     plan.va = &g_va;
     plan.vquery = vquery;
     win32_shims_memory_install(*br, plan);
+    install_heap(*br);
     if (g_opt.total_phys_mb)
         wx86_mem_set_total_phys_mb(g_opt.total_phys_mb);
     win32_shims_sync_install(*br);

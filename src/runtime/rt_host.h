@@ -86,7 +86,8 @@ struct RunOptions {
     // blocks over pool_large_min, before the faces allocate (0: none): blocks
     // that large found no piece of a long session's pool, whose free space
     // had gone to 64-256 KiB pieces, and took the spare (issue #70). Only
-    // they go there, so nothing smaller can cut it up.
+    // they go there, so nothing smaller can cut it up; and the game's heap
+    // blocks over pool_large_min that no free piece of the pool holds.
     uint32_t pool_large = 0;
     uint32_t pool_large_min = 256u << 10;
     // CPUID leaf-1 EDX reported to the guest; 0 keeps the backend's default

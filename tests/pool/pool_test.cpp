@@ -3,7 +3,8 @@
 // and a spare, taken apart by random allocations and frees. Whenever
 // pool_fits_top says a VirtualAlloc block fits, the face must place it
 // without the spare; whenever it says no, the face must fail or take the
-// spare. Run through `scripts/docker.sh test pool`.
+// spare. pool_fits_bottom makes the same promise for the heap face's large
+// blocks. Run through `scripts/docker.sh test pool`.
 #include "runtime/guest_region.h"
 #include "runtime/pool_fit.h"
 
@@ -72,7 +73,40 @@ int main()
             }
             if (a)
                 va.free(a);
+            // A large heap block (the game's own, 256-640 KiB): the same
+            // promise from pool_fits_bottom for the heap face.
+            const uint32_t hwant = 256 * KiB + rng() % (384 * KiB);
+            const bool hfits = rt::pool_fits_bottom(pool.used_map(), pool.base(), kSize, hwant, 16);
+            const uint32_t htakes = pool.spare_takes();
+            const uint32_t h = heap.alloc(hwant);
+            const bool hspare = pool.spare_takes() != htakes;
+            checked++;
+            if (hfits) {
+                yes++;
+                CHECK(h != 0 && !hspare);
+            } else {
+                no++;
+                spare_no += hspare;
+                CHECK(h == 0 || hspare);
+            }
+            if (h)
+                heap.free(h);
         }
+    }
+    // The heap face: an exact gap holds its block; one byte more does not.
+    {
+        wx86::GuestRegion pool, heap, va;
+        pool.init(kBase, 1 * MiB, 16, "pool");
+        heap.share(pool, 16, false, "heap");
+        va.share(pool, kAlign, true, "va");
+        const uint32_t lo = heap.alloc(64 * KiB), mid = heap.alloc(256 * KiB), hi = heap.alloc(64 * KiB);
+        CHECK(lo == kBase && mid == kBase + 64 * KiB && hi == kBase + 320 * KiB);
+        CHECK(va.alloc(640 * KiB) == kBase + 384 * KiB);   // the rest: no room above
+        heap.free(mid);
+        CHECK(rt::pool_fits_bottom(pool.used_map(), pool.base(), 1 * MiB, 256 * KiB, 16));
+        CHECK(!rt::pool_fits_bottom(pool.used_map(), pool.base(), 1 * MiB, 256 * KiB + 1, 16));
+        CHECK(heap.alloc(256 * KiB) == kBase + 64 * KiB);
+        CHECK(!rt::pool_fits_bottom(pool.used_map(), pool.base(), 1 * MiB, 16, 16));
     }
     // Edge cases: an exact 256 KiB piece holds a 256 KiB block; one byte
     // more does not; nothing fits in a full pool.

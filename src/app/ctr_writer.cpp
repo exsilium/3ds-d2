@@ -11,8 +11,15 @@ namespace {
 constexpr size_t kStreams = 4;
 // A write at most this long: the FS service takes one request at a time,
 // and the game's own reads (the loader, on this core too) wait behind it.
-constexpr size_t kChunk = 4 * 1024;
-constexpr s64 kRoundNs = 500 * 1000000LL;   // a round at least this often
+// A write cost the card 10-13 ms whatever its size up to 4 KiB, and a long
+// session of small ones (~70 every 10 s for three files) ended in stalls of
+// 1-3 s, then 14 s, with the game's reads queued behind them (3DS-D2-14,
+// 2026-11-08). So a file is written when it has kBatch queued, or kMaxAge
+// after its last write: a few writes every 10 s.
+constexpr size_t kChunk = 16 * 1024;
+constexpr size_t kBatch = 16 * 1024;
+constexpr uint64_t kMaxAgeUs = 5 * 1000000ULL;
+constexpr s64 kRoundNs = 1000 * 1000000LL;   // a round at least this often
 
 struct Stream {
     bool used = false;
@@ -26,6 +33,7 @@ struct Stream {
     LightLock io_lock;           // one writer of `file` at a time
     uint64_t bytes = 0, us = 0;
     uint32_t writes = 0, longest_us = 0, lost = 0;
+    uint64_t last_us = 0;   // the last write (or the wrap): kMaxAge counts from it
 };
 
 Stream g_streams[kStreams];
@@ -74,14 +82,25 @@ bool write_chunk(Stream &s)
     LightLock_Lock(&s.ring_lock);
     s.tail = t + len;   // written or failed: either way it is not queued any more
     LightLock_Unlock(&s.ring_lock);
+    s.last_us = now_us();
     return true;
+}
+
+// The writer thread writes a file only with a batch queued, or after
+// kMaxAge: anyone else (a drain, a pause, a close) writes it all.
+bool due(Stream &s)
+{
+    LightLock_Lock(&s.ring_lock);
+    const size_t queued = s.head - s.tail;
+    LightLock_Unlock(&s.ring_lock);
+    return queued >= kBatch || (queued && now_us() - s.last_us >= kMaxAgeUs);
 }
 
 // Everything queued in `s`. The writer thread stops at a pause or a crash.
 void write_out(Stream &s, bool by_writer)
 {
     LightLock_Lock(&s.io_lock);
-    if (s.used)
+    if (s.used && (!by_writer || due(s)))
         while (!(by_writer && (g_paused || g_crashed)) && write_chunk(s)) {
         }
     LightLock_Unlock(&s.io_lock);
@@ -114,7 +133,8 @@ int stream_write(void *cookie, const char *buf, _READ_WRITE_BUFSIZE_TYPE size)
         return n;
     }
     LightLock_Lock(&s.ring_lock);
-    const size_t room = s.cap - (s.head - s.tail);
+    const size_t queued = s.head - s.tail, room = s.cap - queued;
+    bool batch = false;
     if ((size_t)n > room) {
         s.lost += (uint32_t)n;   // dropped, counted: the game does not wait for the card
     } else {
@@ -122,8 +142,11 @@ int stream_write(void *cookie, const char *buf, _READ_WRITE_BUFSIZE_TYPE size)
         std::memcpy(s.ring + off, buf, first);
         std::memcpy(s.ring, buf + first, (size_t)n - first);
         s.head += (size_t)n;
+        batch = queued < kBatch && queued + (size_t)n >= kBatch;
     }
     LightLock_Unlock(&s.ring_lock);
+    if (batch)   // a batch is ready: the writer need not wait for its round
+        LightEvent_Signal(&g_wake);
     return n;
 }
 
@@ -194,6 +217,7 @@ FILE *writer_wrap(FILE *file, char *ring, size_t bytes, const char *name)
         s->head = s->tail = 0;
         s->bytes = s->us = 0;
         s->writes = s->longest_us = s->lost = 0;
+        s->last_us = now_us();
         s->name = name;
         s->file = file;
         s->ring = ring;

@@ -39,7 +39,16 @@ FILE *writer_wrap(FILE *file, char *ring, size_t bytes, const char *name);
 // once. At the app's end, after the last line.
 void writer_stop();
 
-// Wakes the writer: what is queued goes out now, not at its next round.
+// How soon queued bytes reach the card (the INFO checklist's "log writes"
+// row): Batched, a file at 16 KiB queued or 5 s after its last write (the
+// default); EverySecond, what is queued once a second; AtOnce, each write
+// from the calling thread before it goes on, so that a crash, a freeze or
+// a power-off loses nothing written before it (slower: for chasing crashes).
+enum class WriterMode : uint8_t { Batched, EverySecond, AtOnce };
+void writer_set_mode(WriterMode mode);
+
+// Wakes the writer to look at its streams before its next round (a file is
+// still written by the mode's rule).
 void writer_kick();
 
 // Writes out every stream's queued bytes from the calling thread.

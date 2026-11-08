@@ -57,12 +57,12 @@ The diagnostics are on the bottom screen's INFO tab (tap INFO in the tab bar; [c
 
 To measure more, tap **profiler run** on INFO, tick what to measure and start the run (sprite trace, guest code profile, file-read trace, SD card benchmark). The session is then offered as a report with what the run wrote. There is no separate profiling build any more.
 
-The checklist's last row, **trace writes**, sets how the traces reach the SD card, and a tap steps it on, during a run too:
-- **buffered** (the default, as before): large writes as the buffers fill; a crash loses what they still hold, minutes of reads.
-- **every second**: what the traces hold is written out once a second.
-- **at once**: every record is written as it is made, so a crash loses nothing before it. This costs an SD card write per file read and per sprite use, so use it to chase a crash (issue #66), not to measure the frame rate.
+The checklist's last row, **log writes**, sets how all logging reaches the SD card, game.log and the traces alike, whether a profiler run is on or not, and a tap steps it on. game.log and the traces go through rings in memory, written by a thread of their own (`src/app/ctr_writer.h`):
+- **batched** (the default): a file is written once 16 KiB is queued, or 5 s after its last write. The card's cost is per write, and a long session of small writes ended in stalls of 9–14 s (3DS-D2-14). A crash the app catches writes out what is queued; a freeze or a power-off loses up to 5 s of it.
+- **every second**: what is queued is written once a second.
+- **at once**: every log line and trace record is written as it is made, from the thread that makes it, so a freeze or a power-off loses nothing before it. This costs an SD card write per line, file read and sprite use, so use it to chase a crash or a freeze (issue #66), not to measure the frame rate.
 
-The setting is saved, logged as `profiler run: trace writes <buffered|second|now>`, and a report carries it as the `trace_writes` tag.
+The setting is saved (`tracewrites=` in settings.txt), logged as `profiler run: trace writes <buffered|second|now>`, and a report carries it as the `trace_writes` tag.
 
 Logs are on the SD card in `3ds/3ds-d2/logs/`: `game.log` for the runtime, and `stderr.txt` for the CPU backend, including its arena line. Saves and settings are in `3ds/3ds-d2/save/`. `python3 -I tools/session_report.py game.log` summarises a session from its heartbeats: the frame rate by game state, the slowest windows and what they were doing (sprite re-loads, new code, SD reads), memory over time (with the sprites' frames' blocks and units, issue #44), and the hitches (`prof hitch:` lines: frames by interval, the longest, sprites taken and let go of, the frame thread's read wait, frames not drawn, starved sound grains) with the slowest windows' causes.
 

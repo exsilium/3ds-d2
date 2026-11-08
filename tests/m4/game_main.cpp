@@ -209,6 +209,9 @@ int main(int argc, char **argv)
         // Storm serving a waiting caller first, as on the console (M4_STORM_PRIO=0: as the game does).
         if (!std::getenv("M4_STORM_PRIO") || std::string(std::getenv("M4_STORM_PRIO")) != "0")
             game::install_storm_read_priority(c);
+        // ...and reading it itself while the read thread is not reading (M4_STORM_DIRECT=0: queued).
+        if (!std::getenv("M4_STORM_DIRECT") || std::string(std::getenv("M4_STORM_DIRECT")) != "0")
+            game::install_storm_direct_reads(c);
         game::install_fatal_exit(c);
         if (ctr_layout) {
             game::install_pool_release(c);

@@ -3,6 +3,8 @@
 #ifndef D2_GAME_STORM_READS_H
 #define D2_GAME_STORM_READS_H
 
+#include <cstdint>
+
 namespace d2rt { struct Cpu; }
 
 namespace game {
@@ -12,6 +14,16 @@ namespace game {
 // ahead of it, instead of after them (storm_reads.cpp). Returns false,
 // changing nothing, on a different Game.exe.
 bool install_storm_read_priority(d2rt::Cpu &c);
+
+// A caller's read without OVERLAPPED (the drawing thread's: a sound, a
+// sprite's file) is read on its own thread under Storm's lock, as on an
+// archive opened for synchronous reads, whenever the read thread is not
+// itself reading, instead of queued behind what the read thread does next:
+// its completion callbacks decode whole sprite groups in guest code, tens of
+// ms each (issue #76). False, changing nothing, on a different Game.exe.
+bool install_storm_direct_reads(d2rt::Cpu &c);
+// Reads taken that way, and those queued because the read thread was reading.
+void storm_direct_counts(uint32_t &direct, uint32_t &queued);
 
 }  // namespace game
 

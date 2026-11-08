@@ -8,6 +8,7 @@
 #include "runtime/cpu.h"
 #include "runtime/guest_region.h"
 #include "runtime/guest_scratch.h"
+#include "runtime/guest_sync.h"
 #include "runtime/guest_thread.h"
 #include "runtime/guest_thread_ctx.h"
 #include "runtime/host_clock.h"
@@ -715,6 +716,12 @@ uint64_t g_prof_report_us = 0;   // of which the profile's lines (issue #71)
 // for the heartbeat's few largest.
 uint32_t g_frame_where = 0;
 std::map<uint32_t, uint64_t> g_frame_wait_at;
+// The same for the frame trace, since its last frame: a few sites, each with
+// the owner of the critical section it waited for (0: not a critsec, or free).
+struct FrameWaitSite { uint32_t site, owner; uint64_t us; uint32_t from[kWaitFrom]; };
+FrameWaitSite g_frame_waits[8] = {};
+uint32_t g_frame_owner = 0;   // at the last sample: the critsec's owner
+uint32_t g_frame_from[kWaitFrom] = {};   // ...and the game's calls it waits under (frame_wait_callers)
 
 // Where a blocked guest thread waits from: its saved EIP when that is in the
 // game's image, else (a shim's trap) the return address on its stack.
@@ -725,6 +732,31 @@ uint32_t wait_site(const GuestThread &t)
         return eip;
     Cpu *c = g_tick_cpu.load(std::memory_order_relaxed);
     return c ? c->read_u32(t.ctx.gpr[R_ESP]) : eip;
+}
+
+// The return addresses on a blocked thread's EBP chain (the game's and
+// Storm's functions keep frames), up to 4 into the game's image: who waits
+// under a site shared by many (Storm's read wait at 0x41af0d). From the
+// wait's start only.
+void frame_wait_callers(const GuestThread &t, uint32_t out[kWaitFrom])
+{
+    for (size_t i = 0; i < kWaitFrom; i++)
+        out[i] = 0;
+    Cpu *c = g_tick_cpu.load(std::memory_order_relaxed);
+    if (!c)
+        return;
+    const uint32_t esp = t.ctx.gpr[R_ESP];
+    uint32_t ebp = t.ctx.gpr[R_EBP], n = 0;
+    for (int i = 0; i < 12 && n < kWaitFrom; i++) {
+        if (ebp < esp || ebp - esp > (1u << 20) || (ebp & 3))
+            break;
+        const uint32_t ret = c->read_u32(ebp + 4), next = c->read_u32(ebp);
+        if (ret >= g_exe_base && ret < g_exe_base + g_exe_size)
+            out[n++] = ret;
+        if (next <= ebp)
+            break;
+        ebp = next;
+    }
 }
 
 size_t frame_thread_doing()
@@ -744,10 +776,16 @@ size_t frame_thread_doing()
     case GuestThread::State::Blocked: break;
     default: return kFrameKindCount;
     }
-    g_frame_where = wait_site(*t);
+    const uint32_t where = wait_site(*t);
+    if (where != g_frame_where || g_frame_was < kFrameSleep)
+        frame_wait_callers(*t, g_frame_from);   // a new wait
+    g_frame_where = where;
+    g_frame_owner = 0;
     if (!t->wait_obj)
         return kFrameSleep;
     const char *k = static_cast<Waitable *>(t->wait_obj)->kind();
+    if (std::strcmp(k, "critsec") == 0)
+        g_frame_owner = static_cast<WxCrit *>(t->wait_obj)->owner & ~WX86_CRIT_WAITERS;
     for (size_t i = kFrameWaits; i + 1 < kFrameKindCount; i++)
         if (std::strcmp(k, kFrameKinds[i]) == 0)
             return i;
@@ -763,8 +801,26 @@ uint64_t charge_frame_thread()
         g_frame_us[g_frame_was] += us - g_frame_at;
         if (g_frame_was == kFrameReady && g_slice_tid >= 0 && g_slice_tid < 16)
             g_ready_by[g_slice_tid] += us - g_frame_at;
-        if (g_frame_was >= kFrameSleep)
+        if (g_frame_was >= kFrameSleep) {
             g_frame_wait_at[g_frame_where] += us - g_frame_at;
+            if (g_frame_was > kFrameSleep) {
+                FrameWaitSite *w = nullptr;
+                for (FrameWaitSite &e : g_frame_waits)
+                    if (e.us && e.site == g_frame_where && e.owner == g_frame_owner) {
+                        w = &e;
+                        break;
+                    }
+                for (FrameWaitSite &e : g_frame_waits)
+                    if (!w && !e.us)
+                        w = &e;
+                if (w) {
+                    w->site = g_frame_where;
+                    w->owner = g_frame_owner;
+                    w->us += us - g_frame_at;
+                    std::memcpy(w->from, g_frame_from, sizeof w->from);
+                }
+            }
+        }
     }
     g_frame_at = us;
     return us;
@@ -926,6 +982,10 @@ void prof_report(uint64_t ms)
          (unsigned long long)(f.cache_bytes >> 10), (unsigned long long)((f.wait_us - f0.wait_us) / 1000),
          (unsigned long long)(f.waits - f0.waits), (unsigned long long)((f.wait_frame_us - f0.wait_frame_us) / 1000),
          (unsigned long long)((f.stall_us - f0.stall_us) / 1000));
+    if (f.jobs != f0.jobs)
+        logf("prof jobs: %llu on the I/O worker, %llu ms (%llu past 5 ms), %llu ms queued",
+             (unsigned long long)(f.jobs - f0.jobs), (unsigned long long)((f.job_us - f0.job_us) / 1000),
+             (unsigned long long)(f.job_long - f0.job_long), (unsigned long long)((f.job_queued_us - f0.job_queued_us) / 1000));
     log_frame_thread();
 #ifdef PROF_COUNTERS
     now.run_ns = prof::run_ns;
@@ -1155,6 +1215,32 @@ void frame_thread_us(uint64_t out[kFrameThreadKinds])
     charge_frame_thread();
     for (size_t i = 0; i < kFrameKindCount; i++)
         out[i] = g_frame_us[i];
+}
+
+int current_thread_id() { return g_sched ? (int)g_sched->current_id() : -1; }
+
+bool on_frame_thread()
+{
+    return g_sched && g_stats.frame_thread >= 0 && (int)g_sched->current_id() == g_stats.frame_thread;
+}
+
+uint64_t frame_thread_wait_top(uint32_t &site, uint32_t &owner, uint32_t from[kWaitFrom])
+{
+    charge_frame_thread();
+    uint64_t most = 0;
+    site = owner = 0;
+    for (size_t i = 0; i < kWaitFrom; i++)
+        from[i] = 0;
+    for (FrameWaitSite &e : g_frame_waits) {
+        if (e.us > most) {
+            most = e.us;
+            site = e.site;
+            owner = e.owner;
+            std::memcpy(from, e.from, sizeof e.from);
+        }
+        e = FrameWaitSite{};
+    }
+    return most;
 }
 
 uint64_t last_heartbeat_us() { return g_heartbeat_us; }

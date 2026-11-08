@@ -185,7 +185,9 @@ SpriteGovernor g_governor;
 uint32_t g_inserted = 0;   // since the start, wrapping
 uint32_t g_decodes = 0;    // sprites decoded since the start, and the time it took
 uint64_t g_decode_us = 0;
-uint64_t g_decode_from = 0;   // the decode under way began (0: none)
+uint64_t g_decode_from[16] = {};   // by guest thread: its decode under way began (0: none)
+uint32_t g_frame_decodes = 0;      // ...of them the frame thread's, for the frame trace
+uint64_t g_frame_decode_us = 0;
 struct {
     uint32_t inserted, sprites, decodes;
     uint64_t decode_us;
@@ -395,17 +397,28 @@ bool install_sprite_decode_timer(d2rt::Cpu &c)
     if (!c.read(kDecode, have, sizeof have) || std::memcmp(have, kDecodeOrig, sizeof have) != 0 ||
         !c.read(kDecodeStub, slack, sizeof slack) || std::memcmp(slack, kZero, sizeof slack) != 0)
         return false;
-    // The game's thread alone decodes, and the guest's threads take turns:
-    // no lock. A decode does not nest in another.
+    // The game's thread decodes, and Storm's read thread in its loads'
+    // callbacks (issue #76): a start by thread, the guest's threads taking
+    // turns (no lock). A decode does not nest in another on one thread. The
+    // frame trace counts the frame thread's alone: the read thread's cost
+    // the frames only the turns it takes, counted as their ready time.
     const uint32_t begin = rt::native_entry("SpriteDecodeBegin", 0, [](d2rt::Cpu &) -> uint32_t {
-        g_decode_from = rt::now_us();
+        const int t = rt::current_thread_id();
+        if (t >= 0 && t < 16)
+            g_decode_from[t] = rt::now_us();
         return 0;
     });
     const uint32_t end = rt::native_entry("SpriteDecodeEnd", 0, [](d2rt::Cpu &) -> uint32_t {
-        if (g_decode_from) {
-            g_decode_us += rt::now_us() - g_decode_from;
+        const int t = rt::current_thread_id();
+        if (t >= 0 && t < 16 && g_decode_from[t]) {
+            const uint64_t us = rt::now_us() - g_decode_from[t];
+            g_decode_us += us;
             g_decodes++;
-            g_decode_from = 0;
+            if (rt::on_frame_thread()) {
+                g_frame_decode_us += us;
+                g_frame_decodes++;
+            }
+            g_decode_from[t] = 0;
         }
         return 0;
     });
@@ -465,8 +478,8 @@ uint32_t sprite_cache_taken() { return __atomic_load_n(&g_inserted, __ATOMIC_REL
 
 void sprite_decode_totals(uint32_t &decodes, uint64_t &us)
 {
-    decodes = g_decodes;
-    us = g_decode_us;
+    decodes = g_frame_decodes;
+    us = g_frame_decode_us;
 }
 
 uint32_t govern_sprite_cache(d2rt::Cpu &c, uint32_t pool_free, bool spare_taken, uint32_t evicted, uint32_t reserve,

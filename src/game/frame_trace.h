@@ -5,10 +5,10 @@
 // tools/frame_report.py.
 //
 // The file is text:
-//   # 3ds-d2 frame trace 1                       the format
+//   # 3ds-d2 frame trace 3                       the format
 //   # <anything>                                 a note (a state change), between
 //                                                the frames it came between
-//   t gap tick run ready host sleep wait io dec dec_us skip who
+//   t gap tick run ready host sleep wait io dec dec_us skip who cs ev wsite wown wus wfrom
 // one line per frame, each field the change since the line before:
 //   t       the host clock at the present, ms since the trace started
 //   gap     us since the last present
@@ -19,10 +19,18 @@
 //   sleep   us it slept (Sleep)
 //   wait    us it waited on a lock, an event or a thread
 //   io      us it waited on a file read
-//   dec     sprites decoded, and dec_us the time that took (on the frame thread)
+//   dec     sprites the frame thread decoded, and dec_us the time that took
+//           (Storm's read thread decodes too: its time is the frames' ready)
 //   skip    frames not shown since: the screen was still drawing the last
 //   who     the guest thread that ran longest while it was ready (-1: none);
 //           a note "# thread <id> entry <va>" names it the first time
+//   cs, ev  of wait: us on a critical section, and on an event
+//   wsite   the game's code it waited from longest (hex, 0: no wait), wown
+//           the thread that held that critical section (0: none or an
+//           event), wus the us of that one wait, wfrom the game's calls it
+//           waited under (up to 4 return addresses on its EBP chain, hex,
+//           comma-separated; -)
+// (version 2 had no cs..wus; version 1 no who either)
 //
 // Platform-independent: the platform samples, opens and closes the file.
 #ifndef D2_GAME_FRAME_TRACE_H
@@ -41,6 +49,9 @@ struct FrameSample {
     uint64_t decode_us = 0;
     uint32_t skipped = 0;        // frames not shown since the start
     uint64_t ready_by[16] = {};  // its ready time by the thread that ran (rt::frame_thread_ready_by)
+    uint64_t wait_us = 0;        // its longest wait since the last frame (rt::frame_thread_wait_top)
+    uint32_t wait_site = 0, wait_owner = 0;
+    uint32_t wait_from[4] = {};   // rt::kWaitFrom
 };
 
 // Starts writing to `f` (the caller keeps it, and closes it after stop).

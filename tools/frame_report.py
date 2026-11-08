@@ -23,7 +23,9 @@ import argparse
 import statistics
 import sys
 
-FIELDS = ["t", "gap", "tick", "run", "ready", "host", "sleep", "wait", "io", "dec", "dec_us", "skip", "who"]
+FIELDS = ["t", "gap", "tick", "run", "ready", "host", "sleep", "wait", "io", "dec", "dec_us", "skip", "who",
+          "cs", "ev", "wsite", "wown", "wus", "wfrom"]
+V2 = 13   # version 2: up to "who"; version 1 one fewer
 
 
 def read(path, all_frames):
@@ -40,16 +42,22 @@ def read(path, all_frames):
                 panel = "panel open" in line
             continue
         parts = line.split()
-        if len(parts) == len(FIELDS) - 1:   # version 1: no "who"
+        if len(parts) == V2 - 1:   # version 1: no "who"
             parts.append("-1")
+        if len(parts) == V2:       # version 2: no wait split
+            parts += ["0", "0", "0", "0", "0"]
+        if len(parts) == len(FIELDS) - 1:   # no wfrom
+            parts.append("-")
         if len(parts) != len(FIELDS):
             continue
-        f = dict(zip(FIELDS, map(int, parts)))
+        parts[FIELDS.index("wsite")] = str(int(parts[FIELDS.index("wsite")], 16))
+        f = dict(zip(FIELDS[:-1], map(int, parts[:-1])))
+        f["wfrom"] = parts[-1]
         f["entry"] = entries.get(f["who"], "")
         f["in_game"], f["panel"] = in_game, panel
         if all_frames or (in_game and not panel):
             frames.append(f)
-    return frames
+    return frames, entries
 
 
 def pct(v, p):
@@ -57,7 +65,8 @@ def pct(v, p):
     return s[min(len(s) - 1, int(p / 100 * len(s)))]
 
 
-def report(frames, slow_ms, out=sys.stdout):
+def report(frames, slow_ms, out=sys.stdout, entries=None):
+    entries = entries or {}
     if len(frames) < 2:
         print("too few frames", file=out)
         return {}
@@ -107,6 +116,20 @@ def report(frames, slow_ms, out=sys.stdout):
                 who[k] = who.get(k, 0) + 1
         if who:
             print("slow frames held up by: " + ", ".join(f"{k} {c}" for k, c in sorted(who.items(), key=lambda x: -x[1])), file=out)
+        # Where the slow frames' longest waits came from (the game's code),
+        # and the thread that held the lock: version 3 traces.
+        sites = {}
+        for f in slow:
+            if f["wus"] > 2000:
+                k = f"{f['wsite']:08x}" + (f" held by thread {f['wown']} ({entries.get(f['wown'], '')})" if f["wown"] else "")
+                if f["wfrom"] != "-":
+                    k += f" from {f['wfrom']}"
+                n, us = sites.get(k, (0, 0))
+                sites[k] = (n + 1, us + f["wus"])
+        if sites:
+            print("slow frames' waits (site: frames, mean ms):", file=out)
+            for k, (n, us) in sorted(sites.items(), key=lambda x: -x[1][1])[:8]:
+                print(f"  {k}: {n}, {us / n / 1000:.1f}", file=out)
     return r
 
 
@@ -119,13 +142,14 @@ def main():
     ap.add_argument("--slow", type=float, default=50)
     ap.add_argument("--csv", help="write the frames kept to this CSV")
     a = ap.parse_args()
-    frames = [f for f in read(a.trace, a.all) if a.t0 * 1000 <= f["t"] <= a.t1 * 1000]
+    frames, entries = read(a.trace, a.all)
+    frames = [f for f in frames if a.t0 * 1000 <= f["t"] <= a.t1 * 1000]
     if a.csv:
         with open(a.csv, "w", encoding="utf-8") as o:
             o.write(",".join(FIELDS) + "\n")
             for f in frames:
                 o.write(",".join(str(f[k]) for k in FIELDS) + "\n")
-    report(frames, a.slow)
+    report(frames, a.slow, entries=entries)
 
 
 if __name__ == "__main__":

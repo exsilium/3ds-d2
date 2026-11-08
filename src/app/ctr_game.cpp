@@ -1077,6 +1077,7 @@ void present(const rt::Frame &f)
         s.tick_ms = rt::tick_ms();
         rt::frame_thread_us(s.thread_us);
         rt::frame_thread_ready_by(s.ready_by);
+        s.wait_us = rt::frame_thread_wait_top(s.wait_site, s.wait_owner, s.wait_from);
         game::sprite_decode_totals(s.decodes, s.decode_us);
         s.skipped = g_frames_skipped;
         game::frame_trace_frame(s);
@@ -1156,6 +1157,9 @@ uint32_t g_background_quantum = kBackgroundQuantum;
 // ...and its time (rt::RunOptions::background_slice_us): "bgslice=" (0: none).
 constexpr uint32_t kBackgroundSliceUs = 2000;
 uint32_t g_background_slice_us = kBackgroundSliceUs;
+// Storm's direct reads (game::install_storm_direct_reads): "stormdirect=0"
+// leaves them queued, as the game does.
+bool g_storm_direct = true;
 
 void load_settings()
 {
@@ -1184,6 +1188,9 @@ void load_settings()
             g_background_quantum = (uint32_t)std::strtoul(line + 10, nullptr, 10);
         else if (std::strncmp(line, "bgslice=", 8) == 0)
             g_background_slice_us = (uint32_t)std::strtoul(line + 8, nullptr, 10);
+        else if (std::strncmp(line, "stormdirect=", 12) == 0)
+            g_storm_direct = std::atoi(line + 12) != 0;
+
     }
     std::fclose(f);
     g_ss.take_settings_changed();
@@ -1990,6 +1997,16 @@ int main()
         hitch_heartbeat(w);   // before the sprite cache line, the window's last (tools/session_report.py)
         const game::SpriteCacheStats sc = game::sprite_cache_stats(*g_guest_cpu);
         char line[208], frames[192];
+        static uint32_t storm_mark[2] = {};
+        uint32_t storm[2];
+        game::storm_direct_counts(storm[0], storm[1]);
+        if (storm[0] != storm_mark[0] || storm[1] != storm_mark[1]) {
+            std::snprintf(line, sizeof line, "[rt] storm reads: %u read by their caller, %u queued (the read thread reading)",
+                          (unsigned)(storm[0] - storm_mark[0]), (unsigned)(storm[1] - storm_mark[1]));
+            logline_held(line);
+            storm_mark[0] = storm[0];
+            storm_mark[1] = storm[1];
+        }
         if (game::sprite_frames_line(frames, sizeof frames)) {
             std::snprintf(line, sizeof line, "[rt] %s", frames);
             logline_held(line);
@@ -2063,6 +2080,8 @@ int main()
         game::install_sprite_decode_timer(c);
         game::install_sprite_trace(c);
         game::install_storm_read_priority(c);
+        if (g_storm_direct)
+            game::install_storm_direct_reads(c);
         game::install_fatal_exit(c);
         game::install_pool_release(c);
         game::set_pool_block_size(c, game::kCtrPoolBlock);

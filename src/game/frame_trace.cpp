@@ -23,8 +23,8 @@ void frame_trace_start(FILE *f)
     g_have_last = false;
     g_named = 0;
     if (g_file)
-        std::fputs("# 3ds-d2 frame trace 2\n"
-                   "# t gap tick run ready host sleep wait io dec dec_us skip who\n",
+        std::fputs("# 3ds-d2 frame trace 3\n"
+                   "# t gap tick run ready host sleep wait io dec dec_us skip who cs ev wsite wown wus wfrom\n",
                    g_file);
 }
 
@@ -54,16 +54,24 @@ void frame_trace_frame(const FrameSample &s)
             most = s.ready_by[i] - g_last.ready_by[i];
             who = i;
         }
-    if (who >= 0 && !(g_named & (1u << who))) {
-        g_named |= 1u << who;
-        std::fprintf(g_file, "# thread %d entry %08x\n", who, (unsigned)rt::guest_thread_entry((uint32_t)who));
-    }
-    std::fprintf(g_file, "%llu %llu %u %llu %llu %llu %llu %llu %llu %u %llu %u %d\n",
+    for (const int id : {who, s.wait_owner ? (int)s.wait_owner : -1})
+        if (id >= 0 && id < 32 && !(g_named & (1u << id))) {
+            g_named |= 1u << id;
+            std::fprintf(g_file, "# thread %d entry %08x\n", id, (unsigned)rt::guest_thread_entry((uint32_t)id));
+        }
+    std::fprintf(g_file, "%llu %llu %u %llu %llu %llu %llu %llu %llu %u %llu %u %d %llu %llu %x %u %llu ",
                  (unsigned long long)((s.host_us - g_start_us) / 1000), (unsigned long long)(s.host_us - g_last.host_us),
                  (unsigned)(s.tick_ms - g_last.tick_ms), (unsigned long long)d[kRun], (unsigned long long)d[kReady],
                  (unsigned long long)d[kHost], (unsigned long long)d[kSleep], (unsigned long long)wait,
                  (unsigned long long)d[kFileio], (unsigned)(s.decodes - g_last.decodes),
-                 (unsigned long long)(s.decode_us - g_last.decode_us), (unsigned)(s.skipped - g_last.skipped), who);
+                 (unsigned long long)(s.decode_us - g_last.decode_us), (unsigned)(s.skipped - g_last.skipped), who,
+                 (unsigned long long)d[kCritsec], (unsigned long long)d[kEvent], (unsigned)s.wait_site,
+                 (unsigned)s.wait_owner, (unsigned long long)s.wait_us);
+    if (!s.wait_from[0])
+        std::fputs("-", g_file);
+    for (int i = 0; i < 4 && s.wait_from[i]; i++)
+        std::fprintf(g_file, i ? ",%x" : "%x", (unsigned)s.wait_from[i]);
+    std::fputc('\n', g_file);
     g_last = s;
 }
 

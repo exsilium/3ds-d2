@@ -55,7 +55,7 @@ The diagnostics are on the bottom screen's INFO tab (tap INFO in the tab bar; [c
 4. A red **JIT MEMORY FULL** line, if it ever appears.
 5. **hitch** and **wait**: the last 10 s's frames over 100 and 250 ms and the longest, and what stops frames: the drawing thread's time blocked (`wait`, mostly on Storm's reads from the SD card), `ready` while another game thread runs, `host` work on its core (the scheduler, the heartbeat), and `hb`, the last heartbeat's length; on the `files` line, frames not drawn (`skip`) and sound starved (`fam`).
 
-To measure more, tap **profiler run** on INFO, tick what to measure and start the run (sprite trace, guest code profile, file-read trace, SD card benchmark). The session is then offered as a report with what the run wrote. There is no separate profiling build any more.
+To measure more, tap **profiler run** on INFO, tick what to measure and start the run (sprite trace, guest code profile, file-read trace, SD card benchmark, frame timing). The session is then offered as a report with what the run wrote. There is no separate profiling build any more.
 
 The checklist's last row, **log writes**, sets how all logging reaches the SD card, game.log and the traces alike, whether a profiler run is on or not, and a tap steps it on. game.log and the traces go through rings in memory, written by a thread of their own (`src/app/ctr_writer.h`):
 - **batched** (the default): a file is written once 16 KiB is queued, or 5 s after its last write. The card's cost is per write, and a long session of small writes ended in stalls of 9–14 s (3DS-D2-14). A crash the app catches writes out what is queued; a freeze or a power-off loses up to 5 s of it.
@@ -161,6 +161,62 @@ Two more settings matter for these checks:
 Scripts for these runs are in `tests/m4/scripts/` (`M4_SCRIPT="$(cat tests/m4/scripts/fight.txt)"`): `town-walk.txt` walks around the Rogue Encampment, `fight.txt` crosses the bridge into Blood Moor and fights the quill rats there, and `act2-east.txt` takes a character that has finished Act I (`dist/save/BeforeCh1End`) to Warriv and East to Lut Gholein (issue #66). It finds Warriv in the game's units (`tapunit`, `src/game/d2_units.h`), so it does not depend on the frame rate. The fight's route is the map the virtual clock gives. The same file works on the console as `sdmc:/3ds/3ds-d2/autoplay.txt`.
 
 Example: the native light grid (`LightGrid`, mask bit 8), with the town walk script, `WX86_FAKETSC=1` and `M4_HASHMEM=0x7b0e68:0x4800`. Masks `0xff` and `0x1ff` give the same 2,372 frames, pixels and grid alike, over 185 distinct grid states.
+
+## Frame pacing (issue #76)
+
+Walking around a town felt jumpy, and the 10 s frame rate did not show it: most frames took 40 ms, then one took 70–150 ms. This is measured off the console, in Azahar, and only the result is checked on the console. The jumpiness Azahar showed in town matched the console's.
+
+**The frame trace.** The profiler's **frame timing** option writes `logs/frames.trc`, a line per frame presented (`src/game/frame_trace.h` has the format), and a report attaches it. Each line gives:
+- the gap since the last frame, and how far the game's clock moved;
+- the frame thread's time running, ready while another guest thread ran (and which one), in host work, sleeping, waiting on a lock, an event or a file read;
+- its sprite decodes;
+- for its longest wait: the game code it waited from, the thread that held the lock, and the return addresses on its EBP chain.
+
+The trace is buffered and written by the log writer thread, so it does not make frames uneven itself. `python3 tools/frame_report.py frames.trc` counts the frames in game with no panel open and gives:
+- the gap percentiles and the share past 50, 60 and 100 ms;
+- the jitter (the mean change from one gap to the next);
+- the share of frame pairs near 40 ms;
+- what the slow frames did instead, with the threads and wait sites behind them.
+
+**An unattended walk in Azahar.** This runs a CIA and writes `frames.trc`, `game.log` and `report.txt` to `build/smooth/<time>/`:
+
+    scripts/measure-smoothness.sh --save DuringCh2Mid [--setting stormdirect=0] [--cia <file>]
+
+It plays `tests/m4/scripts/smooth-walk.txt`:
+1. the first character into the game;
+2. a profiler run with the frame trace only;
+3. 90 s of circle-pad loops around the town. A panel the walk clicks open (an NPC's menu) is closed with START (`closepanels`).
+
+`--save` picks the starting point: `BeforeCh1End` (the Rogue Encampment) or `DuringCh2Mid` (Lut Gholein, the busier one). The zips beside the saves in `dist/save/` restore them.
+
+Two runs of the same build differ by a few points, so compare settings over alternating runs, two or more each. Azahar is slower than the console per guest instruction, so its figures compare builds with each other; they are not the console's.
+
+**What made the frames uneven, and the changes.** All guest threads take turns on one core.
+1. Storm's read thread (thread 4, entry `0x41a550`) decompresses what it reads with the Huffman, ADPCM and PKWARE natives. A turn was 300,000 guest instructions, and time in natives did not count toward it, so one long decode kept the core for 10–16 ms.
+   - Turns of other threads are now 40,000 instructions (backend patch 0059; `bgquantum=` in settings.txt, `M4_BG_QUANTUM` on the lane).
+   - A background thread past 2 ms yields once a native returns, when the frame thread is waiting to run (`bgslice=`).
+   - The read thread's decoders run on the I/O worker's core while it waits (`rt::offload_job`). Each job takes under 1 ms there.
+2. The frame thread's own small reads (a sprite file's header at `0x5fdf2c`, sounds) waited about 35 ms at `0x41af0d`, Storm's wait for its read thread. The read thread serves them next (`install_storm_read_priority`), but first finishes what it is doing: after reading a load, its completion callback decodes the whole sprite group in guest code (`0x5ff6e0` → `0x60bff0`), 30–60 ms in Azahar. Storm's request size made no difference (16 against 4 KiB).
+   - A caller with no OVERLAPPED now reads on its own thread under Storm's lock whenever the read thread is not inside its own read (`install_storm_direct_reads`, `src/game/storm_reads.cpp`), as Storm does for an archive opened for synchronous reads. The read thread marks its read with a flag. It cannot start another without the lock, so the archive's handle is never used by both at once.
+   - `stormdirect=0` in settings.txt (`M4_STORM_DIRECT=0` on the lane) leaves those reads queued. The heartbeat logs `storm reads: <n> read by their caller, <n> queued`.
+
+Lut Gholein, 90 s walks in Azahar:
+
+| Build | Past 50 ms | Past 60 ms | Jitter | Pairs near 40 ms |
+| --- | --- | --- | --- | --- |
+| Before (two runs) | 21.2%, 18.8% | 9.3%, 7.6% | 10.0, 9.3 ms | 61%, 65% |
+| Shorter turns and the time limit | 18.5%, 14.9% | | 7.4, 6.8 ms | |
+| ...and the decoders on the I/O core (five runs) | 6.6%, 9.5%, 5.8%, 6.6%, 9.6% | 3.3–5.3% | 4.7–5.8 ms | 83–88% |
+| ...and direct reads (two runs, against four without them on the same build) | 9.6%, 6.5% (without: 10.6%, 9.1%, 8.3%, 11.3%) | 4.7%, 3.2% (without: 3.9–6.2%) | 6.0, 4.8 ms (without: 5.0–7.3) | 82%, 87% (without: 78–85%) |
+
+Direct reads are a small gain in Azahar, where a read from the emulated SD card costs about 5.6 ms; the waits they remove are the 35 ms ones at `0x41af0d`. Reads that find the read thread mid-read are still queued: having the caller wait for that read instead, the lock held, made the frames much worse (15.6% and 22.3% past 50 ms).
+
+What the slow frames left in Azahar did instead, roughly a third each:
+- **run**: the frame thread's own work running long (new sprites' decodes on its own thread, the game's logic);
+- **ready**: the read thread running, mostly its callbacks' sprite decodes in guest code;
+- **wait**: reads queued behind the read thread, and the frame thread's own reads from the card.
+
+The console's figures decide what comes next: its SD reads and its speed per guest instruction differ from Azahar's.
 
 ## Blood Moor: VirtualAlloc ran out (2026-10-18)
 

@@ -62,12 +62,12 @@ void init_once()
 
 uint64_t now_us() { return svcGetSystemTick() / (SYSCLOCK_ARM11 / 1000000); }
 
-// One chunk of `s`'s queue to its file; false if there is none. The caller
-// holds io_lock.
-bool write_chunk(Stream &s)
+// One chunk of `s`'s queue to its file, up to `upto` (a head seen earlier) if
+// given; false if there is none. The caller holds io_lock.
+bool write_chunk(Stream &s, const size_t *upto = nullptr)
 {
     LightLock_Lock(&s.ring_lock);
-    const size_t h = s.head, t = s.tail;
+    const size_t t = s.tail, h = upto ? *upto : s.head;
     LightLock_Unlock(&s.ring_lock);
     if (h == t || !s.file)
         return false;
@@ -118,13 +118,21 @@ void write_direct(Stream &s, const char *buf, size_t n)
     s.last_us = now_us();
 }
 
-// Everything queued in `s`. The writer thread stops at a pause or a crash.
+// Everything queued in `s`. The writer thread stops at a pause or a crash,
+// and writes only what was queued when it found the file due: chasing what
+// came in meanwhile wrote a busy trace in pieces of ~150 B, 196 writes and
+// 1.9 s of the card in the 10 s of the game's exit, its reads waiting behind
+// them (3DS-D2-15, 2026-11-08). The rest waits for its own batch.
 void write_out(Stream &s, bool by_writer)
 {
     LightLock_Lock(&s.io_lock);
-    if (s.used && (!by_writer || due(s)))
-        while (!(by_writer && (g_paused || g_crashed)) && write_chunk(s)) {
+    if (s.used && (!by_writer || due(s))) {
+        LightLock_Lock(&s.ring_lock);
+        const size_t upto = s.head;
+        LightLock_Unlock(&s.ring_lock);
+        while (!(by_writer && (g_paused || g_crashed)) && write_chunk(s, by_writer ? &upto : nullptr)) {
         }
+    }
     LightLock_Unlock(&s.io_lock);
 }
 

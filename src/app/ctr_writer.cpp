@@ -19,6 +19,7 @@ constexpr size_t kStreams = 4;
 constexpr size_t kChunk = 16 * 1024;
 constexpr size_t kBatch = 16 * 1024;
 constexpr uint64_t kMaxAgeUs = 5 * 1000000ULL;
+constexpr uint64_t kSecondUs = 1000000ULL;   // WriterMode::EverySecond
 constexpr s64 kRoundNs = 1000 * 1000000LL;   // a round at least this often
 
 struct Stream {
@@ -41,6 +42,7 @@ LightLock g_list_lock;
 LightEvent g_wake;
 Thread g_thread = nullptr;
 volatile bool g_quit = false, g_paused = false, g_crashed = false;
+volatile WriterMode g_mode = WriterMode::Batched;
 bool g_init = false;
 
 void init_once()
@@ -93,7 +95,27 @@ bool due(Stream &s)
     LightLock_Lock(&s.ring_lock);
     const size_t queued = s.head - s.tail;
     LightLock_Unlock(&s.ring_lock);
-    return queued >= kBatch || (queued && now_us() - s.last_us >= kMaxAgeUs);
+    if (!queued)
+        return false;
+    if (g_mode != WriterMode::Batched)   // every second (or what at once left queued, during a pause)
+        return now_us() - s.last_us >= kSecondUs;
+    return queued >= kBatch || now_us() - s.last_us >= kMaxAgeUs;
+}
+
+// `buf` straight to the file, counted with the writer's own writes.
+void write_direct(Stream &s, const char *buf, size_t n)
+{
+    if (!n || !s.file)
+        return;
+    const uint64_t t0 = now_us();
+    std::fwrite(buf, 1, n, s.file);
+    std::fflush(s.file);
+    const uint64_t dt = now_us() - t0;
+    s.bytes += n;
+    s.writes++;
+    s.us += dt;
+    s.longest_us = std::max<uint32_t>(s.longest_us, (uint32_t)std::min<uint64_t>(dt, UINT32_MAX));
+    s.last_us = now_us();
 }
 
 // Everything queued in `s`. The writer thread stops at a pause or a crash.
@@ -113,10 +135,7 @@ void write_now(Stream &s, const char *buf, size_t n)
     const bool locked = LightLock_TryLock(&s.io_lock) == 0;
     while (write_chunk(s)) {
     }
-    if (n && s.file) {
-        std::fwrite(buf, 1, n, s.file);
-        std::fflush(s.file);
-    }
+    write_direct(s, buf, n);
     if (locked)
         LightLock_Unlock(&s.io_lock);
 }
@@ -130,6 +149,17 @@ int stream_write(void *cookie, const char *buf, _READ_WRITE_BUFSIZE_TYPE size)
         return 0;
     if (g_crashed || !g_thread) {
         write_now(s, buf, (size_t)n);
+        return n;
+    }
+    // At once: from this thread, after what is queued, before the caller goes
+    // on; a freeze or a power-off then loses nothing written before it. Not
+    // while paused (the HOME menu has the card): queued then, as any other.
+    if (g_mode == WriterMode::AtOnce && !g_paused) {
+        LightLock_Lock(&s.io_lock);
+        while (write_chunk(s)) {
+        }
+        write_direct(s, buf, (size_t)n);
+        LightLock_Unlock(&s.io_lock);
         return n;
     }
     LightLock_Lock(&s.ring_lock);
@@ -234,6 +264,12 @@ FILE *writer_wrap(FILE *file, char *ring, size_t bytes, const char *name)
     }
     LightLock_Unlock(&g_list_lock);
     return s ? s->front : nullptr;
+}
+
+void writer_set_mode(WriterMode mode)
+{
+    g_mode = mode;
+    writer_kick();   // what batched mode left queued goes by the new rule
 }
 
 void writer_kick()

@@ -1604,14 +1604,15 @@ void file_trace_stop()
     g_files_trace_buf = nullptr;
 }
 
-// How the traces reach the SD card (issue #66: a crash in game lost the
-// last minutes of both), as the checklist's last row says, from the service
-// call (every 50 ms, loads included) on the game's thread, the one that
-// writes the traces. A change applies at once and is logged as
+// How game.log and the traces reach the SD card (issue #66: a crash in
+// game lost the last minutes of both), as the checklist's last row says:
+// the writer's mode (ctr_writer.h), and the traces' own records each at
+// once into it for "at once". From the service call (every 50 ms, loads
+// included) on the game's thread. A change applies at once and is logged as
 //   profiler run: trace writes <buffered|second|now>
-// (the first only if not buffered). Buffered changes nothing from before.
+// (the first only if not buffered; the line keeps its old name, which the
+// reports read).
 game::TraceWrites g_trace_writes = game::TraceWrites::Buffered;
-uint64_t g_trace_written_us = 0;   // every second: the last write-out
 
 void trace_writes_service()
 {
@@ -1621,16 +1622,22 @@ void trace_writes_service()
         const bool each = m == game::TraceWrites::AtOnce;
         rt::set_file_trace_each(each);
         game::sprite_trace_each(each);
+        app::writer_set_mode(each                                      ? app::WriterMode::AtOnce
+                             : m == game::TraceWrites::EverySecond ? app::WriterMode::EverySecond
+                                                                   : app::WriterMode::Batched);
         char line[64];
         std::snprintf(line, sizeof line, "%strace writes %s", game::kProfilerRunLine, game::trace_writes_info(m).name);
         logline(line);
     }
+    // Every second: what the traces' own buffers hold, into the writer's
+    // rings (it then writes them out by its own second).
     if (m != game::TraceWrites::EverySecond || g_storage_closed)   // the HOME menu has the SD card
         return;
+    static uint64_t written_us = 0;
     const uint64_t now = host_us();
-    if (now - g_trace_written_us < 1000000)
+    if (now - written_us < 1000000)
         return;
-    g_trace_written_us = now;
+    written_us = now;
     if (g_files_trace)
         std::fflush(g_files_trace);
     game::sprite_trace_flush();

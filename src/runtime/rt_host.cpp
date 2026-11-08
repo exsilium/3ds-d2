@@ -586,13 +586,19 @@ void crash_report(const uint32_t r[16], uint32_t far, void (*line)(const char *)
     }
 }
 
+void background_slice_check();   // after the frame thread's state, below
+
 uint32_t native_entry(const char *name, uint32_t stack_args, std::function<uint32_t(Cpu &)> fn)
 {
     Shim s;
     s.argc = stack_args;
     s.stdcall_cleanup = true;
     s.tag = std::string("3DSD2NATIVE!") + name;
-    s.fn = std::move(fn);
+    s.fn = [fn = std::move(fn)](Cpu &c) {
+        const uint32_t r = fn(c);
+        background_slice_check();
+        return r;
+    };
     g_br->register_shim("3DSD2NATIVE", name, s);
     return g_br->shim_trap("3DSD2NATIVE", name);
 }
@@ -696,6 +702,10 @@ enum : size_t { kFrameRun, kFrameReady, kFrameHost, kFrameSleep, kFrameWaits };
 uint64_t g_frame_us[kFrameKindCount] = {}, g_frame_mark[kFrameKindCount] = {};
 size_t g_frame_was = kFrameKindCount;   // what it was doing at the last sample (none yet)
 uint64_t g_frame_at = 0;
+// Its ready time by the guest thread that ran meanwhile (ids under 16), for
+// the frame trace: who kept it from its frame.
+uint64_t g_ready_by[16] = {};
+uint64_t g_slice_start_us = 0;   // the running slice's start (real clock)
 int g_slice_tid = -1;          // the guest thread whose slice runs, -1 between slices
 bool g_slice_sink = false;     // the scheduler reports its slices
 bool g_host_work = false;      // the heartbeat or the app's service runs
@@ -751,6 +761,8 @@ uint64_t charge_frame_thread()
     const uint64_t us = wx86_now_us();
     if (g_frame_was < kFrameKindCount && us > g_frame_at) {
         g_frame_us[g_frame_was] += us - g_frame_at;
+        if (g_frame_was == kFrameReady && g_slice_tid >= 0 && g_slice_tid < 16)
+            g_ready_by[g_slice_tid] += us - g_frame_at;
         if (g_frame_was >= kFrameSleep)
             g_frame_wait_at[g_frame_where] += us - g_frame_at;
     }
@@ -768,12 +780,34 @@ void sample_frame_thread()
 void on_slice(uint32_t tid, bool start)
 {
     const uint64_t us = charge_frame_thread();
+    if (start)
+        g_slice_start_us = us;
     if (start && g_opt.real_clock)
         raise_tick(us / 1000 - g_t0_ms);   // now_ms's value, from the clock read just made
     g_slice_sink = true;
     g_slice_tid = start ? (int)tid : -1;
     g_frame_was = frame_thread_doing();
 }
+
+}  // namespace
+
+// RunOptions::background_slice_us, after a native: a background thread
+// past its time yields when the frame thread waits to run.
+void background_slice_check()
+{
+    const int frame = g_stats.frame_thread;
+    // Real clock only: on the virtual clock a run must not depend on host time.
+    if (!g_opt.background_slice_us || !g_opt.real_clock || !g_sched || frame < 0 || g_slice_tid < 0 ||
+        g_slice_tid == frame)
+        return;
+    if (wx86_now_us() - g_slice_start_us < g_opt.background_slice_us)
+        return;
+    GuestThread *t = g_sched->thread_by_id((uint32_t)frame);
+    if (t && t->state == GuestThread::State::Ready)
+        g_sched->yield();
+}
+
+namespace {
 
 // Host work on the guest's core, from the scheduler's thread.
 void host_work(bool on)
@@ -1102,6 +1136,25 @@ FrameThreadTimes frame_thread_times()
         blocked += g_frame_us[i];
     t.blocked_ms = blocked / 1000;
     return t;
+}
+
+void frame_thread_ready_by(uint64_t out[16])
+{
+    for (int i = 0; i < 16; i++)
+        out[i] = g_ready_by[i];
+}
+uint32_t guest_thread_entry(uint32_t tid)
+{
+    GuestThread *t = g_sched ? g_sched->thread_by_id(tid) : nullptr;
+    return t ? t->entry : 0;
+}
+
+void frame_thread_us(uint64_t out[kFrameThreadKinds])
+{
+    static_assert(kFrameThreadKinds == kFrameKindCount, "rt_host.h's kinds are kFrameKinds");
+    charge_frame_thread();
+    for (size_t i = 0; i < kFrameKindCount; i++)
+        out[i] = g_frame_us[i];
 }
 
 uint64_t last_heartbeat_us() { return g_heartbeat_us; }
@@ -1463,6 +1516,11 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
     sched.set_max_switches(~0ull);   // runs end by exit or max_ms, never by a switch count
     sched.set_time_sink([](uint64_t ms) { check_time_limit(ms); });
     sched.set_slice_sink(on_slice);
+    if (opt.background_quantum)
+        sched.set_quantum_for([](uint32_t tid) -> uint32_t {
+            const int frame = g_stats.frame_thread;   // -1 until the first frame
+            return frame >= 0 && tid != (uint32_t)frame ? g_opt.background_quantum : 0;
+        });
     wx86_set_scheduler(&sched);
     sched.set_main(img->entry_va(), L.main_stack + 0x200000 - 0x100, L.main_tib);
     g_tick_cpu.store(cpu, std::memory_order_release);

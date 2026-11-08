@@ -29,6 +29,9 @@ struct GameState {
 
 // Cheap: a check byte and up to 42 dwords. Call once per input poll.
 GameState read_game_state();
+// The next read_game_state logs (and notes in the frame trace) the state as
+// a change, whether it changed or not: a trace started in game says so.
+void note_game_state_again();
 
 }  // namespace game
 

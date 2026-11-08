@@ -136,7 +136,7 @@ const Pad &Autoplay::step(uint64_t now_ms, Controls &controls, bool &shot, const
     while (next_ < events_.size()) {
         const char *ev = events_[next_].c_str();
         unsigned long long at = 0;
-        char verb[16] = {}, arg[16] = {};
+        char verb[16] = {}, arg[64] = {};
         int x = 0, y = 0;
         if (std::sscanf(ev, "%llu %15s", &at, verb) < 2) {   // malformed: skip it
             next_++;
@@ -175,6 +175,8 @@ const Pad &Autoplay::step(uint64_t now_ms, Controls &controls, bool &shot, const
                 rt::input_char((unsigned char)*t);
         } else if (v == "shot") {
             shot = true;
+        } else if (v == "profile" && std::sscanf(ev, "%*s %*s %63s", arg) == 1) {
+            profile_ = arg;
         } else if (v == "tapmenu" && std::sscanf(ev, "%*s %*s %d", &x) == 1 && x > 0) {
             if (!menu_unit_) {
                 rt::logf("autoplay: tapmenu without an NPC (tapunit first)");

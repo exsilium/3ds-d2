@@ -168,6 +168,7 @@ int main(int argc, char **argv)
         opt.total_phys_mb = 64;
         opt.pool_spare = game::kCtrPoolSpare;
         opt.pool_large = game::kCtrPoolLarge;
+        opt.background_quantum = 40000;   // as the console's (ctr_game.cpp)
     }
     if (const char *kb = std::getenv("M4_POOL_SPARE_KB"))   // another spare (0: none)
         opt.pool_spare = (uint32_t)std::atoi(kb) << 10;
@@ -175,6 +176,8 @@ int main(int argc, char **argv)
         opt.pool_large = (uint32_t)std::atoi(kb) << 10;
     if (const char *kb = std::getenv("M4_POOL_LARGE_MIN_KB"))   // blocks over this go there (256: the console's)
         opt.pool_large_min = (uint32_t)std::atoi(kb) << 10;
+    if (const char *q = std::getenv("M4_BG_QUANTUM"))   // the other threads' slice (0: the frame thread's)
+        opt.background_quantum = (uint32_t)std::atoi(q);
     if (const char *mb = std::getenv("M4_PHYS_MB"))   // override the RAM the game is told about
         opt.total_phys_mb = (uint32_t)std::atoi(mb);
     opt.virtual_tick_us = 250;   // used only under M4_VIRTUAL_CLOCK

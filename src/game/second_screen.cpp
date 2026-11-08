@@ -210,6 +210,12 @@ void SecondScreen::set_profile_choice(uint32_t bits)
     dirty_ = true;
 }
 
+void SecondScreen::set_profiling(bool on)
+{
+    profiling_ = on && profile_ != 0;
+    dirty_ = true;
+}
+
 void SecondScreen::set_trace_writes(TraceWrites m)
 {
     if (m != trace_writes_)
@@ -872,7 +878,7 @@ void draw_bottom(uint16_t *fb, const BottomView &v, const uint8_t *frame, int fw
                     kGold);
             for (int i = 0; i < kProfileOptionCount; i++) {
                 const ProfileOptionInfo &o = kProfileOptions[i];
-                const int y = SecondScreen::kProfRowY + i * SecondScreen::kProfRowH + 8;
+                const int y = SecondScreen::kProfRowY + i * SecondScreen::kProfRowH + 3;
                 const bool ticked = (v.profile & o.bit) != 0;
                 const uint16_t ink = v.profiling ? kHint : rgb(230, 220, 200);
                 cv.fill(8, y, 14, 14, ink);
@@ -884,7 +890,7 @@ void draw_bottom(uint16_t *fb, const BottomView &v, const uint8_t *frame, int fw
                 // How the traces are written: no box, a tap steps it on;
                 // never greyed, it changes during a run too.
                 const TraceWritesInfo &w = trace_writes_info(v.trace_writes);
-                const int y = SecondScreen::kProfRowY + kProfileOptionCount * SecondScreen::kProfRowH + 8;
+                const int y = SecondScreen::kProfRowY + kProfileOptionCount * SecondScreen::kProfRowH + 3;
                 cv.text(32, y + 3, w.label, w.mode == TraceWrites::Buffered ? rgb(230, 220, 200) : kGold);
                 cv.text(32, y + 15, w.note, kHint);
             }

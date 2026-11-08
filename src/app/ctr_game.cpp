@@ -29,6 +29,7 @@
 #include "game/d2_memory.h"
 #include "game/d2_native.h"
 #include "game/d2_state.h"
+#include "game/frame_trace.h"
 #include "game/osk.h"
 #include "game/profiler.h"
 #include "game/second_screen.h"
@@ -284,6 +285,7 @@ const char kSaveDir[] = "sdmc:/3ds/3ds-d2/save";
 const char kLogDir[] = "sdmc:/3ds/3ds-d2/logs";
 const char kTracePath[] = "sdmc:/3ds/3ds-d2/logs/sprites.trc";   // the profiler run's sprite trace (issue #18)
 const char kFileTracePath[] = "sdmc:/3ds/3ds-d2/logs/files.trc";  // ...and its file-read trace (issue #21)
+const char kFrameTracePath[] = "sdmc:/3ds/3ds-d2/logs/frames.trc";  // ...and its frame trace
 const char kSettings[] = "sdmc:/3ds/3ds-d2/settings.txt";   // the bottom screen's tab and map size, the profiler checklist
 
 FILE *g_log = nullptr;
@@ -1069,6 +1071,16 @@ void present(const rt::Frame &f)
     }
     g_timing.frames++;
     g_timing.total_frames++;
+    if (game::frame_trace_on()) {
+        game::FrameSample s;
+        s.host_us = t0;
+        s.tick_ms = rt::tick_ms();
+        rt::frame_thread_us(s.thread_us);
+        rt::frame_thread_ready_by(s.ready_by);
+        game::sprite_decode_totals(s.decodes, s.decode_us);
+        s.skipped = g_frames_skipped;
+        game::frame_trace_frame(s);
+    }
 
     if (__atomic_load_n(&g_render_busy, __ATOMIC_ACQUIRE)) {
         g_frames_skipped++;   // the screen is still showing/drawing the last one
@@ -1136,6 +1148,15 @@ uint32_t g_last_focus = 0;           // the last focused edit box seen (auto-ope
 
 // ---- settings: the bottom screen's tab and map size -------------------------------------
 
+// The other guest threads' slice (rt::RunOptions::background_quantum), in
+// instructions; the frame thread keeps the scheduler's 300000. settings.txt's
+// "bgquantum=" overrides it for a measurement (0: one slice for all).
+constexpr uint32_t kBackgroundQuantum = 40000;
+uint32_t g_background_quantum = kBackgroundQuantum;
+// ...and its time (rt::RunOptions::background_slice_us): "bgslice=" (0: none).
+constexpr uint32_t kBackgroundSliceUs = 2000;
+uint32_t g_background_slice_us = kBackgroundSliceUs;
+
 void load_settings()
 {
     FILE *f = std::fopen(kSettings, "r");
@@ -1159,6 +1180,10 @@ void load_settings()
             g_ss.set_profile_choice(game::profile_bits(line + 8));
         else if (std::strncmp(line, "tracewrites=", 12) == 0)   // ...and how its traces are written (issue #66)
             g_ss.set_trace_writes(game::trace_writes_from_name(line + 12));
+        else if (std::strncmp(line, "bgquantum=", 10) == 0)   // a measurement's, not written back
+            g_background_quantum = (uint32_t)std::strtoul(line + 10, nullptr, 10);
+        else if (std::strncmp(line, "bgslice=", 8) == 0)
+            g_background_slice_us = (uint32_t)std::strtoul(line + 8, nullptr, 10);
     }
     std::fclose(f);
     g_ss.take_settings_changed();
@@ -1426,6 +1451,15 @@ void poll()
             bool shot = false;
             pad = g_autoplay.step(rt::now_ms(), g_controls, shot, gs);
             g_shot_request |= shot;
+            // A profiler run from the script: started or stopped at the next
+            // heartbeat, as by its button.
+            std::string prof;
+            if (g_autoplay.take_profile(prof)) {
+                if (prof != "off")
+                    g_ss.set_profile_choice(game::profile_bits(prof.c_str()));
+                g_ss.set_profiling(prof != "off");
+                rt::logf("autoplay: profile %s", prof.c_str());
+            }
         }
     }
     // A newly focused text field (the hero name box, a game name) opens the keyboard.
@@ -1604,6 +1638,45 @@ void file_trace_stop()
     g_files_trace_buf = nullptr;
 }
 
+// The frame trace (game/frame_trace.h): a line per frame, from present().
+// ~25 lines of ~50 bytes a second: 1.2 KiB/s through the writer.
+FILE *g_frame_trace = nullptr;
+char *g_frame_trace_buf = nullptr;
+bool g_frames_traced = false;   // a second run this session appends
+
+bool frame_trace_file_start()
+{
+    constexpr size_t kBuffer = 16 * 1024;
+    g_frame_trace_buf = (char *)std::malloc(kBuffer);
+    g_frame_trace = g_frame_trace_buf ? (g_frames_traced ? open_at_end(kFrameTracePath, false)
+                                                         : std::fopen(kFrameTracePath, "w"))
+                                      : nullptr;
+    if (!g_frame_trace) {
+        std::free(g_frame_trace_buf);
+        g_frame_trace_buf = nullptr;
+        return false;
+    }
+    if (FILE *w = app::writer_wrap(g_frame_trace, g_frame_trace_buf, kBuffer, "frames.trc"))
+        g_frame_trace = w;
+    else
+        std::setvbuf(g_frame_trace, g_frame_trace_buf, _IOFBF, kBuffer);
+    g_frames_traced = true;
+    game::frame_trace_start(g_frame_trace);
+    game::note_game_state_again();
+    return true;
+}
+
+void frame_trace_file_stop()
+{
+    if (!g_frame_trace)
+        return;
+    game::frame_trace_stop();
+    std::fclose(g_frame_trace);
+    std::free(g_frame_trace_buf);
+    g_frame_trace = nullptr;
+    g_frame_trace_buf = nullptr;
+}
+
 // How game.log and the traces reach the SD card (issue #66: a crash in
 // game lost the last minutes of both), as the checklist's last row says:
 // the writer's mode (ctr_writer.h), and the traces' own records each at
@@ -1657,6 +1730,8 @@ void profiler_switch(uint32_t want)
     }
     if (stop & game::kProfFiles)
         file_trace_stop();
+    if (stop & game::kProfFrames)
+        frame_trace_file_stop();
     g_prof_on &= ~stop;
     uint32_t refused = 0;
     if ((start & game::kProfSprites) && !game::sprite_trace_start(kTracePath))
@@ -1669,6 +1744,8 @@ void profiler_switch(uint32_t want)
     }
     if ((start & game::kProfFiles) && !file_trace_start())
         refused |= game::kProfFiles;
+    if ((start & game::kProfFrames) && !frame_trace_file_start())
+        refused |= game::kProfFrames;
     if (start & game::kProfSdBench)
         sd_benchmark(g_bench_path);   // once, as the run starts
     if (refused)
@@ -1801,6 +1878,7 @@ int main()
     const std::string kept = report::keep_unclosed_session();
     std::remove(kTracePath);   // the last session's, if it closed (its report has its own copy)
     std::remove(kFileTracePath);
+    std::remove(kFrameTracePath);
     g_log_path = std::string(kLogDir) + "/game.log";
     g_log = open_log(false);
     std::freopen((std::string(kLogDir) + "/stderr.txt").c_str(), "w", stderr);
@@ -1880,6 +1958,11 @@ int main()
     opt.total_phys_mb = 64;   // the game's own 24 MiB sprite-cache floor
     opt.pool_spare = game::kCtrPoolSpare;
     opt.pool_large = game::kCtrPoolLarge;
+    opt.background_quantum = g_background_quantum;
+    opt.background_slice_us = g_background_slice_us;
+    if (g_background_quantum != kBackgroundQuantum || g_background_slice_us != kBackgroundSliceUs)
+        status("background threads' slice: %u instructions, %u us (settings.txt)", (unsigned)g_background_quantum,
+               (unsigned)g_background_slice_us);
     // Cheaper video defaults than a PC's (the game's Options menu still
     // changes them): 640x480 in game (36% fewer pixels to draw, and exactly
     // 2:1 down to the 240-line screen), low lighting, no blended shadows, no

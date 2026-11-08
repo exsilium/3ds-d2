@@ -90,6 +90,20 @@ struct RunOptions {
     // blocks over pool_large_min that no free piece of the pool holds.
     uint32_t pool_large = 0;
     uint32_t pool_large_min = 256u << 10;
+    // The scheduler's slice for every guest thread but the frame thread, in
+    // instructions (0: the scheduler's quantum, 300000, for all). The
+    // threads take turns on one core: a file loader decompressing for a
+    // whole quantum kept the game's thread from its frame (~16 ms in Azahar,
+    // most of the frames over 50 ms while walking). Shorter slices give it
+    // the same share in smaller pieces.
+    uint32_t background_quantum = 0;
+    // ...and by time (us, 0: none): the quantum counts guest instructions
+    // only, and a native (a decompressor, called sector by sector) runs for
+    // free, so a loader's slice of Storm's decoders held the game's thread
+    // 15 ms at a time, every 250-550 ms, in Azahar. After a native returns on
+    // another thread, past this much of its slice and with the frame thread
+    // ready, the thread yields.
+    uint32_t background_slice_us = 0;
     // CPUID leaf-1 EDX reported to the guest; 0 keeps the backend's default
     // (FPU CMOV MMX FXSR SSE SSE2). The 3DS reports kCpuidNoSimd: the game
     // then takes its x87/integer paths instead of SSE code the ARM11 emulates.
@@ -169,6 +183,25 @@ struct FrameThreadTimes {
     uint64_t run_ms = 0, ready_ms = 0, host_ms = 0, blocked_ms = 0;
 };
 FrameThreadTimes frame_thread_times();
+// The same in us by what it was doing, charged up to now: run, ready, host,
+// sleep, then its waits (critsec, event, fileio, multi, thread, other). For
+// the frame trace (game/frame_trace.h), at each frame; the scheduler's
+// thread (a shim's).
+constexpr size_t kFrameThreadKinds = 10;
+void frame_thread_us(uint64_t out[kFrameThreadKinds]);
+// Of its ready time, us by the guest thread that ran meanwhile (ids 0-15),
+// and a guest thread's entry point (0: none), to name it.
+void frame_thread_ready_by(uint64_t out[16]);
+uint32_t guest_thread_entry(uint32_t tid);
+// A native's work on the I/O worker (the second core) while the guest
+// thread that called it waits, as a file read does: the other guest threads
+// run meanwhile. `job` gets `args` (at most 8, captured from the guest's
+// registers and stack before the call), touches guest memory only through
+// host pointers, and must not depend on anything the game's core changes
+// meanwhile. True: the native returns `ret`, and the thread's EAX becomes
+// what the job returned when it wakes. False (asynchronous reads off, the
+// frame thread calling, the worker full): the caller runs it itself.
+bool offload_job(uint32_t (*job)(const uint32_t *), const uint32_t *args, size_t n, uint32_t &ret);
 // How long the last heartbeat took (us): the runtime's lines and
 // RunOptions::heartbeat, on the guest's core, so the frame after it waited
 // as long. The scheduler's thread.

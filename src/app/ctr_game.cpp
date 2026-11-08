@@ -21,6 +21,7 @@
 // palette lookup per sample, no texture upload, no GPU state. Cinematics
 // (src/game/cinematics.cpp) arrive as YUV and are drawn the same way, scaled
 // to fit the screen with their aspect ratio; their sound is ctr_audio.cpp's.
+#include "app/ctr_writer.h"
 #include "game/autoplay.h"
 #include "game/automap.h"
 #include "game/cinematics.h"
@@ -423,23 +424,21 @@ void update_stats()
     g_timing.worst_gap_us = 0;
 }
 
-// game.log, buffered: a line is written to the SD card at once, unless it
-// is one of the heartbeat's, which go together at its end (log_flush). A
-// write per line cost the frame after the heartbeat about 10 ms a line, 300
-// ms with the guest code profile's (issue #19: 3DS-D2-E).
-char g_log_buf[16 << 10];
+// game.log: its lines go to a ring that the writer thread writes to the SD
+// card (ctr_writer.h, issue #71). Written from the game's thread, the
+// heartbeat's ~11 KiB held the game ~213 ms every 10 s while profiling, and
+// one write took 2.4 s (3DS-D2-13). A line is queued at once; the
+// heartbeat's lines wake the writer together at its end (log_flush), other
+// lines as they come.
+char g_log_ring[64 << 10];
 
-void log_flush()
-{
-    if (g_log)
-        std::fflush(g_log);
-}
+void log_flush() { app::writer_kick(); }
 
 void logline(const char *s)
 {
     if (g_log) {
         std::fprintf(g_log, "%s\n", s);
-        std::fflush(g_log);
+        app::writer_kick();
     }
 }
 
@@ -561,6 +560,7 @@ void on_cpu_exception(ERRF_ExceptionInfo *e, CpuRegisters *regs)
     static volatile int entered = 0;
     if (entered++)
         svcBreak(USERBREAK_PANIC);
+    app::writer_crash();   // the queued lines, then this report, from this thread
     static const char *const kType[] = {"prefetch abort", "data abort", "undefined instruction", "VFP exception"};
     char s[200];
     std::snprintf(s, sizeof s, "crash: %s at pc %08lx, fsr %08lx, far %08lx, lr %08lx, sp %08lx, cpsr %08lx",
@@ -1014,6 +1014,18 @@ void join_io_thread()
     g_io_thread = nullptr;
 }
 
+// The SD card's writer (ctr_writer.h, issue #71): on the drawing core,
+// below the drawing and the reads, so it writes in their gaps. Without a
+// second core the streams write at once, from the thread that writes.
+void start_writer_thread()
+{
+    if (g_render_core < 0)
+        return;
+    s32 prio = 0x30;
+    svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+    status("SD card writes: %s", app::writer_start(g_render_core, prio + 1) ? "their own thread" : "at once (no thread)");
+}
+
 void stop_render_thread()
 {
     if (!g_render_thread)
@@ -1280,16 +1292,36 @@ bool apt_service()
 bool g_romfs = false;          // the CIA's RomFS is mounted
 std::string g_log_path;
 
-FILE *open_log(const char *mode)
+// An existing file opened to write at its end: without append mode, whose
+// every write seeks to the end and asks the FS for the file's size. After a
+// HOME suspend game.log reopened with "a" cost 55-90 ms a write instead of
+// 10-13 (3DS-D2-14). A file that is gone is created.
+FILE *open_at_end(const char *path, bool binary)
 {
-    FILE *f = std::fopen(g_log_path.c_str(), mode);
-    if (f)
-        std::setvbuf(f, g_log_buf, _IOFBF, sizeof g_log_buf);
+    FILE *f = std::fopen(path, binary ? "r+b" : "r+");
+    if (f && std::fseek(f, 0, SEEK_END) != 0) {
+        std::fclose(f);
+        f = nullptr;
+    }
+    return f ? f : std::fopen(path, binary ? "wb" : "w");
+}
+
+FILE *open_log(bool again)
+{
+    FILE *f = again ? open_at_end(g_log_path.c_str(), false) : std::fopen(g_log_path.c_str(), "w");
+    if (!f)
+        return nullptr;
+    if (FILE *w = app::writer_wrap(f, g_log_ring, sizeof g_log_ring, "game.log"))
+        return w;
+    std::setvbuf(f, nullptr, _IOLBF, 0);   // no stream for the writer: a line at a time, as it comes
     return f;
 }
 
 void close_storage()
 {
+    // What is queued goes out now, and nothing more while the archive is
+    // closed: the traces keep queueing, game.log is closed below.
+    app::writer_pause(true);
     rt::suspend_files();
     if (FILE *f = g_log) {
         g_log = nullptr;
@@ -1308,8 +1340,9 @@ void open_storage()
     if (g_romfs)
         g_romfs = R_SUCCEEDED(romfsInit());
     if (!g_log_path.empty())
-        g_log = open_log("a");
+        g_log = open_log(true);
     rt::resume_files();
+    app::writer_pause(false);
 }
 
 // Leaving for the HOME menu or sleep: libctru then hands the screens over
@@ -1494,6 +1527,7 @@ void sd_benchmark(const std::string &path)
 void close_log()
 {
     logline(report::closed_line());
+    app::writer_stop();   // what is queued, written; the streams write at once from here
     if (g_log)
         std::fclose(g_log);
     g_log = nullptr;
@@ -1543,13 +1577,17 @@ bool file_trace_start()
 {
     constexpr size_t kBuffer = 32 * 1024;
     g_files_trace_buf = (char *)std::malloc(kBuffer);
-    g_files_trace = g_files_trace_buf ? std::fopen(kFileTracePath, g_files_traced ? "a" : "w") : nullptr;
+    g_files_trace = g_files_trace_buf ? (g_files_traced ? open_at_end(kFileTracePath, false) : std::fopen(kFileTracePath, "w")) : nullptr;
     if (!g_files_trace) {
         std::free(g_files_trace_buf);
         g_files_trace_buf = nullptr;
         return false;
     }
-    std::setvbuf(g_files_trace, g_files_trace_buf, _IOFBF, kBuffer);
+    // The buffer is the writer's ring (ctr_writer.h), or stdio's without it.
+    if (FILE *w = app::writer_wrap(g_files_trace, g_files_trace_buf, kBuffer, "files.trc"))
+        g_files_trace = w;
+    else
+        std::setvbuf(g_files_trace, g_files_trace_buf, _IOFBF, kBuffer);
     g_files_traced = true;
     rt::set_file_trace(g_files_trace);
     return true;
@@ -1566,14 +1604,15 @@ void file_trace_stop()
     g_files_trace_buf = nullptr;
 }
 
-// How the traces reach the SD card (issue #66: a crash in game lost the
-// last minutes of both), as the checklist's last row says, from the service
-// call (every 50 ms, loads included) on the game's thread, the one that
-// writes the traces. A change applies at once and is logged as
+// How game.log and the traces reach the SD card (issue #66: a crash in
+// game lost the last minutes of both), as the checklist's last row says:
+// the writer's mode (ctr_writer.h), and the traces' own records each at
+// once into it for "at once". From the service call (every 50 ms, loads
+// included) on the game's thread. A change applies at once and is logged as
 //   profiler run: trace writes <buffered|second|now>
-// (the first only if not buffered). Buffered changes nothing from before.
+// (the first only if not buffered; the line keeps its old name, which the
+// reports read).
 game::TraceWrites g_trace_writes = game::TraceWrites::Buffered;
-uint64_t g_trace_written_us = 0;   // every second: the last write-out
 
 void trace_writes_service()
 {
@@ -1583,16 +1622,22 @@ void trace_writes_service()
         const bool each = m == game::TraceWrites::AtOnce;
         rt::set_file_trace_each(each);
         game::sprite_trace_each(each);
+        app::writer_set_mode(each                                      ? app::WriterMode::AtOnce
+                             : m == game::TraceWrites::EverySecond ? app::WriterMode::EverySecond
+                                                                   : app::WriterMode::Batched);
         char line[64];
         std::snprintf(line, sizeof line, "%strace writes %s", game::kProfilerRunLine, game::trace_writes_info(m).name);
         logline(line);
     }
+    // Every second: what the traces' own buffers hold, into the writer's
+    // rings (it then writes them out by its own second).
     if (m != game::TraceWrites::EverySecond || g_storage_closed)   // the HOME menu has the SD card
         return;
+    static uint64_t written_us = 0;
     const uint64_t now = host_us();
-    if (now - g_trace_written_us < 1000000)
+    if (now - written_us < 1000000)
         return;
-    g_trace_written_us = now;
+    written_us = now;
     if (g_files_trace)
         std::fflush(g_files_trace);
     game::sprite_trace_flush();
@@ -1692,6 +1737,7 @@ extern "C" __attribute__((noreturn)) void __wrap_abort(void)
 {
     char s[80];
     std::snprintf(s, sizeof s, "FATAL: abort() called from %08lx", (unsigned long)__builtin_return_address(0));
+    app::writer_crash();
     logline(s);
     svcBreak(USERBREAK_PANIC);
     for (;;) {
@@ -1756,7 +1802,7 @@ int main()
     std::remove(kTracePath);   // the last session's, if it closed (its report has its own copy)
     std::remove(kFileTracePath);
     g_log_path = std::string(kLogDir) + "/game.log";
-    g_log = open_log("w");
+    g_log = open_log(false);
     std::freopen((std::string(kLogDir) + "/stderr.txt").c_str(), "w", stderr);
     // The main thread's handler is the default for the others; the guest runs here.
     threadOnException(on_cpu_exception, g_exc_stack + sizeof g_exc_stack, WRITE_DATA_TO_HANDLER_STACK);
@@ -1833,6 +1879,7 @@ int main()
     opt.cpuid_edx = rt::kCpuidNoSimd;
     opt.total_phys_mb = 64;   // the game's own 24 MiB sprite-cache floor
     opt.pool_spare = game::kCtrPoolSpare;
+    opt.pool_large = game::kCtrPoolLarge;
     // Cheaper video defaults than a PC's (the game's Options menu still
     // changes them): 640x480 in game (36% fewer pixels to draw, and exactly
     // 2:1 down to the 240-line screen), low lighting, no blended shadows, no
@@ -1891,6 +1938,30 @@ int main()
                           ms(total), ms(prof), ms(t1 - t0), ms(t2 - t1), ms(t3 - t2), ms(t4 - t3), ms(t5 - t4));
             logline_held(line);
         }
+        // The writer's work since the last heartbeat (issue #71): per file,
+        // the bytes, the writes and the time in them, and anything dropped.
+        // While profiling, or when something was dropped.
+        static app::WriterStats last[4] = {};
+        app::WriterStats now[4];
+        const size_t n = app::writer_stats(now, 4);
+        std::string sd;
+        bool dropped = false;
+        for (size_t i = 0; i < n; i++) {
+            app::WriterStats was{};
+            for (const app::WriterStats &l : last)
+                if (l.name && std::strcmp(l.name, now[i].name) == 0 && l.bytes <= now[i].bytes)
+                    was = l;
+            char item[128];
+            std::snprintf(item, sizeof item, "%s%s %u KiB in %u writes, %u ms (longest %u ms so far), %u B dropped",
+                          i ? "; " : "", now[i].name, (unsigned)((now[i].bytes - was.bytes) >> 10),
+                          now[i].writes - was.writes, now[i].ms - was.ms, now[i].longest_ms, now[i].lost - was.lost);
+            sd += item;
+            dropped |= now[i].lost != was.lost;
+        }
+        for (size_t i = 0; i < 4; i++)
+            last[i] = i < n ? now[i] : app::WriterStats{};
+        if (n && (g_prof_on || dropped))
+            logline_held(("[rt] sd writes: " + sd).c_str());
     };
     // Sound through ds_emul into the DSP (ctr_audio.cpp), mixed on another core.
     setenv("WX86_SON", "vita", 1);   // ds_emul's name for the console's realtime sink
@@ -1954,6 +2025,8 @@ int main()
     opt.io_idle_wait = [](uint32_t ms) { LightEvent_WaitTimeout(&g_io_done_event, (s64)ms * 1000000); };
 
     start_render_thread();
+    start_writer_thread();
+    game::sprite_trace_set_wrap([](FILE *f, char *buf, size_t n) { return app::writer_wrap(f, buf, n, "sprites.trc"); });
     aptHook(&g_apt_cookie, apt_hook, nullptr);
     rt::RunResult r = rt::run_exe(std::move(exe), opt);
     join_io_thread();

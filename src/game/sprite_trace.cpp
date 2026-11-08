@@ -55,7 +55,7 @@ constexpr uint8_t kUseOrig[] = {0x8b, 0x58, 0x20, 0x85, 0xdb};
 constexpr uint32_t kRemoveAt = 0x005ff53c, kRemoveNext = 0x005ff542;
 constexpr uint8_t kRemoveOrig[] = {0x8b, 0x4f, 0x04, 0x29, 0x4e, 0x08};
 constexpr uint32_t kFlag = 0x006cb6e0;
-constexpr uint32_t kUseStub = 0x006cb6f0, kUseStubSize = 30;
+constexpr uint32_t kUseStub = 0x006cb6f0, kUseStubSize = 45;
 constexpr uint32_t kRemoveStub = 0x006cb720, kRemoveStubSize = 31;
 constexpr uint32_t kSlackEnd = 0x006cb740;
 
@@ -76,6 +76,7 @@ Seen *g_seen = nullptr;
 uint64_t g_start_ms = 0;
 bool g_started = false;   // the file has its header: later starts append
 uint32_t g_lost = 0;
+SpriteTraceWrap g_wrap = nullptr;   // sprite_trace_set_wrap
 bool g_each = false;      // sprite_trace_each: every record written out at once
 
 void put_rel32(uint8_t *at, uint32_t insn_end, uint32_t target)
@@ -84,7 +85,9 @@ void put_rel32(uint8_t *at, uint32_t insn_end, uint32_t target)
     std::memcpy(at, &rel, 4);
 }
 
-uint32_t elapsed_ms() { return (uint32_t)(rt::now_ms() - g_start_ms); }
+// The game's own clock (GetTickCount's, rt::tick_ms): taken for every use,
+// and a host clock read costs ~1 us on the console (issue #72).
+uint32_t elapsed_ms() { return rt::tick_ms() - (uint32_t)g_start_ms; }
 
 void record(uint32_t type, uint32_t a, uint32_t b, uint32_t c)
 {
@@ -111,13 +114,19 @@ uint32_t key_of(d2rt::Cpu &c, uint32_t rec)
     return h ? h : 1;
 }
 
-void on_use(d2rt::Cpu &c)
+d2rt::Cpu *g_cpu = nullptr;   // the guest's memory, for the in-line path
+
+// A use: the stub's argument is the sprite's record (eax at 0x600350, a
+// pool unit: 16-byte aligned), with bit 0 set when the caller's [ebp+0xc]
+// is 0 (the game moves the sprite up its list). One argument: the in-line
+// path sees the first argument only, not eax or ebp.
+void on_use(d2rt::Cpu &c, uint32_t arg)
 {
-    const uint32_t rec = c.reg(d2rt::R_EAX);
+    const uint32_t rec = arg & ~1u;
+    const bool touched = arg & 1;
     const uint32_t entry = rec ? c.read_u32(rec + 0x24) : 0;
     if (!entry || !g_seen)
         return;
-    const bool touched = c.read_u32(c.reg(d2rt::R_EBP) + 0xc) == 0;
     const uint32_t key = key_of(c, rec), window = elapsed_ms() / kWindowMs + 1;
     const uint32_t bytes = c.read_u32(entry + 4) & ~kTouched;
     Seen &s = g_seen[key % kSeen];
@@ -161,8 +170,8 @@ bool install_sprite_trace(d2rt::Cpu &c)
         return false;
     g_flag = (uint8_t *)c.hostptr(kFlag, 1);
     // Both trap natives may change eax, ecx and edx.
-    const uint32_t use_native = rt::native_entry("SpriteTraceUse", 0, [](d2rt::Cpu &c) -> uint32_t {
-        on_use(c);
+    const uint32_t use_native = rt::native_entry("SpriteTraceUse", 1, [](d2rt::Cpu &c) -> uint32_t {
+        on_use(c, c.arg(0));
         return 0;
     });
     const uint32_t remove_native = rt::native_entry("SpriteTraceRemove", 0, [](d2rt::Cpu &c) -> uint32_t {
@@ -180,20 +189,40 @@ bool install_sprite_trace(d2rt::Cpu &c)
     // translated.
     c.set_inline_shim(use_native);
     c.set_inline_shim(remove_native);
+    // The use, as the lock calls are (issue #48): served before the Bridge,
+    // without the GIL. Under the cooperative scheduler one guest thread runs
+    // at a time and only the game's thread draws, so the trace's state needs
+    // no lock; the trace's stream locks its own. Under the native scheduler
+    // (IntrinFrame::thread set) it declines, and the shim above serves it.
+    g_cpu = &c;
+    const bool fast = c.set_intrinsic_nogil(use_native, [](d2rt::Cpu::IntrinFrame &f, uint32_t) {
+        if (f.thread)
+            return false;
+        on_use(*g_cpu, f.arg0);
+        f.pop = 4;
+        return true;
+    });
 
-    // S+0  cmp byte [flag], 0; je S+20
-    // S+9  push eax; push ecx; push edx; call use; pop edx; pop ecx; pop eax
-    // S+20 mov ebx, [eax+0x20]; test ebx, ebx; jmp 0x600355 (its je)
+    // S+0  cmp byte [flag], 0; je S+35
+    // S+9  push eax; push ecx; push edx
+    // S+12 mov ecx, eax; cmp dword [ebp+0xc], 0; sete dl; movzx edx, dl; or ecx, edx
+    // S+26 push ecx; S+27 call use (pops it)
+    // S+32 pop edx; pop ecx; pop eax
+    // S+35 mov ebx, [eax+0x20]; test ebx, ebx; jmp 0x600355 (its je)
+    static const uint8_t kArg[] = {0x89, 0xc1, 0x83, 0x7d, 0x0c, 0x00, 0x0f, 0x94,
+                                   0xc2, 0x0f, 0xb6, 0xd2, 0x09, 0xd1, 0x51};
     uint8_t u[kUseStubSize] = {0x80, 0x3d};
     std::memcpy(u + 2, &kFlag, 4);
-    u[6] = 0x00, u[7] = 0x74, u[8] = 20 - 9;
+    u[6] = 0x00, u[7] = 0x74, u[8] = 35 - 9;
     u[9] = 0x50, u[10] = 0x51, u[11] = 0x52;
-    u[12] = 0xe8;
-    put_rel32(u + 13, kUseStub + 17, use_native);
-    u[17] = 0x5a, u[18] = 0x59, u[19] = 0x58;
-    std::memcpy(u + 20, kUseOrig, sizeof kUseOrig);
-    u[25] = 0xe9;
-    put_rel32(u + 26, kUseStub + 30, kUseNext);
+    std::memcpy(u + 12, kArg, sizeof kArg);
+    u[27] = 0xe8;
+    put_rel32(u + 28, kUseStub + 32, use_native);
+    u[32] = 0x5a, u[33] = 0x59, u[34] = 0x58;
+    std::memcpy(u + 35, kUseOrig, sizeof kUseOrig);
+    u[40] = 0xe9;
+    put_rel32(u + 41, kUseStub + 45, kUseNext);
+    static_assert(kUseStub + kUseStubSize <= kRemoveStub, "the use stub runs into the remove stub");
 
     // S+0  cmp byte [flag], 0; je S+20
     // S+9  push eax; push ecx; push edx; call remove; pop edx; pop ecx; pop eax
@@ -222,7 +251,8 @@ bool install_sprite_trace(d2rt::Cpu &c)
     c.invalidate_code(kRemoveStub, sizeof r);
     c.invalidate_code(kUseAt, sizeof use_jump);
     c.invalidate_code(kRemoveAt, sizeof remove_jump);
-    rt::logf("sprite trace: stubs at %08x and %08x (in line), off", kUseAt, kRemoveAt);
+    rt::logf("sprite trace: stubs at %08x and %08x (in line%s), off", kUseAt, kRemoveAt,
+             fast ? ", the use without the GIL" : "");
     return true;
 }
 
@@ -234,7 +264,18 @@ bool sprite_trace_start(const char *path)
     g_seen = (Seen *)std::calloc(kSeen, sizeof(Seen));
     // Started again in the same run: on in the same file, on the same clock.
     const bool again = g_started;
-    g_file = g_buffer && g_seen ? std::fopen(path, again ? "ab" : "wb") : nullptr;
+    // Again: at the file's end, without append mode (whose every write on
+    // the console seeks to the end and asks the FS for the size).
+    g_file = nullptr;
+    if (g_buffer && g_seen && again) {
+        g_file = std::fopen(path, "r+b");
+        if (g_file && std::fseek(g_file, 0, SEEK_END) != 0) {
+            std::fclose(g_file);
+            g_file = nullptr;
+        }
+    }
+    if (!g_file && g_buffer && g_seen)
+        g_file = std::fopen(path, "wb");
     if (!g_file) {
         std::free(g_buffer);
         std::free(g_seen);
@@ -242,11 +283,14 @@ bool sprite_trace_start(const char *path)
         g_seen = nullptr;
         return false;
     }
-    std::setvbuf(g_file, g_buffer, _IOFBF, kFileBuffer);
+    if (FILE *w = g_wrap ? g_wrap(g_file, g_buffer, kFileBuffer) : nullptr)
+        g_file = w;   // its own buffer: g_buffer, freed after the stream is closed
+    else
+        std::setvbuf(g_file, g_buffer, _IOFBF, kFileBuffer);
     g_lost = 0;
     if (!again) {
         g_started = true;
-        g_start_ms = rt::now_ms();
+        g_start_ms = rt::tick_ms();
         uint32_t header[8] = {0, 0, 4, 16, kWindowMs, (uint32_t)std::time(nullptr), sprite_frames_on() ? 1u : 0u, 0};
         std::memcpy(header, "D2SPTRC1", 8);
         std::fwrite(header, sizeof header, 1, g_file);
@@ -281,6 +325,8 @@ void sprite_trace_flush()
 }
 
 void sprite_trace_each(bool on) { g_each = on; }
+
+void sprite_trace_set_wrap(SpriteTraceWrap wrap) { g_wrap = wrap; }
 
 void sprite_trace_beat(const SpriteTraceBeat &b)
 {

@@ -79,6 +79,17 @@ constexpr uint32_t kCtrPoolRelease = 10u << 20;
 // (rt::RunOptions::pool_spare): the heap blocks the console was refused at
 // the end of long sessions were 262 to 656 KiB.
 constexpr uint32_t kCtrPoolSpare = 2u << 20;
+// Of the pool, set aside for the sprites' frames over 256 KiB
+// (rt::RunOptions::pool_large): in 3DS-D2-13 (30 min of Act I) every request
+// the spare served was one of them, 258 to 396 KiB, while the pool had 4-8
+// MiB free in 64-256 KiB pieces. Three were in the spare at once, 1152 KiB
+// in 64 KiB granules. To the governor it is used space: the reserve is
+// kept in the rest of the pool, so the cache holds at most this much less.
+// In 3DS-D2-15 (53 min of Act II) the frames held up to four 320 KiB blocks
+// at once, 1280 of the 1536 KiB then, and the six spare takes were the
+// game's own heap blocks of 282-533 KiB, which the zone now serves too when
+// the pool holds no piece for them: four frame blocks and one of those.
+constexpr uint32_t kCtrPoolLarge = 2048u << 10;
 uint32_t govern_sprite_cache(d2rt::Cpu &c, uint32_t pool_free, bool spare_taken, uint32_t evicted, uint32_t reserve,
                              uint32_t min_limit);
 

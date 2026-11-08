@@ -463,6 +463,12 @@ SpriteCacheWindow sprite_cache_window(d2rt::Cpu &c)
 
 uint32_t sprite_cache_taken() { return __atomic_load_n(&g_inserted, __ATOMIC_RELAXED); }
 
+void sprite_decode_totals(uint32_t &decodes, uint64_t &us)
+{
+    decodes = g_decodes;
+    us = g_decode_us;
+}
+
 uint32_t govern_sprite_cache(d2rt::Cpu &c, uint32_t pool_free, bool spare_taken, uint32_t evicted, uint32_t reserve,
                              uint32_t min_limit)
 {

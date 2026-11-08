@@ -133,10 +133,13 @@ public:
     // run on or not, and the platform applies it at once.
     static constexpr int kProfBtnX = 4, kProfBtnW = 156;
     static constexpr int kProfRows = kProfileOptionCount + 1;
-    static constexpr int kProfRowY = kBarH + 20, kProfRowH = 36;
+    static constexpr int kProfRowY = kBarH + 20, kProfRowH = 30;   // six rows above the buttons
     bool profiling() const { return profiling_; }
     uint32_t profile_choice() const { return profile_; }
     void set_profile_choice(uint32_t bits);
+    // A run started or stopped other than by its button (autoplay's
+    // "profile"): on only with something ticked.
+    void set_profiling(bool on);
     TraceWrites trace_writes() const { return trace_writes_; }
     void set_trace_writes(TraceWrites m);
     // The buttons' shortcuts (Select + D-pad): the next or previous tab

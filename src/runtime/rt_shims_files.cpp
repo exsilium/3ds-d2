@@ -547,6 +547,11 @@ struct IoRequest : Waitable {
     std::atomic<int> state{0};   // 0 free, 1 queued, 2 done; the waiter's acquire frees it
     uint64_t wait_from_us = 0;   // a guest wait on it: when the read was queued (0: not one)
     int waiter = -1;             // and the waiting thread
+    // Or a job instead of a read (offload_job): its function, its arguments
+    // as captured on the game's core, and what it returned.
+    uint32_t (*job)(const uint32_t *) = nullptr;
+    uint32_t args[8] = {};
+    uint32_t job_result = 0;
     bool try_acquire(GuestThread *) override
     {
         int done = 2;
@@ -562,7 +567,7 @@ struct IoRequest : Waitable {
         return true;
     }
     bool ready(GuestThread *) override { return state.load(std::memory_order_acquire) == 2; }
-    uint32_t result() const override { return 1; }   // ReadFile's TRUE
+    uint32_t result() const override { return job ? job_result : 1; }   // the job's, or ReadFile's TRUE
     const char *kind() const override { return "fileio"; }
 };
 
@@ -584,8 +589,12 @@ void io_worker_main()
             continue;
         }
         IoRequest *r = g_io_ring[t % kIoMax];
-        r->cache->read(r->pos, r->dst, r->n);
-        r->cache->inflight.fetch_sub(1, std::memory_order_acq_rel);
+        if (r->job) {
+            r->job_result = r->job(r->args);
+        } else {
+            r->cache->read(r->pos, r->dst, r->n);
+            r->cache->inflight.fetch_sub(1, std::memory_order_acq_rel);
+        }
         g_io_tail.store(t + 1, std::memory_order_release);
         r->state.store(2, std::memory_order_release);   // before the count: the scheduler polls while it is nonzero
         wx86_host_pending(-1);
@@ -604,8 +613,31 @@ IoRequest *io_submit(ReadCache *cache, uint64_t pos, uint8_t *dst, uint32_t n)
         r.pos = pos;
         r.dst = dst;
         r.n = n;
+        r.job = nullptr;
         r.state.store(1, std::memory_order_relaxed);
         cache->inflight.fetch_add(1, std::memory_order_acq_rel);
+        wx86_host_pending(1);
+        const uint32_t h = g_io_head.load(std::memory_order_relaxed);
+        g_io_ring[h % kIoMax] = &r;
+        g_io_head.store(h + 1, std::memory_order_release);
+        options().io_wake();
+        return &r;
+    }
+    return nullptr;
+}
+
+// Queues a job (offload_job); null when every request is in flight.
+IoRequest *io_submit_job(uint32_t (*job)(const uint32_t *), const uint32_t *args, size_t n)
+{
+    for (IoRequest &r : g_io) {
+        if (r.state.load(std::memory_order_acquire) != 0)
+            continue;
+        r.cache = nullptr;
+        r.job = job;
+        for (size_t i = 0; i < n && i < 8; i++)
+            r.args[i] = args[i];
+        r.wait_from_us = 0;
+        r.state.store(1, std::memory_order_relaxed);
         wx86_host_pending(1);
         const uint32_t h = g_io_head.load(std::memory_order_relaxed);
         g_io_ring[h % kIoMax] = &r;
@@ -625,6 +657,19 @@ void io_pause()
 }
 
 }  // namespace
+
+// See rt_host.h.
+bool offload_job(uint32_t (*job)(const uint32_t *), const uint32_t *args, size_t n, uint32_t &ret)
+{
+    ThreadScheduler *s = wx86_sched();
+    if (!g_io_on || !s || n > 8 || (int)s->current_id() == stats().frame_thread)
+        return false;
+    IoRequest *r = io_submit_job(job, args, n);
+    if (!r)
+        return false;   // the worker is busy enough: the caller does it
+    ret = s->wait(r, 0xFFFFFFFFu);   // EAX = the job's result when the thread wakes
+    return true;
+}
 
 // See rt_host.h. The I/O worker drains its queue first: only the game's
 // thread queues reads, and it is the one here.

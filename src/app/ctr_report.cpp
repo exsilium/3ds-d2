@@ -6,6 +6,7 @@
 //       game.log, stderr.txt   the session's logs, as they were
 //       sprites.trc            a profiler run's sprite trace (issue #18)
 //       files.trc              a profiler run's file-read trace (issue #21)
+//       frames.trc             a profiler run's frame trace (game/frame_trace.h)
 //       crash_dump_*.dmp       Luma3DS's dumps saved during it (copies)
 //       report.txt             why there is a report (key=value)
 //       note.txt               the player's description
@@ -114,6 +115,8 @@ constexpr uint64_t kTraceMax = 32u << 20, kTraceRecord = 16;
 // The file-read trace (rt::set_file_trace): text, its first 16 MiB. A line
 // per read of the game's; it compresses about 5:1.
 constexpr uint64_t kFileTraceMax = 16u << 20;
+// The frame trace: ~4 MiB an hour; its start and end past 8 MiB.
+constexpr uint64_t kFrameTraceMax = 8u << 20, kFrameTraceHead = 2u << 20;
 
 void say(const Host &host, const std::string &s)
 {
@@ -452,6 +455,10 @@ void draw_offer(const Offer &o)
     if (trace > 0)
         std::printf(" sprites.trc (%s%s)\n", kib(trace < (long)kTraceMax ? trace : (long)kTraceMax).c_str(),
                     trace > (long)kTraceMax ? ", its start" : "");
+    const long frames = file_size(o.dir + "/frames.trc");
+    if (frames > 0)
+        std::printf(" frames.trc (%s%s)\n", kib(frames < (long)kFrameTraceMax ? frames : (long)kFrameTraceMax).c_str(),
+                    frames > (long)kFrameTraceMax ? ", its start and end" : "");
     const long reads = file_size(o.dir + "/files.trc");
     if (reads > 0)
         std::printf(" files.trc (%s%s)\n", kib(reads < (long)kFileTraceMax ? reads : (long)kFileTraceMax).c_str(),
@@ -974,6 +981,7 @@ bool build_envelope(const Host &host, const Offer &o, const game::report::Dsn &d
     add_file_item(gz, o.dir + "/stderr.txt", "stderr.txt", "text/plain", kStderrMax, 0);
     add_trace_item(gz, o.dir + "/sprites.trc");
     add_file_item(gz, o.dir + "/files.trc", "files.trc", "text/plain", kFileTraceMax, kFileTraceMax);
+    add_file_item(gz, o.dir + "/frames.trc", "frames.trc", "text/plain", kFrameTraceMax, kFrameTraceHead);
     for (const std::string &d : o.dumps)
         add_file_item(gz, o.dir + "/" + d, d, "application/octet-stream", kDumpMax, kDumpMax);
     // a/b: Sentry lists attachments by name, so a pair's top comes first.
@@ -1366,6 +1374,7 @@ std::string keep_unclosed_session()
     move_file(std::string(kLogDir) + "/stderr.txt", dir + "/stderr.txt");
     move_file(std::string(kLogDir) + "/sprites.trc", dir + "/sprites.trc");
     move_file(std::string(kLogDir) + "/files.trc", dir + "/files.trc");
+    move_file(std::string(kLogDir) + "/frames.trc", dir + "/frames.trc");
     const int dumps = s.start_time() ? copy_new_dumps(dir, s.start_time()) : 0;
     write_all(dir + "/report.txt", "reason=" + reason_of(s, dumps) + "\nbuild=" + build + "\n");
     if (!have_dsn())
@@ -1384,6 +1393,7 @@ std::string keep_session(const char *reason)
     copy_file(std::string(kLogDir) + "/stderr.txt", dir + "/stderr.txt");
     copy_file(std::string(kLogDir) + "/sprites.trc", dir + "/sprites.trc");
     copy_file(std::string(kLogDir) + "/files.trc", dir + "/files.trc");
+    copy_file(std::string(kLogDir) + "/frames.trc", dir + "/frames.trc");
     write_all(dir + "/report.txt", std::string("reason=") + reason + "\nbuild=" + D2_BUILD_ID + "\n");
     prune_reports();
     return dir;

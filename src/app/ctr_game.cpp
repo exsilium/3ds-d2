@@ -1292,9 +1292,23 @@ bool apt_service()
 bool g_romfs = false;          // the CIA's RomFS is mounted
 std::string g_log_path;
 
-FILE *open_log(const char *mode)
+// An existing file opened to write at its end: without append mode, whose
+// every write seeks to the end and asks the FS for the file's size. After a
+// HOME suspend game.log reopened with "a" cost 55-90 ms a write instead of
+// 10-13 (3DS-D2-14). A file that is gone is created.
+FILE *open_at_end(const char *path, bool binary)
 {
-    FILE *f = std::fopen(g_log_path.c_str(), mode);
+    FILE *f = std::fopen(path, binary ? "r+b" : "r+");
+    if (f && std::fseek(f, 0, SEEK_END) != 0) {
+        std::fclose(f);
+        f = nullptr;
+    }
+    return f ? f : std::fopen(path, binary ? "wb" : "w");
+}
+
+FILE *open_log(bool again)
+{
+    FILE *f = again ? open_at_end(g_log_path.c_str(), false) : std::fopen(g_log_path.c_str(), "w");
     if (!f)
         return nullptr;
     if (FILE *w = app::writer_wrap(f, g_log_ring, sizeof g_log_ring, "game.log"))
@@ -1326,7 +1340,7 @@ void open_storage()
     if (g_romfs)
         g_romfs = R_SUCCEEDED(romfsInit());
     if (!g_log_path.empty())
-        g_log = open_log("a");
+        g_log = open_log(true);
     rt::resume_files();
     app::writer_pause(false);
 }
@@ -1563,7 +1577,7 @@ bool file_trace_start()
 {
     constexpr size_t kBuffer = 32 * 1024;
     g_files_trace_buf = (char *)std::malloc(kBuffer);
-    g_files_trace = g_files_trace_buf ? std::fopen(kFileTracePath, g_files_traced ? "a" : "w") : nullptr;
+    g_files_trace = g_files_trace_buf ? (g_files_traced ? open_at_end(kFileTracePath, false) : std::fopen(kFileTracePath, "w")) : nullptr;
     if (!g_files_trace) {
         std::free(g_files_trace_buf);
         g_files_trace_buf = nullptr;
@@ -1781,7 +1795,7 @@ int main()
     std::remove(kTracePath);   // the last session's, if it closed (its report has its own copy)
     std::remove(kFileTracePath);
     g_log_path = std::string(kLogDir) + "/game.log";
-    g_log = open_log("w");
+    g_log = open_log(false);
     std::freopen((std::string(kLogDir) + "/stderr.txt").c_str(), "w", stderr);
     // The main thread's handler is the default for the others; the guest runs here.
     threadOnException(on_cpu_exception, g_exc_stack + sizeof g_exc_stack, WRITE_DATA_TO_HANDLER_STACK);

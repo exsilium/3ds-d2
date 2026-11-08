@@ -264,7 +264,18 @@ bool sprite_trace_start(const char *path)
     g_seen = (Seen *)std::calloc(kSeen, sizeof(Seen));
     // Started again in the same run: on in the same file, on the same clock.
     const bool again = g_started;
-    g_file = g_buffer && g_seen ? std::fopen(path, again ? "ab" : "wb") : nullptr;
+    // Again: at the file's end, without append mode (whose every write on
+    // the console seeks to the end and asks the FS for the size).
+    g_file = nullptr;
+    if (g_buffer && g_seen && again) {
+        g_file = std::fopen(path, "r+b");
+        if (g_file && std::fseek(g_file, 0, SEEK_END) != 0) {
+            std::fclose(g_file);
+            g_file = nullptr;
+        }
+    }
+    if (!g_file && g_buffer && g_seen)
+        g_file = std::fopen(path, "wb");
     if (!g_file) {
         std::free(g_buffer);
         std::free(g_seen);

@@ -8,7 +8,9 @@
 // written to it goes into a ring in memory, and a thread of its own (on the
 // drawing core, below the drawing thread) writes the ring out. The callers
 // keep their stdio calls; a write costs a copy. A ring that is full drops
-// what does not fit and counts it.
+// what does not fit and counts it. The writer writes a file in batches of
+// 16 KiB, or 5 s after its last write: the card's cost is per write, and a
+// long session of small ones ended in stalls of many seconds (3DS-D2-14).
 //
 // The SD card's archive is closed while the HOME menu has the system: the
 // writer is paused around that (writer_pause), after writing out what is

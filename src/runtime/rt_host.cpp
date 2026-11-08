@@ -1217,6 +1217,11 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
     // Allocation failures: the first few of each region are logged with its
     // state, so an "Out of memory" from the game can be traced to its cause.
     wx86::region_set_fail_handler([](const wx86::RegionFail &f) {
+        // The large-block zone turning a block down is not a failure: it goes
+        // to the pool (va_alloc logs it). Counted, those misses ended a
+        // session with "ran out of memory" and nothing refused (3DS-D2-14).
+        if (std::strcmp(f.name, "large") == 0)
+            return;
         static unsigned n = 0;
         g_stats.alloc_failures++;
         if (++n <= 16)

@@ -12,7 +12,7 @@ Diablo II: Lord of Destruction 1.14d on the New 3DS.
 - **Luma3DS** custom firmware.
 - **FBI** (or another CIA installer).
 - About **2 GB free** on the SD card for the game files.
-- Your own **Diablo II + Lord of Destruction**, patched to **1.14d**. The current Blizzard installers for Diablo II and Lord of Destruction install 1.14d.
+- Your own **Diablo II + Lord of Destruction**, patched to **1.14d**. The current Blizzard installers for Diablo II and Lord of Destruction install 1.14c, not 1.14d, so patch the installed game before copying its files: update it to 1.14d through Battle.net ([Blizzard support](https://support.blizzard.com/en/help/article/13867)), or apply the offline [1.14d patch](https://www.moddb.com/games/diablo-2-lod/downloads/diablo-ii-lord-of-destruction-v114d-patch). The app refuses any other `Game.exe` (see [step 1](#1-copy-the-game-files-to-the-sd-card)).
 - For sound: a **DSP firmware dump** at `sdmc:/3ds/dspfirm.cdc` (see [step 2](#2-dump-the-dsp-firmware-for-sound)).
 
 ## Setup
@@ -55,7 +55,7 @@ SD card
 
 The app creates `save/` (characters and settings) and `logs/` (`game.log`, `stderr.txt`) next to `game/` the first time it runs.
 
-To check that your `Game.exe` is the 1.14d build this project is tested with, its SHA-256 should be `631066c1649c4ea9ffe48bf97e24c00bca1f7a6759c21150f1a79982589adaaf`. The app does not check the hash itself. The patches it applies check the bytes they replace and skip anything that does not match, so other builds of `Game.exe` are not supported.
+To check that your `Game.exe` is the 1.14d build this project is tested with, its SHA-256 should be `631066c1649c4ea9ffe48bf97e24c00bca1f7a6759c21150f1a79982589adaaf`. The app checks the `Game.exe` before starting it and refuses any other build, older 1.14 builds (1.14c from the current installers) and the small `Game.exe` of the versions before 1.14 included, with what to do on the top screen. It tells 1.14d by where the program starts (its entry point), not by the hash.
 
 ### 2. Dump the DSP firmware (for sound)
 
@@ -102,6 +102,8 @@ Start 3ds-d2 from the HOME menu. The game appears on the top screen. The bottom 
 When the game asks for text, such as a character name, a keyboard opens on the bottom screen. Tap the keys. B deletes, Y is shift, Start confirms, Select closes it. R + Select opens the keyboard at any time. [docs/controls.md](docs/controls.md) has the full mapping.
 
 If the app shows "Game.exe not found", check the folder name and that `Game.exe` is inside `/3ds/3ds-d2/game/`.
+
+If the app shows "Game.exe ... is not Diablo II 1.14d" or "... is from a Diablo II before 1.14", the `Game.exe` on the SD card is another version: patch the game to 1.14d ([requirements](#requirements)) and copy its `Game.exe` and `patch_d2.mpq` again.
 
 ### Problem reports
 

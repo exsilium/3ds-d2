@@ -285,30 +285,51 @@ The frame thread had no slack in a 40 ms frame. Drawing is most of its work, and
 | From the floor to the blit (walls, units, UI) | 18.7 |
 | Present (copying the frame for the render thread) | 1.1 |
 
-**The floor queue** (`floorqueue=1`, the default on a New 3DS; `0` turns it off; `D2_FLOOR_QUEUE` on the lane), in `src/game/d2_native.cpp`:
+**Draw on core 2.** The profiler checklist's last row switches it on and off, at once, a run on or not. It is on by default on a New 3DS, saved as `floorqueue=`; it is off with no core 2. Each switch is noted in the frame trace. It does two things.
+
+**1. The floor queue** (`D2_FLOOR_QUEUE` on the lane), in `src/game/d2_native.cpp`:
 - The call at `0x476cdc` arms it, and the call at `0x476ce1` empties it. Both are redirected to natives that then go on to the call's own target.
 - While it is armed, `FloorTile` queues a tile whose blocks all have flat light. Each tile is queued with a copy of the light cells it reads and of the renderer's globals it was called with: the frame buffer, its pitch, the clip window and the light flags.
 - A worker thread on core 2 draws each tile as soon as it is queued. When the queue is emptied, the frame thread draws whatever is left beside the worker, then waits for the worker's last tile.
 - Floor tiles do not overlap, so the order they are drawn in does not matter.
 - Any other draw native empties the queue first. In the measured runs none had to.
 - A tile with interpolated light needs the game's own blitters, so it is drawn at once, after the queue is emptied. The console sets "Light Quality" to 0, so it has none.
+- The ring's counts (tiles published, taken and drawn) only ever grow. Reset each frame, they let a worker paused between reading a count and its compare-and-swap take a slot of the frame before again. That was the one-frame difference `fight.txt` showed in 2 of 7 runs with the worker.
+
+**2. The frame's copy.** Present used to copy the frame for the render thread on the game's thread, about 1 ms a frame in Azahar. Now present leaves the frame in the game's buffer, and the render thread copies it first, on core 2.
+- Until the copy is done, each of the renderer table's 54 entries (`0x74c4a8`, through `[0x7c8cc0]`) holds a native that waits for it, then goes on to the renderer's own function. All the game's drawing goes through that table.
+- The render thread puts the table back as soon as it has copied, so a normal frame never stops.
+- `copycheck=1` in settings.txt (Azahar) compares each copy with the frame as present saw it. With only `BeginScene` guarded, 2–9 copies a run differed, around loads, where the game draws a moment after present. With the whole table guarded, a walk and an act load had none. 11–16 frames a run waited, at most 5.5 ms.
+
+**The frame trace** (version 5) gives each frame:
+- `floor`: the floor's time on the game's thread;
+- `flush`: the part of that spent drawing the queue's last tiles and waiting for the worker;
+- `cwait`: the time waited for the last frame's copy.
+
+`tools/frame_report.py` prints their medians, and reports each part of a run apart when the switch was changed in it.
 
 **Checks on the lane** (virtual clock, `M4_NATIVE=late`, `M4_FRAMEHASH`):
-- `D2_FLOOR_QUEUE=2` draws the queue in reverse order at the end of the run. `town-walk.txt` (1,726 frames) and `fight.txt` (2,843 frames) hash the same as with the queue off.
-- With the worker, one early run of `fight.txt` differed in one frame. That was before each tile kept its own copy of the globals; the worker then read them while it drew. After that change, three more runs matched.
-- `D2_FLOOR_QUEUE=3` uses the worker, then draws every tile again in order and counts any pixel change. 26,276 flushes changed nothing, and every frame hashed the same.
+- `D2_FLOOR_QUEUE=2` draws the queue in reverse order at the end of the floor. `town-walk.txt` (1,726 frames) and `fight.txt` (2,843 frames) hash the same as with the queue off.
+- `D2_FLOOR_QUEUE=1` (the worker) hashes the same in both.
+- `D2_FLOOR_QUEUE=3` uses the worker, then draws every tile again in order and counts any pixel change. 26,276 flushes changed nothing.
 
-**Azahar** (Lut Gholein and the Rogue Encampment walks, the queue off and on, alternating):
+**Azahar.** At its full speed, Azahar's town frames have slack in their 40 ms. The game spends what is left waiting for its next tick. The queue saves the game's thread 2.7 ms a frame (the floor takes 5.6 ms on it, against 8.4), but the gaps barely move: 6.6% against 6.3% of frames past 50 ms. An earlier comparison that showed 13% against 6–8% had the draw phases' timing on, which put the queue-off frames over budget.
 
-| | fps | Median gap | Past 50 ms | Floor run on the frame thread |
-| --- | --- | --- | --- | --- |
-| Lut Gholein, off (2 runs) | 21.3, 21.4 | 43.8, 43.4 ms | 13.1%, 13.5% | 9.7, 10.2 ms |
-| Lut Gholein, on (2 runs) | 23.1, 23.3 | 39.9, 40.8 ms | 8.3%, 6.1% | 2.95, 2.78 ms |
-| Rogue Encampment, off | 22.8 | 41.9 ms | 7.5% | 8.0 ms |
-| Rogue Encampment, on | 23.7 | 40.2 ms | 4.4% | 2.4 ms |
+The console has no such slack: its town frame ran 38.9 ms of 40. `scripts/measure-smoothness.sh --cpu 70` runs Azahar at 70% of its emulated CPU clock, short of time as the console is (rather more so). Lut Gholein, two runs each:
 
-- The worker draws about 65% of the tiles. The frame thread waits 0.4 ms a frame for its last one.
-- The act-load script was unchanged: 25.0 fps and 0.2% past 50 ms either way. Its longest frame went from 323 to 225 ms.
+| 70% CPU | fps | Median gap | Past 60 ms | Frame thread's run, median | Floor on the game's thread |
+| --- | --- | --- | --- | --- | --- |
+| Off | 15.0, 15.0 | 62.0, 62.2 ms | 61.3%, 60.2% | 60.6 ms | 12.6 ms |
+| On | 17.0, 16.9 | 53.1, 53.5 ms | 21.2%, 21.7% | 51.9, 52.1 ms | 7.84 ms (3.7 at the flush) |
+
+**Not done:** LightBlock on the worker.
+- Between LightBlock and the floor tile, the floor loop passes the light buffer through four of the game's own functions: `0x4de190`, `0x4de260`, `0x4ddfd0` and `0x4de070`, the dynamic lights.
+- They would all have to be native, with their light sources copied, for about 1 ms in Azahar (0.5 ms on the console).
+
+**The walls, with the console's video settings.** The census with `M4_FAST=1` (Light Quality 0, 640×480) on the town walk:
+- 244 draw natives a frame in 10.9 runs, against 34.6 runs with the PC settings. 60% of the natives are in runs of 65 or more.
+- After the floor, the walls and many sprites form one run of about 100 natives.
+- A queue for it would have to draw in order, because walls and sprites overlap. The sprite natives' return values would have to be worked out on the game's thread. And a stretch would have to end where the sprite cache lets a sprite go.
 
 **Not kept:** native versions of the four interpolated-light blitters (`0x4f6bb0`, `0x4f71a0`, `0x4f7850`, and `0x4f89f0`'s iso branch), so that those tiles could be queued too.
 - Checked block by block on the lane against the game's own blitters, they drew the same pixels.

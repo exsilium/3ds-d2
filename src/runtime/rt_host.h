@@ -198,20 +198,16 @@ void frame_thread_ready_by(uint64_t out[16]);
 // addresses into the game on its EBP chain (0: fewer). Clears them.
 constexpr size_t kWaitFrom = 4;
 uint64_t frame_thread_wait_top(uint32_t &site, uint32_t &owner, uint32_t from[kWaitFrom]);
-// Stalls of the frame thread (the frame trace): from another host thread,
-// every few ms. When the frame thread's slice has run `min_us` or longer (a
-// slice is a few ms of guest code; longer, a host call or a guest loop
-// held it), its EIP and the first three dwords on its stack are kept, once a
-// slice; in a shim or a native, EIP is its trap and the stack's first dword
-// the game's call site. take_stall, on the scheduler's thread, takes them.
+// Long frames, sampled (the frame trace's stall column). note_present at
+// each present (the scheduler's thread). stall_probe from another host
+// thread every few ms: once the frame thread has gone `min_us` without a
+// present, it is told to stop at its next block and where it stops is
+// kept (its EIP, and the dword on top of its stack: after a host call, the
+// call's return), up to 8 samples a frame. take_stall, at the next present,
+// takes them (the count).
+void note_present();
 void stall_probe(uint64_t min_us);
-bool take_stall(uint32_t out[4]);
-// A shim's or a native's tag ("KERNEL32.dll!ReadFile", "3DSD2NATIVE!FloorTile")
-// from its trap address, or null when `va` is not one.
-const char *trap_name(uint32_t va);
-// The frame thread's slices since the start: many in a long frame, its own
-// guest code ran long; one, a host call held it.
-uint32_t frame_thread_slices();
+int take_stall(uint32_t out[][2], int max);
 uint32_t guest_thread_entry(uint32_t tid);
 // The running guest thread is the one presenting frames (stats().frame_thread);
 // the running guest thread's id (-1: none).

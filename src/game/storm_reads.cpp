@@ -184,4 +184,18 @@ bool install_storm_read_priority(d2rt::Cpu &c)
     return true;
 }
 
+bool set_storm_read_rate(d2rt::Cpu &c, uint32_t bytes_per_s)
+{
+    constexpr uint32_t kRatePush = 0x0040a3b8;   // push 0x40000; call 0x4164a0
+    const uint8_t want[] = {0x68, 0x00, 0x00, 0x04, 0x00, 0xe8};
+    uint8_t have[sizeof want];
+    if (!bytes_per_s || !c.read(kRatePush, have, sizeof have) || std::memcmp(have, want, sizeof have) != 0)
+        return false;
+    c.write(kRatePush + 1, &bytes_per_s, 4);
+    c.invalidate_code(kRatePush, 5);
+    rt::logf("storm reads: the read thread's rate limit %u KiB/s (the game's 256), at %08x", (unsigned)(bytes_per_s >> 10),
+             kRatePush);
+    return true;
+}
+
 }  // namespace game

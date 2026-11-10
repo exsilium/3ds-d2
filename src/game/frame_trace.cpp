@@ -24,7 +24,7 @@ void frame_trace_start(FILE *f)
     g_named = 0;
     if (g_file)
         std::fputs("# 3ds-d2 frame trace 4\n"
-                   "# t gap tick run ready host sleep wait io dec dec_us skip who cs ev wsite wown wus wfrom sl stall\n",
+                   "# t gap tick run ready host sleep wait io dec dec_us skip who cs ev wsite wown wus wfrom stall\n",
                    g_file);
 }
 
@@ -71,13 +71,10 @@ void frame_trace_frame(const FrameSample &s)
         std::fputs("-", g_file);
     for (int i = 0; i < 4 && s.wait_from[i]; i++)
         std::fprintf(g_file, i ? ",%x" : "%x", (unsigned)s.wait_from[i]);
-    std::fprintf(g_file, " %u", (unsigned)(s.slices - g_last.slices));
-    if (s.stalled) {
-        if (const char *name = rt::trap_name(s.stall[0]))   // a shim or a native: its tag
-            std::fprintf(g_file, " %s", name);
-        else
-            std::fprintf(g_file, " %x", (unsigned)s.stall[0]);
-        std::fprintf(g_file, "/%x,%x,%x\n", (unsigned)s.stall[1], (unsigned)s.stall[2], (unsigned)s.stall[3]);
+    if (s.stalls) {
+        for (int i = 0; i < s.stalls; i++)
+            std::fprintf(g_file, "%s%x/%x", i ? ";" : " ", (unsigned)s.stall[i][0], (unsigned)s.stall[i][1]);
+        std::fputc('\n', g_file);
     }
     else
         std::fputs(" -\n", g_file);

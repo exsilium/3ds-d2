@@ -1072,14 +1072,14 @@ void present(const rt::Frame &f)
     g_timing.frames++;
     g_timing.total_frames++;
     if (game::frame_trace_on()) {
+        rt::note_present();   // the stall column: how long since this present
         game::FrameSample s;
         s.host_us = t0;
         s.tick_ms = rt::tick_ms();
         rt::frame_thread_us(s.thread_us);
         rt::frame_thread_ready_by(s.ready_by);
         s.wait_us = rt::frame_thread_wait_top(s.wait_site, s.wait_owner, s.wait_from);
-        s.stalled = rt::take_stall(s.stall);
-        s.slices = rt::frame_thread_slices();
+        s.stalls = rt::take_stall(s.stall, 8);
         game::sprite_decode_totals(s.decodes, s.decode_us);
         s.skipped = g_frames_skipped;
         game::frame_trace_frame(s);
@@ -1162,8 +1162,11 @@ uint32_t g_background_slice_us = kBackgroundSliceUs;
 // Storm's direct reads (game::install_storm_direct_reads): "stormdirect=0"
 // leaves them queued, as the game does.
 bool g_storm_direct = true;
-// The frame trace's stall column: a slice of the frame thread this long or
-// longer is caught (rt::stall_probe). "stallms=" (a measurement's).
+// The read thread's rate limit (game::set_storm_read_rate): "stormrate=" in
+// KiB/s, 0: the game's 256 KiB/s.
+uint32_t g_storm_rate_kib = 0;
+// The frame trace's stall column: a frame this long or longer is sampled
+// (rt::stall_probe). "stallms=" (a measurement's).
 uint32_t g_stall_ms = 150;
 
 void load_settings()
@@ -1195,6 +1198,8 @@ void load_settings()
             g_background_slice_us = (uint32_t)std::strtoul(line + 8, nullptr, 10);
         else if (std::strncmp(line, "stallms=", 8) == 0)
             g_stall_ms = (uint32_t)std::strtoul(line + 8, nullptr, 10);
+        else if (std::strncmp(line, "stormrate=", 10) == 0)
+            g_storm_rate_kib = (uint32_t)std::strtoul(line + 10, nullptr, 10);
         else if (std::strncmp(line, "stormdirect=", 12) == 0)
             g_storm_direct = std::atoi(line + 12) != 0;
 
@@ -1659,8 +1664,8 @@ char *g_frame_trace_buf = nullptr;
 bool g_frames_traced = false;   // a second run this session appends
 
 // The frame trace's stall column (rt::stall_probe): a thread on the second
-// core looks every 20 ms whether the frame thread's slice has run 150 ms;
-// nothing on the game's core, and two reads of the clock a look.
+// core looks every 20 ms whether the frame thread has gone 150 ms without a
+// present, and if so samples where it is; nothing on the game's core.
 Thread g_stall_thread = nullptr;
 volatile bool g_stall_stop = false;
 
@@ -2125,6 +2130,8 @@ int main()
         game::install_storm_read_priority(c);
         if (g_storm_direct)
             game::install_storm_direct_reads(c);
+        if (g_storm_rate_kib)
+            game::set_storm_read_rate(c, g_storm_rate_kib << 10);
         game::install_fatal_exit(c);
         game::install_pool_release(c);
         game::set_pool_block_size(c, game::kCtrPoolBlock);

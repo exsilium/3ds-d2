@@ -148,7 +148,44 @@ std::string leaf_of(const std::string &rel)
     return k == std::string::npos ? rel : rel.substr(k + 1);
 }
 
-bool host_stat(const std::string &host, struct stat &st) { return ::stat(host.c_str(), &st) == 0; }
+// Every path the game looks up is a stat on the card, and the game looks up
+// the same ones again and again: its save folder's three levels at each save,
+// a file in the write root and then the data root before every open, the
+// MPQs' names. On the 3DS SD card each took 30-90 ms in Azahar, 12 s of an
+// act change's load (issue #76). Results are kept, "absent" included, and a
+// path is forgotten (touched) whenever these shims change it: the game's
+// files change only through them.
+std::unordered_map<std::string, std::pair<bool, struct stat>> g_stat_cache;
+void ini_cache_clear();   // the INI files parsed (ini_load), forgotten
+
+bool host_stat(const std::string &host, struct stat &st)
+{
+    auto it = g_stat_cache.find(host);
+    if (it != g_stat_cache.end()) {
+        if (it->second.first)
+            st = it->second.second;
+        return it->second.first;
+    }
+    const bool ok = ::stat(host.c_str(), &st) == 0;
+    g_stat_cache.emplace(host, std::make_pair(ok, ok ? st : (struct stat){}));
+    return ok;
+}
+
+// A host path these shims changed (created, written, removed, renamed):
+// its stat is read again, and the INI files are parsed again.
+void forget_dir(const std::string &dir);
+
+void touched(const std::string &host)
+{
+    g_stat_cache.erase(host);
+    const size_t k = host.rfind('/');
+    if (k != std::string::npos)
+        forget_dir(host.substr(0, k));   // its directory's listing: a name may come or go
+    ini_cache_clear();
+}
+
+std::unordered_map<std::string, std::vector<std::string>> g_dir_names;   // collect's listings
+void touched_all();
 
 // Directory listings, lower-case name -> actual name, keyed by host directory.
 std::unordered_map<std::string, std::unordered_map<std::string, std::string>> g_dirs;
@@ -209,7 +246,20 @@ bool find_ci(const std::string &root, const std::string &rel, std::string &host)
     return host_stat(host, st);
 }
 
-void forget_dir(const std::string &dir) { g_dirs.erase(dir); }
+void forget_dir(const std::string &dir)
+{
+    g_dirs.erase(dir);
+    g_dir_names.erase(dir);
+}
+
+// Everything forgotten: a rename may move a directory and all under it.
+void touched_all()
+{
+    g_stat_cache.clear();
+    g_dirs.clear();
+    g_dir_names.clear();
+    ini_cache_clear();
+}
 
 const std::string &write_root() { return options().write_root; }
 const std::string &data_root() { return options().data_root; }
@@ -228,6 +278,7 @@ bool copy_host_file(const std::string &from, const std::string &to)
     if (!in)
         return false;
     FILE *out = std::fopen(to.c_str(), "wb");
+    touched(to);
     if (!out) {
         std::fclose(in);
         return false;
@@ -255,6 +306,7 @@ bool ensure_write_dir(const std::string &rel, std::string &host)
         return false;
     host = parent + "/" + leaf_of(data.substr(data_root().size()));
     ::mkdir(host.c_str(), 0777);
+    touched(host);
     forget_dir(parent);
     return true;
 }
@@ -579,6 +631,7 @@ struct IoRequest : Waitable {
     const char *kind() const override { return "fileio"; }
 };
 
+constexpr uint64_t kSlowFileUs = 20000;   // a file call this long is logged (K, install)
 constexpr uint32_t kIoMax = 16;   // requests in flight; past that, reads wait their turn synchronously
 IoRequest g_io[kIoMax];
 IoRequest *g_io_ring[kIoMax];
@@ -874,13 +927,26 @@ void collect(const std::string &root, const std::string &dir_rel, const std::str
     std::string dir;
     if (!find_ci(root, dir_rel, dir))
         return;
-    DIR *d = ::opendir(dir.c_str());
-    if (!d)
-        return;
+    // The directory's names, as readdir gave them, kept until these shims
+    // change something in it (touched): a listing of the card's save folder
+    // took ~165 ms in Azahar, three of them at each save.
+    auto it = g_dir_names.find(dir);
+    if (it == g_dir_names.end()) {
+        DIR *d = ::opendir(dir.c_str());
+        if (!d)
+            return;
+        std::vector<std::string> names;
+        while (dirent *e = ::readdir(d)) {
+            const std::string n = e->d_name;
+            if (n != "." && n != "..")
+                names.push_back(n);
+        }
+        ::closedir(d);
+        it = g_dir_names.emplace(dir, std::move(names)).first;
+    }
     const std::string pat = pattern == "*.*" ? "*" : pattern;
-    while (dirent *e = ::readdir(d)) {
-        const std::string n = e->d_name;
-        if (n == "." || n == ".." || !wild(pat.c_str(), n.c_str()))
+    for (const std::string &n : it->second) {
+        if (!wild(pat.c_str(), n.c_str()))
             continue;
         bool dup = false;
         for (const FindEntry &f : out)
@@ -890,7 +956,6 @@ void collect(const std::string &root, const std::string &dir_rel, const std::str
             continue;
         out.push_back({n, attrs_of(st, in_data), (uint64_t)st.st_size, filetime_of(st.st_mtime)});
     }
-    ::closedir(d);
 }
 
 // WIN32_FIND_DATAA (320 bytes) / WIN32_FIND_DATAW (592 bytes).
@@ -950,7 +1015,23 @@ std::string trim(const std::string &s)
     return s.substr(a, b - a);
 }
 
+std::unordered_map<std::string, std::vector<IniLine>> g_ini_cache;   // by the guest's name, parsed
+void ini_cache_clear() { g_ini_cache.clear(); }
+
+std::vector<IniLine> ini_parse(const std::string &guest_file);
+
+// The game reads its settings one key a call (GetPrivateProfileIntA), each
+// a read of the whole file from the card (32 ms a call in Azahar): the file
+// is parsed once, until these shims change a file (touched).
 std::vector<IniLine> ini_load(const std::string &guest_file)
+{
+    auto it = g_ini_cache.find(guest_file);
+    if (it != g_ini_cache.end())
+        return it->second;
+    return g_ini_cache[guest_file] = ini_parse(guest_file);
+}
+
+std::vector<IniLine> ini_parse(const std::string &guest_file)
 {
     std::vector<IniLine> lines;
     std::string host;
@@ -1081,6 +1162,7 @@ bool ini_write(const std::string &file, const std::string &app, const std::strin
     if (!resolve_write(normalize(file), false, host))
         return false;
     FILE *f = std::fopen(host.c_str(), "wb");
+    touched(host);
     if (!f)
         return false;
     for (const std::string &s : out)
@@ -1130,6 +1212,8 @@ uint32_t create_file(Cpu &c, const std::string &guest, uint32_t access, uint32_t
     auto *f = new RtFile();
     f->host = host;
     f->mode = mode;
+    if (mode[0] == 'w' || write)
+        touched(host);   // created, truncated or about to be written
     // Read-only and in the game install: the cached path (see the top).
     const std::string &data = data_root();
     if (std::strcmp(mode, "rb") == 0 && split_roots() && host.compare(0, data.size(), data) == 0) {
@@ -1180,6 +1264,7 @@ uint32_t create_directory(Cpu &c, const std::string &guest)
         set_last_error(c, ERROR_PATH_NOT_FOUND);
         return 0;
     }
+    touched(parent + "/" + leaf_of(rel));
     if (::mkdir((parent + "/" + leaf_of(rel)).c_str(), 0777) != 0) {
         set_last_error(c, ERROR_ACCESS_DENIED);
         return 0;
@@ -1291,7 +1376,29 @@ void install_files(Bridge &br)
         s.argc = argc;
         s.stdcall_cleanup = true;
         s.tag = std::string("KERNEL32.dll!") + name;
-        s.fn = std::move(fn);
+        // A call past kSlowFileUs is logged, with its path when its first
+        // argument is one (the A functions taking a name): the card's file
+        // system calls held the game's thread 0.5 s and more (issue #76).
+        static const char *const kPathFirst[] = {"CreateFileA",      "GetFileAttributesA", "GetFileAttributesExA",
+                                                 "SetFileAttributesA", "CreateDirectoryA", "RemoveDirectoryA",
+                                                 "DeleteFileA",      "MoveFileA",          "CopyFileA",
+                                                 "FindFirstFileA",   "SetCurrentDirectoryA"};
+        bool path = false;
+        for (const char *p : kPathFirst)
+            path = path || std::strcmp(name, p) == 0;
+        s.fn = [fn = std::move(fn), name, path](Cpu &c) -> uint32_t {
+            const uint64_t t0 = wx86_now_us();
+            const uint32_t r = fn(c);
+            const uint64_t us = wx86_now_us() - t0;
+            if (us >= kSlowFileUs) {
+                if (path)
+                    logf("slow file call: %s(\"%s\") %llu ms", name, read_cstr(c, c.arg(0)).c_str(),
+                         (unsigned long long)(us / 1000));
+                else
+                    logf("slow file call: %s %llu ms", name, (unsigned long long)(us / 1000));
+            }
+            return r;
+        };
         br.register_shim("KERNEL32.dll", name, s);
     };
     g_cwd.clear();
@@ -1390,6 +1497,7 @@ void install_files(Bridge &br)
         RtFile *f = file_of(h);
         if (!f) { set_last_error(c, ERROR_INVALID_HANDLE); return 0; }
         if (f->cache) { set_last_error(c, ERROR_ACCESS_DENIED); return 0; }   // opened for reading only
+        touched(f->host);   // its size and time change
         if (ov)
             std::fseek(f->fp, (long)c.read_u32(ov + 8), SEEK_SET);
         const uint32_t put = (uint32_t)stream_write(c, f->fp, buf, n);
@@ -1453,6 +1561,7 @@ void install_files(Bridge &br)
         if (!f) { set_last_error(c, ERROR_INVALID_HANDLE); return 0; }
         if (f->cache) { set_last_error(c, ERROR_ACCESS_DENIED); return 0; }
         std::fflush(f->fp);
+        touched(f->host);
         return ::ftruncate(fileno(f->fp), std::ftell(f->fp)) == 0;
     });
     K("GetFileTime", 4, [](Cpu &c) -> uint32_t {
@@ -1475,7 +1584,7 @@ void install_files(Bridge &br)
     K("CreateDirectoryW", 2, [](Cpu &c) { return create_directory(c, read_wstr(c, c.arg(0))); });
     K("RemoveDirectoryA", 1, [](Cpu &c) -> uint32_t {
         std::string host;
-        if (!find_ci(write_root(), normalize(read_cstr(c, c.arg(0))), host) || ::rmdir(host.c_str()) != 0) {
+        if (!find_ci(write_root(), normalize(read_cstr(c, c.arg(0))), host) || (touched(host), ::rmdir(host.c_str())) != 0) {
             set_last_error(c, ERROR_ACCESS_DENIED);
             return 0;
         }
@@ -1489,6 +1598,7 @@ void install_files(Bridge &br)
             set_last_error(c, resolve_read(rel, host) ? ERROR_ACCESS_DENIED : ERROR_FILE_NOT_FOUND);
             return 0;
         }
+        touched(host);
         if (std::remove(host.c_str()) != 0) { set_last_error(c, ERROR_ACCESS_DENIED); return 0; }
         forget_dir(host.substr(0, host.rfind('/')));
         return 1;
@@ -1498,6 +1608,7 @@ void install_files(Bridge &br)
         const std::string from = normalize(read_cstr(c, c.arg(0))), to = normalize(read_cstr(c, c.arg(1)));
         if (resolve_read(to, dst)) { set_last_error(c, ERROR_ALREADY_EXISTS); return 0; }
         if (!resolve_write(from, true, src)) { set_last_error(c, ERROR_FILE_NOT_FOUND); return 0; }
+        touched_all();
         if (!resolve_write(to, false, dst) || std::rename(src.c_str(), dst.c_str()) != 0) {
             set_last_error(c, ERROR_ACCESS_DENIED);
             return 0;
@@ -1548,13 +1659,13 @@ void install_files(Bridge &br)
     K("GetTempPathA", 2, [](Cpu &c) {
         std::string host;
         if (!find_ci(write_root(), "temp", host))
-            ::mkdir((write_root() + "/temp").c_str(), 0777), forget_dir(write_root());
+            ::mkdir((write_root() + "/temp").c_str(), 0777), forget_dir(write_root()), touched(write_root() + "/temp");
         return write_cstr(c, c.arg(1), c.arg(0), "C:\\temp\\");
     });
     K("GetTempPathW", 2, [](Cpu &c) -> uint32_t {
         std::string host;
         if (!find_ci(write_root(), "temp", host))
-            ::mkdir((write_root() + "/temp").c_str(), 0777), forget_dir(write_root());
+            ::mkdir((write_root() + "/temp").c_str(), 0777), forget_dir(write_root()), touched(write_root() + "/temp");
         static const char kTemp[] = "C:\\temp\\";
         const uint32_t n = sizeof kTemp - 1;
         if (c.arg(0) < n + 1)
@@ -1583,7 +1694,7 @@ void install_files(Bridge &br)
         if (!unique) {   // the name is reserved by creating the file
             std::string host;
             if (FILE *f = resolve_write(normalize(name), false, host) ? std::fopen(host.c_str(), "wb") : nullptr)
-                std::fclose(f);
+                std::fclose(f), touched(host);
         }
         write_cstr(c, c.arg(3), 260, name);
         return unique ? unique : counter;
@@ -1690,7 +1801,7 @@ void install_files(Bridge &br)
         for (size_t i = 0; i < g_views.size(); i++)
             if (g_views[i].va == c.arg(0)) {
                 const View v = g_views[i];
-                if (v.map->writable)
+                if (v.map->writable && (touched(v.map->host), true))
                     if (FILE *fp = std::fopen(v.map->host.c_str(), "r+b")) {
                         std::fseek(fp, (long)v.offset, SEEK_SET);
                         stream_write(c, fp, v.va, v.size);

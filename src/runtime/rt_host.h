@@ -206,6 +206,12 @@ uint64_t frame_thread_wait_top(uint32_t &site, uint32_t &owner, uint32_t from[kW
 // call's return), up to 8 samples a frame. take_stall, at the next present,
 // takes them (the count).
 void note_present();
+// The dynarec's translation knobs (dyn86.c): return-address prediction,
+// flag archiving at blocks ending in a CALL (1: dropped), the budget check
+// at a block's tail, the forward-bridge size. Each -1 keeps the backend's
+// default. Before the game runs (blocks translated already keep their
+// shape); the run logs them.
+void set_dynarec_knobs(int callret, int nopend, int budgettail, int forward);
 void stall_probe(uint64_t min_us);
 int take_stall(uint32_t out[][2], int max);
 uint32_t guest_thread_entry(uint32_t tid);

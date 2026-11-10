@@ -30,6 +30,7 @@
 #include "game/d2_native.h"
 #include "game/d2_state.h"
 #include "game/frame_trace.h"
+#include "game/game_exe.h"
 #include "game/osk.h"
 #include "game/profiler.h"
 #include "game/second_screen.h"
@@ -1989,6 +1990,27 @@ int main()
     if (exe.empty() && !read_file(game_dir + "/Game.exe", exe)) {
         status("Game.exe not found in %s.", kGameDir);
         status("Copy Game.exe (1.14d) and the .mpq files there.");
+        close_log();
+        wait_for_start();
+        gfxExit();
+        return 1;
+    }
+    // Only 1.14d's Game.exe runs here (issue #77): any other is refused
+    // before it starts, with what to do. The session ends in order
+    // (close_log), so no crash report is made of it.
+    const game::GameExe exe_check = game::check_game_exe(exe.data(), exe.size());
+    if (exe_check.kind != game::GameExe::kOk) {
+        if (exe_check.kind == game::GameExe::kNotPe)
+            status("Game.exe (%u bytes) is not a Windows program.", (unsigned)exe.size());
+        else if (exe_check.kind == game::GameExe::kBeforeV114)
+            status("Game.exe (%u bytes, entry %08lx) is from a Diablo II before 1.14.", (unsigned)exe.size(),
+                   (unsigned long)exe_check.entry);
+        else
+            status("Game.exe (%u bytes, entry %08lx) is not Diablo II 1.14d.", (unsigned)exe.size(),
+                   (unsigned long)exe_check.entry);
+        status("3ds-d2 runs only the 1.14d Game.exe (3.6 MB).");
+        status("Patch Diablo II to 1.14d (the installers give 1.14c),");
+        status("then copy its Game.exe and patch_d2.mpq to %s.", kGameDir);
         close_log();
         wait_for_start();
         gfxExit();

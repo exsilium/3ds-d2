@@ -41,6 +41,7 @@
 #include "game/controls.h"
 #include "game/d2_state.h"
 #include "game/osk.h"
+#include "game/port_options.h"
 #include "game/profiler.h"
 
 #include <cstdint>
@@ -80,8 +81,9 @@ struct BottomView {
     bool profiling = false;           // kInfo: a profiler run is on (its button lit)
     bool checklist = false;           // kInfo: the profiler run's checklist instead of the lines
     uint32_t profile = 0;             // the checklist's ticks (profiler.h)
-    TraceWrites trace_writes = TraceWrites::Buffered;   // the checklist's row under the options
-    bool floor_queue = true;          // its last row: drawing on core 2 (issue #80): the floor queue and the frame copy
+    TraceWrites trace_writes = TraceWrites::Buffered;   // the checklist's last row
+    bool options = false;             // kInfo: the OPTIONS page instead of the lines (port_options.h)
+    uint32_t port = 0;                // its ticks
     // kKeyboard.
     std::string osk_title;
     std::vector<Osk::KeyView> osk_keys;
@@ -131,13 +133,16 @@ public:
     // run's options at its heartbeat as profiling() says. Ticks are a
     // setting; they do not change while a run is on. Under them, how the
     // traces are written (profiler.h's TraceWrites): a tap steps it on, a
-    // run on or not, and the platform applies it at once. Last, whether the
-    // floor is drawn on core 2 (issue #80, game/d2_native.h's floor queue):
-    // a box, a tap switches it, a run on or not, at once; each switch is
-    // logged, so one run can compare the two.
+    // run on or not, and the platform applies it at once.
     static constexpr int kProfBtnX = 4, kProfBtnW = 156;
-    static constexpr int kProfRows = kProfileOptionCount + 2;
-    static constexpr int kProfRowY = kBarH + 20, kProfRowH = 26;   // seven rows above the buttons
+    static constexpr int kProfRows = kProfileOptionCount + 1;
+    static constexpr int kProfRowY = kBarH + 20, kProfRowH = 30;   // six rows above the buttons
+    // INFO's own page has three buttons: the profiler run, the port's
+    // OPTIONS (port_options.h: how the engine runs, a box each, applied at
+    // once, a run on or not) and the report. On the checklist and the
+    // OPTIONS page, the right-hand one goes back to INFO.
+    static constexpr int kInfoBtnW = 104, kInfoBtnX0 = 2, kInfoBtnX1 = 108, kInfoBtnX2 = 214;
+    static constexpr int kOptRowY = kBarH + 20, kOptRowH = 30;
     bool profiling() const { return profiling_; }
     uint32_t profile_choice() const { return profile_; }
     void set_profile_choice(uint32_t bits);
@@ -146,8 +151,8 @@ public:
     void set_profiling(bool on);
     TraceWrites trace_writes() const { return trace_writes_; }
     void set_trace_writes(TraceWrites m);
-    bool floor_queue() const { return floor_queue_; }
-    void set_floor_queue(bool on);
+    uint32_t port_options() const { return port_; }
+    void set_port_options(uint32_t bits);
     // The buttons' shortcuts (Select + D-pad): the next or previous tab
     // along the bar (PANEL too while a panel is open), MAP, and MAP's size
     // (both showing the map, not HELP). Not while the keyboard is open.
@@ -202,7 +207,8 @@ private:
     bool checklist_ = false;
     uint32_t profile_ = 1;            // profiler.h's kProfSprites until settings say otherwise
     TraceWrites trace_writes_ = TraceWrites::Buffered;
-    bool floor_queue_ = true;
+    bool options_ = false;            // INFO shows the OPTIONS page
+    uint32_t port_ = kPortDefault;    // port_options.h's bits
     const Osk *osk_ = nullptr;
 
     // The cinematic playing.

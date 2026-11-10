@@ -31,6 +31,7 @@
 #include "game/d2_state.h"
 #include "game/draw_census.h"
 #include "game/frame_trace.h"
+#include "game/port_options.h"
 #include "game/game_exe.h"
 #include "game/osk.h"
 #include "game/profiler.h"
@@ -1050,10 +1051,14 @@ void stop_sampler()
 
 // The floor queue's worker (issue #80, game::set_floor_worker): the floor
 // tiles a frame queues, drawn on the second core beside the game's thread,
-// at the I/O worker's priority. Only on core 2 (a New 3DS): core 1's time
-// share (30%) could hold a tile the frame thread then waits for, and with no
-// worker the queue only adds copies. Switched on and off from the profiler
-// checklist's last row (g_ss.floor_queue(), saved as "floorqueue=").
+// below the I/O worker and the drawing (3DS-D2-18: at the I/O worker's own
+// priority, a finished read waited out the worker's tiles, as threads of
+// one priority do not preempt each other). What it has not drawn by the
+// floor's end, the game's thread draws itself. Only on core 2 (a New 3DS):
+// core 1's time share (30%) could hold a tile the frame thread then waits
+// for, and with no worker the queue only adds copies. Switched on and off on the INFO tab's
+// OPTIONS page (port_options.h's kPortCore2Draw, saved as "port=").
+bool core2_draw() { return (g_ss.port_options() & game::kPortCore2Draw) != 0; }
 LightEvent g_floor_event;
 Thread g_floor_thread = nullptr;
 void (*g_floor_worker)() = nullptr;
@@ -1068,7 +1073,7 @@ bool start_floor_thread(void (*worker)())
     LightEvent_Init(&g_floor_event, RESET_ONESHOT);
     s32 prio = 0x30;
     svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
-    g_floor_thread = threadCreate(floor_main, nullptr, 16 * 1024, prio - 1, g_render_core, false);
+    g_floor_thread = threadCreate(floor_main, nullptr, 16 * 1024, prio + 1, g_render_core, false);
     return g_floor_thread != nullptr;
 }
 
@@ -1170,8 +1175,8 @@ void present(const rt::Frame &f)
     uint64_t t_copy = t_automap, t_bottom = t_automap;    g_timing.frames++;
     g_timing.total_frames++;
     // The checklist's floor row (issue #80): at a frame's end, for the next floor.
-    if (game::set_floor_queue_on(g_ss.floor_queue()) && game::frame_trace_on())
-        game::frame_trace_note(g_ss.floor_queue() ? "floor queue: on" : "floor queue: off");
+    if (game::set_floor_queue_on(core2_draw()) && game::frame_trace_on())
+        game::frame_trace_note(core2_draw() ? "floor queue: on" : "floor queue: off");
     uint32_t floor_us, flush_us;
     game::floor_queue_take(floor_us, flush_us);
     if (game::frame_trace_on()) {
@@ -1237,7 +1242,7 @@ void present(const rt::Frame &f)
             for (uint32_t y = 0; y < f.height; y++)
                 std::memcpy(&g_copy_ref[(size_t)y * f.width], f.pixels + (ptrdiff_t)y * f.stride, f.width);
         }
-        if (g_render_thread && g_render_core == 2 && g_ss.floor_queue() && game::renderer_guard(copy_wait))
+        if (g_render_thread && g_render_core == 2 && core2_draw() && game::renderer_guard(copy_wait))
             g_copy_state.store(1, std::memory_order_release);   // the render thread copies it
         else
             copy_frame_now();
@@ -1342,8 +1347,11 @@ void load_settings()
             g_storm_rate_kib = (uint32_t)std::strtoul(line + 10, nullptr, 10);
         else if (std::strncmp(line, "stormdirect=", 12) == 0)
             g_storm_direct = std::atoi(line + 12) != 0;
-        else if (std::strncmp(line, "floorqueue=", 11) == 0)   // the checklist's floor row (issue #80)
-            g_ss.set_floor_queue(std::atoi(line + 11) != 0);
+        else if (std::strncmp(line, "port=", 5) == 0)   // the OPTIONS page's ticks (port_options.h)
+            g_ss.set_port_options(game::port_bits(line + 5));
+        else if (std::strncmp(line, "floorqueue=", 11) == 0)   // its first form (issue #80)
+            g_ss.set_port_options(std::atoi(line + 11) ? g_ss.port_options() | game::kPortCore2Draw
+                                                       : g_ss.port_options() & ~game::kPortCore2Draw);
         else if (std::strncmp(line, "copycheck=", 10) == 0)   // a measurement's (Azahar), issue #80
             g_copy_check = std::atoi(line + 10) != 0;
         else if (std::strncmp(line, "drawphases=", 11) == 0)   // the draw natives timed (issue #80)
@@ -1357,10 +1365,10 @@ void load_settings()
 void save_settings()
 {
     if (FILE *f = std::fopen(kSettings, "w")) {
-        std::fprintf(f, "bottom=%s\nmapscale=%d\nmapms=%u\nmaphelp=%d\nprofile=%s\ntracewrites=%s\nfloorqueue=%d\n",
+        std::fprintf(f, "bottom=%s\nmapscale=%d\nmapms=%u\nmaphelp=%d\nprofile=%s\ntracewrites=%s\nport=%s\n",
                      game::bottom_tab_name(g_ss.tab()), g_ss.map_scale(), (unsigned)g_ss.map_ms(),
                      g_ss.map_help() ? 1 : 0, game::profile_names(g_ss.profile_choice()).c_str(),
-                     game::trace_writes_info(g_ss.trace_writes()).name, g_ss.floor_queue() ? 1 : 0);
+                     game::trace_writes_info(g_ss.trace_writes()).name, game::port_names(g_ss.port_options()).c_str());
         std::fclose(f);
     }
 }
@@ -1862,7 +1870,7 @@ bool frame_trace_file_start()
     g_frames_traced = true;
     start_stall_watch();   // the trace's stall column
     game::frame_trace_start(g_frame_trace);
-    game::frame_trace_note(g_ss.floor_queue() ? "floor queue: on" : "floor queue: off");
+    game::frame_trace_note(core2_draw() ? "floor queue: on" : "floor queue: off");
     game::note_game_state_again();
     return true;
 }
@@ -2306,7 +2314,7 @@ int main()
         game::set_pool_block_size(c, game::kCtrPoolBlock);
         game::install_sprite_frames(c);
         game::set_floor_queue(g_render_core == 2 ? 1 : 0);
-        game::set_floor_queue_on(g_ss.floor_queue());
+        game::set_floor_queue_on(core2_draw());
         game::FloorWorker fw;
         fw.start = start_floor_thread;
         fw.wait = [] { LightEvent_Wait(&g_floor_event); };

@@ -4,7 +4,11 @@ or the lane's): one row per 10 s heartbeat, then the frame rate by game state,
 the slow windows, what the slow windows were doing (sprite re-decoding, new
 code, SD reads), the hitches, and memory over time.
 
-    python3 -I tools/session_report.py dist/game.log [--csv rows.csv]
+    python3 -I tools/session_report.py dist/game.log [--csv rows.csv] [--windows fights|quiet|play|loads]
+
+`--windows` reports on only those windows, picked by
+tools/profile_windows.py the same way tools/profile_report.py picks them
+(issue #73).
 
 A window is the heartbeat's four lines: `prof:` (frames, idle, thread
 switches, cache syncs), `prof intrin:` (DCC cells decoded so far), `prof
@@ -41,8 +45,12 @@ import argparse
 import collections
 import csv
 import re
+import os
 import statistics
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import profile_windows  # noqa: E402
 
 PROF = re.compile(r"prof: (\d+) ms, frames (\d+), idle (\d+) ms, switches (\d+), cache syncs (\d+) \((\d+) us\)")
 INTRIN = re.compile(r"DccCell appels=(\d+)")
@@ -59,6 +67,7 @@ FRAME = re.compile(r"prof frame thread -?\d+:((?: [a-z]+ \d+)+) ms")
 WAITS = re.compile(r"prof frame thread waits: (.*) ms")
 FRAME_KINDS = ["run", "ready", "host", "sleep", "critsec", "event", "fileio", "multi", "thread", "other"]
 STATE = re.compile(r"game state: (.*?) \(ui")
+CLOCK = re.compile(r"prof clock: \d+ reads in line(?:, by caller((?: [0-9a-f]+:\d+)+))?")
 HITCH = re.compile(r"prof hitch: frames \d+, <=50ms \d+, <=100ms \d+, <=250ms (\d+), >250ms (\d+), longest (\d+) ms, "
                    r"sprites in \d+ out \d+, (?:read wait (\d+) ms|wait (\d+) ms, ready (\d+) ms, host (\d+) ms, "
                    r"heartbeat (\d+) ms), skipped (\d+), famine (\d+)")
@@ -112,6 +121,11 @@ def parse(path):
                        hitch_wait_ms=g[4], hitch_ready_ms=g[5], hitch_host_ms=g[6], heartbeat_ms=g[7],
                        skipped=g[8], famine=g[9])
             continue
+        m = CLOCK.search(line)
+        if m:   # builds with the clock counters (issue #39): the unit timers' reads
+            cur["timer_reads"] = sum(int(n) for ret, n in (p.split(":") for p in (m.group(1) or "").split())
+                                     if int(ret, 16) == profile_windows.TIMER_RET)
+            continue
         m = WAITS.search(line)
         if m:   # where it waited longest from: "site:ms ..."
             cur["ft_sites"] = m.group(1)
@@ -146,9 +160,11 @@ def parse(path):
             for k in FIELDS:
                 cur.setdefault(k, 0)
             cur.setdefault("ft_sites", "")
+            cur.setdefault("timer_reads", None)
+            cur.update(syncs=cur["cache_syncs"])   # tools/profile_windows.py's names
             # An area load (a waypoint, a portal, a respawn): the game opens and
             # reads the area's files and draws few frames or none.
-            cur["load"] = int(cur["opened"] >= 10 or cur["reads"] >= 1000)
+            cur["load"] = int(profile_windows.load(cur))
             rows.append(cur)
             cur = None
     return rows
@@ -294,8 +310,13 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("log")
     ap.add_argument("--csv", help="also write every window as a row")
+    ap.add_argument("--windows", choices=profile_windows.KINDS,
+                    help="only these windows (tools/profile_windows.py): fights, quiet play, play, area loads")
     args = ap.parse_args()
     rows = parse(args.log)
+    if args.windows:
+        rows, how = profile_windows.select(rows, args.windows)
+        print(how)
     report(rows)
     if args.csv:
         with open(args.csv, "w", newline="") as f:

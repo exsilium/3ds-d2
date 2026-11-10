@@ -24,14 +24,14 @@ import statistics
 import sys
 
 FIELDS = ["t", "gap", "tick", "run", "ready", "host", "sleep", "wait", "io", "dec", "dec_us", "skip", "who",
-          "cs", "ev", "wsite", "wown", "wus", "wfrom", "stall"]
+          "cs", "ev", "wsite", "wown", "wus", "wfrom", "stall", "floor", "flush", "cwait"]
 TEXT = ("wfrom", "stall")   # the fields that are not numbers
 V2 = 13   # version 2: up to "who"; version 1 one fewer
 
 
 def read(path, all_frames):
     frames = []
-    in_game, panel = False, False
+    in_game, panel, floorq = False, False, None
     entries = {}
     for line in open(path, encoding="utf-8", errors="replace"):
         if line.startswith("#"):
@@ -41,6 +41,8 @@ def read(path, all_frames):
             if "game state:" in line:
                 in_game = "in game" in line
                 panel = "panel open" in line
+            if line.startswith("# floor queue: "):   # version 5: the bottom screen's switch (issue #80)
+                floorq = line.split()[3]
             continue
         parts = line.split()
         if len(parts) == V2 - 1:   # version 1: no "who"
@@ -49,12 +51,16 @@ def read(path, all_frames):
             parts += ["0", "0", "0", "0", "0"]
         if len(parts) in (V2 + 5, V2 + 6):   # version 3: no wfrom or stall
             parts += ["-"] * (V2 + 7 - len(parts))
+        if len(parts) == V2 + 7:             # version 4: no floor, flush or cwait
+            parts += ["0", "0", "0"]
+        if len(parts) == V2 + 9:             # version 5's first builds: no cwait
+            parts += ["0"]
         if len(parts) != len(FIELDS):
             continue
         parts[FIELDS.index("wsite")] = str(int(parts[FIELDS.index("wsite")], 16))
         f = {k: (v if k in TEXT else int(v)) for k, v in zip(FIELDS, parts)}
         f["entry"] = entries.get(f["who"], "")
-        f["in_game"], f["panel"] = in_game, panel
+        f["in_game"], f["panel"], f["floorq"] = in_game, panel, floorq
         if all_frames or (in_game and not panel):
             frames.append(f)
     return frames, entries
@@ -175,6 +181,25 @@ def main():
             for f in frames:
                 o.write(",".join(str(f[k]) for k in FIELDS) + "\n")
     report(frames, a.slow, entries=entries)
+    floored = [f for f in frames if f["floor"]]
+    if floored:
+        # The floor (issue #80): its time on the frame thread, and of that
+        # the flush (the tiles left, and the wait for the worker's last).
+        print(f"floor on the frame thread: median {statistics.median(f['floor'] for f in floored) / 1000:.2f} ms "
+              f"(flush {statistics.median(f['flush'] for f in floored) / 1000:.2f}), in {len(floored)} frames")
+    waited = [f["cwait"] for f in frames if f["cwait"]]
+    if waited:
+        print(f"waited for the last frame's copy: {len(waited)} frames, median {statistics.median(waited) / 1000:.2f} ms, "
+              f"longest {max(waited) / 1000:.2f} ms")
+    states = sorted({f["floorq"] for f in frames if f["floorq"]})
+    if len(states) > 1:
+        # A run that switched the floor queue: each state's frames apart.
+        for st in states:
+            sub = [f for f in frames if f["floorq"] == st]
+            fl = [f for f in sub if f["floor"]]
+            print(f"\n== floor queue {st}: " + (f"floor median {statistics.median(f['floor'] for f in fl) / 1000:.2f} ms"
+                                                if fl else "no floor timed"))
+            report(sub, a.slow, entries=entries)
     if a.timeline:
         timeline(frames)
 

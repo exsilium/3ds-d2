@@ -27,6 +27,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -716,7 +717,10 @@ struct FloorJob {
 };
 constexpr uint32_t kFloorJobs = 512;   // a town frame queues ~90; more are drawn at once
 int g_floor_mode = 0, g_floor_mode_wanted = 0;
-bool g_floor_armed = false;            // between 476cdc and 476ce1
+bool g_floor_on = true;                // the bottom screen's switch: queue the tiles, or draw them at once
+bool g_floor_armed = false;            // between 476cdc and 476ce1, with g_floor_on
+uint64_t g_floor_t0 = 0;               // the floor's start (476cdc), host us
+uint64_t g_floor_us = 0, g_flush_us = 0;   // since floor_queue_take
 FloorJob *g_floor_ring = nullptr;
 std::atomic<uint32_t> g_floor_pub{0}, g_floor_next{0}, g_floor_done{0};
 FloorWorker g_floor_host{};
@@ -1692,7 +1696,8 @@ constexpr uint32_t kAfterFloorCall = 0x00476ce1, kAfterFloorFn = 0x00473c00;
 
 uint32_t floor_queue_arm(Cpu &c)
 {
-    g_floor_armed = true;
+    g_floor_armed = g_floor_on;
+    g_floor_t0 = wx86_now_us();
     resume_original(c, kFloorFn, c.reg(R_ESP), 0);
     return c.reg(R_EAX);
 }
@@ -1700,7 +1705,11 @@ uint32_t floor_queue_arm(Cpu &c)
 uint32_t floor_queue_end(Cpu &c)
 {
     g_floor_armed = false;
+    const uint64_t t1 = wx86_now_us();
     floor_queue_flush();
+    const uint64_t t2 = wx86_now_us();
+    g_floor_us += t2 - g_floor_t0;
+    g_flush_us += t2 - t1;
     resume_original(c, kAfterFloorFn, c.reg(R_ESP), 0);
     static uint32_t frames = 0;
     if (++frames % 250 == 0)
@@ -1713,6 +1722,29 @@ uint32_t floor_queue_end(Cpu &c)
                  (unsigned long long)g_floor_stats.guarded, (unsigned long long)g_scan_fail[0],
                  (unsigned long long)g_scan_fail[1], g_floor_stats.wait_us / 1000.0 / frames,
                  (unsigned long long)g_floor_verified, (unsigned long long)g_floor_mismatch);
+    return c.reg(R_EAX);
+}
+
+// The renderer guard (issue #80): the game draws into the frame buffer only
+// through its renderer, the functions in the table at [0x7c8cc0]. The app
+// copies a frame out of the buffer on the second core after present; until
+// the copy is done, every entry of that table holds a native that waits for
+// it, then goes on to the renderer's own function. The copy's thread puts
+// the table back as soon as it is done, so a frame whose copy ends before
+// the game's next draw (nearly all) never stops in one.
+constexpr uint32_t kRendererTable = 0x007c8cc0;
+constexpr uint32_t kGuardMax = 54;           // the GDI renderer's functions (0x74c4a8: 54, then its data)
+void (*g_guard_wait)() = nullptr;
+uint32_t g_guard_native[kGuardMax];          // a native per entry
+uint32_t g_guard_orig[kGuardMax];            // the renderer's functions, while guarded
+uint32_t g_guard_table = 0, g_guard_n = 0;   // the table and its entries (code pointers)
+std::atomic<bool> g_guarded{false};
+
+uint32_t guard_entry(Cpu &c, uint32_t k)
+{
+    if (g_guard_wait)
+        g_guard_wait();
+    resume_original(c, g_guard_orig[k], c.reg(R_ESP), 0);
     return c.reg(R_EAX);
 }
 
@@ -2267,6 +2299,13 @@ int install_d2_native(Cpu &c)
     if (const char *q = std::getenv("D2_FLOOR_QUEUE"))
         g_floor_mode_wanted = std::atoi(q);
     const bool floor_queue = install_floor_queue(c, g_floor_mode_wanted);
+    if (floor_queue)   // the renderer guard's natives (renderer_guard)
+        for (uint32_t k = 0; k < kGuardMax; k++) {
+            // One name each: the bridge keeps natives by name.
+            static char names[kGuardMax][20];
+            std::snprintf(names[k], sizeof names[k], "RendererGuard%02u", (unsigned)k);
+            g_guard_native[k] = rt::native_entry(names[k], 0, [k](Cpu &cc) { return guard_entry(cc, k); });
+        }
     // Any other draw native draws what the floor queue holds first.
     auto guard = [floor_queue](NativeFn fn) -> NativeFn {
         if (!floor_queue)
@@ -2378,6 +2417,62 @@ int install_d2_native(Cpu &c)
 }
 
 void set_floor_queue(int mode) { g_floor_mode_wanted = mode; }
+
+bool set_floor_queue_on(bool on)
+{
+    if (on == g_floor_on)
+        return false;
+    g_floor_on = on;   // read at the next frame's floor (476cdc), on this thread
+    if (g_floor_mode)
+        rt::logf("floor queue: %s (the bottom screen)", on ? "on" : "off");
+    return true;
+}
+
+bool renderer_guard(void (*wait)())
+{
+    g_guard_wait = wait;
+    if (!g_base || !wait || !g_guard_native[0] || g_guarded.load(std::memory_order_acquire))
+        return false;
+    const uint32_t table = U32(kRendererTable);
+    if (!table)
+        return false;   // no renderer yet
+    if (table != g_guard_table) {
+        // The table's functions: the game's own code, or a native placed in
+        // one of them (a trap address below the code).
+        g_guard_table = table;
+        g_guard_n = kGuardMax;
+        rt::logf("renderer guard: table %08x, %u entries; each waits for the last frame's copy", table, g_guard_n);
+    }
+    for (uint32_t k = 0; k < g_guard_n; k++) {
+        g_guard_orig[k] = U32(g_guard_table + 4 * k);
+        if (!g_guard_orig[k] || g_guard_orig[k] == g_guard_native[k])
+            return false;   // not a function, or still guarded: no guard, the app copies at once
+    }
+    for (uint32_t k = 0; k < g_guard_n; k++)
+        std::memcpy(H(g_guard_table + 4 * k), &g_guard_native[k], 4);
+    g_guarded.store(true, std::memory_order_release);
+    return true;
+}
+
+void renderer_unguard()
+{
+    if (!g_guarded.load(std::memory_order_acquire))
+        return;
+    for (uint32_t k = 0; k < g_guard_n; k++) {
+        // Only an entry still the guard's: one the game set meanwhile stays.
+        uint32_t *slot = (uint32_t *)H(g_guard_table + 4 * k);
+        uint32_t expect = g_guard_native[k];
+        __atomic_compare_exchange_n(slot, &expect, g_guard_orig[k], false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+    }
+    g_guarded.store(false, std::memory_order_release);
+}
+
+void floor_queue_take(uint32_t &floor_us, uint32_t &flush_us)
+{
+    floor_us = (uint32_t)g_floor_us;
+    flush_us = (uint32_t)g_flush_us;
+    g_floor_us = g_flush_us = 0;
+}
 void set_floor_worker(const FloorWorker &w) { g_floor_host = w; }
 
 void stop_floor_worker()

@@ -23,8 +23,9 @@ void frame_trace_start(FILE *f)
     g_have_last = false;
     g_named = 0;
     if (g_file)
-        std::fputs("# 3ds-d2 frame trace 4\n"
-                   "# t gap tick run ready host sleep wait io dec dec_us skip who cs ev wsite wown wus wfrom stall\n",
+        std::fputs("# 3ds-d2 frame trace 5\n"
+                   "# t gap tick run ready host sleep wait io dec dec_us skip who cs ev wsite wown wus wfrom stall "
+                   "floor flush cwait\n",
                    g_file);
 }
 
@@ -74,10 +75,10 @@ void frame_trace_frame(const FrameSample &s)
     if (s.stalls) {
         for (int i = 0; i < s.stalls; i++)
             std::fprintf(g_file, "%s%x/%x", i ? ";" : " ", (unsigned)s.stall[i][0], (unsigned)s.stall[i][1]);
-        std::fputc('\n', g_file);
+    } else {
+        std::fputs(" -", g_file);
     }
-    else
-        std::fputs(" -\n", g_file);
+    std::fprintf(g_file, " %u %u %u\n", (unsigned)s.floor_us, (unsigned)s.flush_us, (unsigned)s.copy_wait_us);
     g_last = s;
 }
 

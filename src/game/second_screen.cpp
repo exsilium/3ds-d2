@@ -216,6 +216,14 @@ void SecondScreen::set_profiling(bool on)
     dirty_ = true;
 }
 
+void SecondScreen::set_floor_queue(bool on)
+{
+    if (on != floor_queue_)
+        settings_changed_ = true;
+    floor_queue_ = on;
+    dirty_ = true;
+}
+
 void SecondScreen::set_trace_writes(TraceWrites m)
 {
     if (m != trace_writes_)
@@ -478,6 +486,8 @@ void SecondScreen::update(Pad &pad, const GameState &gs, int cursor_x, int curso
                 dirty_ = true;
             } else if (key_ == 5 + kProfileOptionCount) {
                 set_trace_writes(next_trace_writes(trace_writes_));   // a run on or not
+            } else if (key_ == 6 + kProfileOptionCount) {
+                set_floor_queue(!floor_queue_);   // a run on or not
             } else if (key_ >= 5) {
                 if (!profiling_)
                     set_profile_choice(profile_ ^ kProfileOptions[key_ - 5].bit);
@@ -655,6 +665,7 @@ bool SecondScreen::stage(BottomView &v, uint64_t now_ms)
             v.checklist = checklist_;
             v.profile = profile_;
             v.trace_writes = trace_writes_;
+            v.floor_queue = floor_queue_;
             const int rows = (kAreaH - kMapBtnH) / 8 - (int)stats_.size();
             const uint32_t n = log_head_ < (uint32_t)kLogLines ? log_head_ : (uint32_t)kLogLines;
             const uint32_t show = rows > 0 ? ((uint32_t)rows < n ? (uint32_t)rows : n) : 0;
@@ -893,6 +904,15 @@ void draw_bottom(uint16_t *fb, const BottomView &v, const uint8_t *frame, int fw
                 const int y = SecondScreen::kProfRowY + kProfileOptionCount * SecondScreen::kProfRowH + 3;
                 cv.text(32, y + 3, w.label, w.mode == TraceWrites::Buffered ? rgb(230, 220, 200) : kGold);
                 cv.text(32, y + 15, w.note, kHint);
+            }
+            {
+                // The floor on core 2: a box, never greyed (a run compares it on and off).
+                const int y = SecondScreen::kProfRowY + (kProfileOptionCount + 1) * SecondScreen::kProfRowH + 3;
+                const uint16_t ink = rgb(230, 220, 200);
+                cv.fill(8, y, 14, 14, ink);
+                cv.fill(10, y + 2, 10, 10, v.floor_queue ? kGold : kBg);
+                cv.text(32, y + 3, "draw on core 2", ink);
+                cv.text(32, y + 15, "floor, frame copy beside the game", kHint);
             }
         } else {
             for (size_t i = 0; i < v.lines.size() && (int)i < (kAreaH - SecondScreen::kMapBtnH) / 8; i++)

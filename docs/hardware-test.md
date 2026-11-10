@@ -314,6 +314,7 @@ The frame thread had no slack in a 40 ms frame. Drawing is most of its work, and
 - Checked block by block on the lane against the game's own blitters, they drew the same pixels.
 - A few frames still differed, because the lane's virtual clock counts the guest instructions they no longer run.
 - The console never draws interpolated light, so they would only help a player who raises Light Quality.
+- Parked as [parked/gouraud-natives.patch](parked/gouraud-natives.patch), against commit `d9c08c1`. Take it up if a player raising Light Quality is reported, or asked for. With Light Quality up, interpolated tiles are drawn at once on the game's thread, as before issue #80.
 
 ## Blood Moor: VirtualAlloc ran out (2026-10-18)
 

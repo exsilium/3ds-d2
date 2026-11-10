@@ -43,6 +43,7 @@
 #include <3ds.h>
 #include <3ds/allocator/mappable.h>
 
+#include <atomic>
 #include <cstdarg>
 #include <fcntl.h>
 #include <cstdio>
@@ -804,6 +805,55 @@ Staged g_staged;
 LightEvent g_render_go;
 volatile bool g_render_busy = false, g_render_quit = false;
 
+// The frame's copy on the second core (issue #80): with "draw on core 2",
+// present() leaves the frame in the game's buffer and the render thread
+// copies it first thing. The game draws into the buffer only through its
+// renderer, guarded until the copy is done (game::renderer_guard): a call
+// into it waits in copy_wait(). The render thread lifts the guard as soon
+// as it has copied. "copycheck=1" in settings.txt (Azahar): at the next
+// present, the buffer the copy was made from is compared with the copy, and
+// a frame the game changed outside its renderer before the copy is logged.
+std::atomic<int> g_copy_state{0};   // 0 none, 1 asked for, 2 done
+const uint8_t *g_copy_src = nullptr;
+int32_t g_copy_stride = 0;
+LightEvent g_copy_event;
+bool g_copy_check = false;
+uint64_t g_copy_wait_us = 0;        // since the frame trace's last frame
+uint32_t g_copy_changed = 0;        // copycheck: the mismatches logged
+std::atomic<uint32_t> g_copy_bad{0};   // copycheck: copies that differ from the frame at present
+std::vector<uint8_t> g_copy_ref;    // copycheck: the frame as present saw it
+
+void copy_frame_now()
+{
+    Staged &st = g_staged;
+    for (uint32_t y = 0; y < st.height; y++)
+        std::memcpy(&st.pixels[(size_t)y * st.width], g_copy_src + (ptrdiff_t)y * g_copy_stride, st.width);
+}
+
+void copy_wait()
+{
+    if (g_copy_state.load(std::memory_order_acquire) == 0)
+        return;
+    if (g_copy_state.load(std::memory_order_acquire) == 1) {
+        const uint64_t t0 = host_us();
+        while (g_copy_state.load(std::memory_order_acquire) != 2)
+            LightEvent_WaitTimeout(&g_copy_event, 1000000);
+        g_copy_wait_us += host_us() - t0;
+    }
+    if (g_copy_check) {
+        // The render thread's copy against the frame as present saw it.
+        const uint32_t bad = g_copy_bad.load(std::memory_order_acquire);
+        if (bad != g_copy_changed) {
+            g_copy_changed = bad;
+            const game::GameState gs = game::read_game_state();
+            if (bad <= 40)
+                status("copy check: the copy differs from the frame at present (%u times; %s%s)", (unsigned)bad,
+                       gs.in_game ? "in game" : "menus", gs.panel_open ? ", a panel" : "");
+        }
+    }
+    g_copy_state.store(0, std::memory_order_release);
+}
+
 // Screenshots (L+R+Select): the request rides on the next staged frame, and
 // the thread that draws it saves it after drawing, so the picture is the one
 // on screen. Encoding and writing take a moment, while the screen holds that
@@ -925,6 +975,15 @@ void render_main(void *)
         LightEvent_Wait(&g_render_go);
         if (g_render_quit)
             break;
+        if (g_copy_state.load(std::memory_order_acquire) == 1) {
+            copy_frame_now();
+            game::renderer_unguard();
+            if (g_copy_check && g_copy_ref.size() == g_staged.pixels.size() &&
+                std::memcmp(g_copy_ref.data(), g_staged.pixels.data(), g_copy_ref.size()))
+                g_copy_bad.fetch_add(1, std::memory_order_release);
+            g_copy_state.store(2, std::memory_order_release);
+            LightEvent_Signal(&g_copy_event);
+        }
         const uint64_t t0 = host_us();
         draw_staged();
         g_timing.draw_us += host_us() - t0;
@@ -936,6 +995,7 @@ void render_main(void *)
 void start_render_thread()
 {
     LightEvent_Init(&g_render_go, RESET_ONESHOT);
+    LightEvent_Init(&g_copy_event, RESET_ONESHOT);
     s32 prio = 0x30;
     svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
     // Core 2 exists on a New 3DS and is the application's to use; core 1 is
@@ -992,8 +1052,8 @@ void stop_sampler()
 // tiles a frame queues, drawn on the second core beside the game's thread,
 // at the I/O worker's priority. Only on core 2 (a New 3DS): core 1's time
 // share (30%) could hold a tile the frame thread then waits for, and with no
-// worker the queue only adds copies. "floorqueue=0" in settings.txt: off.
-int g_floor_queue = 1;
+// worker the queue only adds copies. Switched on and off from the profiler
+// checklist's last row (g_ss.floor_queue(), saved as "floorqueue=").
 LightEvent g_floor_event;
 Thread g_floor_thread = nullptr;
 void (*g_floor_worker)() = nullptr;
@@ -1088,6 +1148,7 @@ void second_screen_active()
 
 void present(const rt::Frame &f)
 {
+    copy_wait();   // the last frame's copy, should the game not have drawn since
     const uint64_t t0 = host_us();
     if (g_timing.last_present_us) {
         const uint64_t gap = t0 - g_timing.last_present_us;
@@ -1108,6 +1169,11 @@ void present(const rt::Frame &f)
     const uint64_t t_automap = host_us();
     uint64_t t_copy = t_automap, t_bottom = t_automap;    g_timing.frames++;
     g_timing.total_frames++;
+    // The checklist's floor row (issue #80): at a frame's end, for the next floor.
+    if (game::set_floor_queue_on(g_ss.floor_queue()) && game::frame_trace_on())
+        game::frame_trace_note(g_ss.floor_queue() ? "floor queue: on" : "floor queue: off");
+    uint32_t floor_us, flush_us;
+    game::floor_queue_take(floor_us, flush_us);
     if (game::frame_trace_on()) {
         rt::note_present();   // the stall column: how long since this present
         game::FrameSample s;
@@ -1117,6 +1183,10 @@ void present(const rt::Frame &f)
         rt::frame_thread_ready_by(s.ready_by);
         s.wait_us = rt::frame_thread_wait_top(s.wait_site, s.wait_owner, s.wait_from);
         s.stalls = rt::take_stall(s.stall, 8);
+        s.floor_us = floor_us;
+        s.flush_us = flush_us;
+        s.copy_wait_us = (uint32_t)g_copy_wait_us;
+        g_copy_wait_us = 0;
         game::sprite_decode_totals(s.decodes, s.decode_us);
         s.skipped = g_frames_skipped;
         game::frame_trace_frame(s);
@@ -1160,8 +1230,17 @@ void present(const rt::Frame &f)
         st.width = f.width;
         st.height = f.height;
         st.pixels.resize((size_t)f.width * f.height);
-        for (uint32_t y = 0; y < f.height; y++)
-            std::memcpy(&st.pixels[(size_t)y * f.width], f.pixels + (ptrdiff_t)y * f.stride, f.width);
+        g_copy_src = f.pixels;
+        g_copy_stride = f.stride;
+        if (g_copy_check) {   // the frame as present sees it, for the render thread's copy to match
+            g_copy_ref.resize(st.pixels.size());
+            for (uint32_t y = 0; y < f.height; y++)
+                std::memcpy(&g_copy_ref[(size_t)y * f.width], f.pixels + (ptrdiff_t)y * f.stride, f.width);
+        }
+        if (g_render_thread && g_render_core == 2 && g_ss.floor_queue() && game::renderer_guard(copy_wait))
+            g_copy_state.store(1, std::memory_order_release);   // the render thread copies it
+        else
+            copy_frame_now();
         std::memcpy(st.palette, f.palette, sizeof st.palette);
         t_copy = host_us();
         st.zoom = g_zoom;
@@ -1263,8 +1342,10 @@ void load_settings()
             g_storm_rate_kib = (uint32_t)std::strtoul(line + 10, nullptr, 10);
         else if (std::strncmp(line, "stormdirect=", 12) == 0)
             g_storm_direct = std::atoi(line + 12) != 0;
-        else if (std::strncmp(line, "floorqueue=", 11) == 0)   // issue #80
-            g_floor_queue = std::atoi(line + 11);
+        else if (std::strncmp(line, "floorqueue=", 11) == 0)   // the checklist's floor row (issue #80)
+            g_ss.set_floor_queue(std::atoi(line + 11) != 0);
+        else if (std::strncmp(line, "copycheck=", 10) == 0)   // a measurement's (Azahar), issue #80
+            g_copy_check = std::atoi(line + 10) != 0;
         else if (std::strncmp(line, "drawphases=", 11) == 0)   // the draw natives timed (issue #80)
             game::draw_phases_set(std::atoi(line + 11) != 0);
 
@@ -1276,10 +1357,10 @@ void load_settings()
 void save_settings()
 {
     if (FILE *f = std::fopen(kSettings, "w")) {
-        std::fprintf(f, "bottom=%s\nmapscale=%d\nmapms=%u\nmaphelp=%d\nprofile=%s\ntracewrites=%s\n",
+        std::fprintf(f, "bottom=%s\nmapscale=%d\nmapms=%u\nmaphelp=%d\nprofile=%s\ntracewrites=%s\nfloorqueue=%d\n",
                      game::bottom_tab_name(g_ss.tab()), g_ss.map_scale(), (unsigned)g_ss.map_ms(),
                      g_ss.map_help() ? 1 : 0, game::profile_names(g_ss.profile_choice()).c_str(),
-                     game::trace_writes_info(g_ss.trace_writes()).name);
+                     game::trace_writes_info(g_ss.trace_writes()).name, g_ss.floor_queue() ? 1 : 0);
         std::fclose(f);
     }
 }
@@ -1781,6 +1862,7 @@ bool frame_trace_file_start()
     g_frames_traced = true;
     start_stall_watch();   // the trace's stall column
     game::frame_trace_start(g_frame_trace);
+    game::frame_trace_note(g_ss.floor_queue() ? "floor queue: on" : "floor queue: off");
     game::note_game_state_again();
     return true;
 }
@@ -2223,7 +2305,8 @@ int main()
         game::install_pool_release(c);
         game::set_pool_block_size(c, game::kCtrPoolBlock);
         game::install_sprite_frames(c);
-        game::set_floor_queue(g_render_core == 2 ? g_floor_queue : 0);
+        game::set_floor_queue(g_render_core == 2 ? 1 : 0);
+        game::set_floor_queue_on(g_ss.floor_queue());
         game::FloorWorker fw;
         fw.start = start_floor_thread;
         fw.wait = [] { LightEvent_Wait(&g_floor_event); };

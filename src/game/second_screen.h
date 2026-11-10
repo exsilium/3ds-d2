@@ -80,7 +80,8 @@ struct BottomView {
     bool profiling = false;           // kInfo: a profiler run is on (its button lit)
     bool checklist = false;           // kInfo: the profiler run's checklist instead of the lines
     uint32_t profile = 0;             // the checklist's ticks (profiler.h)
-    TraceWrites trace_writes = TraceWrites::Buffered;   // the checklist's last row
+    TraceWrites trace_writes = TraceWrites::Buffered;   // the checklist's row under the options
+    bool floor_queue = true;          // its last row: drawing on core 2 (issue #80): the floor queue and the frame copy
     // kKeyboard.
     std::string osk_title;
     std::vector<Osk::KeyView> osk_keys;
@@ -130,10 +131,13 @@ public:
     // run's options at its heartbeat as profiling() says. Ticks are a
     // setting; they do not change while a run is on. Under them, how the
     // traces are written (profiler.h's TraceWrites): a tap steps it on, a
-    // run on or not, and the platform applies it at once.
+    // run on or not, and the platform applies it at once. Last, whether the
+    // floor is drawn on core 2 (issue #80, game/d2_native.h's floor queue):
+    // a box, a tap switches it, a run on or not, at once; each switch is
+    // logged, so one run can compare the two.
     static constexpr int kProfBtnX = 4, kProfBtnW = 156;
-    static constexpr int kProfRows = kProfileOptionCount + 1;
-    static constexpr int kProfRowY = kBarH + 20, kProfRowH = 30;   // six rows above the buttons
+    static constexpr int kProfRows = kProfileOptionCount + 2;
+    static constexpr int kProfRowY = kBarH + 20, kProfRowH = 26;   // seven rows above the buttons
     bool profiling() const { return profiling_; }
     uint32_t profile_choice() const { return profile_; }
     void set_profile_choice(uint32_t bits);
@@ -142,6 +146,8 @@ public:
     void set_profiling(bool on);
     TraceWrites trace_writes() const { return trace_writes_; }
     void set_trace_writes(TraceWrites m);
+    bool floor_queue() const { return floor_queue_; }
+    void set_floor_queue(bool on);
     // The buttons' shortcuts (Select + D-pad): the next or previous tab
     // along the bar (PANEL too while a panel is open), MAP, and MAP's size
     // (both showing the map, not HELP). Not while the keyboard is open.
@@ -196,6 +202,7 @@ private:
     bool checklist_ = false;
     uint32_t profile_ = 1;            // profiler.h's kProfSprites until settings say otherwise
     TraceWrites trace_writes_ = TraceWrites::Buffered;
+    bool floor_queue_ = true;
     const Osk *osk_ = nullptr;
 
     // The cinematic playing.

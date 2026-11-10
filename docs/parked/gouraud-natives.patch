@@ -1,0 +1,300 @@
+diff --git a/scripts/docker.sh b/scripts/docker.sh
+index c6aa498..30e98ef 100755
+--- a/scripts/docker.sh
++++ b/scripts/docker.sh
+@@ -123,7 +123,7 @@ test)
+         make_args=(-C tests/m4 run MS="${3:-20000}")
+         [ -n "${4:-}" ] && make_args+=(CMD="$4")
+         RUN_EXTRA=(-v "$(host_path "$(cd "$2" && pwd)"):/game:ro")
+-        for v in M4_LAYOUT M4_VIRTUAL_CLOCK M4_SCRIPT M4_BOTTOM RT_MSGLOG M4_PHYS_MB M4_FAST M4_QEMU_FLAGS WX86_SON WX86_SONDUMP WX86_SONMAXS WX86_HOTPROF D2_NOLINK M4_FRAMEHASH M4_NATIVE D2_NATIVE_MASK M4_DUMPFRAME M4_VIDEO M4_VIDEO_WAV M4_PROF RT_FILETRACE M4_HASHMEM WX86_FAKETSC M4_ASYNCIO M4_SPRITE_MB M4_POOL_RESERVE_MB M4_POOL_SPARE_KB M4_SPRITE_TRACE M4_STORM_PRIO M4_STORM_DIRECT D2_NATIVE_CHECK M4_SPRITE_FRAMES M4_META_CAP_KB D2_JITEVICT M4_POOL_PIECES M4_POOL_BALLAST_MB M4_POOL_LARGE_KB M4_POOL_LARGE_MIN_KB M4_BG_QUANTUM M4_CALLRET M4_NOPEND M4_BUDGETTAIL M4_FORWARD D2_DRAW_CENSUS D2_FLOOR_QUEUE; do [ -n "${!v:-}" ] && RUN_EXTRA+=(-e "$v=${!v}"); done
++        for v in M4_LAYOUT M4_VIRTUAL_CLOCK M4_SCRIPT M4_BOTTOM RT_MSGLOG M4_PHYS_MB M4_FAST M4_QEMU_FLAGS WX86_SON WX86_SONDUMP WX86_SONMAXS WX86_HOTPROF D2_NOLINK M4_FRAMEHASH M4_NATIVE D2_NATIVE_MASK M4_DUMPFRAME M4_VIDEO M4_VIDEO_WAV M4_PROF RT_FILETRACE M4_HASHMEM WX86_FAKETSC M4_ASYNCIO M4_SPRITE_MB M4_POOL_RESERVE_MB M4_POOL_SPARE_KB M4_SPRITE_TRACE M4_STORM_PRIO M4_STORM_DIRECT D2_NATIVE_CHECK M4_SPRITE_FRAMES M4_META_CAP_KB D2_JITEVICT M4_POOL_PIECES M4_POOL_BALLAST_MB M4_POOL_LARGE_KB M4_POOL_LARGE_MIN_KB M4_BG_QUANTUM M4_CALLRET M4_NOPEND M4_BUDGETTAIL M4_FORWARD D2_DRAW_CENSUS D2_FLOOR_QUEUE D2_GOURAUD D2_GOURAUD_MASK D2_GOURAUD_CHECK D2_GOURAUD_PROBE; do [ -n "${!v:-}" ] && RUN_EXTRA+=(-e "$v=${!v}"); done
+         run_in "$HOSTTEST_IMAGE" make "${make_args[@]}" ;;
+     *)    die "test host | test x86 [golden] | test cpu [armv7|armv6] | test m3 | test report | test governor | test gameexe | test frames | test pool | test tls | test m4 <game-dir>" ;;
+     esac
+diff --git a/src/game/d2_native.cpp b/src/game/d2_native.cpp
+index 754ebb4..892d105 100644
+--- a/src/game/d2_native.cpp
++++ b/src/game/d2_native.cpp
+@@ -575,6 +575,162 @@ void iso_flat_clipped(const uint8_t *src, int32_t x, int32_t y, uint8_t *dst, co
+     }
+ }
+ 
++// ---- interpolated light (issue #80) ------------------------------------------------
++//
++// A block whose four corner lights differ is drawn with a light per pixel:
++// a row of 32 light levels from the game's gradient table (0x7ca320, 32 x
++// 32 rows of 32: the row for the left and right edge's levels), each pixel
++// remapped through its level's shade table: d = shades[G[x] * 256 + s].
++// The edges' lights a and b are 4.4 fixed point (sar `shift` picks the
++// level), and step by da and db each row. The game's own routines do the
++// same with an unrolled loop per width; these match them byte for byte,
++// quirks included (the clipped ones read the gradient from the run's
++// start, not from its first drawn pixel). The walls' callers (4f8258,
++// 4f8276) return what the RLE ones leave in EAX, the gradient pointer, and
++// the game uses it: they return it too, as a guest address.
++constexpr uint32_t kGradient = 0x007ca320;
++
++inline const uint8_t *gradient(int32_t a, int32_t b, int32_t shift)
++{
++    return H(kGradient + ((uint32_t)(((a >> shift) << 5) + (b >> shift)) << 5));
++}
++
++inline void remap_lit(uint8_t *d, const uint8_t *s, const uint8_t *g, int32_t n)
++{
++    const uint8_t *shades = H(kShades);
++    for (int32_t i = 0; i < n; i++)
++        d[i] = shades[((uint32_t)g[i] << 8) + s[i]];
++}
++
++// 4f6bb0(ecx=src iso block, edx=dst, [8]=a, [c]=da, [10]=b, [14]=db), ret
++// 0x10. Only a row 4, 8, ... 32 wide is drawn (its jump table sends the others
++// past the row).
++void gouraud_iso(const uint8_t *src, uint8_t *dst, int32_t a, int32_t da, int32_t b, int32_t db, int32_t pitch)
++{
++    for (int r = 0; r < 15; r++, dst += pitch, a += da, b += db) {
++        const int32_t w = g_width[r];
++        if ((uint32_t)(w - 4) <= 0x1c && !(w & 3))
++            remap_lit(dst + g_xoff[r], src + g_soff[r], gradient(a, b, 7) + g_xoff[r], w);
++    }
++}
++
++// 4f71a0(ecx=src stream, edx=dst, [8]=a, [c]=da, [10]=b, [14]=db, [18]=rows,
++// [1c]=shift), ret 0x18: RleFlat's pairs, lit. A run of 0 or over 32 draws
++// nothing but still advances. Returns the gradient pointer (EAX).
++uint32_t gouraud_rle(const uint8_t *src, uint8_t *rowp, int32_t a, int32_t da, int32_t b, int32_t db, uint32_t rows,
++                 int32_t shift, int32_t pitch)
++{
++    const uint8_t *g = gradient(a, b, shift);
++    uint8_t *d = rowp;
++    while (rows != 0) {
++        const uint8_t skip = src[0], run = src[1];
++        src += 2;
++        if (skip == 0 && run == 0) {
++            a += da;
++            b += db;
++            rowp += pitch;
++            rows--;
++            g = gradient(a, b, shift);
++            d = rowp;
++            continue;
++        }
++        d += skip;
++        g += skip;
++        if (run >= 1 && run <= 32)
++            remap_lit(d, src, g, run);
++        d += run;
++        src += run;
++        g += run;
++    }
++    return (uint32_t)(g - g_base);
++}
++
++// 4f7850(ecx=x0, edx=y, [8]=src stream, [c]=dst, [10]=a, [14]=da, [18]=b,
++// [1c]=db, [20]=rows, [24]=shift), ret 0x20: clipped to the window.
++// Returns the gradient pointer (EAX), also where a row reaches the window's
++// bottom.
++uint32_t gouraud_rle_clipped(int32_t x0, int32_t y, const uint8_t *src, uint8_t *rowp, int32_t a, int32_t da, int32_t b,
++                         int32_t db, int32_t rows, int32_t shift, const FloorView &v)
++{
++    const uint8_t *g = gradient(a, b, shift);
++    uint8_t *d = rowp;
++    for (int32_t i = 0; i < rows;) {
++        const uint8_t skip = src[0], run = src[1];
++        src += 2;
++        if (skip == 0 && run == 0) {
++            b += db;
++            a += da;
++            rowp += v.pitch;
++            i++;
++            y++;
++            g = gradient(a, b, shift);
++            d = rowp;
++            continue;
++        }
++        if (y >= v.clip_b)
++            return (uint32_t)(g - g_base);
++        d += skip;
++        g += skip;
++        if (y >= v.clip_t) {
++            const int32_t x = x0 + (int32_t)(d - rowp);
++            const int32_t l = imax(0, v.clip_l - x);
++            const int32_t r = imin(imax(0, v.clip_r - x), (int32_t)run);
++            const int32_t n = r - l;
++            if (n >= 1 && n <= 32)
++                remap_lit(d + l, src + l, g, n);   // the gradient from the run's start (the original's)
++        }
++        d += run;
++        src += run;
++        g += run;
++    }
++    return (uint32_t)(g - g_base);
++}
++
++// 4f89f0's iso branch: a 15-row iso block, lit, clipped to the window, at
++// screen (x, y). a and b start at the top row's corners even when rows
++// above the window are skipped (the original's).
++void gouraud_iso_clipped(const uint8_t *src, int32_t x, int32_t y, uint8_t *dst, int32_t a, int32_t da, int32_t b,
++                         int32_t db, const FloorView &v)
++{
++    const int32_t r0 = imax(0, v.clip_t - y);
++    const int32_t r1 = imin(15, v.clip_b - y);
++    uint8_t *rowp = dst + (intptr_t)v.pitch * r0;
++    for (int32_t r = r0; r < r1; r++, rowp += v.pitch, a += da, b += db) {
++        const int32_t sx = x + g_xoff[r];
++        const int32_t l = imax(0, v.clip_l - sx);
++        const int32_t n = imin(imax(0, v.clip_r - sx), g_width[r]) - l;
++        if (n > 0)
++            remap_lit(rowp + g_xoff[r] + l, src + g_soff[r] + l, gradient(a, b, 7) + g_xoff[r], n);
++    }
++}
++
++uint32_t gouraud_iso_native(Cpu &c)
++{
++    gouraud_iso(H(c.reg(R_ECX)), H(c.reg(R_EDX)), (int32_t)c.arg(0), (int32_t)c.arg(1), (int32_t)c.arg(2),
++                (int32_t)c.arg(3), I32(kPitch));
++    return c.arg(3);   // the original leaves db in EAX
++}
++
++uint32_t gouraud_rle_native(Cpu &c)
++{
++    return gouraud_rle(H(c.reg(R_ECX)), H(c.reg(R_EDX)), (int32_t)c.arg(0), (int32_t)c.arg(1), (int32_t)c.arg(2),
++                       (int32_t)c.arg(3), c.arg(4), (int32_t)c.arg(5), I32(kPitch));
++}
++
++uint32_t gouraud_rle_clipped_native(Cpu &c)
++{
++    return gouraud_rle_clipped((int32_t)c.reg(R_ECX), (int32_t)c.reg(R_EDX), H(c.arg(0)), H(c.arg(1)),
++                               (int32_t)c.arg(2), (int32_t)c.arg(3), (int32_t)c.arg(4), (int32_t)c.arg(5),
++                               (int32_t)c.arg(6), (int32_t)c.arg(7), floor_view_now());
++}
++
++// D2_GOURAUD=0 (lane): FloorTile's interpolated blocks go to the game's own
++// 4f8850 / 4f89f0 again, as before issue #80 (the A/B for byte-exactness).
++bool g_gouraud_native = true;
++bool g_gouraud_check = std::getenv("D2_GOURAUD_CHECK") != nullptr;
++uint64_t g_gouraud_checks = 0;
++int g_gouraud_probe = std::getenv("D2_GOURAUD_PROBE") ? std::atoi(std::getenv("D2_GOURAUD_PROBE")) : 0;
++
+ // 4f8b80(ecx=tile, edx=x, [8]=y, [c]=light buffer), ret 8. Per block (20
+ // bytes from [tile+0x54], [tile+0x50] of them): offset (short x, short y) at
+ // +0, flags at +8 (1: drawn, 4: RLE), light cell (+6, +7), pixels at
+@@ -651,7 +807,7 @@ bool floor_tile_blocks(Cpu *c, uint32_t tile, int32_t x, int32_t y, const uint8_
+             }
+         }
+         if (scan) {
+-            if (!flat || 12 * cell + 0x139 > kLightBytes) {
++            if ((!flat && !g_gouraud_native) || 12 * cell + 0x139 > kLightBytes) {
+                 g_scan_fail[flat ? 1 : 0]++;
+                 return false;
+             }
+@@ -673,17 +829,74 @@ bool floor_tile_blocks(Cpu *c, uint32_t tile, int32_t x, int32_t y, const uint8_
+                     iso_flat_clipped(H(src), sx, sy, H(dst), tbl, v);
+             }
+         } else {
+-            // The original passes its four corners by address: here they go
+-            // below the stack pointer, under guest_call's own frame.
+-            const uint32_t buf = c->reg(R_ESP) - 0x20;
+-            std::memcpy(H(buf), corners, sizeof corners);
+-            c->set_reg(R_ECX, e);
+-            if (inside) {
+-                c->set_reg(R_EDX, dst);
+-                rt::guest_call(*c, 0x004f8850, {buf});
++            // 4f8850 / 4f89f0: the edges' lights from the corners.
++            const int32_t a = (int32_t)corners[0] << 4, da = (int32_t)corners[3] - (int32_t)corners[0];
++            const int32_t b = (int32_t)corners[1] << 4, db = (int32_t)corners[2] - (int32_t)corners[1];
++            auto native = [&] {
++                if (inside) {
++                    if (flags & 4)
++                        gouraud_rle(H(src), H(dst), a, da, b, db, 15, 7, v.pitch);
++                    else
++                        gouraud_iso(H(src), H(dst), a, da, b, db, v.pitch);
++                } else {
++                    if (flags & 4)
++                        gouraud_rle_clipped(sx, sy, H(src), H(dst), a, da, b, db, 15, 7, v);
++                    else
++                        gouraud_iso_clipped(H(src), sx, sy, H(dst), a, da, b, db, v);
++                }
++            };
++            auto game = [&] {
++                // The original passes its four corners by address: here they go
++                // below the stack pointer, under guest_call's own frame.
++                const uint32_t buf = c->reg(R_ESP) - 0x20;
++                std::memcpy(H(buf), corners, sizeof corners);
++                c->set_reg(R_ECX, e);
++                if (inside) {
++                    c->set_reg(R_EDX, dst);
++                    rt::guest_call(*c, 0x004f8850, {buf});
++                } else {
++                    c->set_reg(R_EDX, (uint32_t)sx);
++                    rt::guest_call(*c, 0x004f89f0, {(uint32_t)sy, dst, buf});
++                }
++            };
++            if (g_gouraud_probe) {
++                // D2_GOURAUD_PROBE (lane): the game's, with one of its side
++                // effects undone: 1 the stack below ESP, 2 ECX and EDX.
++                const uint32_t esp = c->reg(R_ESP), lo = esp - 1024;
++                std::vector<uint8_t> stack(H(lo), H(esp));
++                const uint32_t ecx = c->reg(R_ECX), edx = c->reg(R_EDX), eax = c->reg(R_EAX);
++                game();
++                if (g_gouraud_probe == 1)
++                    std::memcpy(H(lo), stack.data(), stack.size());
++                if (g_gouraud_probe == 2) {
++                    c->set_reg(R_ECX, ecx);
++                    c->set_reg(R_EDX, edx);
++                    c->set_reg(R_EAX, eax);
++                }
++            } else if (!g_gouraud_native) {
++                game();
++            } else if (!g_gouraud_check || !c) {
++                native();
+             } else {
+-                c->set_reg(R_EDX, (uint32_t)sx);
+-                rt::guest_call(*c, 0x004f89f0, {(uint32_t)sy, dst, buf});
++                // D2_GOURAUD_CHECK (lane): both, compared around the block; the game's kept.
++                const uint32_t lo = dst - 40 - 2 * pitch, n = 20 * pitch + 120;
++                std::vector<uint8_t> before(H(lo), H(lo) + n), mine;
++                native();
++                mine.assign(H(lo), H(lo) + n);
++                std::memcpy(H(lo), before.data(), n);
++                game();
++                g_gouraud_checks++;
++                for (uint32_t k = 0; k < n; k++)
++                    if (mine[k] != *H(lo + k)) {
++                        const int32_t at = (int32_t)(lo + k - dst);
++                        rt::logf("gouraud check: %s %s sx %d sy %d a %d da %d b %d db %d clip %d,%d,%d,%d: at row "
++                                 "%d col %d the game %u, native %u",
++                                 inside ? "inside" : "clipped", (flags & 4) ? "rle" : "iso", sx, sy, a, da, b, db,
++                                 v.clip_l, v.clip_t, v.clip_r, v.clip_b, (int32_t)((at + 40 + 2 * (int32_t)pitch) /
++                                 (int32_t)pitch) - 2, (int32_t)((at + 40 + 2 * (int32_t)pitch) % (int32_t)pitch) - 40,
++                                 *H(lo + k), mine[k]);
++                        break;
++                    }
+             }
+         }
+     }
+@@ -2372,6 +2585,25 @@ int install_d2_native(Cpu &c)
+          "CurrentLookup", !check);
+     static const uint8_t k52df40[] = {0xa1, 0x34, 0x2d, 0x88, 0x00, 0x85, 0xc0, 0x75, 0x1f};
+     HOOK(c, 0x0052df40, k52df40, sizeof k52df40, 0, current_unlock, "CurrentUnlock", true);
++    // The interpolated-light blitters (issue #80): FloorTile's own blocks
++    // and the walls' (4f8240-4f8276) call them. D2_GOURAUD=0: the game's.
++    if (const char *gn = std::getenv("D2_GOURAUD"))
++        g_gouraud_native = std::atoi(gn) != 0;
++    static const uint8_t k4f6bb0[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x08, 0x53, 0x56, 0x89, 0x4d, 0xf8};
++    static const uint8_t k4f71a0[] = {0x55, 0x8b, 0xec, 0x51, 0x8b, 0x45, 0x08, 0x53, 0x8b, 0x5d, 0x10};
++    static const uint8_t k4f7850[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x14, 0x8b, 0x45, 0x10, 0x53};
++    // D2_GOURAUD_MASK (lane, finding a difference): 1 the iso hook, 2 the RLE
++    // hook, 4 the clipped RLE hook, 8 FloorTile's own blocks.
++    const char *gmask = std::getenv("D2_GOURAUD_MASK");
++    const unsigned gm = !g_gouraud_native ? 0u : gmask ? (unsigned)std::strtoul(gmask, nullptr, 0) : 15u;
++    if (!(gm & 8))
++        g_gouraud_native = false;
++    if (gm & 1)
++        HOOK(c, 0x004f6bb0, k4f6bb0, sizeof k4f6bb0, 4, DRAW(gouraud_iso_native, "GouraudIso"), true);
++    if (gm & 2)
++        HOOK(c, 0x004f71a0, k4f71a0, sizeof k4f71a0, 6, DRAW(gouraud_rle_native, "GouraudRle"), true);
++    if (gm & 4)
++        HOOK(c, 0x004f7850, k4f7850, sizeof k4f7850, 8, DRAW(gouraud_rle_clipped_native, "GouraudRleClipped"), true);
+ #undef DRAW
+ #undef HOOK
+     return n;

@@ -1078,6 +1078,8 @@ void present(const rt::Frame &f)
         rt::frame_thread_us(s.thread_us);
         rt::frame_thread_ready_by(s.ready_by);
         s.wait_us = rt::frame_thread_wait_top(s.wait_site, s.wait_owner, s.wait_from);
+        s.stalled = rt::take_stall(s.stall);
+        s.slices = rt::frame_thread_slices();
         game::sprite_decode_totals(s.decodes, s.decode_us);
         s.skipped = g_frames_skipped;
         game::frame_trace_frame(s);
@@ -1160,6 +1162,9 @@ uint32_t g_background_slice_us = kBackgroundSliceUs;
 // Storm's direct reads (game::install_storm_direct_reads): "stormdirect=0"
 // leaves them queued, as the game does.
 bool g_storm_direct = true;
+// The frame trace's stall column: a slice of the frame thread this long or
+// longer is caught (rt::stall_probe). "stallms=" (a measurement's).
+uint32_t g_stall_ms = 150;
 
 void load_settings()
 {
@@ -1188,6 +1193,8 @@ void load_settings()
             g_background_quantum = (uint32_t)std::strtoul(line + 10, nullptr, 10);
         else if (std::strncmp(line, "bgslice=", 8) == 0)
             g_background_slice_us = (uint32_t)std::strtoul(line + 8, nullptr, 10);
+        else if (std::strncmp(line, "stallms=", 8) == 0)
+            g_stall_ms = (uint32_t)std::strtoul(line + 8, nullptr, 10);
         else if (std::strncmp(line, "stormdirect=", 12) == 0)
             g_storm_direct = std::atoi(line + 12) != 0;
 
@@ -1651,6 +1658,40 @@ FILE *g_frame_trace = nullptr;
 char *g_frame_trace_buf = nullptr;
 bool g_frames_traced = false;   // a second run this session appends
 
+// The frame trace's stall column (rt::stall_probe): a thread on the second
+// core looks every 20 ms whether the frame thread's slice has run 150 ms;
+// nothing on the game's core, and two reads of the clock a look.
+Thread g_stall_thread = nullptr;
+volatile bool g_stall_stop = false;
+
+void stall_main(void *)
+{
+    while (!g_stall_stop) {
+        svcSleepThread(20000000);
+        rt::stall_probe((uint64_t)g_stall_ms * 1000);
+    }
+}
+
+void start_stall_watch()
+{
+    if (g_stall_thread)
+        return;
+    g_stall_stop = false;
+    s32 prio = 0x30;
+    svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+    g_stall_thread = threadCreate(stall_main, nullptr, 4 * 1024, prio - 3, g_render_core >= 0 ? g_render_core : 2, false);
+}
+
+void stop_stall_watch()
+{
+    if (!g_stall_thread)
+        return;
+    g_stall_stop = true;
+    threadJoin(g_stall_thread, U64_MAX);
+    threadFree(g_stall_thread);
+    g_stall_thread = nullptr;
+}
+
 bool frame_trace_file_start()
 {
     constexpr size_t kBuffer = 16 * 1024;
@@ -1668,6 +1709,7 @@ bool frame_trace_file_start()
     else
         std::setvbuf(g_frame_trace, g_frame_trace_buf, _IOFBF, kBuffer);
     g_frames_traced = true;
+    start_stall_watch();   // the trace's stall column
     game::frame_trace_start(g_frame_trace);
     game::note_game_state_again();
     return true;
@@ -1678,6 +1720,7 @@ void frame_trace_file_stop()
     if (!g_frame_trace)
         return;
     game::frame_trace_stop();
+    stop_stall_watch();
     std::fclose(g_frame_trace);
     std::free(g_frame_trace_buf);
     g_frame_trace = nullptr;

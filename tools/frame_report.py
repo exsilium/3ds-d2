@@ -24,7 +24,8 @@ import statistics
 import sys
 
 FIELDS = ["t", "gap", "tick", "run", "ready", "host", "sleep", "wait", "io", "dec", "dec_us", "skip", "who",
-          "cs", "ev", "wsite", "wown", "wus", "wfrom"]
+          "cs", "ev", "wsite", "wown", "wus", "wfrom", "sl", "stall"]
+TEXT = ("wfrom", "stall")   # the fields that are not numbers
 V2 = 13   # version 2: up to "who"; version 1 one fewer
 
 
@@ -46,13 +47,12 @@ def read(path, all_frames):
             parts.append("-1")
         if len(parts) == V2:       # version 2: no wait split
             parts += ["0", "0", "0", "0", "0"]
-        if len(parts) == len(FIELDS) - 1:   # no wfrom
-            parts.append("-")
+        if len(parts) in (V2 + 5, V2 + 6):   # version 3: no wfrom, sl or shim
+            parts += ["-"] * (V2 + 6 - len(parts)) + ["0", "-"]
         if len(parts) != len(FIELDS):
             continue
         parts[FIELDS.index("wsite")] = str(int(parts[FIELDS.index("wsite")], 16))
-        f = dict(zip(FIELDS[:-1], map(int, parts[:-1])))
-        f["wfrom"] = parts[-1]
+        f = {k: (v if k in TEXT else int(v)) for k, v in zip(FIELDS, parts)}
         f["entry"] = entries.get(f["who"], "")
         f["in_game"], f["panel"] = in_game, panel
         if all_frames or (in_game and not panel):
@@ -130,6 +130,15 @@ def report(frames, slow_ms, out=sys.stdout, entries=None):
             print("slow frames' waits (site: frames, mean ms):", file=out)
             for k, (n, us) in sorted(sites.items(), key=lambda x: -x[1][1])[:8]:
                 print(f"  {k}: {n}, {us / n / 1000:.1f}", file=out)
+    # Each frame past 250 ms: a stall the player sees as a freeze.
+    long = [f for f in frames if f["gap"] > 250000]
+    if long:
+        print(f"frames past 250 ms ({len(long)}): t s, gap ms (run, wait, io ms), slices, stall (eip/stack), wait site", file=out)
+        for f in long[:20]:
+            print(f"  {f['t'] / 1000:.1f}: {f['gap'] / 1000:.0f} ({f['run'] / 1000:.0f}, {f['wait'] / 1000:.0f}, "
+                  f"{f['io'] / 1000:.0f}) {f['sl']} {f['stall']} {f['wsite']:08x}" if f["wsite"] else
+                  f"  {f['t'] / 1000:.1f}: {f['gap'] / 1000:.0f} ({f['run'] / 1000:.0f}, {f['wait'] / 1000:.0f}, "
+                  f"{f['io'] / 1000:.0f}) {f['sl']} {f['stall']}", file=out)
     return r
 
 

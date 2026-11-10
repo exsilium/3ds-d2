@@ -5,10 +5,10 @@
 // tools/frame_report.py.
 //
 // The file is text:
-//   # 3ds-d2 frame trace 3                       the format
+//   # 3ds-d2 frame trace 4                       the format
 //   # <anything>                                 a note (a state change), between
 //                                                the frames it came between
-//   t gap tick run ready host sleep wait io dec dec_us skip who cs ev wsite wown wus wfrom
+//   t gap tick run ready host sleep wait io dec dec_us skip who cs ev wsite wown wus wfrom sl stall
 // one line per frame, each field the change since the line before:
 //   t       the host clock at the present, ms since the trace started
 //   gap     us since the last present
@@ -30,7 +30,13 @@
 //           event), wus the us of that one wait, wfrom the game's calls it
 //           waited under (up to 4 return addresses on its EBP chain, hex,
 //           comma-separated; -)
-// (version 2 had no cs..wus; version 1 no who either)
+//   sl      the frame thread's scheduler slices: many in a long frame, its
+//           guest code ran long; few, a host call held it
+//   stall   the frame thread held 150 ms or more in one slice (a host call or
+//           a guest loop): its EIP and the first three dwords on its stack,
+//           hex, as eip/a,b,c (- if not); in a shim or a native, EIP is its
+//           trap and a the game's call site
+// (version 3 had no sl or stall, version 2 no cs..wfrom, version 1 no who either)
 //
 // Platform-independent: the platform samples, opens and closes the file.
 #ifndef D2_GAME_FRAME_TRACE_H
@@ -52,6 +58,9 @@ struct FrameSample {
     uint64_t wait_us = 0;        // its longest wait since the last frame (rt::frame_thread_wait_top)
     uint32_t wait_site = 0, wait_owner = 0;
     uint32_t wait_from[4] = {};   // rt::kWaitFrom
+    uint32_t slices = 0;          // rt::frame_thread_slices
+    bool stalled = false;         // rt::take_stall: the frame thread held 150 ms in one slice
+    uint32_t stall[4] = {};       // ...its EIP and the first three dwords on its stack
 };
 
 // Starts writing to `f` (the caller keeps it, and closes it after stop).

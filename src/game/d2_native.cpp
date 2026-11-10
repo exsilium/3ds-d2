@@ -656,12 +656,15 @@ int32_t g_adpcm_adj[32];
 // channels alternating): bit 7 clear, a delta (bits 0-5 select fractions of
 // the step, bit 6 its sign); set, a code: 0 repeats the sample (step index
 // down 1), 1 and 2 move the step index by +8 / -8 without a sample.
-uint32_t adpcm_decode(Cpu &c)
+//
+// The work, from its arguments (an offload_job's): a[0] ecx, a[1] eax,
+// a[2..4] the stack's three.
+uint32_t adpcm_job(const uint32_t *a)
 {
-    const uint32_t dst0 = c.reg(R_ECX);
+    const uint32_t dst0 = a[0];
     uint32_t dst = dst0;
-    const uint32_t src = c.arg(1), end = src + c.reg(R_EAX), channels = c.arg(2);
-    uint32_t avail = c.arg(0);
+    const uint32_t src = a[3], end = src + a[1], channels = a[4];
+    uint32_t avail = a[2];
     int32_t pred[2] = {0, 0}, index[2] = {0x2c, 0x2c};
     const uint32_t shift = *H(src + 1) & 31u;   // x86 masks a 32-bit shift count
     uint32_t p = src + 2;
@@ -738,6 +741,16 @@ uint32_t adpcm_decode(Cpu &c)
         ix = ix < 0 ? 0 : ix > 0x58 ? 0x58 : ix;
     }
     return dst - dst0;
+}
+
+// The loader thread's sounds decode on the I/O worker's core while it waits
+// (rt::offload_job): one call ran ~10 ms in Azahar, all of it the game's
+// thread's frame lost, every few hundred ms in town.
+uint32_t adpcm_decode(Cpu &c)
+{
+    const uint32_t a[5] = {c.reg(R_ECX), c.reg(R_EAX), c.arg(0), c.arg(1), c.arg(2)};
+    uint32_t ret;
+    return rt::offload_job(adpcm_job, a, 5, ret) ? ret : adpcm_job(a);
 }
 
 // ---- sound: MPQ Huffman --------------------------------------------------------------
@@ -996,27 +1009,43 @@ private:
     uint32_t bits_ = 0, count_ = 0, in_ = 0;
 };
 
-HuffTree g_huff;   // guest threads all run on the host's one game thread
+HuffTree g_huff;          // the game's core: guest threads all run on one host thread
+HuffTree g_huff_worker;   // the I/O worker's (rt::offload_job), one job at a time
 
 // 41e000(ecx=dst, edx=&dst bytes, [8]=src, [c]=src bytes), ret 0xc: Storm's
 // PKWARE "explode" wrapper. The original allocates a work buffer, runs the
 // library with callbacks that clip at both buffers' ends, frees it, and
 // stores the bytes written in *edx (pklib_explode.cpp).
-uint32_t pk_decode(Cpu &c)
+// Both as adpcm_decode: on the I/O worker for the loader thread. a[0] ecx
+// (dst), a[1] edx (&dst bytes), a[2..] the stack's.
+uint32_t pk_run(const uint32_t *a, bool worker)
 {
-    const uint32_t plen = c.reg(R_EDX), src = c.arg(0), src_len = c.arg(1);
-    const uint32_t n = pk_explode(H(src), src_len, H(c.reg(R_ECX)), U32(plen));
-    std::memcpy(H(plen), &n, 4);
+    const uint32_t n = pk_explode(H(a[2]), a[3], H(a[0]), U32(a[1]), worker);
+    std::memcpy(H(a[1]), &n, 4);
     return 0;
 }
+uint32_t pk_job(const uint32_t *a) { return pk_run(a, true); }
+
+uint32_t pk_decode(Cpu &c)
+{
+    const uint32_t a[4] = {c.reg(R_ECX), c.reg(R_EDX), c.arg(0), c.arg(1)};
+    uint32_t ret;
+    return rt::offload_job(pk_job, a, 4, ret) ? ret : pk_run(a, false);
+}
+
+uint32_t huffman_run(HuffTree &t, const uint32_t *a)
+{
+    const uint32_t n = t.decompress(H(a[0]), U32(a[1]), a[2]);
+    std::memcpy(H(a[1]), &n, 4);
+    return 0;
+}
+uint32_t huffman_job(const uint32_t *a) { return huffman_run(g_huff_worker, a); }
 
 uint32_t huffman_decode(Cpu &c)
 {
-    const uint32_t plen = c.reg(R_EDX);
-    const uint32_t len = U32(plen);
-    const uint32_t n = g_huff.decompress(H(c.reg(R_ECX)), len, c.arg(0));
-    std::memcpy(H(plen), &n, 4);
-    return 0;
+    const uint32_t a[3] = {c.reg(R_ECX), c.reg(R_EDX), c.arg(0)};
+    uint32_t ret;
+    return rt::offload_job(huffman_job, a, 3, ret) ? ret : huffman_run(g_huff, a);
 }
 
 // ---- string tables -------------------------------------------------------------------

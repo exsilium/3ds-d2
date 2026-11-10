@@ -26,6 +26,11 @@
 //                          NPC is now, again every 1.5 s until the menu closes
 //   <ms> units             log the units near the player (class, id, screen spot)
 //   <ms> skipvideos        from then on, press A (a click) as each cinematic plays: skips it
+//   <ms> closepanels [off] from then on, press START (Escape) while a panel is
+//                          open in the game: a walk that clicks into an NPC's
+//                          menu goes on walking ("off": no more)
+//   <ms> profile <names>   start a profiler run with these options (profiler.h's
+//                          names, comma-separated: frames,guest,...); "off" stops it
 //   states: textfield, ingame, menus, npcmenu, menuclosed, act1 to act5 (in a game, in that act)
 //   # ...                  a comment line
 #ifndef D2_GAME_AUTOPLAY_H
@@ -47,6 +52,9 @@ public:
     // Applies the events due at now_ms to the scripted pad and returns it.
     // shot is set when a "shot" event fired.
     const Pad &step(uint64_t now_ms, Controls &controls, bool &shot, const GameState &state);
+    // A "profile" event since the last call: its argument ("off", or the
+    // options' names). False if none.
+    bool take_profile(std::string &arg) { return !profile_.empty() && (arg.swap(profile_), profile_.clear(), true); }
 
 private:
     std::vector<std::string> events_;
@@ -65,7 +73,10 @@ private:
     uint64_t click_until_ = 0;       // a tap's click (A) is held until then
     bool skip_videos_ = false;       // skipvideos: A while a cinematic plays
     uint64_t skip_release_ms_ = 0, skip_next_ms_ = 0;
+    bool close_panels_ = false;      // closepanels: START while a panel is open
+    uint64_t close_release_ms_ = 0, close_next_ms_ = 0;
     uint64_t next_retry_ms_ = 0;
+    std::string profile_;            // a "profile" event's argument, until taken
 };
 
 }  // namespace game

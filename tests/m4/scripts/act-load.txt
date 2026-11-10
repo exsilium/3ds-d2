@@ -1,0 +1,33 @@
+# Loading, measured: an act's load and the arrival in its town, with the
+# frame trace (tools/frame_report.py --all --timeline). A character that has
+# finished Act I (dist/save/BeforeCh1End) into the game, a profiler run with
+# the frame trace from the start, to Warriv and Go East, then 60 s of
+# walking loops in Lut Gholein while its sprites and sounds load. The
+# act's load is the long gap; the arrival, the windows after it. Azahar:
+#   scripts/measure-smoothness.sh --save BeforeCh1End --script tests/m4/scripts/act-load.txt --seconds 300
+0 skipvideos
+35000 tap 400 307
+40000 tapuntil ingame 690 555
+35000 profile frames
+40500 tapunit warriv
+41000 tapmenu 2
+41500 wait act2
+# In Lut Gholein: 4 s standing, then walking loops; panels the walk clicks
+# open closed with START.
+45500 closepanels
+45500 circle 120 0
+49500 circle 0 120
+53500 circle -120 0
+57500 circle 0 -120
+61500 circle 120 120
+65500 circle -120 -120
+69500 circle 120 -120
+73500 circle -120 120
+77500 circle 120 0
+81500 circle 0 120
+85500 circle -120 0
+89500 circle 0 -120
+93500 circle 120 120
+97500 circle -120 -120
+101500 circle 0 0
+104000 profile off

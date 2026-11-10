@@ -34,6 +34,8 @@ void Autoplay::load(const std::string &script)
     click_until_ = 0;
     skip_videos_ = false;
     skip_release_ms_ = skip_next_ms_ = 0;
+    close_panels_ = false;
+    close_release_ms_ = close_next_ms_ = 0;
     pad_ = Pad();
     std::string item;
     for (size_t i = 0; i <= script.size(); i++) {
@@ -69,6 +71,22 @@ const Pad &Autoplay::step(uint64_t now_ms, Controls &controls, bool &shot, const
             rt::logf("autoplay: A to skip the video");
             pad_.held |= kA;
             skip_release_ms_ = now_ms + 100;
+        }
+    }
+    // closepanels: START (Escape) while a panel is open in the game (an
+    // NPC's menu a walk clicked into, say); one press, the next no sooner
+    // than a second after the release, so the panel has closed.
+    if (close_panels_) {
+        if (close_release_ms_) {
+            if (now_ms >= close_release_ms_) {
+                pad_.held &= ~kStart;
+                close_release_ms_ = 0;
+                close_next_ms_ = now_ms + 1000;
+            }
+        } else if (state.in_game && state.panel_open && now_ms >= close_next_ms_) {
+            rt::logf("autoplay: START to close a panel (ui %llx)", (unsigned long long)state.ui);
+            pad_.held |= kStart;
+            close_release_ms_ = now_ms + 100;
         }
     }
     // The click of a tap (tap, tapuntil, tapunit, tapmenu): A, the left
@@ -136,7 +154,7 @@ const Pad &Autoplay::step(uint64_t now_ms, Controls &controls, bool &shot, const
     while (next_ < events_.size()) {
         const char *ev = events_[next_].c_str();
         unsigned long long at = 0;
-        char verb[16] = {}, arg[16] = {};
+        char verb[16] = {}, arg[64] = {};
         int x = 0, y = 0;
         if (std::sscanf(ev, "%llu %15s", &at, verb) < 2) {   // malformed: skip it
             next_++;
@@ -154,6 +172,8 @@ const Pad &Autoplay::step(uint64_t now_ms, Controls &controls, bool &shot, const
             click_at_ = now_ms + kHoverMs;
         } else if (v == "skipvideos") {
             skip_videos_ = true;
+        } else if (v == "closepanels") {
+            close_panels_ = std::strstr(ev, "closepanels off") == nullptr;
         } else if (v == "touch" && std::sscanf(ev, "%*s %*s %d %d", &x, &y) == 2) {
             int ms = 100;
             std::sscanf(ev, "%*s %*s %*d %*d %d", &ms);
@@ -175,6 +195,8 @@ const Pad &Autoplay::step(uint64_t now_ms, Controls &controls, bool &shot, const
                 rt::input_char((unsigned char)*t);
         } else if (v == "shot") {
             shot = true;
+        } else if (v == "profile" && std::sscanf(ev, "%*s %*s %63s", arg) == 1) {
+            profile_ = arg;
         } else if (v == "tapmenu" && std::sscanf(ev, "%*s %*s %d", &x) == 1 && x > 0) {
             if (!menu_unit_) {
                 rt::logf("autoplay: tapmenu without an NPC (tapunit first)");

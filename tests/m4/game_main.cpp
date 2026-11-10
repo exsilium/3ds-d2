@@ -168,6 +168,7 @@ int main(int argc, char **argv)
         opt.total_phys_mb = 64;
         opt.pool_spare = game::kCtrPoolSpare;
         opt.pool_large = game::kCtrPoolLarge;
+        opt.background_quantum = 40000;   // as the console's (ctr_game.cpp)
     }
     if (const char *kb = std::getenv("M4_POOL_SPARE_KB"))   // another spare (0: none)
         opt.pool_spare = (uint32_t)std::atoi(kb) << 10;
@@ -175,6 +176,12 @@ int main(int argc, char **argv)
         opt.pool_large = (uint32_t)std::atoi(kb) << 10;
     if (const char *kb = std::getenv("M4_POOL_LARGE_MIN_KB"))   // blocks over this go there (256: the console's)
         opt.pool_large_min = (uint32_t)std::atoi(kb) << 10;
+    if (const char *q = std::getenv("M4_BG_QUANTUM"))   // the other threads' slice (0: the frame thread's)
+        opt.background_quantum = (uint32_t)std::atoi(q);
+    {   // The dynarec's knobs, as the console's settings.txt sets them (M4_CALLRET, M4_NOPEND, M4_BUDGETTAIL, M4_FORWARD).
+        auto knob = [](const char *n) { const char *v = std::getenv(n); return v ? std::atoi(v) : -1; };
+        rt::set_dynarec_knobs(knob("M4_CALLRET"), knob("M4_NOPEND"), knob("M4_BUDGETTAIL"), knob("M4_FORWARD"));
+    }
     if (const char *mb = std::getenv("M4_PHYS_MB"))   // override the RAM the game is told about
         opt.total_phys_mb = (uint32_t)std::atoi(mb);
     opt.virtual_tick_us = 250;   // used only under M4_VIRTUAL_CLOCK
@@ -206,6 +213,9 @@ int main(int argc, char **argv)
         // Storm serving a waiting caller first, as on the console (M4_STORM_PRIO=0: as the game does).
         if (!std::getenv("M4_STORM_PRIO") || std::string(std::getenv("M4_STORM_PRIO")) != "0")
             game::install_storm_read_priority(c);
+        // ...and reading it itself while the read thread is not reading (M4_STORM_DIRECT=0: queued).
+        if (!std::getenv("M4_STORM_DIRECT") || std::string(std::getenv("M4_STORM_DIRECT")) != "0")
+            game::install_storm_direct_reads(c);
         game::install_fatal_exit(c);
         if (ctr_layout) {
             game::install_pool_release(c);

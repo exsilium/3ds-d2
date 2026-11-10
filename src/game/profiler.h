@@ -27,6 +27,7 @@ enum ProfileOption : uint32_t {
     kProfGuest = 1u << 1,     // the guest code profile (rt::set_profiling): game.log's "prof" lines
     kProfFiles = 1u << 2,     // every read of a game file (rt::set_file_trace): logs/files.trc
     kProfSdBench = 1u << 3,   // the SD card's read costs, measured once as the run starts
+    kProfFrames = 1u << 4,    // every frame's timing (frame_trace.h): logs/frames.trc
 };
 
 struct ProfileOptionInfo {
@@ -41,9 +42,10 @@ inline constexpr ProfileOptionInfo kProfileOptions[] = {
     {kProfGuest, "guest", "guest code profile", "shims, threads, EIPs; ~12% slower"},
     {kProfFiles, "files", "file-read trace", "every game read to logs/files.trc"},
     {kProfSdBench, "sdbench", "SD card benchmark", "read costs; a 1 s pause at start"},
+    {kProfFrames, "frames", "frame timing", "every frame to logs/frames.trc"},
 };
 inline constexpr int kProfileOptionCount = sizeof kProfileOptions / sizeof kProfileOptions[0];
-inline constexpr uint32_t kProfileAll = kProfSprites | kProfGuest | kProfFiles | kProfSdBench;
+inline constexpr uint32_t kProfileAll = kProfSprites | kProfGuest | kProfFiles | kProfSdBench | kProfFrames;
 
 // How game.log and the traces reach the SD card (issues #66, #71): the
 // checklist's last row, "log writes", which steps through these on a tap, a

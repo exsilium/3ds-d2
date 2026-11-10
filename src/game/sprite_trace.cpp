@@ -69,6 +69,17 @@ struct Seen {
     bool touched;   // a touched use written in this window
 };
 
+// A record's key, kept for the rest of its window (issue #72): nearly every
+// use repeats one made in the same 1 s window, and reading and hashing its
+// 0x1c bytes was most of what a use cost after the call-out. Keyed by the
+// record (a pool unit) and its cache entry, so a record reused for another
+// sprite is hashed again. Direct-mapped; a miss only costs the hash.
+struct RecKey {
+    uint32_t rec, entry, window, key;
+};
+constexpr uint32_t kRecKeys = 1024;
+RecKey g_rec_keys[kRecKeys];
+
 uint8_t *g_flag = nullptr;   // host address of kFlag
 FILE *g_file = nullptr;
 char *g_buffer = nullptr;
@@ -127,7 +138,11 @@ void on_use(d2rt::Cpu &c, uint32_t arg)
     const uint32_t entry = rec ? c.read_u32(rec + 0x24) : 0;
     if (!entry || !g_seen)
         return;
-    const uint32_t key = key_of(c, rec), window = elapsed_ms() / kWindowMs + 1;
+    const uint32_t window = elapsed_ms() / kWindowMs + 1;
+    RecKey &rk = g_rec_keys[(rec >> 4) % kRecKeys];
+    if (rk.rec != rec || rk.entry != entry || rk.window != window)
+        rk = {rec, entry, window, key_of(c, rec)};
+    const uint32_t key = rk.key;
     const uint32_t bytes = c.read_u32(entry + 4) & ~kTouched;
     Seen &s = g_seen[key % kSeen];
     if (s.key != key) {
@@ -288,6 +303,7 @@ bool sprite_trace_start(const char *path)
     else
         std::setvbuf(g_file, g_buffer, _IOFBF, kFileBuffer);
     g_lost = 0;
+    std::memset(g_rec_keys, 0, sizeof g_rec_keys);
     if (!again) {
         g_started = true;
         g_start_ms = rt::tick_ms();

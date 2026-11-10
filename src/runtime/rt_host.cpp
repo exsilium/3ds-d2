@@ -8,6 +8,7 @@
 #include "runtime/cpu.h"
 #include "runtime/guest_region.h"
 #include "runtime/guest_scratch.h"
+#include "runtime/guest_sync.h"
 #include "runtime/guest_thread.h"
 #include "runtime/guest_thread_ctx.h"
 #include "runtime/host_clock.h"
@@ -56,6 +57,11 @@ extern uint64_t dyn86_ctr_cache_sync_ticks __attribute__((weak));
 #include <vector>
 
 using namespace d2rt;
+
+// The dynarec's translation knobs (third_party/winx86 src/dynarec86/dyn86.c).
+extern "C" {
+extern int box86_dynarec_callret, dyn86_nopend, box86_dynarec_budgettail, box86_dynarec_forward;
+}
 
 namespace rt {
 namespace {
@@ -586,13 +592,19 @@ void crash_report(const uint32_t r[16], uint32_t far, void (*line)(const char *)
     }
 }
 
+void background_slice_check();   // after the frame thread's state, below
+
 uint32_t native_entry(const char *name, uint32_t stack_args, std::function<uint32_t(Cpu &)> fn)
 {
     Shim s;
     s.argc = stack_args;
     s.stdcall_cleanup = true;
     s.tag = std::string("3DSD2NATIVE!") + name;
-    s.fn = std::move(fn);
+    s.fn = [fn = std::move(fn)](Cpu &c) {
+        const uint32_t r = fn(c);
+        background_slice_check();
+        return r;
+    };
     g_br->register_shim("3DSD2NATIVE", name, s);
     return g_br->shim_trap("3DSD2NATIVE", name);
 }
@@ -696,6 +708,10 @@ enum : size_t { kFrameRun, kFrameReady, kFrameHost, kFrameSleep, kFrameWaits };
 uint64_t g_frame_us[kFrameKindCount] = {}, g_frame_mark[kFrameKindCount] = {};
 size_t g_frame_was = kFrameKindCount;   // what it was doing at the last sample (none yet)
 uint64_t g_frame_at = 0;
+// Its ready time by the guest thread that ran meanwhile (ids under 16), for
+// the frame trace: who kept it from its frame.
+uint64_t g_ready_by[16] = {};
+uint64_t g_slice_start_us = 0;   // the running slice's start (real clock)
 int g_slice_tid = -1;          // the guest thread whose slice runs, -1 between slices
 bool g_slice_sink = false;     // the scheduler reports its slices
 bool g_host_work = false;      // the heartbeat or the app's service runs
@@ -705,6 +721,12 @@ uint64_t g_prof_report_us = 0;   // of which the profile's lines (issue #71)
 // for the heartbeat's few largest.
 uint32_t g_frame_where = 0;
 std::map<uint32_t, uint64_t> g_frame_wait_at;
+// The same for the frame trace, since its last frame: a few sites, each with
+// the owner of the critical section it waited for (0: not a critsec, or free).
+struct FrameWaitSite { uint32_t site, owner; uint64_t us; uint32_t from[kWaitFrom]; };
+FrameWaitSite g_frame_waits[8] = {};
+uint32_t g_frame_owner = 0;   // at the last sample: the critsec's owner
+uint32_t g_frame_from[kWaitFrom] = {};   // ...and the game's calls it waits under (frame_wait_callers)
 
 // Where a blocked guest thread waits from: its saved EIP when that is in the
 // game's image, else (a shim's trap) the return address on its stack.
@@ -715,6 +737,31 @@ uint32_t wait_site(const GuestThread &t)
         return eip;
     Cpu *c = g_tick_cpu.load(std::memory_order_relaxed);
     return c ? c->read_u32(t.ctx.gpr[R_ESP]) : eip;
+}
+
+// The return addresses on a blocked thread's EBP chain (the game's and
+// Storm's functions keep frames), up to 4 into the game's image: who waits
+// under a site shared by many (Storm's read wait at 0x41af0d). From the
+// wait's start only.
+void frame_wait_callers(const GuestThread &t, uint32_t out[kWaitFrom])
+{
+    for (size_t i = 0; i < kWaitFrom; i++)
+        out[i] = 0;
+    Cpu *c = g_tick_cpu.load(std::memory_order_relaxed);
+    if (!c)
+        return;
+    const uint32_t esp = t.ctx.gpr[R_ESP];
+    uint32_t ebp = t.ctx.gpr[R_EBP], n = 0;
+    for (int i = 0; i < 12 && n < kWaitFrom; i++) {
+        if (ebp < esp || ebp - esp > (1u << 20) || (ebp & 3))
+            break;
+        const uint32_t ret = c->read_u32(ebp + 4), next = c->read_u32(ebp);
+        if (ret >= g_exe_base && ret < g_exe_base + g_exe_size)
+            out[n++] = ret;
+        if (next <= ebp)
+            break;
+        ebp = next;
+    }
 }
 
 size_t frame_thread_doing()
@@ -734,10 +781,16 @@ size_t frame_thread_doing()
     case GuestThread::State::Blocked: break;
     default: return kFrameKindCount;
     }
-    g_frame_where = wait_site(*t);
+    const uint32_t where = wait_site(*t);
+    if (where != g_frame_where || g_frame_was < kFrameSleep)
+        frame_wait_callers(*t, g_frame_from);   // a new wait
+    g_frame_where = where;
+    g_frame_owner = 0;
     if (!t->wait_obj)
         return kFrameSleep;
     const char *k = static_cast<Waitable *>(t->wait_obj)->kind();
+    if (std::strcmp(k, "critsec") == 0)
+        g_frame_owner = static_cast<WxCrit *>(t->wait_obj)->owner & ~WX86_CRIT_WAITERS;
     for (size_t i = kFrameWaits; i + 1 < kFrameKindCount; i++)
         if (std::strcmp(k, kFrameKinds[i]) == 0)
             return i;
@@ -751,8 +804,28 @@ uint64_t charge_frame_thread()
     const uint64_t us = wx86_now_us();
     if (g_frame_was < kFrameKindCount && us > g_frame_at) {
         g_frame_us[g_frame_was] += us - g_frame_at;
-        if (g_frame_was >= kFrameSleep)
+        if (g_frame_was == kFrameReady && g_slice_tid >= 0 && g_slice_tid < 16)
+            g_ready_by[g_slice_tid] += us - g_frame_at;
+        if (g_frame_was >= kFrameSleep) {
             g_frame_wait_at[g_frame_where] += us - g_frame_at;
+            if (g_frame_was > kFrameSleep) {
+                FrameWaitSite *w = nullptr;
+                for (FrameWaitSite &e : g_frame_waits)
+                    if (e.us && e.site == g_frame_where && e.owner == g_frame_owner) {
+                        w = &e;
+                        break;
+                    }
+                for (FrameWaitSite &e : g_frame_waits)
+                    if (!w && !e.us)
+                        w = &e;
+                if (w) {
+                    w->site = g_frame_where;
+                    w->owner = g_frame_owner;
+                    w->us += us - g_frame_at;
+                    std::memcpy(w->from, g_frame_from, sizeof w->from);
+                }
+            }
+        }
     }
     g_frame_at = us;
     return us;
@@ -765,15 +838,42 @@ void sample_frame_thread()
 }
 
 // The scheduler's slice sink (its thread).
+void stall_capture(uint32_t tid);
+
 void on_slice(uint32_t tid, bool start)
 {
     const uint64_t us = charge_frame_thread();
+    if (!start)
+        stall_capture(tid);
+    if (start)
+        g_slice_start_us = us;
     if (start && g_opt.real_clock)
         raise_tick(us / 1000 - g_t0_ms);   // now_ms's value, from the clock read just made
     g_slice_sink = true;
     g_slice_tid = start ? (int)tid : -1;
+
     g_frame_was = frame_thread_doing();
 }
+
+}  // namespace
+
+// RunOptions::background_slice_us, after a native: a background thread
+// past its time yields when the frame thread waits to run.
+void background_slice_check()
+{
+    const int frame = g_stats.frame_thread;
+    // Real clock only: on the virtual clock a run must not depend on host time.
+    if (!g_opt.background_slice_us || !g_opt.real_clock || !g_sched || frame < 0 || g_slice_tid < 0 ||
+        g_slice_tid == frame)
+        return;
+    if (wx86_now_us() - g_slice_start_us < g_opt.background_slice_us)
+        return;
+    GuestThread *t = g_sched->thread_by_id((uint32_t)frame);
+    if (t && t->state == GuestThread::State::Ready)
+        g_sched->yield();
+}
+
+namespace {
 
 // Host work on the guest's core, from the scheduler's thread.
 void host_work(bool on)
@@ -892,6 +992,10 @@ void prof_report(uint64_t ms)
          (unsigned long long)(f.cache_bytes >> 10), (unsigned long long)((f.wait_us - f0.wait_us) / 1000),
          (unsigned long long)(f.waits - f0.waits), (unsigned long long)((f.wait_frame_us - f0.wait_frame_us) / 1000),
          (unsigned long long)((f.stall_us - f0.stall_us) / 1000));
+    if (f.jobs != f0.jobs)
+        logf("prof jobs: %llu on the I/O worker, %llu ms (%llu past 5 ms), %llu ms queued",
+             (unsigned long long)(f.jobs - f0.jobs), (unsigned long long)((f.job_us - f0.job_us) / 1000),
+             (unsigned long long)(f.job_long - f0.job_long), (unsigned long long)((f.job_queued_us - f0.job_queued_us) / 1000));
     log_frame_thread();
 #ifdef PROF_COUNTERS
     now.run_ns = prof::run_ns;
@@ -1102,6 +1206,118 @@ FrameThreadTimes frame_thread_times()
         blocked += g_frame_us[i];
     t.blocked_ms = blocked / 1000;
     return t;
+}
+
+void frame_thread_ready_by(uint64_t out[16])
+{
+    for (int i = 0; i < 16; i++)
+        out[i] = g_ready_by[i];
+}
+uint32_t guest_thread_entry(uint32_t tid)
+{
+    GuestThread *t = g_sched ? g_sched->thread_by_id(tid) : nullptr;
+    return t ? t->entry : 0;
+}
+
+void frame_thread_us(uint64_t out[kFrameThreadKinds])
+{
+    static_assert(kFrameThreadKinds == kFrameKindCount, "rt_host.h's kinds are kFrameKinds");
+    charge_frame_thread();
+    for (size_t i = 0; i < kFrameKindCount; i++)
+        out[i] = g_frame_us[i];
+}
+
+namespace {
+// stall_probe's samples of a long frame: the watching thread nudges the
+// frame thread to stop at its next block; the slice's end (on_slice) takes
+// where it stopped, the context saved. Up to kStallSamples a frame.
+constexpr int kStallSamples = 8;
+std::atomic<bool> g_stall_pending{false};
+std::atomic<uint64_t> g_present_us{0};   // the frame thread's last present (note_present)
+uint32_t g_stall[kStallSamples][2] = {};  // eip, the dword on top of the stack
+std::atomic<int> g_stall_n{0};
+}  // namespace
+
+void note_present() { g_present_us.store(wx86_now_us(), std::memory_order_release); }
+
+void stall_probe(uint64_t min_us)
+{
+    const int frame = g_stats.frame_thread;
+    const uint64_t present = g_present_us.load(std::memory_order_acquire);
+    if (frame < 0 || !present || g_slice_tid != frame || g_stall_pending.load(std::memory_order_acquire) ||
+        g_stall_n.load(std::memory_order_acquire) >= kStallSamples || wx86_now_us() - present < min_us)
+        return;
+    Cpu *c = g_tick_cpu.load(std::memory_order_acquire);
+    if (!c)
+        return;
+    g_stall_pending.store(true, std::memory_order_release);
+    c->nudge_thread_budget(nullptr);   // stops at the next block: where it is, not the last trap
+}
+
+namespace {
+// on_slice, at a slice's end: the nudged slice's EIP and top of stack.
+void stall_capture(uint32_t tid)
+{
+    if (!g_stall_pending.load(std::memory_order_acquire) || (int)tid != g_stats.frame_thread)
+        return;
+    GuestThread *t = g_sched ? g_sched->thread_by_id(tid) : nullptr;
+    Cpu *c = g_tick_cpu.load(std::memory_order_acquire);
+    const int n = g_stall_n.load(std::memory_order_acquire);
+    if (t && c && n < kStallSamples) {
+        g_stall[n][0] = t->ctx.eip;
+        g_stall[n][1] = c->read_u32(t->ctx.gpr[R_ESP]);
+        g_stall_n.store(n + 1, std::memory_order_release);
+    }
+    g_stall_pending.store(false, std::memory_order_release);
+}
+}  // namespace
+
+int take_stall(uint32_t out[][2], int max)
+{
+    const int n = std::min(g_stall_n.load(std::memory_order_acquire), max);
+    std::memcpy(out, g_stall, sizeof g_stall[0] * (size_t)n);
+    g_stall_n.store(0, std::memory_order_release);
+    return n;
+}
+
+
+
+void set_dynarec_knobs(int callret, int nopend, int budgettail, int forward)
+{
+    if (callret >= 0)
+        box86_dynarec_callret = callret;
+    if (nopend >= 0)
+        dyn86_nopend = nopend;
+    if (budgettail >= 0)
+        box86_dynarec_budgettail = budgettail;
+    if (forward >= 0)
+        box86_dynarec_forward = forward;
+}
+
+int current_thread_id() { return g_sched ? (int)g_sched->current_id() : -1; }
+
+bool on_frame_thread()
+{
+    return g_sched && g_stats.frame_thread >= 0 && (int)g_sched->current_id() == g_stats.frame_thread;
+}
+
+uint64_t frame_thread_wait_top(uint32_t &site, uint32_t &owner, uint32_t from[kWaitFrom])
+{
+    charge_frame_thread();
+    uint64_t most = 0;
+    site = owner = 0;
+    for (size_t i = 0; i < kWaitFrom; i++)
+        from[i] = 0;
+    for (FrameWaitSite &e : g_frame_waits) {
+        if (e.us > most) {
+            most = e.us;
+            site = e.site;
+            owner = e.owner;
+            std::memcpy(from, e.from, sizeof e.from);
+        }
+        e = FrameWaitSite{};
+    }
+    return most;
 }
 
 uint64_t last_heartbeat_us() { return g_heartbeat_us; }
@@ -1418,6 +1634,8 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
         for (int i = 0; i < 1000; i++)
             (void)wx86_now_us();
         logf("clock: a host clock read costs %llu ns", (unsigned long long)(wx86_now_us() - t0));
+        logf("dynarec: callret %d, nopend %d, budgettail %d, forward %d", box86_dynarec_callret, dyn86_nopend,
+             box86_dynarec_budgettail, box86_dynarec_forward);
     }
     // The hottest other imports go through the bridge without leaving the
     // dynarec loop (WinVita's in-line shim path): same shim, no trap. Under
@@ -1463,6 +1681,11 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
     sched.set_max_switches(~0ull);   // runs end by exit or max_ms, never by a switch count
     sched.set_time_sink([](uint64_t ms) { check_time_limit(ms); });
     sched.set_slice_sink(on_slice);
+    if (opt.background_quantum)
+        sched.set_quantum_for([](uint32_t tid) -> uint32_t {
+            const int frame = g_stats.frame_thread;   // -1 until the first frame
+            return frame >= 0 && tid != (uint32_t)frame ? g_opt.background_quantum : 0;
+        });
     wx86_set_scheduler(&sched);
     sched.set_main(img->entry_va(), L.main_stack + 0x200000 - 0x100, L.main_tib);
     g_tick_cpu.store(cpu, std::memory_order_release);

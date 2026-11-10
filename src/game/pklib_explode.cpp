@@ -284,13 +284,15 @@ struct Explode {
     }
 };
 
-Explode g_explode;   // the guest threads all run on the host's one game thread
+// The game's core (the guest threads all run on one host thread), and the
+// I/O worker's (rt::offload_job, one job at a time).
+Explode g_explode[2];
 
 }  // namespace
 
-uint32_t pk_explode(const uint8_t *in, uint32_t in_len, uint8_t *out, uint32_t out_max)
+uint32_t pk_explode(const uint8_t *in, uint32_t in_len, uint8_t *out, uint32_t out_max, bool worker)
 {
-    Explode &w = g_explode;
+    Explode &w = g_explode[worker ? 1 : 0];
     w.src = in;
     w.src_len = in_len;
     w.src_pos = 0;

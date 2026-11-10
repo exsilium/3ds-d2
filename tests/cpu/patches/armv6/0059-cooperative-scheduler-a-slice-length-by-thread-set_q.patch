@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Sun, 8 Nov 2026 18:16:20 +0000
+Subject: [PATCH] cooperative scheduler: a slice length by thread
+ (set_quantum_for)
+
+---
+ src/runtime/sched_cooperative.cpp | 8 ++++++--
+ src/runtime/sched_cooperative.h   | 8 ++++++++
+ 2 files changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/src/runtime/sched_cooperative.cpp b/src/runtime/sched_cooperative.cpp
+index fa20b48..82f9906 100755
+--- a/src/runtime/sched_cooperative.cpp
++++ b/src/runtime/sched_cooperative.cpp
+@@ -307,10 +307,14 @@ void CooperativeScheduler::run_slice(GuestThread* t) {
+     if (probe_ && !hook_installed_) {
+         cpu_->set_code_hook([this](uint32_t eip){
+             if (probe_) probe_(eip);
+-            if (++slice_insns_ >= quantum_) { preempted_ = true; cpu_->request_stop(); } });
++            if (++slice_insns_ >= slice_quantum_) { preempted_ = true; cpu_->request_stop(); } });
+         hook_installed_ = true;
+     }
+-    if (!probe_) cpu_->set_run_limit(quantum_);
++    {
++        const uint32_t q = quantum_for_ ? quantum_for_(t->id) : 0;
++        slice_quantum_ = q ? q : quantum_;
++    }
++    if (!probe_) cpu_->set_run_limit(slice_quantum_);
+     cpu_->load_context(t->ctx);
+     if (!t->started) {
+         uint32_t esp = t->stack_top;
+diff --git a/src/runtime/sched_cooperative.h b/src/runtime/sched_cooperative.h
+index de89c94..c64b9f6 100755
+--- a/src/runtime/sched_cooperative.h
++++ b/src/runtime/sched_cooperative.h
+@@ -86,6 +86,12 @@ public:
+     // every thread waits -- the original behaviour.
+     void set_virtual_tick_us(uint32_t us) { virt_tick_us_ = us; }
+     void set_quantum(uint32_t insns) { quantum_ = insns; }   // preemption slice length
++    // A slice's length by guest thread: the consumer's function of the thread
++    // id, 0 for the quantum. A frame thread that a background thread keeps
++    // waiting for a whole quantum misses its frame (3ds-d2: a file loader's
++    // 300000 instructions held the game's thread ~16 ms); the background
++    // thread on shorter slices gets the same share in smaller pieces.
++    void set_quantum_for(uint32_t (*f)(uint32_t tid)) { quantum_for_ = f; }
+     // Loader-lock semantics: pin the CURRENT thread so a time-slice preempt
+     // re-runs it instead of switching away. Used around a DLL's DllMain (CRT
+     // init): if another guest thread runs mid-DllMain it mutates the SHARED
+@@ -251,6 +257,8 @@ private:
+     uint64_t switches_ = 0, max_switches_ = 200000000ull;
+     uint64_t slice_insns_ = 0;
+     uint32_t quantum_ = 300000;   // instructions per slice before preemption
++    uint32_t (*quantum_for_)(uint32_t) = nullptr;   // set_quantum_for
++    uint32_t slice_quantum_ = 300000;   // the running slice's
+     bool preempted_ = false;
+     bool hook_installed_ = false;
+     bool stack_overrun_warned_ = false;   // unused since stacks past the TIBs are refused (create_thread)

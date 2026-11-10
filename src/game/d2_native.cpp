@@ -730,6 +730,7 @@ std::atomic<uint32_t> g_floor_pub{0}, g_floor_next{0}, g_floor_done{0};
 uint32_t g_floor_start = 0;            // the frame thread's: the first tile not yet flushed
 FloorWorker g_floor_host{};
 bool g_floor_worker = false;           // a worker is running
+std::atomic<bool> g_floor_sleeping{false};   // the worker is (about to be) waiting: a tile wakes it
 std::atomic<bool> g_floor_quit{false};
 struct FloorQueueStats {
     uint64_t queued = 0, at_once = 0, flushes = 0, guarded = 0, wait_us = 0;
@@ -758,9 +759,18 @@ bool floor_take_one(bool worker)
 void floor_worker_main()
 {
     while (!g_floor_quit.load(std::memory_order_acquire)) {
-        g_floor_host.wait();
         while (floor_take_one(true)) {
         }
+        // Asleep only when nothing is published: a tile queued after this
+        // look finds the flag set and wakes it (the event keeps a signal
+        // given before the wait).
+        g_floor_sleeping.store(true, std::memory_order_seq_cst);
+        if ((int32_t)(g_floor_pub.load(std::memory_order_seq_cst) - g_floor_next.load(std::memory_order_seq_cst)) > 0) {
+            g_floor_sleeping.store(false, std::memory_order_seq_cst);
+            continue;
+        }
+        g_floor_host.wait();
+        g_floor_sleeping.store(false, std::memory_order_seq_cst);
     }
 }
 
@@ -827,9 +837,10 @@ bool floor_queue_push(uint32_t tile, int32_t x, int32_t y, const uint8_t *light,
     j.y = y;
     j.view = v;
     std::memcpy(j.light, light, kLightBytes);
-    g_floor_pub.store(n + 1, std::memory_order_release);
+    g_floor_pub.store(n + 1, std::memory_order_seq_cst);   // seq_cst: against the worker's look before it sleeps
     g_floor_stats.queued++;
-    if (g_floor_worker)
+    // One wake per sleep, not one per tile (each a kernel call).
+    if (g_floor_worker && g_floor_sleeping.exchange(false, std::memory_order_seq_cst))
         g_floor_host.wake();
     return true;
 }
@@ -2484,6 +2495,7 @@ void stop_floor_worker()
     if (!g_floor_worker)
         return;
     g_floor_quit.store(true, std::memory_order_release);
+    g_floor_sleeping.store(false, std::memory_order_seq_cst);
     g_floor_host.wake();
 }
 

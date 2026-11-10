@@ -285,12 +285,13 @@ The frame thread had no slack in a 40 ms frame. Drawing is most of its work, and
 | From the floor to the blit (walls, units, UI) | 18.7 |
 | Present (copying the frame for the render thread) | 1.1 |
 
-**Draw on core 2.** The profiler checklist's last row switches it on and off, at once, a run on or not. It is on by default on a New 3DS, saved as `floorqueue=`; it is off with no core 2. Each switch is noted in the frame trace. It does two things.
+**Draw on core 2.** The INFO tab's OPTIONS page switches it on and off, at once, during a profiler run too. The page holds the port's own engine options (`src/game/port_options.h`), apart from the profiler's measurements. It is on by default on a New 3DS, saved as `port=core2draw`; it is off with no core 2. Each switch is noted in the frame trace. It does two things.
 
 **1. The floor queue** (`D2_FLOOR_QUEUE` on the lane), in `src/game/d2_native.cpp`:
 - The call at `0x476cdc` arms it, and the call at `0x476ce1` empties it. Both are redirected to natives that then go on to the call's own target.
 - While it is armed, `FloorTile` queues a tile whose blocks all have flat light. Each tile is queued with a copy of the light cells it reads and of the renderer's globals it was called with: the frame buffer, its pitch, the clip window and the light flags.
 - A worker thread on core 2 draws each tile as soon as it is queued. When the queue is emptied, the frame thread draws whatever is left beside the worker, then waits for the worker's last tile.
+- The worker runs one priority below the game's thread, so below the I/O worker and the render thread. At the I/O worker's own priority (3DS-D2-18), a finished SD read waited out the worker's tiles: threads of one priority do not preempt each other on the 3DS. It is woken once each time it sleeps, not once per tile.
 - Floor tiles do not overlap, so the order they are drawn in does not matter.
 - Any other draw native empties the queue first. In the measured runs none had to.
 - A tile with interpolated light needs the game's own blitters, so it is drawn at once, after the queue is emptied. The console sets "Light Quality" to 0, so it has none.
@@ -321,6 +322,13 @@ The console has no such slack: its town frame ran 38.9 ms of 40. `scripts/measur
 | --- | --- | --- | --- | --- | --- |
 | Off | 15.0, 15.0 | 62.0, 62.2 ms | 61.3%, 60.2% | 60.6 ms | 12.6 ms |
 | On | 17.0, 16.9 | 53.1, 53.5 ms | 21.2%, 21.7% | 51.9, 52.1 ms | 7.84 ms (3.7 at the flush) |
+
+**3DS-D2-18, draw on core 2 on for 160 s and then off.** The "on" part looked worse (12.6% against 8.3% of frames past 50 ms), but it covered the arrival, a busier area and a mob fight, and the "off" part did not. The mob's frames of 1-2 s came from the sprite governor (`src/game/sprite_governor.h`):
+- The pool's spare was taken with 13.4 MiB of sprites held, and the governor cut the cache to its 4 MiB minimum.
+- 887 sprites were let go of, and 426, 227 and 104 decoded again over the next three windows.
+- A spare take now cuts by the pool's shortfall, not to the minimum.
+
+Three alternating act loads in Azahar each way, after the worker's priority change: 4.9–6.2% of frames past 50 ms with it on, 5.8–7.6% off.
 
 **Not done:** LightBlock on the worker.
 - Between LightBlock and the floor tile, the floor loop passes the light buffer through four of the game's own functions: `0x4de190`, `0x4de260`, `0x4ddfd0` and `0x4de070`, the dynamic lights.

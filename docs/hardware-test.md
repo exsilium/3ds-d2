@@ -170,7 +170,9 @@ Walking around a town felt jumpy, and the 10 s frame rate did not show it: most 
 - the gap since the last frame, and how far the game's clock moved;
 - the frame thread's time running, ready while another guest thread ran (and which one), in host work, sleeping, waiting on a lock, an event or a file read;
 - its sprite decodes;
-- for its longest wait: the game code it waited from, the thread that held the lock, and the return addresses on its EBP chain.
+- for its longest wait: the game code it waited from, the thread that held the lock, and the return addresses on its EBP chain;
+- the frame thread's scheduler slices: a slice is a few ms of guest code, so a long frame with many slices ran the game's own code long, and one with few was held in a host call;
+- a stall: when a single slice of the frame thread runs 150 ms or more (`stallms=` in settings.txt), a watcher thread on the second core takes its EIP and the top of its stack. In a shim or a native, the trace names it (`KERNEL32.dll!ReadFile`) and the next value is the game's call site. The watcher looks every 20 ms and costs the game's core nothing.
 
 The trace is buffered and written by the log writer thread, so it does not make frames uneven itself. `python3 tools/frame_report.py frames.trc` counts the frames in game with no panel open and gives:
 - the gap percentiles and the share past 50, 60 and 100 ms;
@@ -216,7 +218,21 @@ What the slow frames left in Azahar did instead, roughly a third each:
 - **ready**: the read thread running, mostly its callbacks' sprite decodes in guest code;
 - **wait**: reads queued behind the read thread, and the frame thread's own reads from the card.
 
-The console's figures decide what comes next: its SD reads and its speed per guest instruction differ from Azahar's.
+**The console (3DS-D2-17, New 3DS XL, build `b6a947728230`, 251 s in Lut Gholein):**
+
+| | Past 50 ms | Past 100 ms | Median frame | Jitter |
+| --- | --- | --- | --- | --- |
+| Whole run | 6.0% | 0.49% | 39.8 ms | 7.3 ms |
+| First 70 s in town (loading) | 10–20% a window | up to 8 a window | | |
+| From 110 s on | 2.4% | almost none | | |
+
+- **Slow frames.** The read thread's turns barely matter on the console (16 of 356 slow frames, against a third in Azahar). The rest:
+  - the frame thread's own work (217);
+  - its own SD reads (85), 20–27 ms each: a disk read costs 6–9 ms there, about as in Azahar.
+- **Stalls of a fixed ~640 ms** (one of 1.3 s): pure run, with no read, wait or new sprite, and the JIT translated nothing new meanwhile. Eight in the 40 s after arriving in town, then one every 40–90 s. Azahar never shows them.
+  - They often fall in the same window as a slow SD write by the log writer: 600–1,400 ms writes of `frames.trc` and `game.log`, about every other heartbeat, likely as the files grow by a cluster.
+  - But they last 640 ms whatever the write's length, and some come with no slow write.
+  - The stall column above was added to name them on the next console run.
 
 ## Blood Moor: VirtualAlloc ran out (2026-10-18)
 

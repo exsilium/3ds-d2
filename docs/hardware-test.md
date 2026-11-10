@@ -258,6 +258,13 @@ On the whole run, 7.7% of frames went past 50 ms.
 - The median frame is 38.9 ms of the frame thread's own work: there is no slack in a 40 ms frame, so any read or load in one makes it late.
 - In the #70 session's guest profile (an older build, same town), the frame thread ran 9.3 s of 10, of which 2.5 s in shims and natives; the other ~6.8 s is translated game code. A stable 25 fps needs that time down.
 
+**Tried and dropped on the way (each measured, none a gain):**
+- **The I/O worker serving the frame thread's reads first** (a second ring). The console's next run (build `339e8dcc60c0`) had the frame thread's own reads wait as long as before (23.7 ms over 141 frames, 76.9 ms over 58). The cost is each read's chain of small Storm reads, not the queue. Reverted.
+- **The dynarec's translation knobs** (`callret=`, `nopend=`, `budgettail=`, `forward=` in settings.txt; `M4_CALLRET`, `M4_NOPEND`, `M4_BUDGETTAIL`, `M4_FORWARD` on the lane). On the CPU-bound lane (town walk, `-one-insn-per-tb`), none changed the frames per 10 s (32–34 either way). `nopend` and `budgettail` keep `fight.txt`'s 3,215 frames byte for byte; `callret` moves the scheduling from the menus on. Kept as settings, off.
+- **Storm's read thread's rate limit** (`stormrate=`, the game's 256 KiB/s): the act load in Azahar took as long with 4 MiB/s. Kept as a setting.
+- **Storm's request size** (16 against 4 KiB), **shorter background turns** (10,000 instructions, 1 ms), **a caller waiting for the read thread's read under Storm's lock** (much worse), **a word-wide shade remap and an identity-table copy for the floor** (5.9 against 6.0 µs a tile): no gain, not kept.
+- **Per-call shim timing for the stall column**: Azahar lost 2 fps to it; replaced by the sampling watcher.
+
 ## Blood Moor: VirtualAlloc ran out (2026-10-18)
 
 After about four and a half minutes, three of them in Blood Moor, the console logged `va full: want 512 KiB, live 44416 KiB, largest free 384 KiB`. The 44 MiB VirtualAlloc range was full, while the heap range held 8.2 MiB of its 17 (peak 9.7). The game kept going after the failed allocation, the sound looped, and translated code then faulted on a wild guest pointer (data abort, far = membase + 0x357db9e8, outside the 75 MiB arena).

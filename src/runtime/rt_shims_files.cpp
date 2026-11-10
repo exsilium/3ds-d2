@@ -636,34 +636,20 @@ constexpr uint32_t kIoMax = 16;   // requests in flight; past that, reads wait t
 IoRequest g_io[kIoMax];
 IoRequest *g_io_ring[kIoMax];
 std::atomic<uint32_t> g_io_head{0}, g_io_tail{0};
-// The frame thread's reads, served before the ring's (issue #76): its own
-// read of a sprite's or a sound's file waited 20-52 ms on the console behind
-// the read thread's reads and decode jobs, ~3 ms of card time. Both rings
-// are filled from the scheduler's thread and emptied by the worker.
-IoRequest *g_io_pring[kIoMax];
-std::atomic<uint32_t> g_io_phead{0}, g_io_ptail{0};
-
-bool io_idle()
-{
-    return g_io_tail.load(std::memory_order_acquire) == g_io_head.load(std::memory_order_acquire) &&
-           g_io_ptail.load(std::memory_order_acquire) == g_io_phead.load(std::memory_order_acquire);
-}
 std::atomic<bool> g_io_quit{false};
 bool g_io_on = false;
 
 void io_worker_main()
 {
     for (;;) {
-        const uint32_t pt = g_io_ptail.load(std::memory_order_relaxed);
-        const bool prio = pt != g_io_phead.load(std::memory_order_acquire);
         const uint32_t t = g_io_tail.load(std::memory_order_relaxed);
-        if (!prio && t == g_io_head.load(std::memory_order_acquire)) {
+        if (t == g_io_head.load(std::memory_order_acquire)) {
             if (g_io_quit.load(std::memory_order_acquire))
                 return;
             options().io_wait();
             continue;
         }
-        IoRequest *r = prio ? g_io_pring[pt % kIoMax] : g_io_ring[t % kIoMax];
+        IoRequest *r = g_io_ring[t % kIoMax];
         if (r->job) {
             r->job_start_us = wx86_now_us();
             r->job_result = r->job(r->args);
@@ -672,10 +658,7 @@ void io_worker_main()
             r->cache->read(r->pos, r->dst, r->n);
             r->cache->inflight.fetch_sub(1, std::memory_order_acq_rel);
         }
-        if (prio)
-            g_io_ptail.store(pt + 1, std::memory_order_release);
-        else
-            g_io_tail.store(t + 1, std::memory_order_release);
+        g_io_tail.store(t + 1, std::memory_order_release);
         r->state.store(2, std::memory_order_release);   // before the count: the scheduler polls while it is nonzero
         wx86_host_pending(-1);
         if (options().io_done)
@@ -697,16 +680,9 @@ IoRequest *io_submit(ReadCache *cache, uint64_t pos, uint8_t *dst, uint32_t n)
         r.state.store(1, std::memory_order_relaxed);
         cache->inflight.fetch_add(1, std::memory_order_acq_rel);
         wx86_host_pending(1);
-        ThreadScheduler *s = wx86_sched();
-        if (s && (int)s->current_id() == stats().frame_thread) {
-            const uint32_t h = g_io_phead.load(std::memory_order_relaxed);
-            g_io_pring[h % kIoMax] = &r;
-            g_io_phead.store(h + 1, std::memory_order_release);
-        } else {
-            const uint32_t h = g_io_head.load(std::memory_order_relaxed);
-            g_io_ring[h % kIoMax] = &r;
-            g_io_head.store(h + 1, std::memory_order_release);
-        }
+        const uint32_t h = g_io_head.load(std::memory_order_relaxed);
+        g_io_ring[h % kIoMax] = &r;
+        g_io_head.store(h + 1, std::memory_order_release);
         options().io_wake();
         return &r;
     }
@@ -763,7 +739,7 @@ bool offload_job(uint32_t (*job)(const uint32_t *), const uint32_t *args, size_t
 // thread queues reads, and it is the one here.
 void suspend_files()
 {
-    while (!io_idle())
+    while (g_io_tail.load(std::memory_order_acquire) != g_io_head.load(std::memory_order_acquire))
         if (options().sleep_ms)
             options().sleep_ms(1);
     int n = 0;

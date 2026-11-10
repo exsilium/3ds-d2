@@ -267,6 +267,54 @@ On the whole run, 7.7% of frames went past 50 ms.
 - **Storm's request size** (16 against 4 KiB), **shorter background turns** (10,000 instructions, 1 ms), **a caller waiting for the read thread's read under Storm's lock** (much worse), **a word-wide shade remap and an identity-table copy for the floor** (5.9 against 6.0 µs a tile): no gain, not kept.
 - **Per-call shim timing for the stall column**: Azahar lost 2 fps to it; replaced by the sampling watcher.
 
+## Floor tiles on the second core (issue #80)
+
+The frame thread had no slack in a 40 ms frame. Drawing is most of its work, and the draw natives write only the frame buffer. So some of that work can move to core 2, as long as the game's own drawing never sees the buffer half done.
+
+**Where a frame's drawing can move: the draw census (lane).** `D2_DRAW_CENSUS=<n>` takes every n-th frame. At each draw native, it compares the frame buffer with a copy taken after the last one. A difference means the game's own code drew in between. `python3 -I tools/draw_census.py build/m4/err.txt` groups each frame's natives into runs with no game drawing among them, with each run's callers.
+- After the screen is cleared, the floor is one run: about 96 `FloorTile` calls with nothing else drawn among them. They come from the world's draw (`0x476bc0`) through its call to `0x4ded10` at `0x476cdc`.
+- The very next call (`0x476ce1`, to `0x473c00`) draws over the floor.
+- After that, the game's own drawing (the walls' smaller blitters, the UI) comes in between the wall and sprite natives every 1–20 calls. A queue there would wait at each one.
+
+**What a frame spends: the draw phases.** `drawphases=1` in settings.txt (`D2_DRAW_PHASES` on the lane) times each draw native and the frame's parts with the host clock. It logs `draw phases:` every 250 frames. A 41 ms town frame in Azahar (Lut Gholein):
+
+| Part of the frame | ms |
+| --- | --- |
+| From the last blit to the floor | 12.3 |
+| The floor run | 10.2 (`FloorTile` 8.1, the frame thread's own work between tiles 2.1) |
+| From the floor to the blit (walls, units, UI) | 18.7 |
+| Present (copying the frame for the render thread) | 1.1 |
+
+**The floor queue** (`floorqueue=1`, the default on a New 3DS; `0` turns it off; `D2_FLOOR_QUEUE` on the lane), in `src/game/d2_native.cpp`:
+- The call at `0x476cdc` arms it, and the call at `0x476ce1` empties it. Both are redirected to natives that then go on to the call's own target.
+- While it is armed, `FloorTile` queues a tile whose blocks all have flat light. Each tile is queued with a copy of the light cells it reads and of the renderer's globals it was called with: the frame buffer, its pitch, the clip window and the light flags.
+- A worker thread on core 2 draws each tile as soon as it is queued. When the queue is emptied, the frame thread draws whatever is left beside the worker, then waits for the worker's last tile.
+- Floor tiles do not overlap, so the order they are drawn in does not matter.
+- Any other draw native empties the queue first. In the measured runs none had to.
+- A tile with interpolated light needs the game's own blitters, so it is drawn at once, after the queue is emptied. The console sets "Light Quality" to 0, so it has none.
+
+**Checks on the lane** (virtual clock, `M4_NATIVE=late`, `M4_FRAMEHASH`):
+- `D2_FLOOR_QUEUE=2` draws the queue in reverse order at the end of the run. `town-walk.txt` (1,726 frames) and `fight.txt` (2,843 frames) hash the same as with the queue off.
+- With the worker, one early run of `fight.txt` differed in one frame. That was before each tile kept its own copy of the globals; the worker then read them while it drew. After that change, three more runs matched.
+- `D2_FLOOR_QUEUE=3` uses the worker, then draws every tile again in order and counts any pixel change. 26,276 flushes changed nothing, and every frame hashed the same.
+
+**Azahar** (Lut Gholein and the Rogue Encampment walks, the queue off and on, alternating):
+
+| | fps | Median gap | Past 50 ms | Floor run on the frame thread |
+| --- | --- | --- | --- | --- |
+| Lut Gholein, off (2 runs) | 21.3, 21.4 | 43.8, 43.4 ms | 13.1%, 13.5% | 9.7, 10.2 ms |
+| Lut Gholein, on (2 runs) | 23.1, 23.3 | 39.9, 40.8 ms | 8.3%, 6.1% | 2.95, 2.78 ms |
+| Rogue Encampment, off | 22.8 | 41.9 ms | 7.5% | 8.0 ms |
+| Rogue Encampment, on | 23.7 | 40.2 ms | 4.4% | 2.4 ms |
+
+- The worker draws about 65% of the tiles. The frame thread waits 0.4 ms a frame for its last one.
+- The act-load script was unchanged: 25.0 fps and 0.2% past 50 ms either way. Its longest frame went from 323 to 225 ms.
+
+**Not kept:** native versions of the four interpolated-light blitters (`0x4f6bb0`, `0x4f71a0`, `0x4f7850`, and `0x4f89f0`'s iso branch), so that those tiles could be queued too.
+- Checked block by block on the lane against the game's own blitters, they drew the same pixels.
+- A few frames still differed, because the lane's virtual clock counts the guest instructions they no longer run.
+- The console never draws interpolated light, so they would only help a player who raises Light Quality.
+
 ## Blood Moor: VirtualAlloc ran out (2026-10-18)
 
 After about four and a half minutes, three of them in Blood Moor, the console logged `va full: want 512 KiB, live 44416 KiB, largest free 384 KiB`. The 44 MiB VirtualAlloc range was full, while the heap range held 8.2 MiB of its 17 (peak 9.7). The game kept going after the failed allocation, the sound looped, and translated code then faulted on a wild guest pointer (data abort, far = membase + 0x357db9e8, outside the 75 MiB arena).

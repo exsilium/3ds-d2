@@ -990,8 +990,10 @@ void stop_sampler()
 
 // The floor queue's worker (issue #80, game::set_floor_worker): the floor
 // tiles a frame queues, drawn on the second core beside the game's thread,
-// at the I/O worker's priority. "floorqueue=" in settings.txt: 1 on, 0 off.
-int g_floor_queue = 0;
+// at the I/O worker's priority. Only on core 2 (a New 3DS): core 1's time
+// share (30%) could hold a tile the frame thread then waits for, and with no
+// worker the queue only adds copies. "floorqueue=0" in settings.txt: off.
+int g_floor_queue = 1;
 LightEvent g_floor_event;
 Thread g_floor_thread = nullptr;
 void (*g_floor_worker)() = nullptr;
@@ -1000,7 +1002,7 @@ void floor_main(void *) { g_floor_worker(); }
 
 bool start_floor_thread(void (*worker)())
 {
-    if (g_render_core < 0)
+    if (g_render_core != 2)
         return false;
     g_floor_worker = worker;
     LightEvent_Init(&g_floor_event, RESET_ONESHOT);
@@ -2221,7 +2223,7 @@ int main()
         game::install_pool_release(c);
         game::set_pool_block_size(c, game::kCtrPoolBlock);
         game::install_sprite_frames(c);
-        game::set_floor_queue(g_floor_queue);
+        game::set_floor_queue(g_render_core == 2 ? g_floor_queue : 0);
         game::FloorWorker fw;
         fw.start = start_floor_thread;
         fw.wait = [] { LightEvent_Wait(&g_floor_event); };

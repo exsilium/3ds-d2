@@ -251,9 +251,13 @@ NativeFn draw_census_wrap(const char *name, NativeFn fn)
         }
         Run &r = g_runs.back();
         r.n++;
-        if (r.calls.empty() || r.calls.back().first != name)
-            r.calls.push_back({name, 0});
-        r.calls.back().second++;
+        // The run's calls by name, in the order first seen (a line stays short).
+        auto it = r.calls.begin();
+        while (it != r.calls.end() && it->first != name)
+            ++it;
+        if (it == r.calls.end())
+            it = r.calls.insert(it, {name, 0});
+        it->second++;
         g_depth++;
         const uint32_t v = fn(c);
         g_depth--;

@@ -709,6 +709,10 @@ bool floor_tile_blocks(Cpu *c, uint32_t tile, int32_t x, int32_t y, const uint8_
 // thread draws what is left beside it, then waits for its last tile. The
 // tiles go through a ring of kFloorJobs, published with a release store;
 // a tile is taken by one compare-and-swap on g_floor_next, by either thread.
+// The three counts only ever grow (a tile's slot is its count modulo the
+// ring): were they reset at each frame, a worker stopped between reading
+// g_floor_next and its compare-and-swap could take a slot of the frame
+// before again (ABA), once the count came back to it.
 struct FloorJob {
     uint32_t tile;
     int32_t x, y;
@@ -723,6 +727,7 @@ uint64_t g_floor_t0 = 0;               // the floor's start (476cdc), host us
 uint64_t g_floor_us = 0, g_flush_us = 0;   // since floor_queue_take
 FloorJob *g_floor_ring = nullptr;
 std::atomic<uint32_t> g_floor_pub{0}, g_floor_next{0}, g_floor_done{0};
+uint32_t g_floor_start = 0;            // the frame thread's: the first tile not yet flushed
 FloorWorker g_floor_host{};
 bool g_floor_worker = false;           // a worker is running
 std::atomic<bool> g_floor_quit{false};
@@ -738,12 +743,12 @@ bool floor_take_one(bool worker)
 {
     uint32_t i = g_floor_next.load(std::memory_order_acquire);
     for (;;) {
-        if (i >= g_floor_pub.load(std::memory_order_acquire))
+        if ((int32_t)(g_floor_pub.load(std::memory_order_acquire) - i) <= 0)
             return false;
         if (g_floor_next.compare_exchange_weak(i, i + 1, std::memory_order_acq_rel))
             break;
     }
-    floor_job_draw(g_floor_ring[i]);
+    floor_job_draw(g_floor_ring[i % kFloorJobs]);
     if (worker)
         g_floor_stats.by_worker.fetch_add(1, std::memory_order_relaxed);
     g_floor_done.fetch_add(1, std::memory_order_release);
@@ -765,13 +770,13 @@ void floor_worker_main()
 // whose pixels change is counted and logged.
 uint64_t g_floor_verified = 0, g_floor_mismatch = 0;
 
-void floor_queue_verify(uint32_t n)
+void floor_queue_verify(uint32_t start, uint32_t n)
 {
-    const FloorView &v = g_floor_ring[0].view;
+    const FloorView &v = g_floor_ring[start % kFloorJobs].view;
     const uint32_t bytes = (uint32_t)v.pitch * 600u;
     std::vector<uint8_t> before(H(v.fb), H(v.fb) + bytes);
-    for (uint32_t i = 0; i < n; i++)
-        floor_job_draw(g_floor_ring[i]);
+    for (uint32_t i = start; i != n; i++)
+        floor_job_draw(g_floor_ring[i % kFloorJobs]);
     g_floor_verified++;
     if (std::memcmp(before.data(), H(v.fb), bytes)) {
         g_floor_mismatch++;
@@ -779,20 +784,22 @@ void floor_queue_verify(uint32_t n)
         while (before[at] == H(v.fb)[at])
             at++;
         rt::logf("floor queue: frame %llu drawn again differs, first at row %u column %u (%u tiles)",
-                 (unsigned long long)g_floor_verified, at / (uint32_t)v.pitch, at % (uint32_t)v.pitch, n);
+                 (unsigned long long)g_floor_verified, at / (uint32_t)v.pitch, at % (uint32_t)v.pitch, n - start);
     }
 }
 
 // Every queued tile drawn, by now: the frame thread's.
 void floor_queue_flush()
 {
-    const uint32_t n = g_floor_pub.load(std::memory_order_relaxed);
-    if (!n)
+    const uint32_t n = g_floor_pub.load(std::memory_order_relaxed), start = g_floor_start;
+    if (n == start)
         return;
     g_floor_stats.flushes++;
     if (g_floor_mode == 2) {
-        for (uint32_t i = n; i-- > 0;)
-            floor_job_draw(g_floor_ring[i]);
+        for (uint32_t i = n; i-- != start;)
+            floor_job_draw(g_floor_ring[i % kFloorJobs]);
+        g_floor_next.store(n, std::memory_order_release);
+        g_floor_done.store(n, std::memory_order_release);
     } else {
         while (floor_take_one(false)) {
         }
@@ -803,21 +810,18 @@ void floor_queue_flush()
             g_floor_stats.wait_us += wx86_now_us() - t0;
         }
         if (g_floor_mode == 3)
-            floor_queue_verify(n);
+            floor_queue_verify(start, n);
     }
-    // Every tile is taken: the worker's next look finds none.
-    g_floor_pub.store(0, std::memory_order_release);
-    g_floor_next.store(0, std::memory_order_release);
-    g_floor_done.store(0, std::memory_order_release);
+    g_floor_start = n;   // every tile up to n is drawn
 }
 
 // Queues a tile the scan passed; false: the ring is full.
 bool floor_queue_push(uint32_t tile, int32_t x, int32_t y, const uint8_t *light, const FloorView &v)
 {
     const uint32_t n = g_floor_pub.load(std::memory_order_relaxed);
-    if (n == kFloorJobs)
-        return false;
-    FloorJob &j = g_floor_ring[n];
+    if (n - g_floor_start >= kFloorJobs)
+        return false;   // the frame's tiles fill the ring; the frames before are all drawn
+    FloorJob &j = g_floor_ring[n % kFloorJobs];
     j.tile = tile;
     j.x = x;
     j.y = y;
@@ -2311,7 +2315,7 @@ int install_d2_native(Cpu &c)
         if (!floor_queue)
             return fn;
         return [fn](Cpu &c) -> uint32_t {
-            if (g_floor_pub.load(std::memory_order_relaxed)) {
+            if (g_floor_pub.load(std::memory_order_relaxed) != g_floor_start) {
                 g_floor_stats.guarded++;
                 floor_queue_flush();
             }

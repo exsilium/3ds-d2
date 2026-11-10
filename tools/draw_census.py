@@ -37,8 +37,9 @@ def main():
             f = frames.setdefault(int(m.group(1)), dict(runs=[], end=None))
             calls = collections.Counter()
             for pair in filter(None, m.group(6).split(",")):
-                name, n = pair.rsplit(":", 1)
-                calls[name] += int(n)
+                name, _, n = pair.rpartition(":")
+                if n.isdigit():   # a line the log cut short ends mid-pair
+                    calls[name] += int(n)
             f["runs"].append(dict(guest=box(m.group(3)), ret=int(m.group(4), 16), n=int(m.group(5)), calls=calls, chain=m.group(7) or ""))
             continue
         m = END.search(line)

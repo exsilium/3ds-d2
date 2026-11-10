@@ -6,6 +6,7 @@ shims' and native routines' time, and the translated functions that took the
 most of a thread's time.
 
     python3 -I tools/profile_report.py game.log dist/game/Game.exe [--from 600 --to 1800] [--top 15]
+        [--windows fights|quiet|play|loads] [--routines NAME,0xADDR,0xLO-0xHI]
 
 The log has, per heartbeat window while the profile is on, a `prof thread`
 line per guest thread (its run time, the part of it in shims, and its
@@ -51,8 +52,19 @@ them are the call-out, the body, and the short block before the call.
 
 The threads' table is given for the play windows and for the area loads
 apart (issue #22): a window is an area load when the game made 1000 reads or
-more in it (`prof files:`), as tools/session_report.py counts them. A
-thread's slices are its turns on core 0; their sum is the window's switches.
+more in it (`prof files:`) or opened 10 files or more, as
+tools/session_report.py counts them (tools/profile_windows.py). A thread's
+slices are its turns on core 0; their sum is the window's switches.
+
+Issue #73: `--windows fights|quiet|play|loads` reads only those windows,
+picked by tools/profile_windows.py the same way each time, and prints how
+(the rule and the window count). `--routines` gives a frame's ms of each
+routine named, whether or not a table's `--top` rows reach it: a shim or
+native by name, a function by its start, an EIP, or a range. The sprite
+trace's own cost (its natives and their stubs) is given apart, with the
+frame without it; its stubs are a row of their own in the function table.
+
+    python3 -I tools/profile_report.py game.log dist/game/Game.exe --windows fights         --routines SpriteCacheTouch,SpritePath,0x470c30-0x470d80,0x534658
 
 A tail bucket folds into the function its first byte is in, as translated
 code: the bucket does not say which of its EIPs follow a call, nor which
@@ -67,10 +79,15 @@ import argparse
 import bisect
 import collections
 import re
+import os
 import struct
 import sys
 
-PROF = re.compile(r"prof: (\d+) ms, frames (\d+), idle (\d+) ms(?:, switches (\d+))?")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import profile_windows  # noqa: E402
+
+PROF = re.compile(r"prof: (\d+) ms, frames (\d+), idle (\d+) ms(?:, switches (\d+))?(?:, cache syncs (\d+))?")
+DECODED = re.compile(r"sprite cache \d+/\d+ KiB, \d+ sprites.*?, decoded (\d+) in")
 FILES = re.compile(r"prof files: (\d+) reads")
 THREAD = re.compile(r"prof thread (\d+) \(entry ([0-9a-f]+)\): run (\d+) ms \(shims (\d+) ms\) in (\d+) slices, "
                     r"(\d+) samples")
@@ -82,8 +99,10 @@ CLOCK = re.compile(r"prof clock: (\d+) reads in line(?:, by caller((?: [0-9a-f]+
 LOCKS = re.compile(r"prof locks: (\d+) in line, (\d+) through the shim \((\d+) waited\)"
                    r"(?:, by caller((?: [0-9a-f]+:\d+)+))?")
 HEART = re.compile(r"t=(\d+)s ")
+OPENED = re.compile(r"t=\d+s peeks=\d+ files=(\d+) ")
 STATE = re.compile(r"game state: (.*?) \(ui")
 PROFILE_ON = re.compile(r"prof: guest code profile (on|off)")
+CLOCK_COST = re.compile(r"clock: a host clock read costs (\d+) ns")
 
 THREAD_NAMES = {0x41a550: "loader", 0x4101c0: "worker", 0x516250: "sound update"}
 # src/game/d2_native.cpp's hooks: calls to these run native code.
@@ -92,7 +111,11 @@ NATIVES = {0x4f69b0: "FloorIsoFlat", 0x4f6f60: "RleFlat", 0x4f7580: "RleFlatClip
            0x4756d0: "LightGrid", 0x4ddef0: "LightBlock", 0x4f8b80: "FloorTile", 0x41dce0: "AdpcmDecode",
            0x41f9e0: "HuffmanDecode", 0x41e000: "PkExplode", 0x524c60: "LangLookup", 0x60b9a0: "DccPixelBuffer"}
 TICK_MS = 2.0
-LOAD_READS = 1000   # a window with this many reads is an area load (tools/session_report.py's count)
+# The profiler's own code: src/game/sprite_trace.cpp's use and remove stubs
+# (kUseStub..kSlackEnd), and its natives. A tick in a native lands on the
+# stub's return, so the stub's samples are the natives' time again.
+TRACE_STUBS = (0x6cb6f0, 0x6cb740)
+TRACE_NATIVES = "3DSD2NATIVE!SpriteTrace"
 
 
 class Binary:
@@ -213,8 +236,13 @@ class Binary:
 
 
 def parse(path):
-    windows, cur, state, on = [], None, "start", False
+    windows, cur, state, on, opened = [], None, "start", False, None
+    parse.clock_ns = None
     for line in open(path, encoding="utf-8", errors="replace"):
+        m = CLOCK_COST.search(line)
+        if m:   # the startup log's measure (issue #39)
+            parse.clock_ns = int(m.group(1))
+            continue
         m = STATE.search(line)
         if m:
             state = m.group(1)
@@ -226,12 +254,19 @@ def parse(path):
         m = PROF.search(line)
         if m:
             cur = dict(ms=int(m.group(1)), frames=int(m.group(2)), idle=int(m.group(3)), state=state, on=on,
-                       switches=int(m.group(4) or 0), reads=0, threads={},
+                       switches=int(m.group(4) or 0), syncs=int(m.group(5) or 0), decodes=0, timer_reads=None,
+                       reads=0, threads={},
                        eips=collections.defaultdict(collections.Counter), shims=collections.Counter(),
                        tail=collections.defaultdict(collections.Counter), tail_left=collections.Counter(),
                        clock=0, clock_at=collections.Counter(), locks=[0, 0, 0], locks_at=collections.Counter())
             continue
         if cur is None:
+            continue
+        m = DECODED.search(line)
+        if m:   # after the window's t= line, before the next window's prof: line
+            cur["decodes"] = int(m.group(1))
+            continue
+        if "t" in cur:
             continue
         m = FILES.search(line)
         if m:
@@ -243,6 +278,7 @@ def parse(path):
             for pair in (m.group(2) or "").split():
                 ret, n = pair.split(":")
                 cur["clock_at"][int(ret, 16)] += int(n)
+            cur["timer_reads"] = cur["clock_at"][profile_windows.TIMER_RET]
             continue
         m = LOCKS.search(line)
         if m:
@@ -282,8 +318,11 @@ def parse(path):
         m = HEART.search(line)
         if m:
             cur["t"] = int(m.group(1))
-            windows.append(cur)
-            cur = None
+            o = OPENED.search(line)
+            if o:
+                cur["opened"] = int(o.group(1)) - opened if opened is not None else 0
+                opened = int(o.group(1))
+            windows.append(cur)   # still open for its sprite cache line
     return windows
 
 
@@ -301,12 +340,24 @@ def main():
     ap.add_argument("--to", dest="t1", type=int, default=1 << 30, help="last window")
     ap.add_argument("--top", type=int, default=15)
     ap.add_argument("--thread", type=int, help="the thread for the function table (default: the main thread)")
+    ap.add_argument("--windows", choices=profile_windows.KINDS,
+                    help="only these windows (tools/profile_windows.py): fights, quiet play, play, area loads")
+    ap.add_argument("--routines", action="append", default=[], metavar="LIST",
+                    help="comma-separated routines to give a frame's ms of, listed or not: a shim or native by name "
+                         "(SpriteCacheTouch, KERNEL32.dll!EnterCriticalSection), a function by its start (0x470c30), "
+                         "any other address as that EIP's samples (0x534658), or a range's samples, exact and tail "
+                         "(0x470c30-0x470d80)")
     args = ap.parse_args()
 
     windows = [w for w in parse(args.log) if w["on"] and w["threads"] and args.t0 <= w["t"] <= args.t1]
     if not windows:
         print("no windows with the guest code profile on in that range")
         return 1
+    if args.windows:
+        windows, how = profile_windows.select(windows, args.windows)
+        print(how)
+        if not windows:
+            return 1
     exe = Binary(args.exe)
 
     ms = sum(w["ms"] for w in windows)
@@ -334,9 +385,9 @@ def main():
               f"{t['samples']} |")
     print(f"| idle | | {idle / 1000:.1f} s | {100 * idle / ms:.1f}% | | |")
 
-    in_game = [w for w in windows if w["state"].startswith("in game")]
-    loads = [w for w in in_game if w["reads"] >= LOAD_READS]
-    play = [w for w in in_game if w["reads"] < LOAD_READS]
+    in_game = [w for w in windows if profile_windows.in_game(w)]
+    loads = [w for w in in_game if profile_windows.load(w)]
+    play = [w for w in in_game if not profile_windows.load(w)]
     print(f"\nIn play ({len(play)} windows) and in area loads ({len(loads)} windows"
           + (f", t={', '.join(str(w['t']) for w in loads)}" if loads else "") + "), a share of core 0 "
           "and the turns on it (slices) a 10 s:\n")
@@ -375,8 +426,9 @@ def main():
         clock += w["clock"]
         clock_at.update(w["clock_at"])
     if clock:
-        print(f"\nGetTickCount and timeGetTime in line: {clock} reads, {clock / max(frames, 1):.0f} a frame. "
-              "The callers by return address:\n")
+        print(f"\nGetTickCount and timeGetTime in line: {clock} reads, {clock / max(frames, 1):.0f} a frame"
+              + (f" (a host clock read costs {parse.clock_ns:,} ns, from the startup log)" if parse.clock_ns else "")
+              + ". The callers by return address:\n")
         print("| Function | Return address | Reads | A frame |")
         print("| --- | --- | --- | --- |")
         for ret, n in clock_at.most_common(8):
@@ -405,7 +457,11 @@ def main():
     for w in windows:
         for eip, hits in w["eips"][tid].items():
             call = exe.after_call(eip)
-            if not exe.lo <= eip < exe.hi:
+            if TRACE_STUBS[0] <= eip < TRACE_STUBS[1]:
+                kinds["the sprite trace's stubs"] += hits
+                funcs["trace"] += hits
+                eips["trace"][eip] += hits
+            elif not exe.lo <= eip < exe.hi:
                 kinds["outside Game.exe"] += hits
                 funcs["outside"] += hits
                 eips["outside"][eip] += hits
@@ -424,7 +480,8 @@ def main():
     for w in windows:
         left += w["tail_left"][tid]
         for bucket, hits in w["tail"][tid].items():
-            f = exe.function(bucket) if exe.lo <= bucket < exe.hi else "outside"
+            f = ("trace" if TRACE_STUBS[0] <= bucket < TRACE_STUBS[1] else
+                 exe.function(bucket) if exe.lo <= bucket < exe.hi else "outside")
             kinds["tail buckets"] += hits
             funcs[f] += hits
             tail[f] += hits
@@ -435,8 +492,10 @@ def main():
           f"{100 * listed / max(samples, 1):.0f}% of them in the windows' lists: "
           + ", ".join(f"{k} {pct(n)}" for k, n in kinds.most_common()) + ".")
     if tailed:
+        worst = min(windows, key=lambda w: 1 - w["tail_left"][tid] / max(w["threads"].get(tid, {}).get("samples", 0), 1))
+        cover = 1 - worst["tail_left"][tid] / max(worst["threads"].get(tid, {}).get("samples", 0), 1)
         print(f"Tail buckets in {tailed} of {len(windows)} windows; {left} samples ({pct(left)}) in the buckets "
-              "left out.")
+              f"left out; the worst window's lists and buckets hold {100 * cover:.1f}% of its samples (t={worst['t']}).")
     else:
         print("No tail buckets in these windows: the exact lists held every EIP, or the log is from before issue #40 "
               "and they hold only the busiest.")
@@ -445,7 +504,8 @@ def main():
         per_frame = n * TICK_MS / max(frames, 1)
         return f"{per_frame:.2f} | {100 * per_frame / frame_ms:.1f}%"
 
-    label = lambda f: "outside Game.exe" if f == "outside" else f"`{f:#x}`"
+    label = lambda f: ("outside Game.exe" if f == "outside" else "the sprite trace's stubs (the profiler)"
+                       if f == "trace" else f"`{f:#x}`")
     print("\nTranslated functions (the exact lists and the tail buckets):\n")
     print("| # | Function | Samples | In the tail | Share of thread | ms a frame | Share of a frame | Hottest EIPs |")
     print("| --- | --- | --- | --- | --- | --- | --- | --- |")
@@ -472,7 +532,67 @@ def main():
     print("| --- | --- | --- | --- | --- | --- |")
     for (f, site), hits in indirect.most_common(10):
         print(f"| `{f:#x}` | `{site:#x}` | {hits} | {pct(hits)} | {ms_frame(hits)} |")
+
+    # The profiler's own cost (issue #73): the sprite trace's natives, by
+    # their shim time. Their samples land on the stubs' returns, so those are
+    # the same time seen from the thread, not more of it.
+    trace = {n: t for n, t in shims.items() if n.startswith(TRACE_NATIVES)}
+    if trace or funcs["trace"]:
+        cost = sum(trace.values()) / max(frames, 1)
+        print(f"\nThe profiler's own cost: the sprite trace's natives "
+              + ", ".join(f"{n.split('!')[1]} {t / max(frames, 1):.2f}" for n, t in sorted(trace.items()))
+              + f" ms a frame ({cost:.2f} ms, {100 * cost / frame_ms:.1f}% of a frame); their stubs' samples on "
+              f"thread {tid}, the same time: {funcs['trace'] * TICK_MS / max(frames, 1):.2f} ms. A frame without "
+              f"them: {frame_ms - cost:.1f} ms ({1000 / max(frame_ms - cost, 1e-9):.1f} fps). The sampling's own "
+              "cost is not counted (~12% in issue #3).")
+
+    if args.routines:
+        routines(args.routines, exe, windows, frames, frame_ms, shims, returns, funcs, tid)
     return 0
+
+
+def routines(specs, exe, windows, frames, frame_ms, shims, returns, funcs, tid):
+    """Each routine's ms a frame, whatever --top cut (issue #73): its shim
+    time as timed (only a window's 12 busiest shims are logged, so the windows
+    that listed it are counted), and its samples on the thread: the returns
+    from it (a shim or native), its function's samples (a function start), or
+    that EIP's (any other address), or a range's: the exact EIPs and the tail
+    buckets that start in it."""
+    names = [r.strip() for spec in specs for r in spec.split(",") if r.strip()]
+    per = lambda ms: f"{ms / max(frames, 1):.2f}"
+    share = lambda ms: f"{100 * ms / max(frames, 1) / frame_ms:.1f}%"
+    print(f"\nRoutines asked for, thread {tid}, {len(windows)} windows, {frames} frames:\n")
+    print("| Routine | What | ms a frame | Share of a frame | Listed in |")
+    print("| --- | --- | --- | --- | --- |")
+    for name in names:
+        try:
+            lo, _, hi = name.partition("-")
+            addr, end = int(lo, 16), int(hi, 16) if hi else None
+        except ValueError:
+            addr = end = None
+        if end is not None:
+            hits = sum(h for w in windows for src in (w["eips"][tid], w["tail"][tid])
+                       for e, h in src.items() if addr <= e < end)
+            print(f"| `{addr:#x}`-`{end:#x}` | range, its samples (the lists and the tail) | {per(hits * TICK_MS)} | "
+                  f"{share(hits * TICK_MS)} | {hits} samples |")
+        elif addr is None:
+            match = lambda n: n == name or n.split("!")[-1] == name
+            timed = [n for n in shims if match(n)]
+            t = sum(shims[n] for n in timed)
+            listed = sum(1 for w in windows if any(match(n) for n in w["shims"]))
+            print(f"| {name} | shim time, as timed | {per(t)} | {share(t)} | {listed} of {len(windows)} windows |")
+            hits = sum(h for n, h in returns.items() if match(n))
+            print(f"| {name} | samples after a call to it | {per(hits * TICK_MS)} | {share(hits * TICK_MS)} | "
+                  f"{hits} samples |")
+        elif addr in exe.starts:
+            hits = funcs[addr]
+            print(f"| `{addr:#x}` | function, its samples (the lists and the tail) | {per(hits * TICK_MS)} | "
+                  f"{share(hits * TICK_MS)} | {hits} samples |")
+        else:
+            hits = sum(w["eips"][tid][addr] for w in windows)
+            print(f"| `{addr:#x}` | EIP `{addr:#x}` (in `{exe.function(addr):#x}`), its samples | "
+                  f"{per(hits * TICK_MS)} | {share(hits * TICK_MS)} | "
+                  f"{sum(1 for w in windows if w['eips'][tid][addr])} of {len(windows)} windows |")
 
 
 if __name__ == "__main__":

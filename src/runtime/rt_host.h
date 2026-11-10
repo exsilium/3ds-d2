@@ -90,6 +90,20 @@ struct RunOptions {
     // blocks over pool_large_min that no free piece of the pool holds.
     uint32_t pool_large = 0;
     uint32_t pool_large_min = 256u << 10;
+    // The scheduler's slice for every guest thread but the frame thread, in
+    // instructions (0: the scheduler's quantum, 300000, for all). The
+    // threads take turns on one core: a file loader decompressing for a
+    // whole quantum kept the game's thread from its frame (~16 ms in Azahar,
+    // most of the frames over 50 ms while walking). Shorter slices give it
+    // the same share in smaller pieces.
+    uint32_t background_quantum = 0;
+    // ...and by time (us, 0: none): the quantum counts guest instructions
+    // only, and a native (a decompressor, called sector by sector) runs for
+    // free, so a loader's slice of Storm's decoders held the game's thread
+    // 15 ms at a time, every 250-550 ms, in Azahar. After a native returns on
+    // another thread, past this much of its slice and with the frame thread
+    // ready, the thread yields.
+    uint32_t background_slice_us = 0;
     // CPUID leaf-1 EDX reported to the guest; 0 keeps the backend's default
     // (FPU CMOV MMX FXSR SSE SSE2). The 3DS reports kCpuidNoSimd: the game
     // then takes its x87/integer paths instead of SSE code the ARM11 emulates.
@@ -169,6 +183,51 @@ struct FrameThreadTimes {
     uint64_t run_ms = 0, ready_ms = 0, host_ms = 0, blocked_ms = 0;
 };
 FrameThreadTimes frame_thread_times();
+// The same in us by what it was doing, charged up to now: run, ready, host,
+// sleep, then its waits (critsec, event, fileio, multi, thread, other). For
+// the frame trace (game/frame_trace.h), at each frame; the scheduler's
+// thread (a shim's).
+constexpr size_t kFrameThreadKinds = 10;
+void frame_thread_us(uint64_t out[kFrameThreadKinds]);
+// Of its ready time, us by the guest thread that ran meanwhile (ids 0-15),
+// and a guest thread's entry point (0: none), to name it.
+void frame_thread_ready_by(uint64_t out[16]);
+// Its longest wait on a guest object (a Sleep left out) since the last call:
+// the us, the site it waited from (wait_site: the game's code), and for a
+// critical section the guest thread that owned it (else 0), and the return
+// addresses into the game on its EBP chain (0: fewer). Clears them.
+constexpr size_t kWaitFrom = 4;
+uint64_t frame_thread_wait_top(uint32_t &site, uint32_t &owner, uint32_t from[kWaitFrom]);
+// Long frames, sampled (the frame trace's stall column). note_present at
+// each present (the scheduler's thread). stall_probe from another host
+// thread every few ms: once the frame thread has gone `min_us` without a
+// present, it is told to stop at its next block and where it stops is
+// kept (its EIP, and the dword on top of its stack: after a host call, the
+// call's return), up to 8 samples a frame. take_stall, at the next present,
+// takes them (the count).
+void note_present();
+// The dynarec's translation knobs (dyn86.c): return-address prediction,
+// flag archiving at blocks ending in a CALL (1: dropped), the budget check
+// at a block's tail, the forward-bridge size. Each -1 keeps the backend's
+// default. Before the game runs (blocks translated already keep their
+// shape); the run logs them.
+void set_dynarec_knobs(int callret, int nopend, int budgettail, int forward);
+void stall_probe(uint64_t min_us);
+int take_stall(uint32_t out[][2], int max);
+uint32_t guest_thread_entry(uint32_t tid);
+// The running guest thread is the one presenting frames (stats().frame_thread);
+// the running guest thread's id (-1: none).
+bool on_frame_thread();
+int current_thread_id();
+// A native's work on the I/O worker (the second core) while the guest
+// thread that called it waits, as a file read does: the other guest threads
+// run meanwhile. `job` gets `args` (at most 8, captured from the guest's
+// registers and stack before the call), touches guest memory only through
+// host pointers, and must not depend on anything the game's core changes
+// meanwhile. True: the native returns `ret`, and the thread's EAX becomes
+// what the job returned when it wakes. False (asynchronous reads off, the
+// frame thread calling, the worker full): the caller runs it itself.
+bool offload_job(uint32_t (*job)(const uint32_t *), const uint32_t *args, size_t n, uint32_t &ret);
 // How long the last heartbeat took (us): the runtime's lines and
 // RunOptions::heartbeat, on the guest's core, so the frame after it waited
 // as long. The scheduler's thread.
@@ -200,6 +259,9 @@ struct FileStats {
     // (an OVERLAPPED read, a full request pool, or synchronous reads).
     uint64_t waits = 0, wait_us = 0, wait_frame_us = 0;
     uint64_t stall_us = 0;
+    // Jobs on the I/O worker (offload_job): how many, their time running
+    // there, those past 5 ms, and their time queued behind other requests.
+    uint64_t jobs = 0, job_us = 0, job_long = 0, job_queued_us = 0;
 };
 const FileStats &file_stats();
 // The asynchronous reads' worker (RunOptions::io_start): started and stopped

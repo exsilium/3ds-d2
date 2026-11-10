@@ -29,6 +29,7 @@
 #include "game/d2_memory.h"
 #include "game/d2_native.h"
 #include "game/d2_state.h"
+#include "game/frame_trace.h"
 #include "game/game_exe.h"
 #include "game/osk.h"
 #include "game/profiler.h"
@@ -285,6 +286,7 @@ const char kSaveDir[] = "sdmc:/3ds/3ds-d2/save";
 const char kLogDir[] = "sdmc:/3ds/3ds-d2/logs";
 const char kTracePath[] = "sdmc:/3ds/3ds-d2/logs/sprites.trc";   // the profiler run's sprite trace (issue #18)
 const char kFileTracePath[] = "sdmc:/3ds/3ds-d2/logs/files.trc";  // ...and its file-read trace (issue #21)
+const char kFrameTracePath[] = "sdmc:/3ds/3ds-d2/logs/frames.trc";  // ...and its frame trace
 const char kSettings[] = "sdmc:/3ds/3ds-d2/settings.txt";   // the bottom screen's tab and map size, the profiler checklist
 
 FILE *g_log = nullptr;
@@ -1070,6 +1072,19 @@ void present(const rt::Frame &f)
     }
     g_timing.frames++;
     g_timing.total_frames++;
+    if (game::frame_trace_on()) {
+        rt::note_present();   // the stall column: how long since this present
+        game::FrameSample s;
+        s.host_us = t0;
+        s.tick_ms = rt::tick_ms();
+        rt::frame_thread_us(s.thread_us);
+        rt::frame_thread_ready_by(s.ready_by);
+        s.wait_us = rt::frame_thread_wait_top(s.wait_site, s.wait_owner, s.wait_from);
+        s.stalls = rt::take_stall(s.stall, 8);
+        game::sprite_decode_totals(s.decodes, s.decode_us);
+        s.skipped = g_frames_skipped;
+        game::frame_trace_frame(s);
+    }
 
     if (__atomic_load_n(&g_render_busy, __ATOMIC_ACQUIRE)) {
         g_frames_skipped++;   // the screen is still showing/drawing the last one
@@ -1137,6 +1152,31 @@ uint32_t g_last_focus = 0;           // the last focused edit box seen (auto-ope
 
 // ---- settings: the bottom screen's tab and map size -------------------------------------
 
+// The other guest threads' slice (rt::RunOptions::background_quantum), in
+// instructions; the frame thread keeps the scheduler's 300000. settings.txt's
+// "bgquantum=" overrides it for a measurement (0: one slice for all).
+constexpr uint32_t kBackgroundQuantum = 40000;
+uint32_t g_background_quantum = kBackgroundQuantum;
+// ...and its time (rt::RunOptions::background_slice_us): "bgslice=" (0: none).
+constexpr uint32_t kBackgroundSliceUs = 2000;
+uint32_t g_background_slice_us = kBackgroundSliceUs;
+// Storm's direct reads (game::install_storm_direct_reads): "stormdirect=0"
+// leaves them queued, as the game does.
+bool g_storm_direct = true;
+// The read thread's rate limit (game::set_storm_read_rate): "stormrate=" in
+// KiB/s, 0: the game's 256 KiB/s.
+uint32_t g_storm_rate_kib = 0;
+// The frame trace's stall column: a frame this long or longer is sampled
+// (rt::stall_probe). "stallms=" (a measurement's).
+uint32_t g_stall_ms = 150;
+// The dynarec's translation knobs (third_party/winx86 dyn86.c; read when a
+// block is translated, so set before the game runs): return-address
+// prediction (callret=), no flag archiving at a block that ends in a CALL
+// (nopend=1, no x86 callee reads its caller's flags), the budget check at a
+// block's tail (budgettail=), how far a block may bridge forward (forward=).
+// -1: the backend's default. A measurement's, from settings.txt.
+int g_dyn_callret = -1, g_dyn_nopend = -1, g_dyn_budgettail = -1, g_dyn_forward = -1;
+
 void load_settings()
 {
     FILE *f = std::fopen(kSettings, "r");
@@ -1160,6 +1200,25 @@ void load_settings()
             g_ss.set_profile_choice(game::profile_bits(line + 8));
         else if (std::strncmp(line, "tracewrites=", 12) == 0)   // ...and how its traces are written (issue #66)
             g_ss.set_trace_writes(game::trace_writes_from_name(line + 12));
+        else if (std::strncmp(line, "bgquantum=", 10) == 0)   // a measurement's, not written back
+            g_background_quantum = (uint32_t)std::strtoul(line + 10, nullptr, 10);
+        else if (std::strncmp(line, "bgslice=", 8) == 0)
+            g_background_slice_us = (uint32_t)std::strtoul(line + 8, nullptr, 10);
+        else if (std::strncmp(line, "callret=", 8) == 0)
+            g_dyn_callret = std::atoi(line + 8);
+        else if (std::strncmp(line, "nopend=", 7) == 0)
+            g_dyn_nopend = std::atoi(line + 7);
+        else if (std::strncmp(line, "budgettail=", 11) == 0)
+            g_dyn_budgettail = std::atoi(line + 11);
+        else if (std::strncmp(line, "forward=", 8) == 0)
+            g_dyn_forward = std::atoi(line + 8);
+        else if (std::strncmp(line, "stallms=", 8) == 0)
+            g_stall_ms = (uint32_t)std::strtoul(line + 8, nullptr, 10);
+        else if (std::strncmp(line, "stormrate=", 10) == 0)
+            g_storm_rate_kib = (uint32_t)std::strtoul(line + 10, nullptr, 10);
+        else if (std::strncmp(line, "stormdirect=", 12) == 0)
+            g_storm_direct = std::atoi(line + 12) != 0;
+
     }
     std::fclose(f);
     g_ss.take_settings_changed();
@@ -1427,6 +1486,15 @@ void poll()
             bool shot = false;
             pad = g_autoplay.step(rt::now_ms(), g_controls, shot, gs);
             g_shot_request |= shot;
+            // A profiler run from the script: started or stopped at the next
+            // heartbeat, as by its button.
+            std::string prof;
+            if (g_autoplay.take_profile(prof)) {
+                if (prof != "off")
+                    g_ss.set_profile_choice(game::profile_bits(prof.c_str()));
+                g_ss.set_profiling(prof != "off");
+                rt::logf("autoplay: profile %s", prof.c_str());
+            }
         }
     }
     // A newly focused text field (the hero name box, a game name) opens the keyboard.
@@ -1605,6 +1673,81 @@ void file_trace_stop()
     g_files_trace_buf = nullptr;
 }
 
+// The frame trace (game/frame_trace.h): a line per frame, from present().
+// ~25 lines of ~50 bytes a second: 1.2 KiB/s through the writer.
+FILE *g_frame_trace = nullptr;
+char *g_frame_trace_buf = nullptr;
+bool g_frames_traced = false;   // a second run this session appends
+
+// The frame trace's stall column (rt::stall_probe): a thread on the second
+// core looks every 20 ms whether the frame thread has gone 150 ms without a
+// present, and if so samples where it is; nothing on the game's core.
+Thread g_stall_thread = nullptr;
+volatile bool g_stall_stop = false;
+
+void stall_main(void *)
+{
+    while (!g_stall_stop) {
+        svcSleepThread(20000000);
+        rt::stall_probe((uint64_t)g_stall_ms * 1000);
+    }
+}
+
+void start_stall_watch()
+{
+    if (g_stall_thread)
+        return;
+    g_stall_stop = false;
+    s32 prio = 0x30;
+    svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+    g_stall_thread = threadCreate(stall_main, nullptr, 4 * 1024, prio - 3, g_render_core >= 0 ? g_render_core : 2, false);
+}
+
+void stop_stall_watch()
+{
+    if (!g_stall_thread)
+        return;
+    g_stall_stop = true;
+    threadJoin(g_stall_thread, U64_MAX);
+    threadFree(g_stall_thread);
+    g_stall_thread = nullptr;
+}
+
+bool frame_trace_file_start()
+{
+    constexpr size_t kBuffer = 16 * 1024;
+    g_frame_trace_buf = (char *)std::malloc(kBuffer);
+    g_frame_trace = g_frame_trace_buf ? (g_frames_traced ? open_at_end(kFrameTracePath, false)
+                                                         : std::fopen(kFrameTracePath, "w"))
+                                      : nullptr;
+    if (!g_frame_trace) {
+        std::free(g_frame_trace_buf);
+        g_frame_trace_buf = nullptr;
+        return false;
+    }
+    if (FILE *w = app::writer_wrap(g_frame_trace, g_frame_trace_buf, kBuffer, "frames.trc"))
+        g_frame_trace = w;
+    else
+        std::setvbuf(g_frame_trace, g_frame_trace_buf, _IOFBF, kBuffer);
+    g_frames_traced = true;
+    start_stall_watch();   // the trace's stall column
+    game::frame_trace_start(g_frame_trace);
+    game::note_game_state_again();
+    return true;
+}
+
+void frame_trace_file_stop()
+{
+    if (!g_frame_trace)
+        return;
+    game::frame_trace_stop();
+    stop_stall_watch();
+    std::fclose(g_frame_trace);
+    std::free(g_frame_trace_buf);
+    g_frame_trace = nullptr;
+    g_frame_trace_buf = nullptr;
+}
+
 // How game.log and the traces reach the SD card (issue #66: a crash in
 // game lost the last minutes of both), as the checklist's last row says:
 // the writer's mode (ctr_writer.h), and the traces' own records each at
@@ -1658,6 +1801,8 @@ void profiler_switch(uint32_t want)
     }
     if (stop & game::kProfFiles)
         file_trace_stop();
+    if (stop & game::kProfFrames)
+        frame_trace_file_stop();
     g_prof_on &= ~stop;
     uint32_t refused = 0;
     if ((start & game::kProfSprites) && !game::sprite_trace_start(kTracePath))
@@ -1670,6 +1815,8 @@ void profiler_switch(uint32_t want)
     }
     if ((start & game::kProfFiles) && !file_trace_start())
         refused |= game::kProfFiles;
+    if ((start & game::kProfFrames) && !frame_trace_file_start())
+        refused |= game::kProfFrames;
     if (start & game::kProfSdBench)
         sd_benchmark(g_bench_path);   // once, as the run starts
     if (refused)
@@ -1802,6 +1949,7 @@ int main()
     const std::string kept = report::keep_unclosed_session();
     std::remove(kTracePath);   // the last session's, if it closed (its report has its own copy)
     std::remove(kFileTracePath);
+    std::remove(kFrameTracePath);
     g_log_path = std::string(kLogDir) + "/game.log";
     g_log = open_log(false);
     std::freopen((std::string(kLogDir) + "/stderr.txt").c_str(), "w", stderr);
@@ -1902,6 +2050,12 @@ int main()
     opt.total_phys_mb = 64;   // the game's own 24 MiB sprite-cache floor
     opt.pool_spare = game::kCtrPoolSpare;
     opt.pool_large = game::kCtrPoolLarge;
+    opt.background_quantum = g_background_quantum;
+    rt::set_dynarec_knobs(g_dyn_callret, g_dyn_nopend, g_dyn_budgettail, g_dyn_forward);
+    opt.background_slice_us = g_background_slice_us;
+    if (g_background_quantum != kBackgroundQuantum || g_background_slice_us != kBackgroundSliceUs)
+        status("background threads' slice: %u instructions, %u us (settings.txt)", (unsigned)g_background_quantum,
+               (unsigned)g_background_slice_us);
     // Cheaper video defaults than a PC's (the game's Options menu still
     // changes them): 640x480 in game (36% fewer pixels to draw, and exactly
     // 2:1 down to the 240-line screen), low lighting, no blended shadows, no
@@ -1929,6 +2083,16 @@ int main()
         hitch_heartbeat(w);   // before the sprite cache line, the window's last (tools/session_report.py)
         const game::SpriteCacheStats sc = game::sprite_cache_stats(*g_guest_cpu);
         char line[208], frames[192];
+        static uint32_t storm_mark[2] = {};
+        uint32_t storm[2];
+        game::storm_direct_counts(storm[0], storm[1]);
+        if (storm[0] != storm_mark[0] || storm[1] != storm_mark[1]) {
+            std::snprintf(line, sizeof line, "[rt] storm reads: %u read by their caller, %u queued (the read thread reading)",
+                          (unsigned)(storm[0] - storm_mark[0]), (unsigned)(storm[1] - storm_mark[1]));
+            logline_held(line);
+            storm_mark[0] = storm[0];
+            storm_mark[1] = storm[1];
+        }
         if (game::sprite_frames_line(frames, sizeof frames)) {
             std::snprintf(line, sizeof line, "[rt] %s", frames);
             logline_held(line);
@@ -2002,6 +2166,10 @@ int main()
         game::install_sprite_decode_timer(c);
         game::install_sprite_trace(c);
         game::install_storm_read_priority(c);
+        if (g_storm_direct)
+            game::install_storm_direct_reads(c);
+        if (g_storm_rate_kib)
+            game::set_storm_read_rate(c, g_storm_rate_kib << 10);
         game::install_fatal_exit(c);
         game::install_pool_release(c);
         game::set_pool_block_size(c, game::kCtrPoolBlock);

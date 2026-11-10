@@ -47,6 +47,10 @@ struct SpriteCacheWindow {
     uint32_t decodes, decode_ms;
 };
 SpriteCacheWindow sprite_cache_window(d2rt::Cpu &c);
+// The sprites the frame thread decoded since the start, and the time it
+// took (us), for the frame trace (the heartbeat's window counts every
+// thread's).
+void sprite_decode_totals(uint32_t &decodes, uint64_t &us);
 // The sprites the cache has taken since the start (wrapping).
 uint32_t sprite_cache_taken();
 

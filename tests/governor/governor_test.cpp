@@ -115,17 +115,25 @@ int main()
         h.step(beat(kGame, 12 * MiB, 3, kReserve - 300 * KiB), kReserve, kMin);
         CHECK(h.step(beat(kGame, 12 * MiB, 3, kReserve - 300 * KiB), kReserve, kMin) == 11 * MiB + 512 * KiB);
     }
-    {   // A request served from the spare: the minimum at once, working set or not.
+    {   // A request served from the spare: at once, down by the pool's shortfall
+        // and a step, from what the cache holds; the minimum at the least.
         SpriteGovernor g = started();
         g.step(beat(kGame, 12 * MiB, 0, 11 * MiB), kReserve, kMin);
-        CHECK(g.step(beat(kGame, 12 * MiB, 3, 4 * MiB, true), kReserve, kMin) == kMin);
+        CHECK(g.step(beat(kGame, 12 * MiB, 3, 4 * MiB, true), kReserve, kMin) == 9 * MiB + 768 * KiB);
+        // 3DS-D2-18's mob: 13.5 MiB held, 1 MiB free. Not the minimum (it let
+        // go of the sprites on screen and decoded them again for 30 s).
+        SpriteGovernor h = started();
+        CHECK(h.step(beat(kGame, 13 * MiB + 512 * KiB, 3, 1 * MiB, true), kReserve, kMin) == 8 * MiB + 256 * KiB);
+        // Little held: the minimum.
+        SpriteGovernor m = started();
+        CHECK(m.step(beat(kGame, 5 * MiB, 3, 1 * MiB, true), kReserve, kMin) == kMin);
     }
     {   // Up by half of what the pool has over the reserve, in steps: back to the
         // working set in a few heartbeats, not 32. (One step per beat held the
         // cache at 4 MiB against a 12 MiB working set in the Halls of the Dead,
         // 2026-11-07.)
         SpriteGovernor g = started();
-        g.step(beat(kGame, 12 * MiB, 3, 4 * MiB, true), kReserve, kMin);
+        g.step(beat(kGame, 5 * MiB, 3, 4 * MiB, true), kReserve, kMin);   // to the minimum
         // 12 MiB free, 6 over the reserve: 3 MiB up.
         CHECK(g.step(beat(kMin, 12 * MiB, 3, 12 * MiB), kReserve, kMin) == 7 * MiB);
         // 7.3 MiB free: half of 1.3 MiB is 640 KiB, 512 in steps.
@@ -134,7 +142,7 @@ int main()
         CHECK(g.step(beat(7 * MiB + 512 * KiB, 7 * MiB + 512 * KiB, 3, 30 * MiB), kReserve, kMin) == kGame);
         // A cache filling each raise leaves the pool above the reserve.
         SpriteGovernor h = started();
-        h.step(beat(kGame, 12 * MiB, 3, 4 * MiB, true), kReserve, kMin);
+        h.step(beat(kGame, 5 * MiB, 3, 4 * MiB, true), kReserve, kMin);   // to the minimum
         uint32_t limit = kMin, free = 14 * MiB;
         for (int i = 0; i < 10; i++) {
             const uint32_t want = h.step(beat(limit, limit, 3, free), kReserve, kMin);
@@ -147,7 +155,7 @@ int main()
     {   // The spare still holding a request after the beat that saw it taken
         // holds nothing: with the pool free, the cache goes back up.
         SpriteGovernor g = started();
-        CHECK(g.step(beat(kGame, 12 * MiB, 3, 5 * MiB, true), kReserve, kMin) == kMin);
+        CHECK(g.step(beat(kGame, 5 * MiB, 3, 5 * MiB, true), kReserve, kMin) == kMin);
         CHECK(g.step(beat(kMin, 12 * MiB, 3, 12 * MiB), kReserve, kMin) > kMin);
     }
     {   // The game re-creating its cache (a limit step() did not set): a new start.

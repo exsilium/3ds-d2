@@ -31,8 +31,14 @@
 //   #31): in the next, 10 of 46 MiB were evictions decoded again. The
 //   bound wants judging again on a version 3 trace;
 // - a request served from the pool's spare means no other piece of the pool
-//   was left: the minimum at once, on the heartbeat that sees the new take.
-//   Only then: what stays in the spare afterwards says nothing of the pool.
+//   was left: at once, on the heartbeat that sees the new take, down by what
+//   the pool is short of the reserve and a step more (the spare's), from
+//   what the cache holds, so the least recently used sprites go. Only then:
+//   what stays in the spare afterwards says nothing of the pool. Down to the
+//   minimum instead (as before issue #80), a mob arriving in Act II cut a
+//   13.4 MiB working set to 4 MiB: 887 sprites let go of, and 426, 227 and
+//   104 decoded again in the next three windows, frames of 1-2 s on the
+//   game's thread (3DS-D2-18).
 //   Held at the minimum for as long as the spare held anything, the cache
 //   stayed at 4 MiB with 12 MiB of the pool free, against a 12 MiB working
 //   set in the Halls of the Dead, and re-decoded 550 sprites per 10 s: the

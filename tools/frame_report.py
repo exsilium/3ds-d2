@@ -24,7 +24,7 @@ import statistics
 import sys
 
 FIELDS = ["t", "gap", "tick", "run", "ready", "host", "sleep", "wait", "io", "dec", "dec_us", "skip", "who",
-          "cs", "ev", "wsite", "wown", "wus", "wfrom", "sl", "stall"]
+          "cs", "ev", "wsite", "wown", "wus", "wfrom", "stall"]
 TEXT = ("wfrom", "stall")   # the fields that are not numbers
 V2 = 13   # version 2: up to "who"; version 1 one fewer
 
@@ -47,8 +47,8 @@ def read(path, all_frames):
             parts.append("-1")
         if len(parts) == V2:       # version 2: no wait split
             parts += ["0", "0", "0", "0", "0"]
-        if len(parts) in (V2 + 5, V2 + 6):   # version 3: no wfrom, sl or shim
-            parts += ["-"] * (V2 + 6 - len(parts)) + ["0", "-"]
+        if len(parts) in (V2 + 5, V2 + 6):   # version 3: no wfrom or stall
+            parts += ["-"] * (V2 + 7 - len(parts))
         if len(parts) != len(FIELDS):
             continue
         parts[FIELDS.index("wsite")] = str(int(parts[FIELDS.index("wsite")], 16))
@@ -133,13 +133,28 @@ def report(frames, slow_ms, out=sys.stdout, entries=None):
     # Each frame past 250 ms: a stall the player sees as a freeze.
     long = [f for f in frames if f["gap"] > 250000]
     if long:
-        print(f"frames past 250 ms ({len(long)}): t s, gap ms (run, wait, io ms), slices, stall (eip/stack), wait site", file=out)
+        print(f"frames past 250 ms ({len(long)}): t s, gap ms (run, wait, io ms), stall samples (eip/return), wait site", file=out)
         for f in long[:20]:
             print(f"  {f['t'] / 1000:.1f}: {f['gap'] / 1000:.0f} ({f['run'] / 1000:.0f}, {f['wait'] / 1000:.0f}, "
-                  f"{f['io'] / 1000:.0f}) {f['sl']} {f['stall']} {f['wsite']:08x}" if f["wsite"] else
+                  f"{f['io'] / 1000:.0f}) {f['stall']} {f['wsite']:08x}" if f["wsite"] else
                   f"  {f['t'] / 1000:.1f}: {f['gap'] / 1000:.0f} ({f['run'] / 1000:.0f}, {f['wait'] / 1000:.0f}, "
-                  f"{f['io'] / 1000:.0f}) {f['sl']} {f['stall']}", file=out)
+                  f"{f['io'] / 1000:.0f}) {f['stall']}", file=out)
     return r
+
+
+def timeline(frames, out=sys.stdout, window_s=10):
+    """A line per window: frames, those past 50 and 100 ms, the longest, and
+    the frame thread's ms waiting for reads (io), locks and events (wait), and
+    ready while another thread ran."""
+    print(f"timeline ({window_s} s windows): frames, past 50/100 ms, longest ms, io/wait/ready ms, sprites decoded", file=out)
+    wins = {}
+    for f in frames:
+        wins.setdefault(f["t"] // (window_s * 1000), []).append(f)
+    for w in sorted(wins):
+        fs = wins[w]
+        print(f"  {w * window_s:4d} s: {len(fs):3d}, {sum(f['gap'] > 50000 for f in fs):3d}/{sum(f['gap'] > 100000 for f in fs):2d}, "
+              f"{max(f['gap'] for f in fs) / 1000:6.0f}, {sum(f['io'] for f in fs) / 1000:5.0f}/{sum(f['wait'] for f in fs) / 1000:5.0f}/"
+              f"{sum(f['ready'] for f in fs) / 1000:4.0f}, {sum(f['dec'] for f in fs)}", file=out)
 
 
 def main():
@@ -150,6 +165,7 @@ def main():
     ap.add_argument("--to", dest="t1", type=float, default=1e12)
     ap.add_argument("--slow", type=float, default=50)
     ap.add_argument("--csv", help="write the frames kept to this CSV")
+    ap.add_argument("--timeline", action="store_true", help="a line per 10 s window: frames, the slow ones, and what the frame thread waited for")
     a = ap.parse_args()
     frames, entries = read(a.trace, a.all)
     frames = [f for f in frames if a.t0 * 1000 <= f["t"] <= a.t1 * 1000]
@@ -159,6 +175,8 @@ def main():
             for f in frames:
                 o.write(",".join(str(f[k]) for k in FIELDS) + "\n")
     report(frames, a.slow, entries=entries)
+    if a.timeline:
+        timeline(frames)
 
 
 if __name__ == "__main__":

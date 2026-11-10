@@ -172,7 +172,7 @@ Walking around a town felt jumpy, and the 10 s frame rate did not show it: most 
 - its sprite decodes;
 - for its longest wait: the game code it waited from, the thread that held the lock, and the return addresses on its EBP chain;
 - the frame thread's scheduler slices: a slice is a few ms of guest code, so a long frame with many slices ran the game's own code long, and one with few was held in a host call;
-- a stall: when a single slice of the frame thread runs 150 ms or more (`stallms=` in settings.txt), a watcher thread on the second core takes its EIP and the top of its stack. In a shim or a native, the trace names it (`KERNEL32.dll!ReadFile`) and the next value is the game's call site. The watcher looks every 20 ms and costs the game's core nothing.
+- a stall: in a frame that has gone 150 ms without a present (`stallms=` in settings.txt), a watcher thread on the second core samples the frame thread every 20 ms, up to 8 times. It tells the thread to stop at its next block (the dynarec writes EIP back only at exits and traps) and keeps where it stopped: its EIP and the dword on top of its stack, the call's return after a host call. It costs the game's core nothing in a normal frame.
 
 The trace is buffered and written by the log writer thread, so it does not make frames uneven itself. `python3 tools/frame_report.py frames.trc` counts the frames in game with no panel open and gives:
 - the gap percentiles and the share past 50, 60 and 100 ms;
@@ -233,6 +233,18 @@ What the slow frames left in Azahar did instead, roughly a third each:
   - They often fall in the same window as a slow SD write by the log writer: 600–1,400 ms writes of `frames.trc` and `game.log`, about every other heartbeat, likely as the files grow by a cluster.
   - But they last 640 ms whatever the write's length, and some come with no slow write.
   - The stall column above was added to name them on the next console run.
+
+**Loading: the game's file calls (Azahar, `tests/m4/scripts/act-load.txt`).** The Act I save goes to Warriv and on to Lut Gholein with the frame trace on (`--save BeforeCh1End --script tests/m4/scripts/act-load.txt --seconds 300`, then `tools/frame_report.py --all --timeline`). The act change's longest frame was 4.3 s. The stall samples put it after `GetFileAttributesA`, `CreateDirectoryA`, `CreateFileA` and `ReadFile`: the game's save at the act change.
+- Every lookup is a stat on the card, 30–90 ms each in Azahar. The game repeats the same ones: its save folder's three levels at each save (9 times in this run), a file in the write root and then the data root before each open, the MPQs' names. It also reads its settings one key a call (`GetPrivateProfileIntA`), each a read of the whole INI file.
+- File calls past 2 ms took **13.4 s** of the run: `GetFileAttributesA` 4.3 s, `CreateFileA` 3.8 s, `GetPrivateProfileIntA` 1.7 s, `CreateDirectoryA` 1.2 s.
+- The file shims now keep:
+  - each host path's stat ("absent" included);
+  - each directory's listing (`FindFirstFileA`);
+  - each INI file parsed.
+
+  The game's files change only through these shims, and each change forgets the path, its directory's listing and the INI files (`touched`). A rename forgets everything.
+- After: file calls past 2 ms took **2.9 s** (`GetFileAttributesA` 0.57 s, `CreateFileA` 1.07 s, `GetPrivateProfileIntA` 0.03 s). The act change's longest frame is **2.4 s**, and the arrival's worst 10 s window went from 1,018 ms to about 200 ms at its longest. What is left is mostly each path's first lookup and the save's own writes and reads.
+- A file call of 20 ms or more is logged (`slow file call: CreateFileA("...") 48 ms`).
 
 ## Blood Moor: VirtualAlloc ran out (2026-10-18)
 

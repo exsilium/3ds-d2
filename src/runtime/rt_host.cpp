@@ -14,7 +14,6 @@
 #include "runtime/host_clock.h"
 #include "runtime/prof.h"
 #include "runtime/sched_cooperative.h"
-#include "runtime/trapcnt.h"
 #include "runtime/win32_shims_advapi32.h"
 #include "runtime/win32_shims_gdi32.h"
 #include "runtime/win32_shims_kernel32.h"
@@ -708,7 +707,6 @@ uint64_t g_frame_at = 0;
 // the frame trace: who kept it from its frame.
 uint64_t g_ready_by[16] = {};
 uint64_t g_slice_start_us = 0;   // the running slice's start (real clock)
-uint32_t g_frame_slices = 0;     // the frame thread's slices since the start (frame_thread_slices)
 int g_slice_tid = -1;          // the guest thread whose slice runs, -1 between slices
 bool g_slice_sink = false;     // the scheduler reports its slices
 bool g_host_work = false;      // the heartbeat or the app's service runs
@@ -835,17 +833,20 @@ void sample_frame_thread()
 }
 
 // The scheduler's slice sink (its thread).
+void stall_capture(uint32_t tid);
+
 void on_slice(uint32_t tid, bool start)
 {
     const uint64_t us = charge_frame_thread();
+    if (!start)
+        stall_capture(tid);
     if (start)
         g_slice_start_us = us;
     if (start && g_opt.real_clock)
         raise_tick(us / 1000 - g_t0_ms);   // now_ms's value, from the clock read just made
     g_slice_sink = true;
     g_slice_tid = start ? (int)tid : -1;
-    if (start && (int)tid == g_stats.frame_thread)
-        g_frame_slices++;
+
     g_frame_was = frame_thread_doing();
 }
 
@@ -1222,50 +1223,59 @@ void frame_thread_us(uint64_t out[kFrameThreadKinds])
 }
 
 namespace {
-// stall_probe's capture: the frame thread's registers in a slice past its
-// limit, once a slice. Written by the watching thread, taken by the trace.
-std::atomic<bool> g_stall_set{false};
-uint32_t g_stall[4] = {};          // eip, then the first three dwords on the stack
-uint64_t g_stall_slice = 0;        // the slice it was taken in (its start)
+// stall_probe's samples of a long frame: the watching thread nudges the
+// frame thread to stop at its next block; the slice's end (on_slice) takes
+// where it stopped, the context saved. Up to kStallSamples a frame.
+constexpr int kStallSamples = 8;
+std::atomic<bool> g_stall_pending{false};
+std::atomic<uint64_t> g_present_us{0};   // the frame thread's last present (note_present)
+uint32_t g_stall[kStallSamples][2] = {};  // eip, the dword on top of the stack
+std::atomic<int> g_stall_n{0};
 }  // namespace
+
+void note_present() { g_present_us.store(wx86_now_us(), std::memory_order_release); }
 
 void stall_probe(uint64_t min_us)
 {
     const int frame = g_stats.frame_thread;
-    if (frame < 0 || g_slice_tid != frame || g_stall_set.load(std::memory_order_acquire))
-        return;
-    const uint64_t start = g_slice_start_us;
-    if (start == g_stall_slice || wx86_now_us() - start < min_us)
+    const uint64_t present = g_present_us.load(std::memory_order_acquire);
+    if (frame < 0 || !present || g_slice_tid != frame || g_stall_pending.load(std::memory_order_acquire) ||
+        g_stall_n.load(std::memory_order_acquire) >= kStallSamples || wx86_now_us() - present < min_us)
         return;
     Cpu *c = g_tick_cpu.load(std::memory_order_acquire);
     if (!c)
         return;
-    const uint32_t esp = c->reg(R_ESP);
-    g_stall[0] = c->reg(R_EIP);
-    for (int i = 0; i < 3; i++)
-        g_stall[i + 1] = c->read_u32(esp + 4 * i);
-    g_stall_slice = start;
-    g_stall_set.store(true, std::memory_order_release);
+    g_stall_pending.store(true, std::memory_order_release);
+    c->nudge_thread_budget(nullptr);   // stops at the next block: where it is, not the last trap
 }
 
-const char *trap_name(uint32_t va)
+namespace {
+// on_slice, at a slice's end: the nudged slice's EIP and top of stack.
+void stall_capture(uint32_t tid)
 {
-    const uint32_t base = trapcnt::base;
-    if (!g_br || !base || va < base || (va - base) % 16)
-        return nullptr;
-    return g_br->slot_tag((va - base) / 16);
+    if (!g_stall_pending.load(std::memory_order_acquire) || (int)tid != g_stats.frame_thread)
+        return;
+    GuestThread *t = g_sched ? g_sched->thread_by_id(tid) : nullptr;
+    Cpu *c = g_tick_cpu.load(std::memory_order_acquire);
+    const int n = g_stall_n.load(std::memory_order_acquire);
+    if (t && c && n < kStallSamples) {
+        g_stall[n][0] = t->ctx.eip;
+        g_stall[n][1] = c->read_u32(t->ctx.gpr[R_ESP]);
+        g_stall_n.store(n + 1, std::memory_order_release);
+    }
+    g_stall_pending.store(false, std::memory_order_release);
 }
+}  // namespace
 
-bool take_stall(uint32_t out[4])
+int take_stall(uint32_t out[][2], int max)
 {
-    if (!g_stall_set.load(std::memory_order_acquire))
-        return false;
-    std::memcpy(out, g_stall, sizeof g_stall);
-    g_stall_set.store(false, std::memory_order_release);
-    return true;
+    const int n = std::min(g_stall_n.load(std::memory_order_acquire), max);
+    std::memcpy(out, g_stall, sizeof g_stall[0] * (size_t)n);
+    g_stall_n.store(0, std::memory_order_release);
+    return n;
 }
 
-uint32_t frame_thread_slices() { return g_frame_slices; }
+
 
 int current_thread_id() { return g_sched ? (int)g_sched->current_id() : -1; }
 

@@ -29,6 +29,7 @@
 #include "game/d2_memory.h"
 #include "game/d2_native.h"
 #include "game/d2_state.h"
+#include "game/draw_census.h"
 #include "game/frame_trace.h"
 #include "game/game_exe.h"
 #include "game/osk.h"
@@ -987,6 +988,38 @@ void stop_sampler()
     g_sampler = nullptr;
 }
 
+// The floor queue's worker (issue #80, game::set_floor_worker): the floor
+// tiles a frame queues, drawn on the second core beside the game's thread,
+// at the I/O worker's priority. "floorqueue=" in settings.txt: 1 on, 0 off.
+int g_floor_queue = 0;
+LightEvent g_floor_event;
+Thread g_floor_thread = nullptr;
+void (*g_floor_worker)() = nullptr;
+
+void floor_main(void *) { g_floor_worker(); }
+
+bool start_floor_thread(void (*worker)())
+{
+    if (g_render_core < 0)
+        return false;
+    g_floor_worker = worker;
+    LightEvent_Init(&g_floor_event, RESET_ONESHOT);
+    s32 prio = 0x30;
+    svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+    g_floor_thread = threadCreate(floor_main, nullptr, 16 * 1024, prio - 1, g_render_core, false);
+    return g_floor_thread != nullptr;
+}
+
+void join_floor_thread()
+{
+    if (!g_floor_thread)
+        return;
+    game::stop_floor_worker();
+    threadJoin(g_floor_thread, U64_MAX);
+    threadFree(g_floor_thread);
+    g_floor_thread = nullptr;
+}
+
 // Asynchronous file reads (RunOptions::io_start): the runtime's I/O worker on
 // the second core, above the drawing, so a finished SD read reaches the
 // waiting guest thread at once. It sleeps on an event between requests.
@@ -1070,7 +1103,8 @@ void present(const rt::Frame &f)
         game::automap_frame(f.pixels, f.width, f.height, f.stride);
         game::set_automap_capture(g_ss.wants_automap(), g_ss.map_ms(), g_ss.map_scale());
     }
-    g_timing.frames++;
+    const uint64_t t_automap = host_us();
+    uint64_t t_copy = t_automap, t_bottom = t_automap;    g_timing.frames++;
     g_timing.total_frames++;
     if (game::frame_trace_on()) {
         rt::note_present();   // the stall column: how long since this present
@@ -1086,6 +1120,8 @@ void present(const rt::Frame &f)
         game::frame_trace_frame(s);
     }
 
+    const uint64_t t_trace = host_us();   // the frame trace's sample: not present's own work
+    t_copy = t_bottom = t_trace;
     if (__atomic_load_n(&g_render_busy, __ATOMIC_ACQUIRE)) {
         g_frames_skipped++;   // the screen is still showing/drawing the last one
     } else if (f.yuv[0]) {
@@ -1125,12 +1161,14 @@ void present(const rt::Frame &f)
         for (uint32_t y = 0; y < f.height; y++)
             std::memcpy(&st.pixels[(size_t)y * f.width], f.pixels + (ptrdiff_t)y * f.stride, f.width);
         std::memcpy(st.palette, f.palette, sizeof st.palette);
+        t_copy = host_us();
         st.zoom = g_zoom;
         st.cursor_x = g_controls.cursor_x();
         st.cursor_y = g_controls.cursor_y();
         st.shot = take_shot_request();
         second_screen_active();
         st.bottom_draw = g_ss.stage(st.bottom, rt::now_ms());
+        t_bottom = host_us();
         if (st.bottom.kind == game::BottomView::kKeyboard)
             g_osk.clear_dirty();
         if (g_render_thread) {
@@ -1143,6 +1181,11 @@ void present(const rt::Frame &f)
         }
     }
     update_stats();
+    if (game::draw_phases_on() && !f.yuv[0]) {
+        const uint64_t t_end = host_us();
+        game::draw_phases_present(t_automap - t0, t_copy - t_trace, t_bottom > t_copy ? t_bottom - t_copy : 0,
+                                  t_end - t0 - (t_trace - t_automap));
+    }
 }
 
 // ---- on-screen keyboard (drawn by the second screen) ------------------------------
@@ -1218,6 +1261,10 @@ void load_settings()
             g_storm_rate_kib = (uint32_t)std::strtoul(line + 10, nullptr, 10);
         else if (std::strncmp(line, "stormdirect=", 12) == 0)
             g_storm_direct = std::atoi(line + 12) != 0;
+        else if (std::strncmp(line, "floorqueue=", 11) == 0)   // issue #80
+            g_floor_queue = std::atoi(line + 11);
+        else if (std::strncmp(line, "drawphases=", 11) == 0)   // the draw natives timed (issue #80)
+            game::draw_phases_set(std::atoi(line + 11) != 0);
 
     }
     std::fclose(f);
@@ -2174,6 +2221,12 @@ int main()
         game::install_pool_release(c);
         game::set_pool_block_size(c, game::kCtrPoolBlock);
         game::install_sprite_frames(c);
+        game::set_floor_queue(g_floor_queue);
+        game::FloorWorker fw;
+        fw.start = start_floor_thread;
+        fw.wait = [] { LightEvent_Wait(&g_floor_event); };
+        fw.wake = [] { LightEvent_Signal(&g_floor_event); };
+        game::set_floor_worker(fw);
         game::install_d2_native(c);
         game::install_cinematics(c);
         game::install_automap_capture(c);   // the bottom screen's MAP tab
@@ -2220,6 +2273,7 @@ int main()
     aptHook(&g_apt_cookie, apt_hook, nullptr);
     rt::RunResult r = rt::run_exe(std::move(exe), opt);
     join_io_thread();
+    join_floor_thread();
     if (g_prof_on)
         profiler_switch(0);   // a run still on: its traces closed, in time for the report
     aptUnhook(&g_apt_cookie);

@@ -420,6 +420,10 @@ bool hook_function(d2rt::Cpu &c, uint32_t va, const uint8_t *expect, uint32_t n,
 // and returns its guest address (0 on failure). hook_function is this plus
 // a jmp over a guest function.
 uint32_t native_entry(const char *name, uint32_t stack_args, std::function<uint32_t(d2rt::Cpu &)> fn);
+// Called at each of the game's frames (its StretchBlt or BitBlt of an 8-bit
+// DIB), before the frame is presented: the DIB's guest address and size in
+// bytes. For the draw census (game/draw_census.h, issue #80); null: none.
+void set_blit_hook(void (*hook)(uint32_t bits, uint32_t bytes));
 
 void install_kernel32(d2rt::Bridge &br);
 // The lock calls (EnterCriticalSection, LeaveCriticalSection) since the

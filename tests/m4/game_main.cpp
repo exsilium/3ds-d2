@@ -152,6 +152,13 @@ private:
     bool created_ = false;
 };
 
+// The floor queue's worker (issue #80, D2_FLOOR_QUEUE=1): a thread of its
+// own, woken as the console's is (a one-shot event).
+static std::mutex g_floor_m;
+static std::condition_variable g_floor_cv;
+static bool g_floor_signal = false;
+static std::thread g_floor_thread;
+
 int main(int argc, char **argv)
 {
     if (argc < 4) {
@@ -185,6 +192,26 @@ int main(int argc, char **argv)
     if (const char *mb = std::getenv("M4_PHYS_MB"))   // override the RAM the game is told about
         opt.total_phys_mb = (uint32_t)std::atoi(mb);
     opt.virtual_tick_us = 250;   // used only under M4_VIRTUAL_CLOCK
+    {
+        game::FloorWorker w;
+        w.start = [](void (*worker)()) {
+            g_floor_thread = std::thread(worker);
+            return true;
+        };
+        w.wait = [] {
+            std::unique_lock<std::mutex> l(g_floor_m);
+            g_floor_cv.wait(l, [] { return g_floor_signal; });
+            g_floor_signal = false;
+        };
+        w.wake = [] {
+            {
+                std::lock_guard<std::mutex> l(g_floor_m);
+                g_floor_signal = true;
+            }
+            g_floor_cv.notify_one();
+        };
+        game::set_floor_worker(w);
+    }
     // Native drawing routines, as in the 3DS app; M4_NATIVE=0 runs the
     // translated originals (the A/B for byte-exactness and speed).
     // M4_NATIVE=late installs them on arrival in the game world instead: the
@@ -582,6 +609,9 @@ int main(int argc, char **argv)
     });
 #endif
     rt::RunResult r = rt::run_exe(std::move(exe), opt);
+    game::stop_floor_worker();
+    if (g_floor_thread.joinable())
+        g_floor_thread.join();
     game::sprite_trace_stop();
     if (io_thread.joinable())
         io_thread.join();

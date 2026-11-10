@@ -58,6 +58,11 @@ extern uint64_t dyn86_ctr_cache_sync_ticks __attribute__((weak));
 
 using namespace d2rt;
 
+// The dynarec's translation knobs (third_party/winx86 src/dynarec86/dyn86.c).
+extern "C" {
+extern int box86_dynarec_callret, dyn86_nopend, box86_dynarec_budgettail, box86_dynarec_forward;
+}
+
 namespace rt {
 namespace {
 
@@ -1277,6 +1282,18 @@ int take_stall(uint32_t out[][2], int max)
 
 
 
+void set_dynarec_knobs(int callret, int nopend, int budgettail, int forward)
+{
+    if (callret >= 0)
+        box86_dynarec_callret = callret;
+    if (nopend >= 0)
+        dyn86_nopend = nopend;
+    if (budgettail >= 0)
+        box86_dynarec_budgettail = budgettail;
+    if (forward >= 0)
+        box86_dynarec_forward = forward;
+}
+
 int current_thread_id() { return g_sched ? (int)g_sched->current_id() : -1; }
 
 bool on_frame_thread()
@@ -1617,6 +1634,8 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
         for (int i = 0; i < 1000; i++)
             (void)wx86_now_us();
         logf("clock: a host clock read costs %llu ns", (unsigned long long)(wx86_now_us() - t0));
+        logf("dynarec: callret %d, nopend %d, budgettail %d, forward %d", box86_dynarec_callret, dyn86_nopend,
+             box86_dynarec_budgettail, box86_dynarec_forward);
     }
     // The hottest other imports go through the bridge without leaving the
     // dynarec loop (WinVita's in-line shim path): same shim, no trap. Under

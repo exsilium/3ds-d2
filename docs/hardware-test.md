@@ -246,6 +246,18 @@ What the slow frames left in Azahar did instead, roughly a third each:
 - After: file calls past 2 ms took **2.9 s** (`GetFileAttributesA` 0.57 s, `CreateFileA` 1.07 s, `GetPrivateProfileIntA` 0.03 s). The act change's longest frame is **2.4 s**, and the arrival's worst 10 s window went from 1,018 ms to about 200 ms at its longest. What is left is mostly each path's first lookup and the save's own writes and reads.
 - A file call of 20 ms or more is logged (`slow file call: CreateFileA("...") 48 ms`).
 
+**The console with the file caches (3DS-D2-17, build `e7386f3e01c1`):** Lut Gholein, Rocky Waste and back, 253 s. The player felt the area change and the small mobs much smoother, and the return to town held 25 fps.
+
+| Part | Frames past 50 ms per 10 s window |
+| --- | --- |
+| Arriving in Lut Gholein (0–40 s) | 10–25% |
+| Rocky Waste (90–125 s) | up to 46%, one frame of 515 ms |
+| Back in town (130–240 s) | 1–6%, nothing past 100 ms |
+
+On the whole run, 7.7% of frames went past 50 ms.
+- The median frame is 38.9 ms of the frame thread's own work: there is no slack in a 40 ms frame, so any read or load in one makes it late.
+- In the #70 session's guest profile (an older build, same town), the frame thread ran 9.3 s of 10, of which 2.5 s in shims and natives; the other ~6.8 s is translated game code. A stable 25 fps needs that time down.
+
 ## Blood Moor: VirtualAlloc ran out (2026-10-18)
 
 After about four and a half minutes, three of them in Blood Moor, the console logged `va full: want 512 KiB, live 44416 KiB, largest free 384 KiB`. The 44 MiB VirtualAlloc range was full, while the heap range held 8.2 MiB of its 17 (peak 9.7). The game kept going after the failed allocation, the sound looped, and translated code then faulted on a wild guest pointer (data abort, far = membase + 0x357db9e8, outside the 75 MiB arena).

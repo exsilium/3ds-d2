@@ -178,6 +178,10 @@ int main(int argc, char **argv)
         opt.pool_large_min = (uint32_t)std::atoi(kb) << 10;
     if (const char *q = std::getenv("M4_BG_QUANTUM"))   // the other threads' slice (0: the frame thread's)
         opt.background_quantum = (uint32_t)std::atoi(q);
+    {   // The dynarec's knobs, as the console's settings.txt sets them (M4_CALLRET, M4_NOPEND, M4_BUDGETTAIL, M4_FORWARD).
+        auto knob = [](const char *n) { const char *v = std::getenv(n); return v ? std::atoi(v) : -1; };
+        rt::set_dynarec_knobs(knob("M4_CALLRET"), knob("M4_NOPEND"), knob("M4_BUDGETTAIL"), knob("M4_FORWARD"));
+    }
     if (const char *mb = std::getenv("M4_PHYS_MB"))   // override the RAM the game is told about
         opt.total_phys_mb = (uint32_t)std::atoi(mb);
     opt.virtual_tick_us = 250;   // used only under M4_VIRTUAL_CLOCK

@@ -1168,6 +1168,13 @@ uint32_t g_storm_rate_kib = 0;
 // The frame trace's stall column: a frame this long or longer is sampled
 // (rt::stall_probe). "stallms=" (a measurement's).
 uint32_t g_stall_ms = 150;
+// The dynarec's translation knobs (third_party/winx86 dyn86.c; read when a
+// block is translated, so set before the game runs): return-address
+// prediction (callret=), no flag archiving at a block that ends in a CALL
+// (nopend=1, no x86 callee reads its caller's flags), the budget check at a
+// block's tail (budgettail=), how far a block may bridge forward (forward=).
+// -1: the backend's default. A measurement's, from settings.txt.
+int g_dyn_callret = -1, g_dyn_nopend = -1, g_dyn_budgettail = -1, g_dyn_forward = -1;
 
 void load_settings()
 {
@@ -1196,6 +1203,14 @@ void load_settings()
             g_background_quantum = (uint32_t)std::strtoul(line + 10, nullptr, 10);
         else if (std::strncmp(line, "bgslice=", 8) == 0)
             g_background_slice_us = (uint32_t)std::strtoul(line + 8, nullptr, 10);
+        else if (std::strncmp(line, "callret=", 8) == 0)
+            g_dyn_callret = std::atoi(line + 8);
+        else if (std::strncmp(line, "nopend=", 7) == 0)
+            g_dyn_nopend = std::atoi(line + 7);
+        else if (std::strncmp(line, "budgettail=", 11) == 0)
+            g_dyn_budgettail = std::atoi(line + 11);
+        else if (std::strncmp(line, "forward=", 8) == 0)
+            g_dyn_forward = std::atoi(line + 8);
         else if (std::strncmp(line, "stallms=", 8) == 0)
             g_stall_ms = (uint32_t)std::strtoul(line + 8, nullptr, 10);
         else if (std::strncmp(line, "stormrate=", 10) == 0)
@@ -2014,6 +2029,7 @@ int main()
     opt.pool_spare = game::kCtrPoolSpare;
     opt.pool_large = game::kCtrPoolLarge;
     opt.background_quantum = g_background_quantum;
+    rt::set_dynarec_knobs(g_dyn_callret, g_dyn_nopend, g_dyn_budgettail, g_dyn_forward);
     opt.background_slice_us = g_background_slice_us;
     if (g_background_quantum != kBackgroundQuantum || g_background_slice_us != kBackgroundSliceUs)
         status("background threads' slice: %u instructions, %u us (settings.txt)", (unsigned)g_background_quantum,

@@ -198,6 +198,12 @@ void frame_thread_ready_by(uint64_t out[16]);
 // addresses into the game on its EBP chain (0: fewer). Clears them.
 constexpr size_t kWaitFrom = 4;
 uint64_t frame_thread_wait_top(uint32_t &site, uint32_t &owner, uint32_t from[kWaitFrom]);
+// Moves the real clock's guest time (GetTickCount, QPC, Sleep, timed waits)
+// ahead of the host's by `us`, for good: the frame lock (issue #86) runs the
+// game's clock slightly fast to keep its frames in step with the screen.
+// Never back. Any thread.
+void advance_guest_clock(uint32_t us);
+uint32_t guest_clock_ahead_us();   // the total so far
 // Long frames, sampled (the frame trace's stall column). note_present at
 // each present (the scheduler's thread). stall_probe from another host
 // thread every few ms: once the frame thread has gone `min_us` without a

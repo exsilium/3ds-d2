@@ -82,6 +82,16 @@ thread_local bool t_runs_guest = false;
 bool g_in_service = false;
 uint64_t g_last_service_ms = 0;   // real clock (wx86_now_ms)
 uint64_t g_t0_ms = 0;   // real clock at run start: guest time starts at 0 in both modes
+// How far the platform has moved the real clock's guest time ahead of the
+// host's (advance_guest_clock, issue #86's frame lock), in us. Only ever
+// grows, so the guest's clock never runs back. 32 bits: a lock at its most
+// (2000 ppm) takes 25 days to wrap it.
+std::atomic<uint32_t> g_clock_ahead_us{0};
+// The real clock's guest time for a host clock read (wx86_now_us).
+inline uint64_t guest_us_at(uint64_t host_us)
+{
+    return host_us - g_t0_ms * 1000ull + g_clock_ahead_us.load(std::memory_order_relaxed);
+}
 // GetTickCount and timeGetTime as the in-line intrinsic serves them (issue
 // #39): on the real clock, the clock at the start of the current slice,
 // raised by every now_ms read in it, so it never runs behind a time the guest
@@ -848,7 +858,7 @@ void on_slice(uint32_t tid, bool start)
     if (start)
         g_slice_start_us = us;
     if (start && g_opt.real_clock)
-        raise_tick(us / 1000 - g_t0_ms);   // now_ms's value, from the clock read just made
+        raise_tick(guest_us_at(us) / 1000);   // now_ms's value, from the clock read just made
     g_slice_sink = true;
     g_slice_tid = start ? (int)tid : -1;
 
@@ -1238,6 +1248,9 @@ uint32_t g_stall[kStallSamples][2] = {};  // eip, the dword on top of the stack
 std::atomic<int> g_stall_n{0};
 }  // namespace
 
+void advance_guest_clock(uint32_t us) { g_clock_ahead_us.fetch_add(us, std::memory_order_relaxed); }
+uint32_t guest_clock_ahead_us() { return g_clock_ahead_us.load(std::memory_order_relaxed); }
+
 void note_present() { g_present_us.store(wx86_now_us(), std::memory_order_release); }
 
 void stall_probe(uint64_t min_us)
@@ -1328,7 +1341,7 @@ void count_lock_site(uint32_t ret) { g_lock_sites.count(ret); }
 
 uint64_t now_ms()
 {
-    uint64_t ms = (g_opt.real_clock || !g_sched) ? wx86_now_ms() - g_t0_ms : g_sched->virt_ms();
+    uint64_t ms = (g_opt.real_clock || !g_sched) ? guest_us_at(wx86_now_us()) / 1000 : g_sched->virt_ms();
     check_time_limit(ms);
     return ms;
 }
@@ -1343,7 +1356,7 @@ uint32_t tick_ms()
 uint64_t now_us()
 {
     if (g_opt.real_clock || !g_sched)
-        return wx86_now_us() - g_t0_ms * 1000ull;
+        return guest_us_at(wx86_now_us());
     // Virtual time has millisecond steps; a per-call tick keeps QPC strictly
     // increasing between them, as on a real machine.
     static uint64_t last = 0;
@@ -1443,6 +1456,7 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
     g_stats = Stats();
     g_next_beat = g_opt.heartbeat_ms;
     g_t0_ms = wx86_now_ms();
+    g_clock_ahead_us.store(0, std::memory_order_relaxed);
     g_last_service_ms = g_t0_ms;
     struct RunsGuest {
         RunsGuest() { t_runs_guest = true; }
@@ -1675,7 +1689,7 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
     }
     g_sched = &sched;
     if (opt.real_clock && opt.sleep_ms)
-        sched.set_real_clock([] { return wx86_now_ms() - g_t0_ms; }, opt.sleep_ms);
+        sched.set_real_clock([] { return guest_us_at(wx86_now_us()) / 1000; }, opt.sleep_ms);
     if (!opt.real_clock && opt.virtual_tick_us)
         sched.set_virtual_tick_us(opt.virtual_tick_us);
     sched.set_max_switches(~0ull);   // runs end by exit or max_ms, never by a switch count

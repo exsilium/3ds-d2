@@ -37,6 +37,7 @@ struct DccStats {
     uint32_t refused = 0;                           // groups the native left to the game's code
     uint64_t native_us = 0;                         // the native's time, wherever it ran
     uint32_t checked = 0, differed = 0;             // DccMode::Check
+    uint32_t on_frame = 0, worker_busy = 0;         // decoded in place: on the frame thread, the worker full
 };
 DccStats dcc_stats();
 

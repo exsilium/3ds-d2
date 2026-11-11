@@ -6,6 +6,7 @@
 #include "runtime/rt_host.h"
 
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -130,11 +131,27 @@ uint32_t loop_native(d2rt::Cpu &c)
         g_stats.game++;
         return first;
     }
-    if (mode == DccMode::Offload && !rt::on_frame_thread()) {
+    const bool frame = rt::on_frame_thread();
+    if (mode == DccMode::Offload && !frame) {
         uint32_t ret = 0;
         if (rt::offload_job(worker_job, a, 8, ret)) {
             g_stats.offloaded++;
             return ret;   // EAX becomes the job's result when the thread wakes
+        }
+        g_stats.worker_busy++;
+    }
+    if (frame) {
+        g_stats.on_frame++;
+        if (g_stats.on_frame <= 6) {   // who decodes on the frame thread: its EBP chain
+            char chain[160];
+            int n = 0;
+            uint32_t fp = c.read_u32(ebp);
+            for (int k = 0; k < 8 && fp && n < (int)sizeof chain - 10; k++) {
+                n += std::snprintf(chain + n, sizeof chain - n, " %06x", (unsigned)c.read_u32(fp + 4));
+                fp = c.read_u32(fp);
+            }
+            chain[n] = 0;
+            rt::logf("dcc: decoded on the frame thread from%s", chain);
         }
     }
     const uint64_t t0 = rt::now_us();

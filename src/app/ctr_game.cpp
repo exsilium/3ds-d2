@@ -2170,8 +2170,10 @@ void hitch_heartbeat(const game::SpriteCacheWindow &w)
     static game::DccStats dcc_mark;
     const game::DccStats d = game::dcc_stats();
     std::snprintf(line, sizeof line,
-                  "[rt] dcc: %s; groups native %u, on the worker %u, the game's %u (refused %u); native %u ms",
+                  "[rt] dcc: %s; groups native %u (on the frame thread %u, the worker full %u), on the worker %u, "
+                  "the game's %u (refused %u); native %u ms",
                   game::dcc_mode() == game::DccMode::Off ? "off" : "on", d.native - dcc_mark.native,
+                  d.on_frame - dcc_mark.on_frame, d.worker_busy - dcc_mark.worker_busy,
                   d.offloaded - dcc_mark.offloaded, d.game - dcc_mark.game, d.refused - dcc_mark.refused,
                   (unsigned)((d.native_us - dcc_mark.native_us) / 1000));
     dcc_mark = d;

@@ -41,8 +41,12 @@ struct Bits {
         const unsigned sh = (unsigned)(pos & 7);
         const size_t have = (size_t)((len + 7) >> 3) - byte;
         uint64_t w = 0;
-        for (size_t i = 0; i < 5 && i < have; i++)
-            w |= (uint64_t)base[byte + i] << (8 * i);
+        if (have >= 8) {
+            std::memcpy(&w, base + byte, 8);   // little-endian, as the ARM11 and x86 both are
+        } else {
+            for (size_t i = 0; i < have; i++)
+                w |= (uint64_t)base[byte + i] << (8 * i);
+        }
         pos += n;
         return (uint32_t)(w >> sh) & low_mask(n);
     }

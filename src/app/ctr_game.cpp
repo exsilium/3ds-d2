@@ -948,27 +948,35 @@ int screen_hz_set(bool fifty)
 struct Glass {
     uint32_t shown[4] = {};
     uint32_t held = 0;
+    uint32_t edge = 0, edge_held = 0;   // ready in the last 2 ms before a refresh, and of those held
     uint64_t span_us = 0;    // the frames' times on the screen, added up
     uint32_t refreshes = 0;  // and in refreshes
 };
 Glass g_glass;
 LightLock g_glass_lock;
 uint64_t g_last_shown_us = 0;   // the render thread's: the refresh that showed its last frame
-bool g_swapped = false, g_swap_held = false;   // the render thread's: a swap not yet seen on the screen
+bool g_swapped = false, g_swap_held = false, g_swap_edge = false;   // the render thread's: a swap not yet seen on the screen
 
 // The top screen, and the bottom one when it was drawn: once double-buffered,
 // swapping the bottom without a draw would show the older of its two buffers.
 // At 50 Hz, on the render thread, a frame ready less than a refresh after
 // the last was shown waits for one more, so that each frame stays two
 // refreshes (the game's frames come 35 and 45 ms apart as often as 40: it
-// catches up on a late one).
+// catches up on a late one). The slack is the render thread's wake after
+// the refresh, which g_last_shown_us carries: 2 ms of it let a frame ready
+// 18-20 ms after the last through, onto the next refresh, so that the last
+// stayed one refresh and a 3 came beside it (3DS-D2-19, issue #84).
+constexpr uint64_t kHoldSlackUs = 300;
 void swap_screens(bool bottom_drawn)
 {
-    g_swap_held = false;
-    if (g_render_thread && g_screen50.load(std::memory_order_acquire) && g_last_shown_us &&
-        host_us() - g_last_shown_us + 2000 < kRefresh50Us) {
-        gspWaitForVBlank();
-        g_swap_held = true;
+    g_swap_held = g_swap_edge = false;
+    if (g_render_thread && g_screen50.load(std::memory_order_acquire) && g_last_shown_us) {
+        const uint64_t e = host_us() - g_last_shown_us;
+        g_swap_edge = e + 2000 >= kRefresh50Us && e < kRefresh50Us;
+        if (e + kHoldSlackUs < kRefresh50Us) {
+            gspWaitForVBlank();
+            g_swap_held = true;
+        }
     }
     gfxScreenSwapBuffers(GFX_TOP, true);
     if (bottom_drawn || !g_bottom_double)
@@ -986,7 +994,7 @@ void await_shown()
         return;
     g_swapped = false;
     const uint64_t refresh = g_screen50.load(std::memory_order_acquire) ? kRefresh50Us : kRefresh60Us;
-    const bool held = g_swap_held;
+    const bool held = g_swap_held, edge = g_swap_edge;
     gspWaitForVBlank();
     const uint64_t t = host_us();
     if (g_last_shown_us) {
@@ -995,6 +1003,8 @@ void await_shown()
         LightLock_Lock(&g_glass_lock);
         g_glass.shown[n < 1 ? 0 : n > 4 ? 3 : n - 1]++;
         g_glass.held += held;
+        g_glass.edge += edge;
+        g_glass.edge_held += edge && held;
         if (n >= 1 && n <= 4) {
             g_glass.span_us += span;
             g_glass.refreshes += n;
@@ -2141,10 +2151,10 @@ void hitch_heartbeat(const game::SpriteCacheWindow &w)
     const uint32_t hz100 = g.span_us ? (uint32_t)(100000000ull * g.refreshes / g.span_us) : 0;
     std::snprintf(line, sizeof line,
                   "[rt] screen: %s, refresh %u.%02u Hz measured; frames on it for 1 refresh %u, 2 %u, 3 %u, "
-                  "4+ %u; held back a refresh %u",
+                  "4+ %u; held back a refresh %u; ready in a refresh's last 2 ms %u (held %u)",
                   g_screen50.load() ? "50 Hz" : "59.83 Hz", (unsigned)(hz100 / 100), (unsigned)(hz100 % 100),
                   (unsigned)g.shown[0], (unsigned)g.shown[1], (unsigned)g.shown[2], (unsigned)g.shown[3],
-                  (unsigned)g.held);
+                  (unsigned)g.held, (unsigned)g.edge, (unsigned)g.edge_held);
     logline_held(line);
 }
 

@@ -330,6 +330,23 @@ The console has no such slack: its town frame ran 38.9 ms of 40. `scripts/measur
 
 Three alternating act loads in Azahar each way, after the worker's priority change: 4.9–6.2% of frames past 50 ms with it on, 5.8–7.6% off.
 
+**3DS-D2-18, build `2e2a8a0d5714`: off, then a reload and on, over the same kind of route.** Each half starts with arriving in town.
+
+| Part | Off | On |
+| --- | --- | --- |
+| Floor on the game's thread, median | 6.33 ms | 3.76 ms |
+| The 70 s after arriving, past 50 ms | 18.1% (jitter 13.7 ms) | 14.1% (jitter 12.2 ms) |
+| Town after that, past 50 ms | 4.1% (jitter 4.5 ms) | 2.6% (jitter 5.5 ms) |
+| Whole half, past 50 ms | 9.2% | 6.5% |
+
+- The player felt it smooth with it on. One floor tile south of a torch in town flickered at one corner; not looked into yet.
+- The arrival's 10 s windows lose 0.9–1.2 s each to:
+  - the frame thread's own reads (`io`, 400–600 ms), each a chain of Storm's small reads, about 20 ms in all, at `0x4154d8` (Storm's `ReadFile`);
+  - Storm's read thread taking core 0 (`ready`, 200–450 ms), mostly the load callbacks' sprite decodes (`0x5ff6e0` → `0x60bff0`) in game code;
+  - reads queued behind it (`wait`, 70–280 ms).
+- In town, the slow frames are the game's own work running past 40 ms (`run`).
+- The `run` column is not the game's work alone. The game waits for its next tick by polling the clock, and that counts as running, so a frame's median `run` is about 39 ms whatever the load.
+
 **Not done:** LightBlock on the worker.
 - Between LightBlock and the floor tile, the floor loop passes the light buffer through four of the game's own functions: `0x4de190`, `0x4de260`, `0x4ddfd0` and `0x4de070`, the dynamic lights.
 - They would all have to be native, with their light sources copied, for about 1 ms in Azahar (0.5 ms on the console).

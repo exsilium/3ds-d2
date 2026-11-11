@@ -814,7 +814,7 @@ volatile bool g_render_busy = false, g_render_quit = false;
 // as it has copied. "copycheck=1" in settings.txt (Azahar): at the next
 // present, the buffer the copy was made from is compared with the copy, and
 // a frame the game changed outside its renderer before the copy is logged.
-std::atomic<int> g_copy_state{0};   // 0 none, 1 asked for, 2 done
+std::atomic<int> g_copy_state{0};   // 0 none, 1 asked for, 3 being copied, 2 done
 const uint8_t *g_copy_src = nullptr;
 int32_t g_copy_stride = 0;
 LightEvent g_copy_event;
@@ -835,8 +835,17 @@ void copy_wait()
 {
     if (g_copy_state.load(std::memory_order_acquire) == 0)
         return;
-    if (g_copy_state.load(std::memory_order_acquire) == 1) {
+    if (g_copy_state.load(std::memory_order_acquire) != 2) {
         const uint64_t t0 = host_us();
+        // Not begun (the render thread still waiting for the screen's
+        // refresh, await_shown): the game's thread copies it itself, ~1 ms,
+        // instead of waiting up to a refresh.
+        int asked = 1;
+        if (g_copy_state.compare_exchange_strong(asked, 3, std::memory_order_acq_rel)) {
+            copy_frame_now();
+            game::renderer_unguard();
+            g_copy_state.store(2, std::memory_order_release);
+        }
         while (g_copy_state.load(std::memory_order_acquire) != 2)
             LightEvent_WaitTimeout(&g_copy_event, 1000000);
         g_copy_wait_us += host_us() - t0;
@@ -894,13 +903,115 @@ void save_staged_shot()
     __atomic_store_n(&g_shot_done, true, __ATOMIC_RELEASE);
 }
 
+// ---- the top screen's refresh (port_options.h's kPortScreen50) --------------------
+//
+// The top LCD refreshes at 59.83 Hz, and a swap shows at the next refresh:
+// the game's 25 frames a second each stay on it for two or three refreshes,
+// 33 or 50 ms, however evenly they come. At 50 Hz each can stay exactly two.
+// The rate is the LCD's pixel clock over its line count (PDC0's VTotal, GSP
+// register 0x400424, 0x10400424 physical): 413 (the console's own) gives
+// 59.83 Hz, 494 gives 50.04 Hz. Only that register changes, and only from
+// 413: anything else read there is left alone. The HOME menu, sleep and the
+// game's end get 413 back (apt_hook, main), and a return gets 50 Hz again.
+constexpr u32 kPdcTopVTotal = 0x400424;
+constexpr u32 kVTotal60 = 413, kVTotal50 = 494;
+constexpr uint64_t kRefresh60Us = 16713, kRefresh50Us = 19983;
+u32 g_vtotal_read = 0;            // VTotal as first read (0: not yet, ~0: the read failed)
+std::atomic<bool> g_screen50{false};   // the screen runs at 50 Hz now
+bool g_screen50_want = false;     // the option, as present last applied it
+LightLock g_screen_lock;          // the game's thread and APT's
+
+// 1: as asked; 0: left as it was (VTotal is not the console's own); -1: GSP refused.
+int screen_hz_set(bool fifty)
+{
+    LightLock_Lock(&g_screen_lock);
+    if (!g_vtotal_read) {
+        u32 v = 0;
+        g_vtotal_read = R_SUCCEEDED(GSPGPU_ReadHWRegs(kPdcTopVTotal, &v, 4)) ? v : ~0u;
+    }
+    int r = 0;
+    if (g_vtotal_read == kVTotal60 && fifty != g_screen50.load(std::memory_order_relaxed)) {
+        u32 v = fifty ? kVTotal50 : kVTotal60;
+        r = R_SUCCEEDED(GSPGPU_WriteHWRegs(kPdcTopVTotal, &v, 4)) ? 1 : -1;
+        if (r > 0)
+            g_screen50.store(fifty, std::memory_order_release);
+    } else if (g_vtotal_read == kVTotal60) {
+        r = 1;
+    }
+    LightLock_Unlock(&g_screen_lock);
+    return r;
+}
+
+// What the render thread saw of the screen since the last heartbeat: each
+// frame's time on it in refreshes (1, 2, 3, 4 or more), the frames it held
+// back a refresh (ready too early at 50 Hz), and the refreshes' own length.
+struct Glass {
+    uint32_t shown[4] = {};
+    uint32_t held = 0;
+    uint32_t edge = 0, edge_held = 0;   // ready in the last 2 ms before a refresh, and of those held
+    uint64_t span_us = 0;    // the frames' times on the screen, added up
+    uint32_t refreshes = 0;  // and in refreshes
+};
+Glass g_glass;
+LightLock g_glass_lock;
+uint64_t g_last_shown_us = 0;   // the render thread's: the refresh that showed its last frame
+bool g_swapped = false, g_swap_held = false, g_swap_edge = false;   // the render thread's: a swap not yet seen on the screen
+
 // The top screen, and the bottom one when it was drawn: once double-buffered,
 // swapping the bottom without a draw would show the older of its two buffers.
+// At 50 Hz, on the render thread, a frame ready less than a refresh after
+// the last was shown waits for one more, so that each frame stays two
+// refreshes (the game's frames come 35 and 45 ms apart as often as 40: it
+// catches up on a late one). The slack is the render thread's wake after
+// the refresh, which g_last_shown_us carries: 2 ms of it let a frame ready
+// 18-20 ms after the last through, onto the next refresh, so that the last
+// stayed one refresh and a 3 came beside it (3DS-D2-19, issue #84).
+constexpr uint64_t kHoldSlackUs = 300;
 void swap_screens(bool bottom_drawn)
 {
+    g_swap_held = g_swap_edge = false;
+    if (g_render_thread && g_screen50.load(std::memory_order_acquire) && g_last_shown_us) {
+        const uint64_t e = host_us() - g_last_shown_us;
+        g_swap_edge = e + 2000 >= kRefresh50Us && e < kRefresh50Us;
+        if (e + kHoldSlackUs < kRefresh50Us) {
+            gspWaitForVBlank();
+            g_swap_held = true;
+        }
+    }
     gfxScreenSwapBuffers(GFX_TOP, true);
     if (bottom_drawn || !g_bottom_double)
         gfxScreenSwapBuffers(GFX_BOTTOM, false);
+    g_swapped = g_render_thread != nullptr;
+}
+
+// The render thread, its frame handed back (g_render_busy cleared, so
+// present never skips a frame for this): it waits for the refresh that shows
+// the swap, so that its next frame is drawn in the buffer just taken off the
+// screen, and counts how long the frame before stayed on it.
+void await_shown()
+{
+    if (!g_swapped)
+        return;
+    g_swapped = false;
+    const uint64_t refresh = g_screen50.load(std::memory_order_acquire) ? kRefresh50Us : kRefresh60Us;
+    const bool held = g_swap_held, edge = g_swap_edge;
+    gspWaitForVBlank();
+    const uint64_t t = host_us();
+    if (g_last_shown_us) {
+        const uint64_t span = t - g_last_shown_us;
+        const uint32_t n = (uint32_t)((span + refresh / 2) / refresh);
+        LightLock_Lock(&g_glass_lock);
+        g_glass.shown[n < 1 ? 0 : n > 4 ? 3 : n - 1]++;
+        g_glass.held += held;
+        g_glass.edge += edge;
+        g_glass.edge_held += edge && held;
+        if (n >= 1 && n <= 4) {
+            g_glass.span_us += span;
+            g_glass.refreshes += n;
+        }
+        LightLock_Unlock(&g_glass_lock);
+    }
+    g_last_shown_us = t;
 }
 
 // The second screen's view, when staged to be drawn: true if it was.
@@ -976,7 +1087,8 @@ void render_main(void *)
         LightEvent_Wait(&g_render_go);
         if (g_render_quit)
             break;
-        if (g_copy_state.load(std::memory_order_acquire) == 1) {
+        int asked = 1;
+        if (g_copy_state.compare_exchange_strong(asked, 3, std::memory_order_acq_rel)) {
             copy_frame_now();
             game::renderer_unguard();
             if (g_copy_check && g_copy_ref.size() == g_staged.pixels.size() &&
@@ -985,17 +1097,22 @@ void render_main(void *)
             g_copy_state.store(2, std::memory_order_release);
             LightEvent_Signal(&g_copy_event);
         }
+        while (g_copy_state.load(std::memory_order_acquire) == 3)
+            svcSleepThread(100000);   // the game's thread copying it (copy_wait): ~1 ms
         const uint64_t t0 = host_us();
         draw_staged();
         g_timing.draw_us += host_us() - t0;
         save_staged_shot();
         __atomic_store_n(&g_render_busy, false, __ATOMIC_RELEASE);
+        await_shown();
     }
 }
 
 void start_render_thread()
 {
     LightEvent_Init(&g_render_go, RESET_ONESHOT);
+    LightLock_Init(&g_glass_lock);
+    LightLock_Init(&g_screen_lock);
     LightEvent_Init(&g_copy_event, RESET_ONESHOT);
     s32 prio = 0x30;
     svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
@@ -1177,6 +1294,18 @@ void present(const rt::Frame &f)
     // The checklist's floor row (issue #80): at a frame's end, for the next floor.
     if (game::set_floor_queue_on(core2_draw()) && game::frame_trace_on())
         game::frame_trace_note(core2_draw() ? "floor queue: on" : "floor queue: off");
+    const bool fifty = (g_ss.port_options() & game::kPortScreen50) != 0;
+    if (fifty != g_screen50_want) {   // the OPTIONS page's screen row
+        g_screen50_want = fifty;
+        const int r = screen_hz_set(fifty);
+        char line[160];
+        std::snprintf(line, sizeof line, "screen: %s (the top LCD's VTotal read %u)%s",
+                      g_screen50.load() ? "50 Hz" : "59.83 Hz", (unsigned)g_vtotal_read,
+                      r == 0 ? ", not the console's own 413: left alone" : r < 0 ? ", GSP refused the write" : "");
+        logline(line);
+        if (game::frame_trace_on())
+            game::frame_trace_note(g_screen50.load() ? "screen: 50 Hz" : "screen: 60 Hz");
+    }
     uint32_t floor_us, flush_us;
     game::floor_queue_take(floor_us, flush_us);
     if (game::frame_trace_on()) {
@@ -1556,6 +1685,10 @@ void apt_hook(APT_HookType type, void *)
     u32 thread = 0;
     svcGetThreadId(&thread, CUR_THREAD_HANDLE);
     const bool game_thread = thread == g_apt_thread;
+    if ((type == APTHOOK_ONRESTORE || type == APTHOOK_ONWAKEUP) && g_screen50_want)
+        screen_hz_set(true);   // back from the HOME menu or sleep: 50 Hz again
+    if (type == APTHOOK_ONSUSPEND || type == APTHOOK_ONSLEEP || type == APTHOOK_ONEXIT)
+        screen_hz_set(false);  // the console's own rate for the HOME menu, sleep and the end
     if (type == APTHOOK_ONRESTORE || type == APTHOOK_ONWAKEUP) {
         g_ss.invalidate();   // the HOME menu or sleep drew over the bottom screen
         g_timing.last_present_us = 0;   // the time away is not a frame (worst gap, hitches)
@@ -2009,6 +2142,20 @@ void hitch_heartbeat(const game::SpriteCacheWindow &w)
                   (unsigned)hw.ready_ms, (unsigned)hw.host_ms, (unsigned)hw.heartbeat_ms, (unsigned)hw.skipped,
                   (unsigned)hw.famine);
     logline_held(line);
+    // The screen (swap_screens): how long the frames stayed on it.
+    Glass g;
+    LightLock_Lock(&g_glass_lock);
+    g = g_glass;
+    g_glass = Glass{};
+    LightLock_Unlock(&g_glass_lock);
+    const uint32_t hz100 = g.span_us ? (uint32_t)(100000000ull * g.refreshes / g.span_us) : 0;
+    std::snprintf(line, sizeof line,
+                  "[rt] screen: %s, refresh %u.%02u Hz measured; frames on it for 1 refresh %u, 2 %u, 3 %u, "
+                  "4+ %u; held back a refresh %u; ready in a refresh's last 2 ms %u (held %u)",
+                  g_screen50.load() ? "50 Hz" : "59.83 Hz", (unsigned)(hz100 / 100), (unsigned)(hz100 % 100),
+                  (unsigned)g.shown[0], (unsigned)g.shown[1], (unsigned)g.shown[2], (unsigned)g.shown[3],
+                  (unsigned)g.held, (unsigned)g.edge, (unsigned)g.edge_held);
+    logline_held(line);
 }
 
 }  // namespace
@@ -2371,6 +2518,7 @@ int main()
         profiler_switch(0);   // a run still on: its traces closed, in time for the report
     aptUnhook(&g_apt_cookie);
     stop_render_thread();
+    screen_hz_set(false);   // the console's own rate, whatever the game's end
     console_again();   // the game's end shows on the console, as before the second screen
     if (!r.loaded)
         status("FATAL: %s", r.error.c_str());

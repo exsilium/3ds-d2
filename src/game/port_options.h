@@ -2,7 +2,7 @@
 // opposed to what a profiler run measures. They live on the INFO tab's
 // OPTIONS page (second_screen.h): a box per option, applied at once (a run
 // on or not, so a profiler run can compare them), and saved in settings.txt
-// as "port=" with the names of those that are on.
+// as "port=" (port_names).
 #ifndef D2_GAME_PORT_OPTIONS_H
 #define D2_GAME_PORT_OPTIONS_H
 
@@ -17,6 +17,11 @@ enum PortOption : uint32_t {
     // each frame out of the game's buffer (d2_native.h's floor queue and
     // renderer guard). Only with core 2 (a New 3DS).
     kPortCore2Draw = 1u << 0,
+    // The top screen refreshes at 50 Hz instead of 59.83, so that each of
+    // the game's 25 frames a second stays on it for exactly two refreshes
+    // (40 ms) instead of two or three (33 or 50). ctr_game.cpp's screen_hz:
+    // one LCD timing register, put back for the HOME menu, sleep and exit.
+    kPortScreen50 = 1u << 1,
 };
 
 struct PortOptionInfo {
@@ -28,19 +33,30 @@ struct PortOptionInfo {
 
 inline constexpr PortOptionInfo kPortOptions[] = {
     {kPortCore2Draw, "core2draw", "draw on core 2", "floor and frame copy on core 2"},
+    {kPortScreen50, "screen50", "screen at 50 Hz", "each frame 40 ms on the screen"},
 };
 inline constexpr int kPortOptionCount = sizeof kPortOptions / sizeof kPortOptions[0];
-inline constexpr uint32_t kPortDefault = kPortCore2Draw;
+inline constexpr uint32_t kPortDefault = kPortCore2Draw | kPortScreen50;
+inline constexpr uint32_t kPortAll = kPortCore2Draw | kPortScreen50;
+// The options of the first "port=" lines, which named only those on.
+inline constexpr uint32_t kPortFirst = kPortCore2Draw;
 
-// "core2draw ..." <-> bits; unknown names are left out.
+// settings.txt's "port=": every option, "-name" for one that is off
+// ("core2draw,-screen50"). A line with no "-" is the first form, which named
+// only the options on: those it could name are off unless named, the newer
+// ones keep their defaults. Unknown names are left out.
 inline uint32_t port_bits(const char *names)
 {
-    uint32_t bits = 0;
+    const bool first_form = std::strchr(names, '-') == nullptr;
+    uint32_t bits = first_form ? kPortDefault & ~kPortFirst : kPortDefault;
     while (*names) {
         const size_t n = std::strcspn(names, ", \r\n");
+        const bool off = n > 0 && *names == '-';
+        const char *name = names + (off ? 1 : 0);
+        const size_t len = n - (off ? 1 : 0);
         for (const PortOptionInfo &o : kPortOptions)
-            if (n == std::strlen(o.name) && std::strncmp(names, o.name, n) == 0)
-                bits |= o.bit;
+            if (len == std::strlen(o.name) && std::strncmp(name, o.name, len) == 0)
+                bits = off ? bits & ~o.bit : bits | o.bit;
         names += n;
         names += *names ? 1 : 0;
     }
@@ -50,12 +66,13 @@ inline uint32_t port_bits(const char *names)
 inline std::string port_names(uint32_t bits)
 {
     std::string s;
-    for (const PortOptionInfo &o : kPortOptions)
-        if (bits & o.bit) {
-            if (!s.empty())
-                s += ',';
-            s += o.name;
-        }
+    for (const PortOptionInfo &o : kPortOptions) {
+        if (!s.empty())
+            s += ',';
+        if (!(bits & o.bit))
+            s += '-';
+        s += o.name;
+    }
     return s;
 }
 

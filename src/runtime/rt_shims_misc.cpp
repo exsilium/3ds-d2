@@ -50,11 +50,15 @@ Dib *dib_in(uint32_t dc)
     return d == g_dibs.end() ? nullptr : &d->second;
 }
 
+void (*g_blit_hook)(uint32_t, uint32_t) = nullptr;
+
 uint32_t blit(Cpu &c, uint32_t src_dc)
 {
     Dib *d = dib_in(src_dc);
     if (!d || d->bpp != 8)
         return 1;
+    if (g_blit_hook)
+        g_blit_hook(d->bits, (((d->width * 8 + 31) / 32) * 4) * d->height);
     stats().frames++;
     stats().frame_thread = wx86_sched() ? wx86_sched()->current_id() : -1;
     if (options().audio)
@@ -76,6 +80,8 @@ uint32_t blit(Cpu &c, uint32_t src_dc)
 }
 
 }  // namespace
+
+void set_blit_hook(void (*hook)(uint32_t, uint32_t)) { g_blit_hook = hook; }
 
 void install_misc(Bridge &br)
 {

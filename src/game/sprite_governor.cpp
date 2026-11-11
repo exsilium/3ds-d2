@@ -32,8 +32,15 @@ uint32_t SpriteGovernor::step(const Beat &b, uint32_t reserve, uint32_t min_limi
     const uint32_t top = game_limit_;
     uint32_t want = b.limit;
     if (b.spare_taken) {
+        // At once, by what the pool is short of the reserve and the spare's
+        // own step, from what the cache holds: the least recently used go,
+        // the sprites on screen stay (issue #80).
         short_beats_ = 0;
-        want = min_limit < top ? min_limit : top;
+        const uint32_t from = b.used < b.limit ? b.used : b.limit;
+        const uint32_t cut = (b.pool_free < reserve ? reserve - b.pool_free : 0) + kStep;
+        want = from > cut + min_limit ? (from - cut) & ~(kStep - 1) : min_limit;
+        if (want > top)
+            want = top;
     } else if (b.pool_free < reserve) {
         if (++short_beats_ >= kShortBeats) {
             short_beats_ = 0;

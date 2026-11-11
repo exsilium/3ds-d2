@@ -5,10 +5,10 @@
 // tools/frame_report.py.
 //
 // The file is text:
-//   # 3ds-d2 frame trace 4                       the format
+//   # 3ds-d2 frame trace 5                       the format
 //   # <anything>                                 a note (a state change), between
 //                                                the frames it came between
-//   t gap tick run ready host sleep wait io dec dec_us skip who cs ev wsite wown wus wfrom stall
+//   t gap tick run ready host sleep wait io dec dec_us skip who cs ev wsite wown wus wfrom stall floor flush cwait
 // one line per frame, each field the change since the line before:
 //   t       the host clock at the present, ms since the trace started
 //   gap     us since the last present
@@ -34,7 +34,14 @@
 //           the frame thread was, sampled every 20 ms (up to 8): eip/ret,
 //           hex, separated by ';' (- if none); after a host call, eip is the
 //           call's return
-// (version 3 had no stall, version 2 no cs..wfrom, version 1 no who either)
+//   floor   us the frame thread spent in the floor (issue #80: from the world
+//           draw's call to it to the call after), 0 if not drawn; flush the
+//           us of that it spent drawing what the floor queue still held and
+//           waiting for the worker's last tile
+//   cwait   us the frame thread waited at the scene's start for the last
+//           frame's copy, made on the second core (issue #80)
+// A note "# floor queue: on" or "off" marks the bottom screen's switch.
+// (version 4 had no floor, flush or cwait, 3 no stall, 2 no cs..wfrom, 1 no who)
 //
 // Platform-independent: the platform samples, opens and closes the file.
 #ifndef D2_GAME_FRAME_TRACE_H
@@ -58,6 +65,8 @@ struct FrameSample {
     uint32_t wait_from[4] = {};   // rt::kWaitFrom
     int stalls = 0;               // rt::take_stall: samples of a long frame (150 ms without a present)
     uint32_t stall[8][2] = {};    // ...each the frame thread's EIP and the dword on top of its stack
+    uint32_t floor_us = 0, flush_us = 0;   // the floor since the last frame (game::floor_queue_take)
+    uint32_t copy_wait_us = 0;             // waited at the scene's start for the last frame's copy
 };
 
 // Starts writing to `f` (the caller keeps it, and closes it after stop).

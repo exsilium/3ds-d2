@@ -14,6 +14,7 @@
 // arguments popped by the callee), which rt::hook_function maps directly.
 // No caller reads EAX afterwards; callee-saved registers are untouched here.
 #include "game/d2_native.h"
+#include "game/draw_census.h"
 #include "game/pklib_explode.h"
 
 #include "runtime/bridge.h"
@@ -21,9 +22,12 @@
 #include "runtime/guest_sync.h"
 #include "runtime/guest_thread.h"
 #include "runtime/guest_thread_ctx.h"
+#include "runtime/host_clock.h"
 #include "runtime/rt_host.h"
 
+#include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -76,27 +80,38 @@ inline void remap(uint8_t *d, const uint8_t *s, const uint8_t *tbl, int32_t n)
 inline int32_t imax(int32_t a, int32_t b) { return a > b ? a : b; }
 inline int32_t imin(int32_t a, int32_t b) { return a < b ? a : b; }
 
+// The tile renderer's globals the floor's blitters read: read at the call,
+// or kept with a queued floor tile (issue #80), so a tile drawn later, or on
+// another core, sees what the call saw.
+struct FloorView {
+    int32_t pitch;
+    uint32_t fb;
+    int32_t clip_l, clip_r, clip_t, clip_b;   // the window (kClip*)
+    int32_t rej_t, rej_b, rej_l, rej_r;       // a block outside these is not drawn (4f8b80)
+    int32_t in_t, in_b, in_l, in_r;           // inside these: the unclipped blitters
+    int32_t flat_light, no_gouraud;
+};
+FloorView floor_view_now();
+
 // 4f69b0 FloorIsoFlat(ecx=src 256-byte iso block, edx=dst, [8]=tbl), ret 4.
-void iso_flat(const uint8_t *src, uint8_t *dst, const uint8_t *tbl)
+void iso_flat(const uint8_t *src, uint8_t *dst, const uint8_t *tbl, int32_t pitch)
 {
-    const int32_t pitch = I32(kPitch);
     for (int r = 0; r < 15; r++)
         remap(dst + (intptr_t)r * pitch + g_xoff[r], src + g_soff[r], tbl, g_width[r]);
 }
 
 uint32_t floor_iso_flat(Cpu &c)
 {
-    iso_flat(H(c.reg(R_ECX)), H(c.reg(R_EDX)), H(c.arg(0)));
+    iso_flat(H(c.reg(R_ECX)), H(c.reg(R_EDX)), H(c.arg(0)), I32(kPitch));
     return 0;
 }
 
 // 4f6f60 RleFlat(ecx=src stream, edx=dst, [8]=tbl, [c]=rows), ret 8.
 // Pairs (skip, run); (0,0) ends a row. A run of 0 or over 32 draws nothing
 // but still advances (the original's 32-entry jump table).
-void rle_flat_draw(const uint8_t *src, uint8_t *rowp, const uint8_t *tbl, uint32_t rows)
+void rle_flat_draw(const uint8_t *src, uint8_t *rowp, const uint8_t *tbl, uint32_t rows, int32_t pitch)
 {
     uint8_t *d = rowp;
-    const int32_t pitch = I32(kPitch);
     while (rows != 0) {
         const uint8_t skip = src[0], run = src[1];
         src += 2;
@@ -116,19 +131,20 @@ void rle_flat_draw(const uint8_t *src, uint8_t *rowp, const uint8_t *tbl, uint32
 
 uint32_t rle_flat(Cpu &c)
 {
-    rle_flat_draw(H(c.reg(R_ECX)), H(c.reg(R_EDX)), H(c.arg(0)), c.arg(1));
+    rle_flat_draw(H(c.reg(R_ECX)), H(c.reg(R_EDX)), H(c.arg(0)), c.arg(1), I32(kPitch));
     return 0;
 }
 
 // 4f7580 RleFlatClipped(ecx=x0, edx=y0, [8]=src, [c]=dst, [10]=tbl, [14]=rows), ret 0x10.
-void rle_flat_clipped_draw(int32_t x0, int32_t y, const uint8_t *src, uint8_t *rowp, const uint8_t *tbl, int32_t rows)
+void rle_flat_clipped_draw(int32_t x0, int32_t y, const uint8_t *src, uint8_t *rowp, const uint8_t *tbl, int32_t rows,
+                           const FloorView &v)
 {
     uint8_t *d = rowp;
     if (rows <= 0)
         return;
-    const int32_t pitch = I32(kPitch);
-    const int32_t clip_l = I32(kClipLeft), clip_r = I32(kClipRight);
-    const int32_t clip_t = I32(kClipTop), clip_b = I32(kClipBottom);
+    const int32_t pitch = v.pitch;
+    const int32_t clip_l = v.clip_l, clip_r = v.clip_r;
+    const int32_t clip_t = v.clip_t, clip_b = v.clip_b;
     int32_t i = 0;
     do {
         const uint8_t skip = src[0], run = src[1];
@@ -159,7 +175,7 @@ void rle_flat_clipped_draw(int32_t x0, int32_t y, const uint8_t *src, uint8_t *r
 uint32_t rle_flat_clipped(Cpu &c)
 {
     rle_flat_clipped_draw((int32_t)c.reg(R_ECX), (int32_t)c.reg(R_EDX), H(c.arg(0)), H(c.arg(1)), H(c.arg(2)),
-                          (int32_t)c.arg(3));
+                          (int32_t)c.arg(3), floor_view_now());
     return 0;
 }
 
@@ -544,16 +560,16 @@ inline const uint8_t *shade(uint8_t light) { return H(kShades + ((uint32_t)(ligh
 
 // 4f88b0's iso branch: a 15-row iso block clipped to the window, at screen
 // (x, y), drawn at dst.
-void iso_flat_clipped(const uint8_t *src, int32_t x, int32_t y, uint8_t *dst, const uint8_t *tbl)
+void iso_flat_clipped(const uint8_t *src, int32_t x, int32_t y, uint8_t *dst, const uint8_t *tbl, const FloorView &v)
 {
-    const int32_t pitch = I32(kPitch);
-    const int32_t r0 = imax(0, I32(kClipTop) - y);
-    const int32_t r1 = imin(15, I32(kClipBottom) - y);
+    const int32_t pitch = v.pitch;
+    const int32_t r0 = imax(0, v.clip_t - y);
+    const int32_t r1 = imin(15, v.clip_b - y);
     uint8_t *rowp = dst + (intptr_t)pitch * r0;
     for (int32_t r = r0; r < r1; r++, rowp += pitch) {
         const int32_t sx = g_xoff[r] + x;
-        const int32_t l = imax(0, I32(kClipLeft) - sx);
-        const int32_t n = imin(imax(0, I32(kClipRight) - sx), g_width[r]) - l;
+        const int32_t l = imax(0, v.clip_l - sx);
+        const int32_t n = imin(imax(0, v.clip_r - sx), g_width[r]) - l;
         if (n > 0)
             for (int32_t i = 0; i < n; i++)
                 rowp[g_xoff[r] + l + i] = tbl[src[g_soff[r] + l + i]];
@@ -566,14 +582,44 @@ void iso_flat_clipped(const uint8_t *src, int32_t x, int32_t y, uint8_t *dst, co
 // [+0x10]. Flat light (the light buffer's cell, or interpolation off, or the
 // four neighbours within 10 of each other) goes to the native blitters;
 // interpolated light keeps the game's own 4f8850 / 4f89f0.
-uint32_t floor_tile(Cpu &c)
+//
+// The floor queue (issue #80) keeps a tile's light bytes, at most these:
+// a block's cell (+6 + 8 * +7) reads up to 12 * cell + 0x139.
+constexpr uint32_t kLightBytes = 1072;
+
+FloorView floor_view_now()
 {
-    const uint32_t tile = c.reg(R_ECX);
-    const int32_t x = (int32_t)c.reg(R_EDX), y = (int32_t)c.arg(0);
-    const uint32_t lightbuf = c.arg(1);
+    FloorView v;
+    v.pitch = I32(kPitch);
+    v.fb = U32(kFbBase);
+    v.clip_l = I32(kClipLeft);
+    v.clip_r = I32(kClipRight);
+    v.clip_t = I32(kClipTop);
+    v.clip_b = I32(kClipBottom);
+    v.rej_t = I32(0x007d2330);
+    v.rej_b = I32(0x007d2338);
+    v.rej_l = I32(0x007c9788);
+    v.rej_r = I32(0x007c9798);
+    v.in_t = I32(0x007c9780);
+    v.in_b = I32(0x007c979c);
+    v.in_l = I32(0x007c97a4);
+    v.in_r = I32(0x007d2320);
+    v.flat_light = I32(kFlatLight);
+    v.no_gouraud = I32(kNoGouraud);
+    return v;
+}
+
+uint64_t g_scan_fail[2];   // tiles the floor queue drew at once: a block's light interpolated, out of its copy
+
+// One tile's blocks, with `light` as the light buffer: the game's, or a
+// queued tile's copy. `c` null: no block may need the game's interpolated
+// blitters. `scan`: draws nothing, and says whether the tile can be queued:
+// every block it draws flat, and its light within kLightBytes.
+bool floor_tile_blocks(Cpu *c, uint32_t tile, int32_t x, int32_t y, const uint8_t *light, const FloorView &v, bool scan)
+{
     const int32_t count = I32(tile + 0x50);
-    const uint32_t pitch = U32(kPitch);
-    const uint32_t rowbase = pitch * (uint32_t)y + U32(kFbBase) + (uint32_t)x;
+    const uint32_t pitch = (uint32_t)v.pitch;
+    const uint32_t rowbase = pitch * (uint32_t)y + v.fb + (uint32_t)x;
     for (int32_t i = 0; i < count; i++) {
         const uint32_t e = U32(tile + 0x54) + 20 * (uint32_t)i;
         int16_t ex, ey;
@@ -584,20 +630,20 @@ uint32_t floor_tile(Cpu &c)
         if (!(flags & 1))
             continue;
         const int32_t sx = ex + x, sy = y + ey;
-        if (sy < I32(0x007d2330) || sy >= I32(0x007d2338) || sx < I32(0x007c9788) || sx >= I32(0x007c9798))
+        if (sy < v.rej_t || sy >= v.rej_b || sx < v.rej_l || sx >= v.rej_r)
             continue;
         const uint32_t cell = (uint32_t)*H(e + 6) + 8u * *H(e + 7);
         bool flat = true;
-        uint8_t light;
+        uint8_t lv;
         uint32_t corners[4];
-        if (I32(kFlatLight)) {
-            light = *H(lightbuf + 12 * (cell + 9));
+        if (v.flat_light) {
+            lv = light[12 * (cell + 9)];
         } else {
-            const uint8_t *b = H(lightbuf + 12 * cell);
+            const uint8_t *b = light + 12 * cell;
             const int32_t v6c = b[0x6c], v78 = b[0x78], vcc = b[0xcc], vd8 = b[0xd8];
-            light = (uint8_t)v6c;
+            lv = (uint8_t)v6c;
             const int32_t d = std::abs(v78 - v6c) + std::abs(vcc - v6c) + std::abs(vd8 - v78);
-            if (!I32(kNoGouraud) && d >= 10) {
+            if (!v.no_gouraud && d >= 10) {
                 flat = false;
                 corners[0] = (uint32_t)((vcc + b[0xc0] + v6c + b[0x60]) >> 2);
                 corners[1] = (uint32_t)((b[0x18] + v78 + b[0x0c] + v6c) >> 2);
@@ -605,37 +651,217 @@ uint32_t floor_tile(Cpu &c)
                 corners[3] = (uint32_t)((b[0x138] + vd8 + b[0x12c] + vcc) >> 2);
             }
         }
-        const bool inside = sy >= I32(0x007c9780) && sy < I32(0x007c979c) && sx >= I32(0x007c97a4) &&
-                            sx < I32(0x007d2320);
+        if (scan) {
+            if (!flat || 12 * cell + 0x139 > kLightBytes) {
+                g_scan_fail[flat ? 1 : 0]++;
+                return false;
+            }
+            continue;
+        }
+        const bool inside = sy >= v.in_t && sy < v.in_b && sx >= v.in_l && sx < v.in_r;
         const uint32_t src = U32(e + 0x10);
         if (flat) {
-            const uint8_t *tbl = shade(light);
+            const uint8_t *tbl = shade(lv);
             if (inside) {          // 4f8810
                 if (flags & 4)
-                    rle_flat_draw(H(src), H(dst), tbl, 15);
+                    rle_flat_draw(H(src), H(dst), tbl, 15, v.pitch);
                 else
-                    iso_flat(H(src), H(dst), tbl);
+                    iso_flat(H(src), H(dst), tbl, v.pitch);
             } else {               // 4f88b0
                 if (flags & 4)
-                    rle_flat_clipped_draw(sx, sy, H(src), H(dst), tbl, 15);
+                    rle_flat_clipped_draw(sx, sy, H(src), H(dst), tbl, 15, v);
                 else
-                    iso_flat_clipped(H(src), sx, sy, H(dst), tbl);
+                    iso_flat_clipped(H(src), sx, sy, H(dst), tbl, v);
             }
         } else {
             // The original passes its four corners by address: here they go
             // below the stack pointer, under guest_call's own frame.
-            const uint32_t buf = c.reg(R_ESP) - 0x20;
+            const uint32_t buf = c->reg(R_ESP) - 0x20;
             std::memcpy(H(buf), corners, sizeof corners);
-            c.set_reg(R_ECX, e);
+            c->set_reg(R_ECX, e);
             if (inside) {
-                c.set_reg(R_EDX, dst);
-                rt::guest_call(c, 0x004f8850, {buf});
+                c->set_reg(R_EDX, dst);
+                rt::guest_call(*c, 0x004f8850, {buf});
             } else {
-                c.set_reg(R_EDX, (uint32_t)sx);
-                rt::guest_call(c, 0x004f89f0, {(uint32_t)sy, dst, buf});
+                c->set_reg(R_EDX, (uint32_t)sx);
+                rt::guest_call(*c, 0x004f89f0, {(uint32_t)sy, dst, buf});
             }
         }
     }
+    return true;
+}
+
+// ---- the floor queue (issue #80) ----------------------------------------------------
+//
+// A frame's floor is its first drawing after the clear: the tiles 4ded10
+// draws, called from the world's draw (476bc0) at 476cdc, and nothing else
+// drawn among them (the lane's draw census). The tiles do not overlap, so
+// their order does not matter. Queued there, they can be drawn later, on
+// another core, before the world's draw goes on at 476ce1 (473c00, which
+// draws over them). A tile that needs the game's own blitters is drawn at
+// once, after the queue.
+//
+// D2_FLOOR_QUEUE (lane) or the app: 0 off, 1 on, 2 the lane's check that
+// the order is free (drawn at 476ce1 in reverse, on the frame thread).
+//
+// With a worker (set_floor_worker, the app's thread on the second core), a
+// queued tile is drawn there as soon as it is queued; at 476ce1 the frame
+// thread draws what is left beside it, then waits for its last tile. The
+// tiles go through a ring of kFloorJobs, published with a release store;
+// a tile is taken by one compare-and-swap on g_floor_next, by either thread.
+// The three counts only ever grow (a tile's slot is its count modulo the
+// ring): were they reset at each frame, a worker stopped between reading
+// g_floor_next and its compare-and-swap could take a slot of the frame
+// before again (ABA), once the count came back to it.
+struct FloorJob {
+    uint32_t tile;
+    int32_t x, y;
+    FloorView view;
+    uint8_t light[kLightBytes];
+};
+constexpr uint32_t kFloorJobs = 512;   // a town frame queues ~90; more are drawn at once
+int g_floor_mode = 0, g_floor_mode_wanted = 0;
+bool g_floor_on = true;                // the bottom screen's switch: queue the tiles, or draw them at once
+bool g_floor_armed = false;            // between 476cdc and 476ce1, with g_floor_on
+uint64_t g_floor_t0 = 0;               // the floor's start (476cdc), host us
+uint64_t g_floor_us = 0, g_flush_us = 0;   // since floor_queue_take
+FloorJob *g_floor_ring = nullptr;
+std::atomic<uint32_t> g_floor_pub{0}, g_floor_next{0}, g_floor_done{0};
+uint32_t g_floor_start = 0;            // the frame thread's: the first tile not yet flushed
+FloorWorker g_floor_host{};
+bool g_floor_worker = false;           // a worker is running
+std::atomic<bool> g_floor_sleeping{false};   // the worker is (about to be) waiting: a tile wakes it
+std::atomic<bool> g_floor_quit{false};
+struct FloorQueueStats {
+    uint64_t queued = 0, at_once = 0, flushes = 0, guarded = 0, wait_us = 0;
+    std::atomic<uint64_t> by_worker{0};
+} g_floor_stats;
+
+inline void floor_job_draw(const FloorJob &j) { floor_tile_blocks(nullptr, j.tile, j.x, j.y, j.light, j.view, false); }
+
+// Takes the next published tile and draws it; false when none is left.
+bool floor_take_one(bool worker)
+{
+    uint32_t i = g_floor_next.load(std::memory_order_acquire);
+    for (;;) {
+        if ((int32_t)(g_floor_pub.load(std::memory_order_acquire) - i) <= 0)
+            return false;
+        if (g_floor_next.compare_exchange_weak(i, i + 1, std::memory_order_acq_rel))
+            break;
+    }
+    floor_job_draw(g_floor_ring[i % kFloorJobs]);
+    if (worker)
+        g_floor_stats.by_worker.fetch_add(1, std::memory_order_relaxed);
+    g_floor_done.fetch_add(1, std::memory_order_release);
+    return true;
+}
+
+void floor_worker_main()
+{
+    while (!g_floor_quit.load(std::memory_order_acquire)) {
+        while (floor_take_one(true)) {
+        }
+        // Asleep only when nothing is published: a tile queued after this
+        // look finds the flag set and wakes it (the event keeps a signal
+        // given before the wait).
+        g_floor_sleeping.store(true, std::memory_order_seq_cst);
+        if ((int32_t)(g_floor_pub.load(std::memory_order_seq_cst) - g_floor_next.load(std::memory_order_seq_cst)) > 0) {
+            g_floor_sleeping.store(false, std::memory_order_seq_cst);
+            continue;
+        }
+        g_floor_host.wait();
+        g_floor_sleeping.store(false, std::memory_order_seq_cst);
+    }
+}
+
+// D2_FLOOR_QUEUE=3 (lane): after the worker, every tile drawn again in the
+// order queued. Each draws what it drew before unless its inputs changed
+// meanwhile (the tile, the shade tables) or two tiles overlap: a frame
+// whose pixels change is counted and logged.
+uint64_t g_floor_verified = 0, g_floor_mismatch = 0;
+
+void floor_queue_verify(uint32_t start, uint32_t n)
+{
+    const FloorView &v = g_floor_ring[start % kFloorJobs].view;
+    const uint32_t bytes = (uint32_t)v.pitch * 600u;
+    std::vector<uint8_t> before(H(v.fb), H(v.fb) + bytes);
+    for (uint32_t i = start; i != n; i++)
+        floor_job_draw(g_floor_ring[i % kFloorJobs]);
+    g_floor_verified++;
+    if (std::memcmp(before.data(), H(v.fb), bytes)) {
+        g_floor_mismatch++;
+        uint32_t at = 0;
+        while (before[at] == H(v.fb)[at])
+            at++;
+        rt::logf("floor queue: frame %llu drawn again differs, first at row %u column %u (%u tiles)",
+                 (unsigned long long)g_floor_verified, at / (uint32_t)v.pitch, at % (uint32_t)v.pitch, n - start);
+    }
+}
+
+// Every queued tile drawn, by now: the frame thread's.
+void floor_queue_flush()
+{
+    const uint32_t n = g_floor_pub.load(std::memory_order_relaxed), start = g_floor_start;
+    if (n == start)
+        return;
+    g_floor_stats.flushes++;
+    if (g_floor_mode == 2) {
+        for (uint32_t i = n; i-- != start;)
+            floor_job_draw(g_floor_ring[i % kFloorJobs]);
+        g_floor_next.store(n, std::memory_order_release);
+        g_floor_done.store(n, std::memory_order_release);
+    } else {
+        while (floor_take_one(false)) {
+        }
+        if (g_floor_done.load(std::memory_order_acquire) != n) {
+            const uint64_t t0 = wx86_now_us();
+            while (g_floor_done.load(std::memory_order_acquire) != n) {
+            }
+            g_floor_stats.wait_us += wx86_now_us() - t0;
+        }
+        if (g_floor_mode == 3)
+            floor_queue_verify(start, n);
+    }
+    g_floor_start = n;   // every tile up to n is drawn
+}
+
+// Queues a tile the scan passed; false: the ring is full.
+bool floor_queue_push(uint32_t tile, int32_t x, int32_t y, const uint8_t *light, const FloorView &v)
+{
+    const uint32_t n = g_floor_pub.load(std::memory_order_relaxed);
+    if (n - g_floor_start >= kFloorJobs)
+        return false;   // the frame's tiles fill the ring; the frames before are all drawn
+    FloorJob &j = g_floor_ring[n % kFloorJobs];
+    j.tile = tile;
+    j.x = x;
+    j.y = y;
+    j.view = v;
+    std::memcpy(j.light, light, kLightBytes);
+    g_floor_pub.store(n + 1, std::memory_order_seq_cst);   // seq_cst: against the worker's look before it sleeps
+    g_floor_stats.queued++;
+    // One wake per sleep, not one per tile (each a kernel call).
+    if (g_floor_worker && g_floor_sleeping.exchange(false, std::memory_order_seq_cst))
+        g_floor_host.wake();
+    return true;
+}
+
+uint32_t floor_tile(Cpu &c)
+{
+    const uint32_t tile = c.reg(R_ECX);
+    const int32_t x = (int32_t)c.reg(R_EDX), y = (int32_t)c.arg(0);
+    const uint8_t *light = H(c.arg(1));
+    const FloorView v = floor_view_now();
+    if (g_floor_armed && floor_tile_blocks(nullptr, tile, x, y, light, v, true)) {
+        if (floor_queue_push(tile, x, y, light, v))
+            return 0;
+        g_floor_stats.at_once++;   // the ring full: drawn now, beside the queue (the order is free)
+        floor_tile_blocks(nullptr, tile, x, y, light, v, false);
+        return 0;
+    }
+    floor_queue_flush();   // the order with what is queued
+    if (g_floor_armed)
+        g_floor_stats.at_once++;
+    floor_tile_blocks(&c, tile, x, y, light, v, false);
     return 0;
 }
 
@@ -1477,6 +1703,101 @@ void resume_original(Cpu &c, uint32_t va, uint32_t esp, uint32_t stack_args)
     rt::bridge().redirect_next(va);
 }
 
+// The floor queue's two points in the world's draw (476bc0): the call to
+// the floor (476cdc, to 4ded10) arms it, the call after (476ce1, to 473c00)
+// draws what it holds. Each native then goes on to the call's own target.
+constexpr uint32_t kFloorCall = 0x00476cdc, kFloorFn = 0x004ded10;
+constexpr uint32_t kAfterFloorCall = 0x00476ce1, kAfterFloorFn = 0x00473c00;
+
+uint32_t floor_queue_arm(Cpu &c)
+{
+    g_floor_armed = g_floor_on;
+    g_floor_t0 = wx86_now_us();
+    resume_original(c, kFloorFn, c.reg(R_ESP), 0);
+    return c.reg(R_EAX);
+}
+
+uint32_t floor_queue_end(Cpu &c)
+{
+    g_floor_armed = false;
+    const uint64_t t1 = wx86_now_us();
+    floor_queue_flush();
+    const uint64_t t2 = wx86_now_us();
+    g_floor_us += t2 - g_floor_t0;
+    g_flush_us += t2 - t1;
+    resume_original(c, kAfterFloorFn, c.reg(R_ESP), 0);
+    static uint32_t frames = 0;
+    if (++frames % 250 == 0)
+        rt::logf("floor queue: %u frames, %llu tiles queued (%llu drawn by the worker), %llu at once, %llu flushes, "
+                 "%llu by another native (at once: %llu interpolated light, %llu light past the copy); waited for the "
+                 "worker %.2f ms a frame; drawn again %llu, differed %llu",
+                 frames, (unsigned long long)g_floor_stats.queued,
+                 (unsigned long long)g_floor_stats.by_worker.load(std::memory_order_relaxed),
+                 (unsigned long long)g_floor_stats.at_once, (unsigned long long)g_floor_stats.flushes,
+                 (unsigned long long)g_floor_stats.guarded, (unsigned long long)g_scan_fail[0],
+                 (unsigned long long)g_scan_fail[1], g_floor_stats.wait_us / 1000.0 / frames,
+                 (unsigned long long)g_floor_verified, (unsigned long long)g_floor_mismatch);
+    return c.reg(R_EAX);
+}
+
+// The renderer guard (issue #80): the game draws into the frame buffer only
+// through its renderer, the functions in the table at [0x7c8cc0]. The app
+// copies a frame out of the buffer on the second core after present; until
+// the copy is done, every entry of that table holds a native that waits for
+// it, then goes on to the renderer's own function. The copy's thread puts
+// the table back as soon as it is done, so a frame whose copy ends before
+// the game's next draw (nearly all) never stops in one.
+constexpr uint32_t kRendererTable = 0x007c8cc0;
+constexpr uint32_t kGuardMax = 54;           // the GDI renderer's functions (0x74c4a8: 54, then its data)
+void (*g_guard_wait)() = nullptr;
+uint32_t g_guard_native[kGuardMax];          // a native per entry
+uint32_t g_guard_orig[kGuardMax];            // the renderer's functions, while guarded
+uint32_t g_guard_table = 0, g_guard_n = 0;   // the table and its entries (code pointers)
+std::atomic<bool> g_guarded{false};
+
+uint32_t guard_entry(Cpu &c, uint32_t k)
+{
+    if (g_guard_wait)
+        g_guard_wait();
+    resume_original(c, g_guard_orig[k], c.reg(R_ESP), 0);
+    return c.reg(R_EAX);
+}
+
+// A call at `at` (e8 rel32) to `to`, sent to `native` instead.
+bool redirect_call(Cpu &c, uint32_t at, uint32_t to, uint32_t native)
+{
+    uint8_t ins[5];
+    if (!native || !c.read(at, ins, 5) || ins[0] != 0xe8)
+        return false;
+    int32_t rel;
+    std::memcpy(&rel, ins + 1, 4);
+    if (at + 5 + (uint32_t)rel != to)
+        return false;
+    rel = (int32_t)(native - (at + 5));
+    std::memcpy(ins + 1, &rel, 4);
+    c.write(at, ins, 5);
+    c.invalidate_code(at, 5);
+    return true;
+}
+
+bool install_floor_queue(Cpu &c, int mode)
+{
+    if (!mode)
+        return false;
+    if (!redirect_call(c, kFloorCall, kFloorFn, rt::native_entry("FloorQueueArm", 0, floor_queue_arm)) ||
+        !redirect_call(c, kAfterFloorCall, kAfterFloorFn, rt::native_entry("FloorQueueEnd", 0, floor_queue_end))) {
+        rt::logf("floor queue: the world's draw differs, not installed");
+        return false;
+    }
+    g_floor_mode = mode;
+    g_floor_ring = new FloorJob[kFloorJobs];
+    g_floor_worker = (mode == 1 || mode == 3) && g_floor_host.start && g_floor_host.start(floor_worker_main);
+    rt::logf("floor queue: on (%s)", mode == 2 ? "drawn in reverse at 476ce1, a check"
+                                     : g_floor_worker ? "drawn by a worker, and at 476ce1 beside it"
+                                                      : "drawn at 476ce1, no worker");
+    return true;
+}
+
 // 5ff1b0(ecx=cache, eax=entry): unlinks an entry from the list its flags
 // name (+0xc bit 0: the cache's +0x1c / +0x20 list, else +0x14 / +0x18,
 // head / tail); entries link by +0x14 next and +0x18 previous. A pinned head
@@ -1986,25 +2307,52 @@ int install_d2_native(Cpu &c)
     // The last argument, true: served in line (rt::hook_function). Not for
     // LightBlock and FloorTile, which call back into the game's own code.
 #define HOOK(...) (n += (mask & bit) ? rt::hook_function(__VA_ARGS__) : 0, bit <<= 1)
-    HOOK(c, 0x004f69b0, k4f69b0, sizeof k4f69b0, 1, floor_iso_flat, "FloorIsoFlat", true);
-    HOOK(c, 0x004f6f60, k4f6f60, sizeof k4f6f60, 2, rle_flat, "RleFlat", true);
-    HOOK(c, 0x004f7580, k4f7580, sizeof k4f7580, 4, rle_flat_clipped, "RleFlatClipped", true);
+    // The natives that draw into the frame buffer: counted by the draw census
+    // (draw_census.h) when it is on.
+    draw_census_init(g_base);
+    // The floor queue: from the environment (the lane) or the app's setting.
+    if (const char *q = std::getenv("D2_FLOOR_QUEUE"))
+        g_floor_mode_wanted = std::atoi(q);
+    const bool floor_queue = install_floor_queue(c, g_floor_mode_wanted);
+    if (floor_queue)   // the renderer guard's natives (renderer_guard)
+        for (uint32_t k = 0; k < kGuardMax; k++) {
+            // One name each: the bridge keeps natives by name.
+            static char names[kGuardMax][20];
+            std::snprintf(names[k], sizeof names[k], "RendererGuard%02u", (unsigned)k);
+            g_guard_native[k] = rt::native_entry(names[k], 0, [k](Cpu &cc) { return guard_entry(cc, k); });
+        }
+    // Any other draw native draws what the floor queue holds first.
+    auto guard = [floor_queue](NativeFn fn) -> NativeFn {
+        if (!floor_queue)
+            return fn;
+        return [fn](Cpu &c) -> uint32_t {
+            if (g_floor_pub.load(std::memory_order_relaxed) != g_floor_start) {
+                g_floor_stats.guarded++;
+                floor_queue_flush();
+            }
+            return fn(c);
+        };
+    };
+#define DRAW(fn, name) draw_census_wrap(name, guard(fn)), name
+    HOOK(c, 0x004f69b0, k4f69b0, sizeof k4f69b0, 1, DRAW(floor_iso_flat, "FloorIsoFlat"), true);
+    HOOK(c, 0x004f6f60, k4f6f60, sizeof k4f6f60, 2, DRAW(rle_flat, "RleFlat"), true);
+    HOOK(c, 0x004f7580, k4f7580, sizeof k4f7580, 4, DRAW(rle_flat_clipped, "RleFlatClipped"), true);
     static const uint8_t k4f7ea0[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x0c, 0x8b, 0x45, 0x08};
     static const uint8_t k606d40[] = {0x55, 0x8b, 0xec, 0x51, 0x8b, 0x45, 0x0c, 0x53, 0x56, 0x57};
     static const uint8_t k606da0[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x08, 0x8b, 0x45, 0x0c};
     static const uint8_t k606e40[] = {0x55, 0x8b, 0xec, 0x51, 0x8b, 0x45, 0x0c, 0x53, 0x56};
     static const uint8_t k607060[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x18, 0x8b, 0x45, 0x10};
-    HOOK(c, 0x004f7ea0, k4f7ea0, sizeof k4f7ea0, 1, wall_block_copy, "WallBlockCopy", true);
-    HOOK(c, 0x00606d40, k606d40, sizeof k606d40, 2, dc6_copy, "Dc6Copy", true);
-    HOOK(c, 0x00606da0, k606da0, sizeof k606da0, 5, dc6_copy_clipped, "Dc6CopyClipped", true);
-    HOOK(c, 0x00606e40, k606e40, sizeof k606e40, 4, dc6_blend, "Dc6Blend", true);
-    HOOK(c, 0x00607060, k607060, sizeof k607060, 7, dc6_blend_clipped, "Dc6BlendClipped", true);
+    HOOK(c, 0x004f7ea0, k4f7ea0, sizeof k4f7ea0, 1, DRAW(wall_block_copy, "WallBlockCopy"), true);
+    HOOK(c, 0x00606d40, k606d40, sizeof k606d40, 2, DRAW(dc6_copy, "Dc6Copy"), true);
+    HOOK(c, 0x00606da0, k606da0, sizeof k606da0, 5, DRAW(dc6_copy_clipped, "Dc6CopyClipped"), true);
+    HOOK(c, 0x00606e40, k606e40, sizeof k606e40, 4, DRAW(dc6_blend, "Dc6Blend"), true);
+    HOOK(c, 0x00607060, k607060, sizeof k607060, 7, DRAW(dc6_blend_clipped, "Dc6BlendClipped"), true);
     static const uint8_t k4756d0[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x08, 0x53, 0xe8};
     HOOK(c, 0x004756d0, k4756d0, sizeof k4756d0, 0, light_grid, "LightGrid", true);
     static const uint8_t k4ddef0[] = {0x55, 0x8b, 0xec, 0x51, 0x83, 0x7d, 0x10, 0x00, 0x53};
     HOOK(c, 0x004ddef0, k4ddef0, sizeof k4ddef0, 3, light_block, "LightBlock");
     static const uint8_t k4f8b80[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x48, 0x53, 0x8b, 0x1d};
-    HOOK(c, 0x004f8b80, k4f8b80, sizeof k4f8b80, 2, floor_tile, "FloorTile");
+    HOOK(c, 0x004f8b80, k4f8b80, sizeof k4f8b80, 2, draw_census_wrap("FloorTile", floor_tile), "FloorTile");
     for (int i = 0; i < 89; i++)
         g_adpcm_step[i] = U32(kAdpcmSteps + 4 * i);
     for (int i = 0; i < 32; i++)
@@ -2078,8 +2426,77 @@ int install_d2_native(Cpu &c)
          "CurrentLookup", !check);
     static const uint8_t k52df40[] = {0xa1, 0x34, 0x2d, 0x88, 0x00, 0x85, 0xc0, 0x75, 0x1f};
     HOOK(c, 0x0052df40, k52df40, sizeof k52df40, 0, current_unlock, "CurrentUnlock", true);
+#undef DRAW
 #undef HOOK
     return n;
+}
+
+void set_floor_queue(int mode) { g_floor_mode_wanted = mode; }
+
+bool set_floor_queue_on(bool on)
+{
+    if (on == g_floor_on)
+        return false;
+    g_floor_on = on;   // read at the next frame's floor (476cdc), on this thread
+    if (g_floor_mode)
+        rt::logf("floor queue: %s (the bottom screen)", on ? "on" : "off");
+    return true;
+}
+
+bool renderer_guard(void (*wait)())
+{
+    g_guard_wait = wait;
+    if (!g_base || !wait || !g_guard_native[0] || g_guarded.load(std::memory_order_acquire))
+        return false;
+    const uint32_t table = U32(kRendererTable);
+    if (!table)
+        return false;   // no renderer yet
+    if (table != g_guard_table) {
+        // The table's functions: the game's own code, or a native placed in
+        // one of them (a trap address below the code).
+        g_guard_table = table;
+        g_guard_n = kGuardMax;
+        rt::logf("renderer guard: table %08x, %u entries; each waits for the last frame's copy", table, g_guard_n);
+    }
+    for (uint32_t k = 0; k < g_guard_n; k++) {
+        g_guard_orig[k] = U32(g_guard_table + 4 * k);
+        if (!g_guard_orig[k] || g_guard_orig[k] == g_guard_native[k])
+            return false;   // not a function, or still guarded: no guard, the app copies at once
+    }
+    for (uint32_t k = 0; k < g_guard_n; k++)
+        std::memcpy(H(g_guard_table + 4 * k), &g_guard_native[k], 4);
+    g_guarded.store(true, std::memory_order_release);
+    return true;
+}
+
+void renderer_unguard()
+{
+    if (!g_guarded.load(std::memory_order_acquire))
+        return;
+    for (uint32_t k = 0; k < g_guard_n; k++) {
+        // Only an entry still the guard's: one the game set meanwhile stays.
+        uint32_t *slot = (uint32_t *)H(g_guard_table + 4 * k);
+        uint32_t expect = g_guard_native[k];
+        __atomic_compare_exchange_n(slot, &expect, g_guard_orig[k], false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+    }
+    g_guarded.store(false, std::memory_order_release);
+}
+
+void floor_queue_take(uint32_t &floor_us, uint32_t &flush_us)
+{
+    floor_us = (uint32_t)g_floor_us;
+    flush_us = (uint32_t)g_flush_us;
+    g_floor_us = g_flush_us = 0;
+}
+void set_floor_worker(const FloorWorker &w) { g_floor_host = w; }
+
+void stop_floor_worker()
+{
+    if (!g_floor_worker)
+        return;
+    g_floor_quit.store(true, std::memory_order_release);
+    g_floor_sleeping.store(false, std::memory_order_seq_cst);
+    g_floor_host.wake();
 }
 
 uint64_t dcc_cells_decoded() { return g_dcc_intrin ? g_dcc_intrin->calls : 0; }

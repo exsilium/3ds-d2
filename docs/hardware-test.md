@@ -427,7 +427,7 @@ The run had the decoder on first, then off, each time for an area arrival follow
 | Decoder off | 15.1% (176 of 1162) | 148–452 ms | 145, by the game's code |
 
 - **Baseline:** with no sprites decoding, `ready` is 105–125 ms a window, so with the decoder on almost all the decode time is off core 0. With it off, each group adds about 7 ms of the read thread's time on core 0. The off arrival decoded nearly twice as many groups (the route was not the same), so part of its extra slow frames is the route.
-- **Cost of a decode on the console:** 4–7 ms a group natively. The load's 200 groups, decoded on the frame thread, took 808 ms. The log doesn't time the game's own decodes, so the load itself isn't compared.
+- **Time a group on the console** (the heartbeat's `sprite cache … decoded N in M ms`, timed at the load's callback): 6.8 ms natively (337 groups), against 18.0 ms by the game's code (379 groups; 19.1 ms in 3DS-D2-18, 17.3 ms in 3DS-D2-19). The load's 200 groups, decoded natively on the frame thread, took 808 ms; at the game's 18 ms a group they would take about 3.6 s.
 - **What's left in an arrival:** the frame thread's own Storm reads, `io` at 480–670 ms a window.
 - **The screen:** with 0.3 ms of slack, frames on screen for 1 refresh fell from 2.8% (3DS-D2-19) to 0.36%, and frames on for exactly 2 rose from 93.3% to 96.4%. Frames ready within 2 ms of a refresh come in bursts of about 50 every 30 s or so. That is the game's 40 ms clock drifting against the panel's 39.97 ms refresh pair, which issue #86's frame lock would remove.
 

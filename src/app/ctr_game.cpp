@@ -31,6 +31,7 @@
 #include "game/d2_state.h"
 #include "game/draw_census.h"
 #include "game/dcc_native.h"
+#include "game/frame_reads.h"
 #include "game/frame_trace.h"
 #include "game/port_options.h"
 #include "game/game_exe.h"
@@ -2265,6 +2266,9 @@ void hitch_heartbeat(const game::SpriteCacheWindow &w)
                   (unsigned)((d.native_us - dcc_mark.native_us) / 1000));
     dcc_mark = d;
     logline_held(line);
+    // The game thread's reads by file (issue #89).
+    for (const std::string &l : game::frame_reads_lines())
+        logline_held(l.c_str());
 }
 
 }  // namespace
@@ -2564,6 +2568,7 @@ int main()
         game::install_storm_read_priority(c);
         if (g_storm_direct)
             game::install_storm_direct_reads(c);
+        game::install_frame_reads(c);
         if (g_storm_rate_kib)
             game::set_storm_read_rate(c, g_storm_rate_kib << 10);
         game::install_fatal_exit(c);

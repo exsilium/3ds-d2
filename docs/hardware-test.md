@@ -409,6 +409,17 @@ The game starts a frame when its clock passes the next 40 ms. A pair of refreshe
 - **Steady play:** with the lock on, 91–95% of swaps in each window fell in the middle half of the refresh. The clock moved ahead 12–13 ms per 10 s, about 0.13%.
 - **When it can't hold:** in a run where Azahar fell behind (1–7% of frames past 50 ms), the swaps stayed spread out until the game was back on time. A game that is behind starts each frame as soon as the last one ends, so its clock leaves the lock nothing to move. The lock only matters where the game has time to spare, which is where the bursts happen.
 
+**On the console, 3DS-D2-1B** (build `bb3e8c277367`): about 3.5 min with the lock off, then about 9 min with it on. These are the quiet windows, with at most 6 slow frames and at most 2 new sprites:
+
+| | Frames | 1 refresh | Ready in a refresh's last 2 ms | Swaps in 5–10 ms |
+| --- | --- | --- | --- | --- |
+| Off | 2,018 | 0.64% | 5.3% | 55% |
+| On | 2,989 | **0.10%** | 1.6% | **78%** |
+
+- **Busy play:** the swaps don't drift even with the lock off. A late frame makes the game start from wherever it ended, and that end is set by the render thread's wait for the refresh, so the game's grid re-anchors to the screen by itself. Swaps drift only in quiet play, where the first minute in town went round the whole refresh in 30–40 s.
+- **The push:** small, 85 ms in about 9 minutes (0.016%). The refresh measures 50.01 Hz, so the natural drift is about 8 µs a frame. The lock holds the swaps at about 9 ms into the refresh.
+- **The whole stretch after the arrival:** frames on screen for exactly 2 refreshes went from 95.9% with the lock off to 97.9% with it on. Most of that difference is the game's own slow frames: 5.9% against 3.2%, over play that wasn't the same.
+
 ## The native sprite decoder (issue #83)
 
 0x60bff0 decodes a DCC sprite group into the sprite cache's run-length frames. `src/game/dcc_decode.cpp` does the same in native code, byte for byte, and `src/game/dcc_native.cpp` puts it in the game.

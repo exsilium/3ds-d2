@@ -417,6 +417,20 @@ A native broken on purpose (one skip byte changed) differs in every group.
 - **In play:** 13–26 groups per 10 s go to the worker, and 0–2 stay on the frame thread.
 - **On the console:** game.log's `dcc:` heartbeat line counts each window's groups by where they were decoded.
 
+### On the console: 3DS-D2-1A (build `1c7ca22d9f49`)
+
+The run had the decoder on first, then off, each time for an area arrival followed by a few minutes of play. The screen was at 50 Hz throughout. The arrival is the 50 s after the area appeared, from the frame trace's 10 s windows:
+
+| | Frames past 50 ms | Read thread's turns on core 0 (`ready`, per 10 s) | Groups decoded |
+| --- | --- | --- | --- |
+| Decoder on | **9.3%** (114 of 1227) | 124–146 ms | 77: 62 on the worker, 15 on the frame thread |
+| Decoder off | 15.1% (176 of 1162) | 148–452 ms | 145, by the game's code |
+
+- **Baseline:** with no sprites decoding, `ready` is 105–125 ms a window, so with the decoder on almost all the decode time is off core 0. With it off, each group adds about 7 ms of the read thread's time on core 0. The off arrival decoded nearly twice as many groups (the route was not the same), so part of its extra slow frames is the route.
+- **Cost of a decode on the console:** 4–7 ms a group natively. The load's 200 groups, decoded on the frame thread, took 808 ms. The log doesn't time the game's own decodes, so the load itself isn't compared.
+- **What's left in an arrival:** the frame thread's own Storm reads, `io` at 480–670 ms a window.
+- **The screen:** with 0.3 ms of slack, frames on screen for 1 refresh fell from 2.8% (3DS-D2-19) to 0.36%, and frames on for exactly 2 rose from 93.3% to 96.4%. Frames ready within 2 ms of a refresh come in bursts of about 50 every 30 s or so. That is the game's 40 ms clock drifting against the panel's 39.97 ms refresh pair, which issue #86's frame lock would remove.
+
 ## Blood Moor: VirtualAlloc ran out (2026-10-18)
 
 After about four and a half minutes, three of them in Blood Moor, the console logged `va full: want 512 KiB, live 44416 KiB, largest free 384 KiB`. The 44 MiB VirtualAlloc range was full, while the heap range held 8.2 MiB of its 17 (peak 9.7). The game kept going after the failed allocation, the sound looped, and translated code then faulted on a wild guest pointer (data abort, far = membase + 0x357db9e8, outside the 75 MiB arena).

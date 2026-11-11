@@ -268,8 +268,25 @@ struct FileStats {
     // Jobs on the I/O worker (offload_job): how many, their time running
     // there, those past 5 ms, and their time queued behind other requests.
     uint64_t jobs = 0, job_us = 0, job_long = 0, job_queued_us = 0;
+    // The prefetch store (issue #89): the worker's reads into it, and the
+    // blocks the read caches took from it instead of the card.
+    uint64_t prefetch_reads = 0, prefetch_bytes = 0, prefetch_us = 0, prefetch_hits = 0, prefetch_held = 0;
 };
 const FileStats &file_stats();
+// Reading ahead (issue #89). prefetch_file: the id of the read-only game
+// file named so ("d2data.mpq"), once the game has opened it; -1 otherwise.
+// io_background: `task` runs on the I/O worker when it has no read or job
+// waiting (false: no worker, or 512 queued). In such a task, prefetch_raw
+// reads bytes of the file for the task itself, and prefetch_range reads
+// [pos, pos+n) into the store a read inside it is served from, before the
+// read cache and the card (1 MiB in all, least recently used replaced; a
+// range at most a quarter of that). False if it read nothing: already
+// stored, or the read failed.
+int prefetch_file(const char *name);
+bool io_background(std::function<void()> task);
+bool prefetch_raw(int id, uint64_t pos, void *dst, uint32_t n);
+bool prefetch_range(int id, uint64_t pos, uint32_t n);
+
 // The asynchronous reads' worker (RunOptions::io_start): started and stopped
 // by run_exe.
 void start_async_io();

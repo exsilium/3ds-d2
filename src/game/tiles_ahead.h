@@ -36,6 +36,15 @@ std::vector<TileAhead> tiles_ahead(d2rt::Cpu &c);
 // loaded (frame_reads, at a tile's read on the game thread) checks a tile
 // against it. lines: the window's figures for the heartbeat.
 void tiles_ahead_scan(d2rt::Cpu &c);
+// The prefetch: each scan sends the ring-1 tiles not yet loaded to the I/O
+// worker, which reads their sectors of the archive into the runtime's
+// prefetch store (rt::prefetch_blocks). The DT1s' places in their archives
+// come from Storm's file objects as the game reads them (the act's load
+// reads every DT1 of its level types): frame_reads calls note_file on each
+// DT1 read with the object (+0x08 name, +0x114 archive, name at +0x08;
+// +0x118 the file's block entry: offset, compressed and full sizes, flags).
+void set_tile_prefetch(bool on);
+void tiles_ahead_note_file(d2rt::Cpu &c, const char *name, uint32_t file);
 void tiles_ahead_loaded(d2rt::Cpu &c, uint32_t buffer);   // the DT1 read's buffer
 std::vector<std::string> tiles_ahead_lines();
 

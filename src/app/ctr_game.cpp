@@ -1335,8 +1335,10 @@ void second_screen_active()
 
 void present(const rt::Frame &f)
 {
-    if (g_guest_cpu)
-        game::tiles_ahead_scan(*g_guest_cpu);   // issue #89: the tiles the next frames will load
+    if (g_guest_cpu) {   // issue #89: the tiles the next frames will load, read ahead (the OPTIONS row)
+        game::set_tile_prefetch((g_ss.port_options() & game::kPortTilePrefetch) != 0);
+        game::tiles_ahead_scan(*g_guest_cpu);
+    }   // issue #89: the tiles the next frames will load
     copy_wait();   // the last frame's copy, should the game not have drawn since
     const uint64_t t0 = host_us();
     if (g_timing.last_present_us) {

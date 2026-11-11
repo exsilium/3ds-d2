@@ -42,25 +42,29 @@ constexpr const char *kClassNames[kClasses] = {"tiles",    "presets", "monsters"
 struct Use {
     uint32_t reads = 0;
     uint64_t bytes = 0, wait_us = 0;
+    uint64_t kind_us[4] = {};   // of wait_us: critsec, event, fileio, multi
 };
 
 std::unordered_map<std::string, Use> g_files;   // the window's, by name
 std::string g_last;                              // the game thread's last read, its wait not yet charged
-uint64_t g_last_blocked = 0;
+uint64_t g_last_kind[4] = {};
 
-uint64_t blocked_us()
+// The wait since the last read's entry, to that read, by kind.
+void charge()
 {
     uint64_t t[rt::kFrameThreadKinds];
     rt::frame_thread_us(t);
-    return t[kCritsec] + t[kEvent] + t[kFileio] + t[kMulti];
-}
-
-// The wait since the last read's entry, to that read.
-void charge(uint64_t now)
-{
-    if (!g_last.empty() && now > g_last_blocked)
-        g_files[g_last].wait_us += now - g_last_blocked;
-    g_last_blocked = now;
+    const uint64_t now[4] = {t[kCritsec], t[kEvent], t[kFileio], t[kMulti]};
+    if (!g_last.empty()) {
+        Use &u = g_files[g_last];
+        for (int k = 0; k < 4; k++)
+            if (now[k] > g_last_kind[k]) {
+                u.kind_us[k] += now[k] - g_last_kind[k];
+                u.wait_us += now[k] - g_last_kind[k];
+            }
+    }
+    for (int k = 0; k < 4; k++)
+        g_last_kind[k] = now[k];
 }
 
 Class class_of(const std::string &name)
@@ -104,17 +108,21 @@ uint32_t on_read(d2rt::Cpu &c)
         c.write_u32(read, 0);
     if (!rt::on_frame_thread())
         return 0;
-    charge(blocked_us());
+    charge();
     char name[261];
     if (!file || !c.read(file + 8, name, sizeof name - 1))
         std::strcpy(name, "(no name)");
     name[sizeof name - 1] = 0;
     g_last = name;
-    // A tile's graphics, read at its first draw (issue #89, step 2): 0x5fdea0
-    // reads them into the buffer it has just put at the tile's +0x54.
+    // A DT1 (issue #89): where it is in its archive, for the tile prefetch;
+    // and a tile's graphics read at its first draw, which 0x5fdea0 reads
+    // into the buffer it has just put at the tile's +0x54.
     const size_t len = std::strlen(name);
-    if (len > 4 && (name[len - 1] | 0x20) == '1' && (name[len - 2] | 0x20) == 't' && (name[len - 3] | 0x20) == 'd')
+    if (file && len > 4 && (name[len - 1] | 0x20) == '1' && (name[len - 2] | 0x20) == 't' &&
+        (name[len - 3] | 0x20) == 'd') {
+        tiles_ahead_note_file(c, name, file);
         tiles_ahead_loaded(c, c.read_u32(esp + 0x0c));
+    }
     Use &u = g_files[g_last];
     u.reads++;
     u.bytes += bytes;
@@ -147,7 +155,7 @@ bool install_frame_reads(d2rt::Cpu &c)
 std::vector<std::string> frame_reads_lines()
 {
     std::vector<std::string> out;
-    charge(blocked_us());
+    charge();
     if (g_files.empty())
         return out;
     Use by[kClasses];
@@ -158,6 +166,8 @@ std::vector<std::string> frame_reads_lines()
         u.reads += f.second.reads;
         u.bytes += f.second.bytes;
         u.wait_us += f.second.wait_us;
+        for (int k = 0; k < 4; k++)
+            u.kind_us[k] += f.second.kind_us[k];
         all.reads += f.second.reads;
         all.bytes += f.second.bytes;
         all.wait_us += f.second.wait_us;
@@ -172,6 +182,15 @@ std::vector<std::string> frame_reads_lines()
             n += std::snprintf(line + n, sizeof line - n, " %s %u (%u KiB, %u ms)", kClassNames[k], by[k].reads,
                                (unsigned)(by[k].bytes >> 10), (unsigned)(by[k].wait_us / 1000));
     out.emplace_back(line);
+    // Tiles' waits by kind (issue #89): the card (fileio), Storm's read thread
+    // (event), its lock (critsec).
+    if (by[kTiles].reads) {
+        const Use &t = by[kTiles];
+        std::snprintf(line, sizeof line, "[rt] frame reads, tiles waited: lock %u ms, read thread %u ms, file %u ms, multi %u ms",
+                      (unsigned)(t.kind_us[0] / 1000), (unsigned)(t.kind_us[1] / 1000), (unsigned)(t.kind_us[2] / 1000),
+                      (unsigned)(t.kind_us[3] / 1000));
+        out.emplace_back(line);
+    }
     // The files waited on most.
     std::sort(files.begin(), files.end(),
               [](const auto &a, const auto &b) { return a.second.wait_us > b.second.wait_us; });

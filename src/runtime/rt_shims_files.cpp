@@ -40,6 +40,7 @@
 #include <ctime>
 #include <dirent.h>
 #include <fcntl.h>
+#include <functional>
 #include <memory>
 #include <string>
 #include <sys/stat.h>
@@ -333,6 +334,168 @@ bool resolve_write(const std::string &rel, bool copy_up, std::string &host)
 
 FileStats g_file_stats;
 
+// ---- the prefetch store (issue #89) ------------------------------------------------
+//
+// Byte ranges of game files read ahead on the I/O worker, while it has
+// nothing else to do (io_background), for reads the game will make soon:
+// a tile's compressed sectors, say, 2-10 KiB scattered through its DT1. A
+// read that falls inside a stored range is served from it (ReadCache's
+// try_read and read), before the cache's blocks and the card. Ranges stay,
+// least recently used replaced past kPfBytes, so one read again (Storm's
+// sector table, before each read of an MPQ file) keeps being served. The
+// files are the read-only game files a ReadCache was opened on, by name;
+// the worker reads them through descriptors of its own.
+constexpr uint32_t kPfBytes = 1u << 20, kPfRanges = 512, kPfFiles = 32;
+struct PfFile {
+    std::string path, base;   // the host path, and its file name in lower case
+    int fd = -1;              // the worker's
+};
+PfFile g_pf_files[kPfFiles];
+std::atomic<int> g_pf_count{0};
+struct PfRange {
+    int id = -1;
+    uint64_t pos = 0;
+    uint32_t len = 0, used = 0;
+    std::unique_ptr<uint8_t[]> data;
+};
+PfRange g_pf[kPfRanges];
+uint32_t g_pf_clock = 0;
+std::atomic_flag g_pf_lock = ATOMIC_FLAG_INIT;
+struct PfGuard {
+    PfGuard()
+    {
+        while (g_pf_lock.test_and_set(std::memory_order_acquire)) {
+        }
+    }
+    ~PfGuard() { g_pf_lock.clear(std::memory_order_release); }
+};
+
+std::string lower_name(const std::string &path)
+{
+    const size_t s = path.find_last_of("/\\");
+    std::string n = s == std::string::npos ? path : path.substr(s + 1);
+    for (char &ch : n)
+        ch = (char)std::tolower((unsigned char)ch);
+    return n;
+}
+
+// The game thread, as a cached file opens: its id (kept for its name).
+int pf_register(const std::string &path)
+{
+    const std::string base = lower_name(path);
+    const int n = g_pf_count.load(std::memory_order_acquire);
+    for (int i = 0; i < n; i++)
+        if (g_pf_files[i].base == base)
+            return i;
+    if (n >= (int)kPfFiles)
+        return -1;
+    g_pf_files[n].path = path;
+    g_pf_files[n].base = base;
+    g_pf_count.store(n + 1, std::memory_order_release);
+    return n;
+}
+
+// [pos, pos+n) into dst if a stored range holds all of it.
+bool pf_serve(int id, uint64_t pos, uint8_t *dst, uint32_t n)
+{
+    if (id < 0 || !g_file_stats.prefetch_held)
+        return false;
+    PfGuard g;
+    for (PfRange &r : g_pf)
+        if (r.id == id && r.data && pos >= r.pos && pos + n <= r.pos + r.len) {
+            std::memcpy(dst, r.data.get() + (pos - r.pos), n);
+            r.used = ++g_pf_clock;
+            g_file_stats.prefetch_hits++;
+            return true;
+        }
+    return false;
+}
+
+bool pf_covered(int id, uint64_t pos, uint32_t n)
+{
+    PfGuard g;
+    for (PfRange &r : g_pf)
+        if (r.id == id && r.data && pos >= r.pos && pos + n <= r.pos + r.len) {
+            r.used = ++g_pf_clock;   // wanted again: keep it
+            return true;
+        }
+    return false;
+}
+
+// The worker's: a range into the store, the least recently used going until
+// it fits.
+void pf_put(int id, uint64_t pos, std::unique_ptr<uint8_t[]> data, uint32_t len)
+{
+    PfGuard g;
+    for (;;) {
+        PfRange *free_slot = nullptr, *old = nullptr;
+        for (PfRange &r : g_pf) {
+            if (!r.data) {
+                if (!free_slot)
+                    free_slot = &r;
+            } else if (!old || r.used < old->used) {
+                old = &r;
+            }
+        }
+        if (free_slot && g_file_stats.prefetch_held + len <= kPfBytes) {
+            free_slot->data = std::move(data);
+            free_slot->id = id;
+            free_slot->pos = pos;
+            free_slot->len = len;
+            free_slot->used = ++g_pf_clock;
+            g_file_stats.prefetch_held += len;
+            return;
+        }
+        if (!old)
+            return;
+        g_file_stats.prefetch_held -= old->len;
+        old->data.reset();
+        old->id = -1;
+    }
+}
+
+bool pf_disk(int id, uint64_t pos, void *dst, uint32_t n, uint32_t &got)
+{
+    got = 0;
+    if (id < 0 || id >= g_pf_count.load(std::memory_order_acquire))
+        return false;
+    PfFile &f = g_pf_files[id];
+    if (f.fd < 0)
+        f.fd = ::open(f.path.c_str(), O_RDONLY);
+    if (f.fd < 0 || ::lseek(f.fd, (off_t)pos, SEEK_SET) != (off_t)pos)
+        return false;
+    const uint64_t t0 = wx86_now_us();
+    while (got < n) {
+        const ssize_t r = ::read(f.fd, (uint8_t *)dst + got, n - got);
+        if (r <= 0)
+            break;
+        got += (uint32_t)r;
+    }
+    g_file_stats.prefetch_reads++;
+    g_file_stats.prefetch_bytes += got;
+    g_file_stats.prefetch_us += wx86_now_us() - t0;
+    return got > 0;
+}
+
+// Background tasks for the I/O worker's idle time: one producer (the game
+// thread), the worker the consumer.
+constexpr uint32_t kBgTasks = 512;
+std::function<void()> g_bg[kBgTasks];
+std::atomic<uint32_t> g_bg_head{0}, g_bg_tail{0};
+
+bool run_background()
+{
+    const uint32_t t = g_bg_tail.load(std::memory_order_relaxed);
+    if (t == g_bg_head.load(std::memory_order_acquire))
+        return false;
+    std::function<void()> task = std::move(g_bg[t % kBgTasks]);
+    g_bg[t % kBgTasks] = nullptr;
+    g_bg_tail.store(t + 1, std::memory_order_release);
+    if (task)
+        task();
+    return true;
+}
+
 // A read-only file's recently read blocks. kBlock-aligned blocks of the file,
 // filled whole by one read each; least recently used is replaced. Reads of a
 // block or more go straight to their destination.
@@ -350,7 +513,7 @@ public:
     static constexpr uint32_t kBlock = 16 * 1024, kBlocks = 8;
     static constexpr uint64_t kCap = 1u << 20;
 
-    ReadCache(int fd, uint64_t size) : fd_(fd), size_(size) {}
+    ReadCache(int fd, uint64_t size, int pf = -1) : fd_(fd), size_(size), pf_(pf) {}
     void set_fd(int fd) { fd_ = fd; }   // the file reopened (resume_files)
     ~ReadCache()
     {
@@ -375,6 +538,10 @@ public:
             return true;
         if (n > size_ - pos)
             n = (uint32_t)(size_ - pos);
+        if (pf_serve(pf_, pos, dst, n)) {   // read ahead on the worker (issue #89)
+            got = n;
+            return true;
+        }
         if (n >= kBlock)
             return false;
         Guard g(lock_);
@@ -404,6 +571,8 @@ public:
             return 0;
         if (n > size_ - pos)
             n = (uint32_t)(size_ - pos);
+        if (pf_serve(pf_, pos, dst, n))   // read ahead on the worker (issue #89)
+            return n;
         if (n >= kBlock) {
             g_file_stats.direct++;
             return disk_read(pos, dst, n);
@@ -544,6 +713,7 @@ private:
 
     int fd_;
     uint64_t size_;
+    int pf_;   // the prefetch store's id for this file, -1 none
     uint32_t clock_ = 0;
     uint64_t last_fill_ = ~0ull - kBlock;   // the last block filled: a miss right after it reads ahead
     Block blocks_[kBlocks];
@@ -646,6 +816,8 @@ void io_worker_main()
         if (t == g_io_head.load(std::memory_order_acquire)) {
             if (g_io_quit.load(std::memory_order_acquire))
                 return;
+            if (run_background())   // nothing else to do: a prefetch (issue #89)
+                continue;
             options().io_wait();
             continue;
         }
@@ -721,6 +893,48 @@ void io_pause()
 }
 
 }  // namespace
+
+// See rt_host.h.
+int prefetch_file(const char *name)
+{
+    const std::string base = lower_name(name);
+    const int n = g_pf_count.load(std::memory_order_acquire);
+    for (int i = 0; i < n; i++)
+        if (g_pf_files[i].base == base)
+            return i;
+    return -1;
+}
+
+bool io_background(std::function<void()> task)
+{
+    if (!g_io_on)
+        return false;
+    const uint32_t h = g_bg_head.load(std::memory_order_relaxed);
+    if (h - g_bg_tail.load(std::memory_order_acquire) >= kBgTasks)
+        return false;
+    g_bg[h % kBgTasks] = std::move(task);
+    g_bg_head.store(h + 1, std::memory_order_release);
+    options().io_wake();
+    return true;
+}
+
+bool prefetch_raw(int id, uint64_t pos, void *dst, uint32_t n)
+{
+    uint32_t got;
+    return pf_disk(id, pos, dst, n, got) && got == n;
+}
+
+bool prefetch_range(int id, uint64_t pos, uint32_t n)
+{
+    if (id < 0 || !n || n > kPfBytes / 4 || pf_covered(id, pos, n))
+        return false;
+    std::unique_ptr<uint8_t[]> data(new (std::nothrow) uint8_t[n]);
+    uint32_t got;
+    if (!data || !pf_disk(id, pos, data.get(), n, got) || got != n)
+        return false;
+    pf_put(id, pos, std::move(data), n);
+    return true;
+}
 
 // See rt_host.h.
 bool offload_job(uint32_t (*job)(const uint32_t *), const uint32_t *args, size_t n, uint32_t &ret)
@@ -1221,7 +1435,7 @@ uint32_t create_file(Cpu &c, const std::string &guest, uint32_t access, uint32_t
         struct stat fst;
         if (f->fd >= 0 && ::fstat(f->fd, &fst) == 0) {
             f->size = (uint64_t)fst.st_size;
-            f->cache.reset(new ReadCache(f->fd, f->size));
+            f->cache.reset(new ReadCache(f->fd, f->size, pf_register(host)));
         } else if (f->fd >= 0) {
             ::close(f->fd);
             f->fd = -1;

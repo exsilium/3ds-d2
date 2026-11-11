@@ -36,6 +36,7 @@
 // events (game::Autoplay, src/game/autoplay.h), ';'-separated, e.g.
 //   "20000 tap 400 307;26000 tap 400 290;32000 text Tester;34000 press R;..."
 
+#include "game/dcc_native.h"
 #include "game/autoplay.h"
 #include "game/automap.h"
 #include "game/cinematics.h"
@@ -237,6 +238,9 @@ int main(int argc, char **argv)
         game::install_sprite_cache_counter(c);
         game::install_sprite_decode_timer(c);
         game::install_sprite_trace(c);
+        // The native DCC decoder (issue #83): D2_DCC=1 in place, 2 on the I/O
+        // worker, 3 checked against the game's code; off otherwise.
+        game::install_dcc_native(c, game::DccMode::Off);
         // Storm serving a waiting caller first, as on the console (M4_STORM_PRIO=0: as the game does).
         if (!std::getenv("M4_STORM_PRIO") || std::string(std::getenv("M4_STORM_PRIO")) != "0")
             game::install_storm_read_priority(c);
@@ -278,6 +282,12 @@ int main(int argc, char **argv)
                                             ? (uint32_t)std::atoi(std::getenv("M4_POOL_RESERVE_MB")) << 20
                                             : game::kCtrPoolReserve;
         const game::SpriteCacheWindow w = game::sprite_cache_window(*guest_cpu);
+        if (game::dcc_mode() != game::DccMode::Off) {
+            const game::DccStats d = game::dcc_stats();
+            rt::logf("dcc: native %u, offloaded %u, the game's %u (refused %u), native %llu ms; checked %u, differed %u",
+                     d.native, d.offloaded, d.game, d.refused, (unsigned long long)(d.native_us / 1000), d.checked,
+                     d.differed);
+        }
         if (ctr_layout) {
             const rt::MemoryReport m = rt::memory_report();
             static uint32_t spare_takes_seen = 0;

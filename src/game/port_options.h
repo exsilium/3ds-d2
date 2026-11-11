@@ -22,6 +22,10 @@ enum PortOption : uint32_t {
     // (40 ms) instead of two or three (33 or 50). ctr_game.cpp's screen_hz:
     // one LCD timing register, put back for the HOME menu, sleep and exit.
     kPortScreen50 = 1u << 1,
+    // Sprites (DCC groups) decoded by native code instead of the game's, on
+    // the I/O worker's core when Storm's read thread decodes them
+    // (dcc_native.h, issue #83).
+    kPortNativeDcc = 1u << 2,
 };
 
 struct PortOptionInfo {
@@ -34,10 +38,11 @@ struct PortOptionInfo {
 inline constexpr PortOptionInfo kPortOptions[] = {
     {kPortCore2Draw, "core2draw", "draw on core 2", "floor and frame copy on core 2"},
     {kPortScreen50, "screen50", "screen at 50 Hz", "each frame 40 ms on the screen"},
+    {kPortNativeDcc, "dcc", "native sprite decoder", "new sprites decoded off core 0"},
 };
 inline constexpr int kPortOptionCount = sizeof kPortOptions / sizeof kPortOptions[0];
-inline constexpr uint32_t kPortDefault = kPortCore2Draw | kPortScreen50;
-inline constexpr uint32_t kPortAll = kPortCore2Draw | kPortScreen50;
+inline constexpr uint32_t kPortDefault = kPortCore2Draw | kPortScreen50 | kPortNativeDcc;
+inline constexpr uint32_t kPortAll = kPortCore2Draw | kPortScreen50 | kPortNativeDcc;
 // The options of the first "port=" lines, which named only those on.
 inline constexpr uint32_t kPortFirst = kPortCore2Draw;
 

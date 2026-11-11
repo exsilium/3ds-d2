@@ -32,6 +32,7 @@
 #include "game/draw_census.h"
 #include "game/dcc_native.h"
 #include "game/frame_reads.h"
+#include "game/tiles_ahead.h"
 #include "game/frame_trace.h"
 #include "game/port_options.h"
 #include "game/game_exe.h"
@@ -1334,6 +1335,8 @@ void second_screen_active()
 
 void present(const rt::Frame &f)
 {
+    if (g_guest_cpu)
+        game::tiles_ahead_scan(*g_guest_cpu);   // issue #89: the tiles the next frames will load
     copy_wait();   // the last frame's copy, should the game not have drawn since
     const uint64_t t0 = host_us();
     if (g_timing.last_present_us) {
@@ -2268,6 +2271,8 @@ void hitch_heartbeat(const game::SpriteCacheWindow &w)
     logline_held(line);
     // The game thread's reads by file (issue #89).
     for (const std::string &l : game::frame_reads_lines())
+        logline_held(l.c_str());
+    for (const std::string &l : game::tiles_ahead_lines())
         logline_held(l.c_str());
 }
 

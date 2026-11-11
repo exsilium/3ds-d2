@@ -1,5 +1,6 @@
 // See frame_reads.h.
 #include "game/frame_reads.h"
+#include "game/tiles_ahead.h"
 
 #include "runtime/cpu.h"
 #include "runtime/rt_host.h"
@@ -109,6 +110,11 @@ uint32_t on_read(d2rt::Cpu &c)
         std::strcpy(name, "(no name)");
     name[sizeof name - 1] = 0;
     g_last = name;
+    // A tile's graphics, read at its first draw (issue #89, step 2): 0x5fdea0
+    // reads them into the buffer it has just put at the tile's +0x54.
+    const size_t len = std::strlen(name);
+    if (len > 4 && (name[len - 1] | 0x20) == '1' && (name[len - 2] | 0x20) == 't' && (name[len - 3] | 0x20) == 'd')
+        tiles_ahead_loaded(c, c.read_u32(esp + 0x0c));
     Use &u = g_files[g_last];
     u.reads++;
     u.bytes += bytes;

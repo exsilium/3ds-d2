@@ -218,7 +218,7 @@ void SecondScreen::set_profiling(bool on)
 
 void SecondScreen::set_port_options(uint32_t bits)
 {
-    bits &= kPortDefault | kPortCore2Draw;
+    bits &= kPortAll;
     if (bits != port_)
         settings_changed_ = true;
     port_ = bits;

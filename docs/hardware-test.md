@@ -362,6 +362,18 @@ Three alternating act loads in Azahar each way, after the worker's priority chan
 - The console never draws interpolated light, so they would only help a player who raises Light Quality.
 - Parked as [parked/gouraud-natives.patch](parked/gouraud-natives.patch), against commit `d9c08c1`. Take it up if a player raising Light Quality is reported, or asked for. With Light Quality up, interpolated tiles are drawn at once on the game's thread, as before issue #80.
 
+## The screen at 50 Hz (experiment)
+
+The top LCD refreshes at 59.83 Hz, and a swap shows at the next refresh. So each of the game's 25 frames a second stays on screen for two or three refreshes (33 or 50 ms), however evenly the frames come. At 50 Hz each can stay exactly two.
+
+- **Switching it:** the OPTIONS page's **screen at 50 Hz** row (`port=screen50`), off by default.
+- **What it changes:** one register, the top screen's VTotal (PDC0 +0x24, GSP register `0x400424`), from 413 (59.83 Hz) to 494 (50.04 Hz). It does so only if 413 is what it reads there.
+- **When 60 Hz comes back:** the HOME menu, sleep and the game's end get 413 back. A return to the game sets 50 Hz again.
+- **Holding frames back:** at 50 Hz, a frame ready less than a refresh after the last one was shown waits one more refresh. The game sends frames 35 and 45 ms apart as often as 40.
+- **What the render thread measures:** after each swap it waits for the refresh that shows it. Each heartbeat logs `screen: <rate>, refresh <Hz> measured; frames on it for 1 refresh …, 2 …, 3 …, 4+ …; held back a refresh …`. At 60 Hz, steady play shows about 60% of frames for 2 refreshes and 40% for 3.
+- **The frame's copy:** if the render thread has not begun copying a frame by the time the game draws again, the game's thread now copies it itself (about 1 ms) instead of waiting out a refresh.
+- **Azahar:** it reads 413 and takes the write, but keeps refreshing at about 59 Hz. Only the console can show whether the LCD runs at 50 Hz: then the measured refresh reads about 50.0 and nearly every frame stays 2 refreshes.
+
 ## Blood Moor: VirtualAlloc ran out (2026-10-18)
 
 After about four and a half minutes, three of them in Blood Moor, the console logged `va full: want 512 KiB, live 44416 KiB, largest free 384 KiB`. The 44 MiB VirtualAlloc range was full, while the heap range held 8.2 MiB of its 17 (peak 9.7). The game kept going after the failed allocation, the sound looped, and translated code then faulted on a wild guest pointer (data abort, far = membase + 0x357db9e8, outside the 75 MiB arena).

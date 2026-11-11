@@ -950,6 +950,7 @@ struct Glass {
     uint32_t shown[4] = {};
     uint32_t held = 0;
     uint32_t edge = 0, edge_held = 0;   // ready in the last 2 ms before a refresh, and of those held
+    uint32_t phase[4] = {};   // swaps by where in a refresh they fell: 0-5, 5-10, 10-15, 15-20 ms (frame_lock)
     uint64_t span_us = 0;    // the frames' times on the screen, added up
     uint32_t refreshes = 0;  // and in refreshes
 };
@@ -957,6 +958,60 @@ Glass g_glass;
 LightLock g_glass_lock;
 uint64_t g_last_shown_us = 0;   // the render thread's: the refresh that showed its last frame
 bool g_swapped = false, g_swap_held = false, g_swap_edge = false;   // the render thread's: a swap not yet seen on the screen
+int g_swap_phase = -1;   // the render thread's: the swap's quarter of a refresh (frame_lock), -1 none
+
+// The frame lock (issue #86). The game starts a frame when its clock passes
+// the next 40 ms; a refresh pair at 50 Hz is 39.97 ms, so the point of a
+// refresh where its frames are swapped drifts through the refresh, and a
+// frame swapped just before a refresh's end is shown one refresh early or
+// late (the 1-and-3 pairs, in bursts every half minute in 3DS-D2-1A). The
+// lock keeps the swaps in the middle of a refresh by moving the game's
+// clock ahead a little each frame (rt::advance_guest_clock): never back,
+// at most 80 us a frame (0.2%). With no push the swaps drift later by
+// about 34 us a frame; the most push moves them earlier by about 46.
+//
+// locktest=1 in settings.txt (Azahar, which keeps 59.83 Hz) measures the
+// swaps against a 50 Hz lattice of the host's clock instead of the screen.
+std::atomic<bool> g_lock_on{false};
+// In game (the frame thread's, each input poll): only there. The menus and
+// cinematics keep the host's pace: a cinematic times its video by the
+// guest clock against sound the DSP plays, and 0.13% over three minutes
+// would put them a quarter second apart.
+std::atomic<bool> g_lock_in_game{false};
+bool g_lock_test = false;
+int32_t g_lock_err_us = 0;    // the render thread's: where the swaps fall from a refresh's middle, averaged
+uint64_t g_lock_last_us = 0;  // the render thread's: the last swap
+std::atomic<uint32_t> g_lock_pushes{0};   // frames the clock was moved for
+
+void frame_lock(uint64_t now)
+{
+    const uint64_t ref = g_lock_test ? 0 : g_last_shown_us;
+    if (!g_lock_test && (!ref || !g_screen50.load(std::memory_order_acquire)))
+        return;
+    const int32_t phase = (int32_t)((now - ref) % kRefresh50Us);
+    g_swap_phase = phase * 4 / (int32_t)kRefresh50Us;
+    if (!g_lock_on.load(std::memory_order_relaxed) || !g_lock_in_game.load(std::memory_order_relaxed))
+        return;
+    // Late in the refresh (positive) pushes harder. Averaged over about 16
+    // frames: one frame's swap moves with what it drew. Only frames 35-45 ms
+    // after the last one count: after a late frame the game catches up, and
+    // those come at any point of a refresh (Azahar running behind: the lock
+    // drifted round the refresh instead of holding). One far off counts as
+    // 3 ms off at the most.
+    const uint64_t gap = now - g_lock_last_us;
+    g_lock_last_us = now;
+    if (gap >= 35000 && gap <= 45000) {
+        int32_t err = phase - (int32_t)kRefresh50Us / 2;
+        err = err < -3000 ? -3000 : err > 3000 ? 3000 : err;
+        g_lock_err_us += (err - g_lock_err_us) / 16;
+    }
+    int32_t push = 40 + g_lock_err_us / 40;
+    push = push < 0 ? 0 : push > 80 ? 80 : push;
+    if (push) {
+        rt::advance_guest_clock((uint32_t)push);
+        g_lock_pushes.fetch_add(1, std::memory_order_relaxed);
+    }
+}
 
 // The top screen, and the bottom one when it was drawn: once double-buffered,
 // swapping the bottom without a draw would show the older of its two buffers.
@@ -971,6 +1026,9 @@ constexpr uint64_t kHoldSlackUs = 300;
 void swap_screens(bool bottom_drawn)
 {
     g_swap_held = g_swap_edge = false;
+    g_swap_phase = -1;
+    if (g_render_thread)
+        frame_lock(host_us());
     if (g_render_thread && g_screen50.load(std::memory_order_acquire) && g_last_shown_us) {
         const uint64_t e = host_us() - g_last_shown_us;
         g_swap_edge = e + 2000 >= kRefresh50Us && e < kRefresh50Us;
@@ -996,6 +1054,7 @@ void await_shown()
     g_swapped = false;
     const uint64_t refresh = g_screen50.load(std::memory_order_acquire) ? kRefresh50Us : kRefresh60Us;
     const bool held = g_swap_held, edge = g_swap_edge;
+    const int phase = g_swap_phase;
     gspWaitForVBlank();
     const uint64_t t = host_us();
     if (g_last_shown_us) {
@@ -1006,6 +1065,8 @@ void await_shown()
         g_glass.held += held;
         g_glass.edge += edge;
         g_glass.edge_held += edge && held;
+        if (phase >= 0 && phase < 4)
+            g_glass.phase[phase]++;
         if (n >= 1 && n <= 4) {
             g_glass.span_us += span;
             g_glass.refreshes += n;
@@ -1308,6 +1369,17 @@ void present(const rt::Frame &f)
         if (game::frame_trace_on())
             game::frame_trace_note(g_screen50.load() ? "screen: 50 Hz" : "screen: 60 Hz");
     }
+    {   // the OPTIONS page's frame lock (issue #86)
+        const bool lock = (g_ss.port_options() & game::kPortFrameLock) != 0;
+        if (lock != g_lock_on.load(std::memory_order_relaxed)) {
+            g_lock_on.store(lock, std::memory_order_relaxed);
+            logline(lock ? (g_lock_test ? "frame lock: on, against the host clock's 50 Hz (locktest)"
+                                        : "frame lock: on (at 50 Hz, with core 2 draw)")
+                         : "frame lock: off");
+            if (game::frame_trace_on())
+                game::frame_trace_note(lock ? "frame lock: on" : "frame lock: off");
+        }
+    }
     {   // the OPTIONS page's native sprite decoder (issue #83)
         const game::DccMode want = native_dcc() ? game::DccMode::Offload : game::DccMode::Off;
         if (game::dcc_mode() != want) {
@@ -1493,6 +1565,8 @@ void load_settings()
                                                        : g_ss.port_options() & ~game::kPortCore2Draw);
         else if (std::strncmp(line, "copycheck=", 10) == 0)   // a measurement's (Azahar), issue #80
             g_copy_check = std::atoi(line + 10) != 0;
+        else if (std::strncmp(line, "locktest=", 9) == 0)   // the frame lock against the host clock (Azahar), issue #86
+            g_lock_test = std::atoi(line + 9) != 0;
         else if (std::strncmp(line, "drawphases=", 11) == 0)   // the draw natives timed (issue #80)
             game::draw_phases_set(std::atoi(line + 11) != 0);
 
@@ -1809,6 +1883,7 @@ void poll()
     if (g_ss.take_settings_changed())
         save_settings();
     g_controls.set_context(gs.in_game, gs.panel_open);
+    g_lock_in_game.store(gs.in_game, std::memory_order_relaxed);
     g_controls.update(pad, rt::now_ms());
     if (g_controls.take_zoom_toggle())
         g_zoom = !g_zoom;
@@ -2165,6 +2240,18 @@ void hitch_heartbeat(const game::SpriteCacheWindow &w)
                   g_screen50.load() ? "50 Hz" : "59.83 Hz", (unsigned)(hz100 / 100), (unsigned)(hz100 % 100),
                   (unsigned)g.shown[0], (unsigned)g.shown[1], (unsigned)g.shown[2], (unsigned)g.shown[3],
                   (unsigned)g.held, (unsigned)g.edge, (unsigned)g.edge_held);
+    logline_held(line);
+    // The frame lock (issue #86): where in a refresh the swaps fell, and how
+    // far the game's clock has been moved ahead.
+    static uint32_t pushes_mark = 0;
+    const uint32_t pushes = g_lock_pushes.load(std::memory_order_relaxed);
+    std::snprintf(line, sizeof line,
+                  "[rt] frame lock: %s%s; swaps in a refresh's 0-5 ms %u, 5-10 %u, 10-15 %u, 15-20 %u; "
+                  "clock moved for %u frames, %u.%03u ms ahead in all",
+                  g_lock_on.load() ? "on" : "off", g_lock_test ? " (locktest)" : "", (unsigned)g.phase[0],
+                  (unsigned)g.phase[1], (unsigned)g.phase[2], (unsigned)g.phase[3], (unsigned)(pushes - pushes_mark),
+                  (unsigned)(rt::guest_clock_ahead_us() / 1000), (unsigned)(rt::guest_clock_ahead_us() % 1000));
+    pushes_mark = pushes;
     logline_held(line);
     // The native sprite decoder (issue #83): the window's groups by who decoded them.
     static game::DccStats dcc_mark;

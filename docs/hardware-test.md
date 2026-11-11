@@ -388,6 +388,49 @@ The run spent 20 s at 59.83 Hz, then switched to 50 Hz for about 9 minutes. Ever
 - **Why the pairs happened:** in that build the hold rule allowed 2 ms of slack, so a frame ready 18–20 ms after the last one went to the very next refresh. Build `5d72456c0e41` cuts the slack to 0.3 ms.
 - **The 4+ frames:** the game's own slow frames during loading, which no refresh rate can fix.
 
+## The native sprite decoder (issue #83)
+
+0x60bff0 decodes a DCC sprite group into the sprite cache's run-length frames. `src/game/dcc_decode.cpp` does the same in native code, byte for byte, and `src/game/dcc_native.cpp` puts it in the game.
+
+- **Where it hooks:** at `0x60c10a`, once 0x60bff0 has taken its lock and allocated the group's frames, a call to the native replaces the per-direction loop. It returns the loop's end when it has decoded the group, so the game's own compare jumps to the function's end. It returns the first direction when the game's code should decode instead.
+- **Where it runs:** when Storm's read thread decodes (a load's callback), the work goes to the I/O worker on core 2 (`rt::offload_job`). When the frame thread decodes (the game's synchronous fetch, `0x5ff760` → `0x5ff6e0`), it decodes in place.
+- **Switching it:** INFO → options → **native sprite decoder** (`port=…,dcc`), on by default. On the lane, `D2_DCC`: 1 in place, 2 on the worker, 3 checked.
+
+**The lane's check** (`D2_DCC=3`): the native decodes into a copy of the group's buffer, the game's code decodes into the buffer itself, and the load's callback (`0x5ff723`) compares every byte. The town walk ran too, but its log was overwritten before it was read.
+
+| Script | Groups | Differ |
+| --- | --- | --- |
+| `fight.txt` | 446, and 439 after the reader change | 0 |
+| `act2-east.txt` (Act I to Lut Gholein) | 252 | 0 |
+
+A native broken on purpose (one skip byte changed) differs in every group.
+
+**Azahar, Act I → Act II** (`act-load.txt`, 300 s), three alternating runs each way:
+
+| | Frames past 50 ms | The read thread's turns on core 0 (`ready`) | Decode time a group |
+| --- | --- | --- | --- |
+| Off | 7.5%, 6.6%, 6.4% | 3.6, 3.7, 3.4 s | about 24 ms (the game's code) |
+| On | 6.1%, 6.0%, 5.5% | 2.6, 2.7, 2.6 s | about 18 ms |
+| On, 8-byte bit reads (one run) | 5.0% | | 9.3 ms |
+
+- **Where the groups were decoded:** about 280 of the run's ~350 groups were decoded on the frame thread. Nearly all of those (207 in one window) are the act change's load, the game's synchronous fetch.
+- **In play:** 13–26 groups per 10 s go to the worker, and 0–2 stay on the frame thread.
+- **On the console:** game.log's `dcc:` heartbeat line counts each window's groups by where they were decoded.
+
+### On the console: 3DS-D2-1A (build `1c7ca22d9f49`)
+
+The run had the decoder on first, then off, each time for an area arrival followed by a few minutes of play. The screen was at 50 Hz throughout. The arrival is the 50 s after the area appeared, from the frame trace's 10 s windows:
+
+| | Frames past 50 ms | Read thread's turns on core 0 (`ready`, per 10 s) | Groups decoded |
+| --- | --- | --- | --- |
+| Decoder on | **9.3%** (114 of 1227) | 124–146 ms | 77: 62 on the worker, 15 on the frame thread |
+| Decoder off | 15.1% (176 of 1162) | 148–452 ms | 145, by the game's code |
+
+- **Baseline:** with no sprites decoding, `ready` is 105–125 ms a window, so with the decoder on almost all the decode time is off core 0. With it off, each group adds about 7 ms of the read thread's time on core 0. The off arrival decoded nearly twice as many groups (the route was not the same), so part of its extra slow frames is the route.
+- **Time a group on the console** (the heartbeat's `sprite cache … decoded N in M ms`, timed at the load's callback): 6.8 ms natively (337 groups), against 18.0 ms by the game's code (379 groups; 19.1 ms in 3DS-D2-18, 17.3 ms in 3DS-D2-19). The load's 200 groups, decoded natively on the frame thread, took 808 ms; at the game's 18 ms a group they would take about 3.6 s.
+- **What's left in an arrival:** the frame thread's own Storm reads, `io` at 480–670 ms a window.
+- **The screen:** with 0.3 ms of slack, frames on screen for 1 refresh fell from 2.8% (3DS-D2-19) to 0.36%, and frames on for exactly 2 rose from 93.3% to 96.4%. Frames ready within 2 ms of a refresh come in bursts of about 50 every 30 s or so. That is the game's 40 ms clock drifting against the panel's 39.97 ms refresh pair, which issue #86's frame lock would remove.
+
 ## Blood Moor: VirtualAlloc ran out (2026-10-18)
 
 After about four and a half minutes, three of them in Blood Moor, the console logged `va full: want 512 KiB, live 44416 KiB, largest free 384 KiB`. The 44 MiB VirtualAlloc range was full, while the heap range held 8.2 MiB of its 17 (peak 9.7). The game kept going after the failed allocation, the sound looped, and translated code then faulted on a wild guest pointer (data abort, far = membase + 0x357db9e8, outside the 75 MiB arena).

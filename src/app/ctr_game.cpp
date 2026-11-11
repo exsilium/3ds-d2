@@ -30,6 +30,7 @@
 #include "game/d2_native.h"
 #include "game/d2_state.h"
 #include "game/draw_census.h"
+#include "game/dcc_native.h"
 #include "game/frame_trace.h"
 #include "game/port_options.h"
 #include "game/game_exe.h"
@@ -1176,6 +1177,7 @@ void stop_sampler()
 // for, and with no worker the queue only adds copies. Switched on and off on the INFO tab's
 // OPTIONS page (port_options.h's kPortCore2Draw, saved as "port=").
 bool core2_draw() { return (g_ss.port_options() & game::kPortCore2Draw) != 0; }
+bool native_dcc() { return (g_ss.port_options() & game::kPortNativeDcc) != 0; }
 LightEvent g_floor_event;
 Thread g_floor_thread = nullptr;
 void (*g_floor_worker)() = nullptr;
@@ -1305,6 +1307,14 @@ void present(const rt::Frame &f)
         logline(line);
         if (game::frame_trace_on())
             game::frame_trace_note(g_screen50.load() ? "screen: 50 Hz" : "screen: 60 Hz");
+    }
+    {   // the OPTIONS page's native sprite decoder (issue #83)
+        const game::DccMode want = native_dcc() ? game::DccMode::Offload : game::DccMode::Off;
+        if (game::dcc_mode() != want) {
+            game::set_dcc_mode(want);
+            if (game::frame_trace_on())
+                game::frame_trace_note(native_dcc() ? "native dcc: on" : "native dcc: off");
+        }
     }
     uint32_t floor_us, flush_us;
     game::floor_queue_take(floor_us, flush_us);
@@ -2156,6 +2166,18 @@ void hitch_heartbeat(const game::SpriteCacheWindow &w)
                   (unsigned)g.shown[0], (unsigned)g.shown[1], (unsigned)g.shown[2], (unsigned)g.shown[3],
                   (unsigned)g.held, (unsigned)g.edge, (unsigned)g.edge_held);
     logline_held(line);
+    // The native sprite decoder (issue #83): the window's groups by who decoded them.
+    static game::DccStats dcc_mark;
+    const game::DccStats d = game::dcc_stats();
+    std::snprintf(line, sizeof line,
+                  "[rt] dcc: %s; groups native %u (on the frame thread %u, the worker full %u), on the worker %u, "
+                  "the game's %u (refused %u); native %u ms",
+                  game::dcc_mode() == game::DccMode::Off ? "off" : "on", d.native - dcc_mark.native,
+                  d.on_frame - dcc_mark.on_frame, d.worker_busy - dcc_mark.worker_busy,
+                  d.offloaded - dcc_mark.offloaded, d.game - dcc_mark.game, d.refused - dcc_mark.refused,
+                  (unsigned)((d.native_us - dcc_mark.native_us) / 1000));
+    dcc_mark = d;
+    logline_held(line);
 }
 
 }  // namespace
@@ -2451,6 +2473,7 @@ int main()
         game::install_sprite_cache_counter(c);
         game::install_sprite_decode_timer(c);
         game::install_sprite_trace(c);
+        game::install_dcc_native(c, native_dcc() ? game::DccMode::Offload : game::DccMode::Off);
         game::install_storm_read_priority(c);
         if (g_storm_direct)
             game::install_storm_direct_reads(c);

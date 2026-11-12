@@ -284,8 +284,8 @@ int main(int argc, char **argv)
                                             ? (uint32_t)std::atoi(std::getenv("M4_POOL_RESERVE_MB")) << 20
                                             : game::kCtrPoolReserve;
         const game::SpriteCacheWindow w = game::sprite_cache_window(*guest_cpu);
-        for (const std::string &l : game::frame_reads_lines())
-            rt::logf("%s", l.c_str());
+        for (const std::string &l : game::frame_reads_lines())   // "[rt] ..." lines: logf adds the prefix
+            rt::logf("%s", l.c_str() + (l.compare(0, 5, "[rt] ") == 0 ? 5 : 0));
         if (game::dcc_mode() != game::DccMode::Off) {
             const game::DccStats d = game::dcc_stats();
             rt::logf("dcc: native %u, offloaded %u, the game's %u (refused %u), native %llu ms; checked %u, differed %u",
@@ -633,7 +633,7 @@ int main(int argc, char **argv)
     sampler_stop = true;
     sampler.join();
 #endif
-    dyn86_hotprof_dump(stderr, 60);
+    dyn86_hotprof_dump(stderr, 600);
     save("last.png");
     if (!r.loaded) {
         std::fprintf(stderr, "[rt] FATAL %s\n", r.error.c_str());

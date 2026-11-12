@@ -463,6 +463,42 @@ The run had the decoder on first, then off, each time for an area arrival follow
 - **What's left in an arrival:** the frame thread's own Storm reads, `io` at 480–670 ms a window.
 - **The screen:** with 0.3 ms of slack, frames on screen for 1 refresh fell from 2.8% (3DS-D2-19) to 0.36%, and frames on for exactly 2 rose from 93.3% to 96.4%. Frames ready within 2 ms of a refresh come in bursts of about 50 every 30 s or so. That is the game's 40 ms clock drifting against the panel's 39.97 ms refresh pair, which issue #86's frame lock would remove.
 
+## Crowds: the lights' stamps and the lit sprites (2026-11-12)
+
+**The bench:** `tests/m4/scripts/coldplains.txt`, for the BeforeCh1End save: the Rogue Encampment's waypoint to the Cold Plains, then 84 s of walking loops among its monsters. Its 10 s windows from `52000` to `136000` are the crowd. In Azahar the game there was processing-bound, at 17–19 fps with 33–48% of frames past 50 ms.
+
+**Finding the hot code:** the timer profiles (`prof eip` and the stall samples) can't do it.
+- Both record where the thread is at its next block boundary. Translated blocks that chain to each other never stop at one, but every return from a native does.
+- So time in long runs of translated code is charged to the native that comes next. `SpriteCacheTouch` looked like 12% of the game thread in the crowd, but its own timing is 3–5%.
+- The lane's block counter is exact instead: `WX86_HOTPROF=1 D2_NOLINK=1`, with the console's video settings (`M4_FAST=1`) and decoder (`D2_DCC=1`), over `fight.txt`. Counts times block sizes, rolled up into functions:
+
+| Routine | Share of the game's x86 bytes executed | What it is |
+| --- | --- | --- |
+| `0x607e20` (and its copy `0x607680`) | 8.8% (+0.5%) | DC6 sprite through a remap table: a lit or tinted sprite |
+| `0x4747c0` | 5.9% | one light added to one cell of the 48×48 light grid, 1.7 million calls |
+| `0x475420` | 4.1% | a light with its occlusion map stamped onto the grid |
+| `0x4748d0`, `0x474080`, `0x4740d0` | 1.6%, 1.1%, 1.1% | the plain stamp, and the two copies of its distance |
+| `0x6072f0` | 0.9% | DC6 sprite through two remap tables |
+
+- With the PC's video settings, the interpolated-light floor (`0x4f6bb0`) is 29% on its own. The console never draws it (see issue #80's parked patch).
+
+**Natives** (`d2_native.cpp`, served in line):
+- `Dc6Remap`, `Dc6RemapB` and `Dc6Remap2`, beside the other DC6 natives.
+- `LightStampOccluded` and `LightStamp`, the two stamps whole, with the cell add and the distance inside. `LightAdd` is the cell add on its own, for the shadow-casting stamp (`0x474d70`), which keeps its own code.
+
+**Checked** with `D2_NATIVE_CHECK=1` over `fight.txt`:
+- Each call ran the native, then the game's routine from a trampoline (in a `va_alloc` block) on the same input, and the results were compared. For the sprites that was the pixels and EAX; for the lights, the whole grid.
+- No call differed: more than 32,768 / 4,096 / 8,192 calls of the three sprite natives, 2.1 million of `LightAdd`, 8,192 and 4,096 of the stamps.
+
+**Azahar, alternating builds** (`00b32b833641` without, `ab2159a31744` with), the crowd's windows:
+
+| Build | fps | Frames past 50 ms |
+| --- | --- | --- |
+| Without | 18.3, 17.5 | 41.8%, 47.8% |
+| With | 19.5, 19.3 | 29.4%, 30.8% |
+
+A first run with them reached 24 fps, but it never got into the crowd (8–10 monsters near the player against about 30) and isn't counted.
+
 ## Blood Moor: VirtualAlloc ran out (2026-10-18)
 
 After about four and a half minutes, three of them in Blood Moor, the console logged `va full: want 512 KiB, live 44416 KiB, largest free 384 KiB`. The 44 MiB VirtualAlloc range was full, while the heap range held 8.2 MiB of its 17 (peak 9.7). The game kept going after the failed allocation, the sound looped, and translated code then faulted on a wild guest pointer (data abort, far = membase + 0x357db9e8, outside the 75 MiB arena).

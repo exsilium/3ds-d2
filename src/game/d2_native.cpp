@@ -25,6 +25,7 @@
 #include "runtime/host_clock.h"
 #include "runtime/rt_host.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -322,6 +323,145 @@ uint32_t dc6_blend(Cpu &c)
     }
 }
 
+// The remapped DC6 copies (a lit or tinted sprite: monsters, the player, in
+// a fight 8% of the game's code on the lane), unclipped:
+//   607e20 and 607680 (byte for byte the same) (.., [10]=T), ret 0xc:
+//     d = T[s];
+//   6072f0 (.., [10]=T2, [14]=T1), ret 0x10: d = T2[T1[s]].
+// Each literal is drawn in two parts, its b & 7 pixels then b >> 3 groups of
+// 8, and EAX is left below 256 by both, so EAX is what dc6_blend leaves:
+// dst + pitch; the next-row pointer on each row; a skip (its count) or a
+// literal leaves a value below 256 (cleared by lo0); lo0 at the end.
+// (6072f0 also keeps b & 7 in its [14] argument slot, dead after its ret.)
+struct OpRemap {
+    const uint8_t *t;
+    void operator()(uint8_t *d, const uint8_t *s, int32_t n) const
+    {
+        for (int32_t i = 0; i < n; i++)
+            d[i] = t[s[i]];
+    }
+};
+struct OpRemap2 {
+    const uint8_t *t1, *t2;   // d = t2[t1[s]]
+    void operator()(uint8_t *d, const uint8_t *s, int32_t n) const
+    {
+        for (int32_t i = 0; i < n; i++)
+            d[i] = t2[t1[s[i]]];
+    }
+};
+
+template <class Op> uint32_t dc6_remapped(Cpu &c, const Op &op)
+{
+    const uint8_t *src = H(c.reg(R_ECX));
+    uint32_t dst = c.reg(R_EDX), rows = c.arg(0);
+    const uint32_t pitch = c.arg(1);
+    uint32_t next = dst + pitch, eax = next;
+    for (;;) {
+        const uint8_t b = *src++;
+        if (b == 0x80) {
+            if (--rows == 0)
+                return eax & ~0xffu;
+            dst = next;
+            next += pitch;
+            eax = next;
+        } else if (b & 0x80) {
+            dst += b & 0x7f;
+            eax = 0;
+        } else {
+            op(H(dst), src, b);
+            eax = 0;
+            src += b;
+            dst += b;
+        }
+    }
+}
+
+uint32_t dc6_remap(Cpu &c) { return dc6_remapped(c, OpRemap{H(c.arg(2))}); }
+uint32_t dc6_remap2(Cpu &c) { return dc6_remapped(c, OpRemap2{H(c.arg(3)), H(c.arg(2))}); }
+
+// D2_NATIVE_CHECK=1 (the lane): each call runs the native, keeps its pixels
+// and EAX, puts the destination back, runs the game's routine from a
+// trampoline (its first 7 bytes, then a jump back), and compares. The
+// game's result is the one kept. Not in line (guest_call).
+// Also the light stamps' (below): the whole light grid compared.
+struct RemapCheck {
+    const char *name;
+    uint32_t orig, keep;   // the original, and its first whole instructions' bytes (5 or more) the trampoline copies
+    uint32_t tramp = 0, calls = 0, bad = 0;
+};
+RemapCheck g_remap_check[6] = {{"Dc6Remap", 0x00607e20, 7},    {"Dc6RemapB", 0x00607680, 7},
+                               {"Dc6Remap2", 0x006072f0, 7},   {"LightAdd", 0x004747c0, 6},
+                               {"LightStampOccluded", 0x00475420, 6}, {"LightStamp", 0x004748d0, 6}};
+
+// Before the hooks go in: the trampolines copy the originals' first bytes.
+bool install_remap_check(Cpu &c)
+{
+    const uint32_t at = rt::va_alloc(0x1000, 0x00607e20);
+    if (!at)
+        return false;
+    for (int k = 0; k < 6; k++) {
+        RemapCheck &r = g_remap_check[k];
+        r.tramp = at + 16 * k;
+        uint8_t t[16];
+        c.read(r.orig, t, r.keep);
+        t[r.keep] = 0xe9;
+        const uint32_t rel = (r.orig + r.keep) - (r.tramp + r.keep + 5);
+        std::memcpy(t + r.keep + 1, &rel, 4);
+        c.write(r.tramp, t, r.keep + 5);
+    }
+    c.invalidate_code(at, 16 * 6);
+    return true;
+}
+
+void check_note(RemapCheck &k, bool bad)
+{
+    k.calls++;
+    k.bad += bad;
+    if ((k.calls & (k.calls - 1)) == 0 || (k.calls & 0xffff) == 0)
+        rt::logf("native check: %s %u calls, %u differ", k.name, k.calls, k.bad);
+}
+
+template <int K> uint32_t dc6_remap_checked(Cpu &c)
+{
+    RemapCheck &k = g_remap_check[K];
+    const uint32_t ecx = c.reg(R_ECX), edx = c.reg(R_EDX), rows = c.arg(0), pitch = c.arg(1);
+    // The bytes the stream reaches.
+    uint32_t lo = ~0u, hi = 0, dst = edx, next = edx + pitch, left = rows;
+    for (const uint8_t *s = H(ecx);;) {
+        const uint8_t b = *s++;
+        if (b == 0x80) {
+            if (--left == 0)
+                break;
+            dst = next;
+            next += pitch;
+        } else if (b & 0x80) {
+            dst += b & 0x7f;
+        } else {
+            if (b) {
+                lo = std::min(lo, dst);
+                hi = std::max(hi, dst + b);
+            }
+            s += b;
+            dst += b;
+        }
+    }
+    const uint32_t len = hi > lo ? hi - lo : 0;
+    std::vector<uint8_t> before(H(lo), H(lo) + len);
+    const uint32_t r = K == 2 ? dc6_remap2(c) : dc6_remap(c);
+    std::vector<uint8_t> native(H(lo), H(lo) + len);
+    std::memcpy(H(lo), before.data(), len);
+    const uint32_t r0 = K == 2 ? rt::guest_call(c, k.tramp, {rows, pitch, c.arg(2), c.arg(3)})
+                               : rt::guest_call(c, k.tramp, {rows, pitch, c.arg(2)});
+    c.set_reg(R_ECX, ecx);
+    c.set_reg(R_EDX, edx);
+    const bool bad = r != r0 || std::memcmp(native.data(), H(lo), len);
+    if (bad && k.bad < 20)
+        rt::logf("native check: %s(%08x, %08x, rows %u, pitch %d) gave %08x, the game's %08x; pixels %s", k.name, ecx,
+                 edx, rows, (int32_t)pitch, r, r0, std::memcmp(native.data(), H(lo), len) ? "differ" : "match");
+    check_note(k, bad);
+    return r0;
+}
+
 // Clipped variants: x is the screen column; a literal of b pixels draws
 // [l, r) with l = max(0, clipL - x) and r = min(clipR - x, b) (r is not
 // clamped at 0). A skip advances x too; a new row resets it to x0.
@@ -542,6 +682,185 @@ uint32_t light_block(Cpu &c)
             }
         }
     }
+    return 0;
+}
+
+// ---- the lights' stamps on the light grid ----------------------------------------------
+//
+// Each frame the game stamps every light near the view onto the light grid
+// (dispatcher 4755a0): a square of cells around it, each given the light's
+// falloff at its distance through 4747c0. In a fight on the lane the
+// stamps were 14% of the game's instructions (4747c0 1.7 million calls in
+// 60 s), mostly calls and returns. The two stamp loops are native whole;
+// the third (474d70, shadow casting) keeps its own code and calls the
+// native cell add. Their EAX is dead: 4755a0's one caller overwrites it.
+constexpr uint32_t kGridMaxX = 0x007b0a5c, kGridMaxY = 0x007b0a60;   // the grid's last cell, in cells
+constexpr uint32_t kLightRecip = 0x007b0a68;                         // 256 dwords: 65536 / n, for the colour mix
+
+// 4747c0(eax=x, ecx=y, [8]=intensity, [c] r, [10] g, [14] b), ret 0x10:
+// the cell at subtile (x, y), if on the grid, gains the intensity (to 255)
+// and, with coloured light, the colour weighted by the two intensities.
+inline void light_add(int32_t x, int32_t y, uint32_t v, uint8_t r, uint8_t g, uint8_t b)
+{
+    const uint32_t gx = (uint32_t)(x >> 3) - U32(kGridX), gy = (uint32_t)(y >> 3) - U32(kGridY);
+    if (gx > 0x2f || gy > 0x2f)
+        return;
+    uint8_t *cell = H(kLightGrid + (gy * 48 + gx) * 8);
+    const uint32_t old = cell[4];
+    uint32_t sum = old + v;
+    if (sum >= 0xff)
+        sum = 0xff;
+    if (!U32(kColoredLight)) {
+        cell[5] = cell[6] = cell[7] = 0;
+        cell[4] = (uint8_t)sum;
+        return;
+    }
+    const uint32_t w = U32(kLightRecip + sum * 4);
+    auto mix = [&](uint32_t have, uint32_t add) {
+        const uint32_t m = ((have * old + add * v) * w) >> 16;
+        return (uint8_t)((int32_t)m > 0xff ? 0xff : m);
+    };
+    const uint8_t nr = mix(cell[5], r), ng = mix(cell[6], g), nb = mix(cell[7], b);
+    cell[4] = (uint8_t)sum;
+    cell[5] = nr;
+    cell[6] = ng;
+    cell[7] = nb;
+}
+
+uint32_t light_add_native(Cpu &c)
+{
+    light_add((int32_t)c.reg(R_EAX), (int32_t)c.reg(R_ECX), c.arg(0), (uint8_t)c.arg(1), (uint8_t)c.arg(2),
+              (uint8_t)c.arg(3));
+    return 0;
+}
+
+// 474080 and 4740d0: the distance, as an octagon: 0.96 of the larger
+// difference and 0.4 of the smaller.
+inline int32_t light_distance(int32_t dx, int32_t dy)
+{
+    const uint32_t a = (uint32_t)(dx < 0 ? -dx : dx), b = (uint32_t)(dy < 0 ? -dy : dy);
+    return (int32_t)(a >= b ? (a * 0x3d7 + b * 0x197) >> 10 : (b * 0x3d7 + a * 0x197) >> 10);
+}
+
+// The square both stamps cover: (n + 1) x (n + 1) cells from (x0, y0) in
+// subtiles; false when it is off the grid.
+inline bool light_square(uint32_t light, int32_t radius, int32_t &x0, int32_t &y0, int32_t &n)
+{
+    const int32_t lx = I32(light + 0x10), ly = I32(light + 0x14);
+    x0 = (lx - (lx & 7)) - radius;
+    y0 = (ly - (ly & 7)) - radius;
+    n = (2 * radius) >> 3;
+    return !((x0 >> 3) > I32(kGridMaxX) || (x0 >> 3) + n + 1 < I32(kGridX) || (y0 >> 3) > I32(kGridMaxY) ||
+             (y0 >> 3) + n + 1 < I32(kGridY));
+}
+
+// 475420(edi=light), ret: a light with its occlusion map (light +0x30, a
+// dword per cell of the square; 16 or more: dark), the falloff scaled by
+// (8 - occlusion / 2) / 8.
+uint32_t light_stamp_occluded(Cpu &c)
+{
+    const uint32_t L = c.reg(R_EDI);
+    const int32_t R = I32(L + 0x18);
+    int32_t x0, y0, n;
+    if (R <= 0 || R >= 0x100 || !light_square(L, R, x0, y0, n))
+        return 0;
+    uint32_t map = U32(L + 0x30);
+    if (!map || !U32(L + 0x2c)) {   // the game's assertion (0x47e, 0x47f): never seen
+        static bool said;
+        if (!said)
+            rt::logf("light stamp: light %08x without its occlusion map", L);
+        said = true;
+        return 0;
+    }
+    const int32_t k = (int32_t)((uint32_t)*H(L + 0x24) << 16) / R;
+    const int32_t lx = I32(L + 0x10), ly = I32(L + 0x14);
+    const uint8_t r = *H(L + 0x25), g = *H(L + 0x26), b = *H(L + 0x27);
+    for (int32_t row = 0, y = y0; row <= n; row++, y += 8) {
+        const int32_t dy = ly - y;
+        for (int32_t col = 0, x = x0; col <= n; col++, x += 8, map += 4) {
+            const int32_t occ = I32(map);
+            if (occ >= 0x10)
+                continue;
+            const int32_t d = light_distance(lx - x, dy);
+            int32_t v = (int32_t)((uint32_t)(R - d) * (uint32_t)k) >> 16;
+            v = (int32_t)((uint32_t)v * (uint32_t)(8 - (occ >> 1))) >> 3;
+            if (v > 0)
+                light_add(x, y, (uint32_t)v, r, g, b);
+        }
+    }
+    return 0;
+}
+
+// 4748d0(esi=light, [8]=as is), ret 4: a light without occlusion. Unless
+// `as is`: a light of type 1 has radius 8, one of type 3 none, and one of
+// type 0 not the player's (light +4 against the player unit's +0xc) at
+// most 16.
+uint32_t light_stamp(Cpu &c)
+{
+    const uint32_t L = c.reg(R_ESI);
+    int32_t R = I32(L + 0x18);
+    if ((uint32_t)(R - 1) > 0xfe)
+        return 0;
+    if (!c.arg(0)) {
+        const uint32_t type = U32(L);
+        if (type == 0) {
+            const uint32_t player = U32(kPlayerUnit);
+            const uint32_t id = player ? U32(player + 0xc) : 0xffffffffu;
+            if (U32(L + 4) != id && R >= 0x10)
+                R = 0x10;
+        } else if (type == 1) {
+            R = 8;
+        } else if (type == 3) {
+            return 0;
+        }
+    }
+    int32_t x0, y0, n;
+    if (!light_square(L, R, x0, y0, n))
+        return 0;
+    const int32_t k = (int32_t)((uint32_t)*H(L + 0x24) << 16) / R;
+    const int32_t lx = I32(L + 0x10), ly = I32(L + 0x14);
+    const uint8_t r = *H(L + 0x25), g = *H(L + 0x26), b = *H(L + 0x27);
+    for (int32_t row = 0, y = y0; row <= n; row++, y += 8) {
+        const int32_t dy = ly - y;
+        for (int32_t col = 0, x = x0; col <= n; col++, x += 8) {
+            const int32_t v = (int32_t)((uint32_t)(R - light_distance(lx - x, dy)) * (uint32_t)k) >> 16;
+            if (v > 0)
+                light_add(x, y, (uint32_t)v, r, g, b);
+        }
+    }
+    return 0;
+}
+
+// D2_NATIVE_CHECK=1: the light grid after the native, against the game's
+// routine on the grid as it was (install_remap_check's trampolines, K 3-5).
+template <int K> uint32_t light_checked(Cpu &c)
+{
+    constexpr uint32_t kGridBytes = 48 * 48 * 8;
+    RemapCheck &k = g_remap_check[K];
+    std::vector<uint8_t> before(H(kLightGrid), H(kLightGrid) + kGridBytes);
+    if (K == 3)
+        light_add_native(c);
+    else if (K == 4)
+        light_stamp_occluded(c);
+    else
+        light_stamp(c);
+    std::vector<uint8_t> native(H(kLightGrid), H(kLightGrid) + kGridBytes);
+    std::memcpy(H(kLightGrid), before.data(), kGridBytes);
+    if (K == 3)
+        rt::guest_call(c, k.tramp, {c.arg(0), c.arg(1), c.arg(2), c.arg(3)});
+    else if (K == 4)
+        rt::guest_call(c, k.tramp, {});
+    else
+        rt::guest_call(c, k.tramp, {c.arg(0)});
+    const bool bad = std::memcmp(native.data(), H(kLightGrid), kGridBytes) != 0;
+    if (bad && k.bad < 20) {
+        uint32_t i = 0;
+        while (native[i] == *H(kLightGrid + i))
+            i++;
+        rt::logf("native check: %s differs at cell %u byte %u: %u, the game's %u", k.name, i / 8, i % 8, native[i],
+                 *H(kLightGrid + i));
+    }
+    check_note(k, bad);
     return 0;
 }
 
@@ -2427,6 +2746,27 @@ int install_d2_native(Cpu &c)
          "CurrentLookup", !check);
     static const uint8_t k52df40[] = {0xa1, 0x34, 0x2d, 0x88, 0x00, 0x85, 0xc0, 0x75, 0x1f};
     HOOK(c, 0x0052df40, k52df40, sizeof k52df40, 0, current_unlock, "CurrentUnlock", true);
+    // The remapped DC6 copies (dc6_remapped): last, so that the bits above
+    // keep their places in D2_NATIVE_MASK.
+    static const uint8_t k607e20[] = {0x55, 0x8b, 0xec, 0x51, 0x8b, 0x45, 0x0c, 0x53, 0x56, 0x8b, 0x75, 0x10, 0x57};
+    static const uint8_t k6072f0[] = {0x55, 0x8b, 0xec, 0x51, 0x8b, 0x45, 0x0c, 0x53, 0x56, 0x8b, 0x75, 0x14, 0x57};
+    const bool remap_check = check && install_remap_check(c);
+    HOOK(c, 0x00607e20, k607e20, sizeof k607e20, 3, DRAW(remap_check ? dc6_remap_checked<0> : dc6_remap, "Dc6Remap"),
+         !remap_check);
+    HOOK(c, 0x00607680, k607e20, sizeof k607e20, 3, DRAW(remap_check ? dc6_remap_checked<1> : dc6_remap, "Dc6RemapB"),
+         !remap_check);
+    HOOK(c, 0x006072f0, k6072f0, sizeof k6072f0, 4,
+         DRAW(remap_check ? dc6_remap_checked<2> : dc6_remap2, "Dc6Remap2"), !remap_check);
+    // The lights' stamps (light_stamp, light_stamp_occluded, light_add).
+    static const uint8_t k4747c0[] = {0x55, 0x8b, 0xec, 0x8b, 0x55, 0x08, 0xc1, 0xf8, 0x03};
+    static const uint8_t k475420[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x20, 0x53, 0x8b, 0x5f, 0x18};
+    static const uint8_t k4748d0[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x18, 0x53, 0x8b, 0x5e, 0x18};
+    HOOK(c, 0x004747c0, k4747c0, sizeof k4747c0, 4, remap_check ? light_checked<3> : light_add_native, "LightAdd",
+         !remap_check);
+    HOOK(c, 0x00475420, k475420, sizeof k475420, 0, remap_check ? light_checked<4> : light_stamp_occluded,
+         "LightStampOccluded", !remap_check);
+    HOOK(c, 0x004748d0, k4748d0, sizeof k4748d0, 1, remap_check ? light_checked<5> : light_stamp, "LightStamp",
+         !remap_check);
 #undef DRAW
 #undef HOOK
     return n;

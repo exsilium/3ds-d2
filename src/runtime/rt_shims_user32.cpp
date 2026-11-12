@@ -407,7 +407,10 @@ void install_user32(Bridge &br)
         g_quit_code = c.arg(0);
         return 0u;
     });
-    U("PeekMessageA", 5, [](Cpu &c) { return peek(c, c.arg(0), (c.arg(4) & 1u) != 0); });   // PM_REMOVE
+    U("PeekMessageA", 5, [](Cpu &c) {   // PM_REMOVE; each pass of the game's main loop (note_loop_pass)
+        note_loop_pass();
+        return peek(c, c.arg(0), (c.arg(4) & 1u) != 0);
+    });
     U("GetMessageA", 4, [](Cpu &c) -> uint32_t {
         if (peek(c, c.arg(0), true))
             return c.read_u32(c.arg(0) + 4) == WM_QUIT ? 0u : 1u;

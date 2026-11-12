@@ -1139,6 +1139,11 @@ void check_time_limit(uint64_t ms)
              (unsigned)d2rt_box86_dynarec_kb(),
              (unsigned)d2rt_box86_custommalloc_kb(), (unsigned)d2rt_box86_jmptbl_kb(), (unsigned)(host_used >> 10),
              (unsigned)d2rt_box86_dynarec_used_kb());
+        {
+            const std::string loop = loop_line();   // the game's main loop: frame and idle passes
+            if (!loop.empty())
+                logf("%s", loop.c_str());
+        }
         if (g_spare_size && g_pool.spare_takes() != g_spare_logged) {
             g_spare_logged = g_pool.spare_takes();
             logf("pool spare: %u requests taken so far, %u of %u KiB in use, pool largest free %u KiB", g_spare_logged,
@@ -1252,6 +1257,48 @@ void advance_guest_clock(uint32_t us) { g_clock_ahead_us.fetch_add(us, std::memo
 uint32_t guest_clock_ahead_us() { return g_clock_ahead_us.load(std::memory_order_relaxed); }
 
 void note_present() { g_present_us.store(wx86_now_us(), std::memory_order_release); }
+
+// See rt_host.h. The frame thread's (a shim's), and the heartbeat's.
+struct LoopWindow {
+    uint32_t idle = 0, frames = 0;
+    uint64_t idle_us = 0, frame_us = 0, idle_max_us = 0;
+};
+LoopWindow g_loop;
+uint64_t g_loop_last_us = 0;
+
+void note_loop_pass()
+{
+    if (!on_frame_thread())
+        return;
+    const uint64_t now = wx86_now_us();
+    if (g_loop_last_us && now > g_loop_last_us) {
+        const uint64_t d = now - g_loop_last_us;
+        if (g_present_us.load(std::memory_order_acquire) > g_loop_last_us) {
+            g_loop.frames++;
+            g_loop.frame_us += d;
+        } else {
+            g_loop.idle++;
+            g_loop.idle_us += d;
+            if (d > g_loop.idle_max_us)
+                g_loop.idle_max_us = d;
+        }
+    }
+    g_loop_last_us = now;
+}
+
+std::string loop_line()
+{
+    const LoopWindow w = g_loop;
+    g_loop = LoopWindow{};
+    if (!w.idle && !w.frames)
+        return "";
+    char line[200];
+    std::snprintf(line, sizeof line,
+                  "main loop: %u frame passes %u ms; %u idle passes %u ms (longest %u us, %u us each)", w.frames,
+                  (unsigned)(w.frame_us / 1000), w.idle, (unsigned)(w.idle_us / 1000), (unsigned)w.idle_max_us,
+                  w.idle ? (unsigned)(w.idle_us / w.idle) : 0);
+    return line;
+}
 
 void stall_probe(uint64_t min_us)
 {

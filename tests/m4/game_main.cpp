@@ -37,6 +37,7 @@
 //   "20000 tap 400 307;26000 tap 400 290;32000 text Tester;34000 press R;..."
 
 #include "game/dcc_native.h"
+#include "game/frame_reads.h"
 #include "game/autoplay.h"
 #include "game/automap.h"
 #include "game/cinematics.h"
@@ -247,6 +248,7 @@ int main(int argc, char **argv)
         // ...and reading it itself while the read thread is not reading (M4_STORM_DIRECT=0: queued).
         if (!std::getenv("M4_STORM_DIRECT") || std::string(std::getenv("M4_STORM_DIRECT")) != "0")
             game::install_storm_direct_reads(c);
+        game::install_frame_reads(c);
         game::install_fatal_exit(c);
         if (ctr_layout) {
             game::install_pool_release(c);
@@ -282,6 +284,8 @@ int main(int argc, char **argv)
                                             ? (uint32_t)std::atoi(std::getenv("M4_POOL_RESERVE_MB")) << 20
                                             : game::kCtrPoolReserve;
         const game::SpriteCacheWindow w = game::sprite_cache_window(*guest_cpu);
+        for (const std::string &l : game::frame_reads_lines())
+            rt::logf("%s", l.c_str());
         if (game::dcc_mode() != game::DccMode::Off) {
             const game::DccStats d = game::dcc_stats();
             rt::logf("dcc: native %u, offloaded %u, the game's %u (refused %u), native %llu ms; checked %u, differed %u",

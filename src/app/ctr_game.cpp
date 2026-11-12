@@ -31,6 +31,8 @@
 #include "game/d2_state.h"
 #include "game/draw_census.h"
 #include "game/dcc_native.h"
+#include "game/frame_reads.h"
+#include "game/tiles_ahead.h"
 #include "game/frame_trace.h"
 #include "game/port_options.h"
 #include "game/game_exe.h"
@@ -84,9 +86,18 @@ u32 __ctru_linear_heap_size = 2u << 20;
 // Translated code lives in a static pool in .bss (mman_ctr.c): the console
 // refused to make heap pages executable (every code allocation failed), and
 // .bss sits outside its 96 MiB heap window, in budget the heap cannot use.
-// The town needed 8 MiB of code in Azahar.
-alignas(0x1000) uint8_t dyn86_ctr_jitpool[16u << 20];
-extern const uint32_t dyn86_ctr_jitpool_size = 16u << 20;
+// The town needed 8 MiB of code in Azahar; issue #23's Act I session had
+// 14 MiB of chunks open after 28 minutes and 16 MiB after 2 h 52. What the
+// backend does with a full pool is #23's open question. Box86 takes it in
+// 2 MiB chunks, so its size is a multiple of 2 MiB.
+alignas(0x1000) uint8_t dyn86_ctr_jitpool[14u << 20];
+extern const uint32_t dyn86_ctr_jitpool_size = 14u << 20;
+// The tile prefetch's store (issue #89, rt::set_prefetch_arena), here for
+// the same reason: out of the heap, whose last MiB the JIT's records and
+// the port's own allocations share. The pool's other MiB goes to the budget
+// __system_allocateHeaps hands the linear heap, for jump tables that would
+// otherwise take the main heap.
+alignas(64) uint8_t g_prefetch_arena[1u << 20];
 
 // libctru's own __system_allocateHeaps panics (svcBreak) when the kernel
 // refuses the heap it asks for, and the console refused "all that is left":
@@ -1333,6 +1344,10 @@ void second_screen_active()
 
 void present(const rt::Frame &f)
 {
+    if (g_guest_cpu) {   // issue #89: the tiles the next frames will load, read ahead (the OPTIONS row)
+        game::set_tile_prefetch((g_ss.port_options() & game::kPortTilePrefetch) != 0);
+        game::tiles_ahead_scan(*g_guest_cpu);
+    }   // issue #89: the tiles the next frames will load
     copy_wait();   // the last frame's copy, should the game not have drawn since
     const uint64_t t0 = host_us();
     if (g_timing.last_present_us) {
@@ -2265,6 +2280,11 @@ void hitch_heartbeat(const game::SpriteCacheWindow &w)
                   (unsigned)((d.native_us - dcc_mark.native_us) / 1000));
     dcc_mark = d;
     logline_held(line);
+    // The game thread's reads by file (issue #89).
+    for (const std::string &l : game::frame_reads_lines())
+        logline_held(l.c_str());
+    for (const std::string &l : game::tiles_ahead_lines())
+        logline_held(l.c_str());
 }
 
 }  // namespace
@@ -2295,8 +2315,13 @@ extern "C" __attribute__((noreturn)) void __wrap_abort(void)
 static const rt::Layout *reserve_arena()
 {
     const bool full = __ctru_heap_size >= (95u << 20);
+    // The larger arena only with 3 MiB of jump tables in linear memory. The
+    // console set 1,792 KiB aside, so it has always run ctr-game-n3-heap;
+    // the JIT pool's cut to 14 MiB (issue #89) gives it 2,816 KiB, and that
+    // MiB is for the host's heap, whose last MiB the JIT's records reached
+    // with the tile prefetch (3DS-D2-1C), not for 2 MiB more arena.
     const rt::Layout *const candidates[] = {
-        full && g_heap_setup.jmptbl_linear >= (2u << 20) ? &rt::kCtrGameLayoutN3 : nullptr,
+        full && g_heap_setup.jmptbl_linear >= (3u << 20) ? &rt::kCtrGameLayoutN3 : nullptr,
         full ? &rt::kCtrGameLayoutN3Heap : nullptr,   // the console's full heap
         __ctru_heap_size >= (87u << 20) ? &rt::kCtrGameLayout : nullptr,
     };
@@ -2564,6 +2589,8 @@ int main()
         game::install_storm_read_priority(c);
         if (g_storm_direct)
             game::install_storm_direct_reads(c);
+        game::install_frame_reads(c);
+        rt::set_prefetch_arena(g_prefetch_arena, sizeof g_prefetch_arena);
         if (g_storm_rate_kib)
             game::set_storm_read_rate(c, g_storm_rate_kib << 10);
         game::install_fatal_exit(c);

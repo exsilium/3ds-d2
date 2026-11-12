@@ -31,6 +31,9 @@ enum PortOption : uint32_t {
     // (ctr_game.cpp's frame lock, issue #86). Only with core 2 draw's
     // render thread.
     kPortFrameLock = 1u << 3,
+    // The floor, wall and roof tiles of the rooms near the player read on
+    // core 2 before their first draw needs them (tiles_ahead.h, issue #89).
+    kPortTilePrefetch = 1u << 4,
 };
 
 struct PortOptionInfo {
@@ -45,10 +48,11 @@ inline constexpr PortOptionInfo kPortOptions[] = {
     {kPortScreen50, "screen50", "screen at 50 Hz", "each frame 40 ms on the screen"},
     {kPortNativeDcc, "dcc", "native sprite decoder", "new sprites decoded off core 0"},
     {kPortFrameLock, "framelock", "frame lock at 50 Hz", "the game's frames timed by the screen"},
+    {kPortTilePrefetch, "tiles", "read tiles ahead", "tiles near the player read on core 2"},
 };
 inline constexpr int kPortOptionCount = sizeof kPortOptions / sizeof kPortOptions[0];
-inline constexpr uint32_t kPortDefault = kPortCore2Draw | kPortScreen50 | kPortNativeDcc;
-inline constexpr uint32_t kPortAll = kPortCore2Draw | kPortScreen50 | kPortNativeDcc | kPortFrameLock;
+inline constexpr uint32_t kPortDefault = kPortCore2Draw | kPortScreen50 | kPortNativeDcc | kPortTilePrefetch;
+inline constexpr uint32_t kPortAll = kPortCore2Draw | kPortScreen50 | kPortNativeDcc | kPortFrameLock | kPortTilePrefetch;
 // The options of the first "port=" lines, which named only those on.
 inline constexpr uint32_t kPortFirst = kPortCore2Draw;
 

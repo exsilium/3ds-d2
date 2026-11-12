@@ -636,11 +636,15 @@ This is the split of the New 3DS's 124 MiB application region in play. The figur
 
 **What changed (issue #89, build `9bd7e09077c9`):**
 - The JIT pool went from 16 to 14 MiB. Box86 takes it in 2 MiB chunks, so 15 MiB would have used 14 anyway.
-  - **Not yet known: what happens when the pool is full** (issue #23, open).
-  - In #23's 3 h 51 min Act I session, the chunks opened (`jit=`) reached 14 MiB at t ≈ 1,706 s and 16 MiB at t ≈ 10,310 s. The frame rate didn't visibly change after that.
-  - At 14 MiB, a session like that fills the pool after about half an hour instead of nearly three hours.
-  - The code in use (`jitused=`) was 13.7 MiB after 1 h 46 in 3DS-D2-12.
-  - Before this ships, the full-pool path needs #23's lane run: a small pool, a long script, frame hashes against an unbounded run.
+  - **When the pool is full** (issue #23): in #23's 3 h 51 min Act I session, the chunks opened (`jit=`) reached 14 MiB at t ≈ 1,706 s and 16 MiB at t ≈ 10,310 s. At 14 MiB, a session like that fills the pool after about half an hour. 3DS-D2-12 had 13.7 MiB of code in use after 1 h 46, accumulated over many areas.
+  - **The backend's policy:** it refuses the chunk, retires waves of up to 512 blocks, frees them after a grace period, and translates again. After 24 rounds that free nothing, the thread dies with a named error.
+  - **The lane** (`fight.txt` on the virtual clock, 5,077 frames, 7.2 MiB of code in use unbounded, `D2_JITFAILAFTER`):
+    - bounded at 6 MiB, every frame was the same as an unbounded run, in the same wall time (248 against 250 s);
+    - bounded at 4 MiB, it ran the whole route and drew correctly, but took 6.3 times the wall time, and the frames differed from frame 896.
+    - Two unbounded runs can also differ (from frame 864 here), so a repeat of the reference is needed.
+    - So eviction is exact and cheap while the pool holds the working set with some room, and thrashes when it can't. The console's 14 MiB pool holds about twice a fight's working set.
+  - **On the console, a full pool** makes `mmap` (`mman_ctr.c`) try a 2 MiB heap block, which the console won't make executable, then free it: no leak, but a brief 2 MiB of heap per refused chunk. In Azahar the heap block is accepted and kept. Refusing straight away once the static pool is full would be a small backend change.
+  - **Not measured yet:** a console session that fills the pool, and the cost of an eviction round on the console.
 - The tile prefetch's store is now a static 1 MiB (`g_prefetch_arena`), written as a ring.
 - The image's other freed MiB goes, through `__system_allocateHeaps`' leftover budget, to the linear heap for jump tables: 2,816 KiB of them in linear memory instead of 1,792.
 - `reserve_arena` took the larger `ctr-game-n3` layout (78,848 KiB) from 2 MiB of linear jump tables, which would have spent the two MiB on the arena. It now does so only from 3 MiB.

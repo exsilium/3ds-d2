@@ -527,6 +527,23 @@ A first run with them reached 24 fps, but it never got into the crowd (8–10 mo
   - The town walk: 1.80 billion bytes of x86 for the same 1,507 frames, against 2.21 billion with the second round.
   - All natives checked over the fight: none differ.
 - **Azahar**, round two against round three, can't separate them: the same build gave 19.4 and 22.6 fps over the settled windows in two runs. Near the 25 fps cap, the frame thread's run time floors at about 40 ms a frame, because the game polls the clock while it waits. Gains of a few percent need the console's frame trace, or the lane.
+- **What's left (2026-11-12, after the third round):**
+  - **The guest profile is flat.** In town nothing is above 2.8%. Of the top entries, `0x608540` and `0x4f8120` are dispatchers whose shares come from their big blocks, and the rest are small functions called a few hundred thousand times. A native costs a fixed price per call (registers saved, the bridge, the C++ call), probably more than a 5–10-instruction getter's whole translated body. So natives pay off for loops and long bodies, not for leaves.
+  - **The natives' own time** (Azahar, Cold Plains crowd, the `profile frames,guest` script, ms per 10 s):
+
+    | Native | ms per 10 s |
+    | --- | --- |
+    | FloorQueueEnd | 310–570 |
+    | Dc6Copy | 160–260 |
+    | StretchBlt (the present) | 135–210 |
+    | FloorTile | 130–200 |
+    | LightBlock | 100–150 |
+    | SpriteCacheTouch | 90–170 |
+    | Dc6Shadow | 95–150 |
+    | LightGrid | 75–110 |
+    | LightStamp | 75–110 |
+  - **The floor queue's worker draws only 51–58% of the queued tiles.** The frame thread draws the rest itself at the flush, right after the floor pass (`0x476ce1`); it waits for the worker only 0.4 ms a frame. Deferring the flush to the first renderer call wouldn't buy much: the rain (`0x473c00` → `0x473a70`) and then the units' and walls' passes draw straight after the floor.
+  - **The sprite fetch's cache hit (`0x6001f0`)** costs two natives (SpritePath, SpriteCacheTouch: 1–2% each, mostly the per-call price) plus its own code. One native for the whole hit path would need the cache lookup (`0x60ace0`), `0x5fe990`, `0x600cb0`, `0x5fec90` and `0x5fec50` as well: about 2–3%, the largest single item left.
 - **A bug found on the way:** a native that falls back to the game's code must resume past the bytes its hook's jump covers. `UnitPickFilter` first resumed at `0x466873`, inside the jump. That ran two of the jump's bytes as code, and the lane's town run crashed (a guest thread at `0x40000c`). The checked run hadn't shown it, because the check's trampolines copy the original bytes.
 
 ## Blood Moor: VirtualAlloc ran out (2026-10-18)

@@ -499,6 +499,19 @@ The run had the decoder on first, then off, each time for an area arrival follow
 
 A first run with them reached 24 fps, but it never got into the crowd (8–10 monsters near the player against about 30) and isn't counted.
 
+**Second round**, from the profile with the first round in:
+- **`_ftol2_sse` (`0x682fd0`)**, 2.8%. The C runtime's float-to-int conversion takes `cvttsd2si` when it found SSE2 (`0x994c88`), else a long x87 path through a 64-bit `fistp`/`fild`. The port reports no SIMD, so it always took the long path. Its check is now jumped over. For every value an `int` holds both give the truncated value, and `fstp` + `cvttsd2si` translate to one VFP conversion. Checked on the lane: both paths on each call, 1,048,576 calls, none differ.
+- **`LoadsPending` (`0x5ff2a0`)**, 3.2%. The monsters' preloader asks for each unit of each frame how many sprite loads are pending, and the game walks the sprite cache's whole list to answer: 1.3 million entries in the fight. The native counts loads that are done, and loads whose event isn't signalled (probed with `Waitable::ready`, which consumes nothing). On anything else, a signalled event (whose poll finishes the load) or an assert's case, it runs the game's code. Checked: 8,192+ counts, none differ.
+- **Loop steps over empty slots.** Four of the game's per-frame walks are mostly over empty entries:
+  - the 1024-slot table at `0x882d38` (`0x52fc20`, `0x52fd90`), 3.5%;
+  - the room's cell grid (`0x4df1c0`, `0x4df510`), 3.7%;
+  - the floor's tile records (`0x4de730`), where nine in ten of `0x4de410`'s 922k calls returned at once: flagged, outside the view's rectangle, or with its block already drawn.
+  
+  Each loop's step is now a call to a native that skips the entries with nothing to do and resumes the game's code at the loop's body (or exit) with the registers it would have (`SlotStepA/B`, `CellStepA/B`, `FloorRecordStep`).
+- **The lane's fight, all in:** 4.52 billion bytes of x86 executed for the same 2,507 frames, against 7.63 billion before the first round (41% less).
+- **Azahar** (each game makes a new map, so the first windows' load waits, 0.2–2 s a window, differ from run to run): over the last three windows, once the loads have settled, 19.4 and 20.4 fps without either round, 22.0–22.7 with the first, 23.6 and 23.9 with both. The game's own cap is 25.
+- **Not yet:** `0x608540`, a clipped DC6 blitter with seven pixel modes. Its inner loops run inside one translated block, so the block counter undercounts it below its 3%.
+
 ## Blood Moor: VirtualAlloc ran out (2026-10-18)
 
 After about four and a half minutes, three of them in Blood Moor, the console logged `va full: want 512 KiB, live 44416 KiB, largest free 384 KiB`. The 44 MiB VirtualAlloc range was full, while the heap range held 8.2 MiB of its 17 (peak 9.7). The game kept going after the failed allocation, the sound looped, and translated code then faulted on a wild guest pointer (data abort, far = membase + 0x357db9e8, outside the 75 MiB arena).

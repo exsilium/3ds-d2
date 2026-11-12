@@ -389,9 +389,10 @@ struct RemapCheck {
     uint32_t orig, keep;   // the original, and its first whole instructions' bytes (5 or more) the trampoline copies
     uint32_t tramp = 0, calls = 0, bad = 0;
 };
-RemapCheck g_remap_check[6] = {{"Dc6Remap", 0x00607e20, 7},    {"Dc6RemapB", 0x00607680, 7},
+RemapCheck g_remap_check[7] = {{"Dc6Remap", 0x00607e20, 7},    {"Dc6RemapB", 0x00607680, 7},
                                {"Dc6Remap2", 0x006072f0, 7},   {"LightAdd", 0x004747c0, 6},
-                               {"LightStampOccluded", 0x00475420, 6}, {"LightStamp", 0x004748d0, 6}};
+                               {"LightStampOccluded", 0x00475420, 6}, {"LightStamp", 0x004748d0, 6},
+                               {"LoadsPending", 0x005ff2a0, 7}};
 
 // Before the hooks go in: the trampolines copy the originals' first bytes.
 bool install_remap_check(Cpu &c)
@@ -399,7 +400,7 @@ bool install_remap_check(Cpu &c)
     const uint32_t at = rt::va_alloc(0x1000, 0x00607e20);
     if (!at)
         return false;
-    for (int k = 0; k < 6; k++) {
+    for (int k = 0; k < 7; k++) {
         RemapCheck &r = g_remap_check[k];
         r.tramp = at + 16 * k;
         uint8_t t[16];
@@ -409,7 +410,7 @@ bool install_remap_check(Cpu &c)
         std::memcpy(t + r.keep + 1, &rel, 4);
         c.write(r.tramp, t, r.keep + 5);
     }
-    c.invalidate_code(at, 16 * 6);
+    c.invalidate_code(at, 16 * 7);
     return true;
 }
 
@@ -2600,6 +2601,349 @@ bool install_check(Cpu &c)
     return true;
 }
 
+// ---- loads pending: 5ff2a0 -----------------------------------------------------------
+//
+// The monsters' preloader (4700b0) asks, for each unit of each frame, how
+// many sprite loads are still pending (fewer than 30: it starts the next).
+// 5ff2a0 walks the sprite cache's whole list (0x89db7c, next at +0x14) for
+// it, calling 40a7f0 on each entry's load: 1.3 million entries in the
+// lane's fight. 40a7f0, for a load not marked done (+0x48 bit 0), polls its
+// event (WaitForSingleObject(h, 0)), and when it is signalled finishes the
+// load (40a4c0). The native counts what it can decide without the poll's
+// side effect: loads done, and loads whose event is not signalled (a
+// zero-timeout wait on those returns at once, changing nothing, on the
+// console's scheduler). A signalled event, or anything unexpected (the
+// asserts' cases), runs the original from its third instruction.
+constexpr uint32_t kSpriteList = 0x0089db7c;
+constexpr uint32_t kLoadMagic = 0x41737960;   // a load's +0x48, its low four bits aside
+
+// The count, or false if the original must run.
+bool loads_pending_count(uint32_t &n)
+{
+    ThreadScheduler *sch = wx86_sched();
+    GuestThread *t = sch ? sch->current() : nullptr;
+    n = 0;
+    for (uint32_t e = U32(kSpriteList); e; e = U32(e + 0x14)) {
+        const uint32_t sp = U32(e);
+        if (!sp || (*H(sp + 0x20) & 1))
+            continue;
+        const uint32_t ld = U32(sp + 0xb0);
+        const uint32_t st = ld ? U32(ld + 0x48) : 0;
+        if (!ld || (st & ~0xfu) != kLoadMagic)
+            return false;
+        if (st & 1)
+            continue;
+        {
+            d2rt::Waitable *w = wx86_handle_find(U32(U32(ld + 0x38)));
+            if (!w || !t || w->ready(t))   // unknown handles count as signalled, as the shim does
+                return false;
+        }
+        n++;
+    }
+    return true;
+}
+
+uint32_t loads_pending(Cpu &c)
+{
+    uint32_t n;
+    if (loads_pending_count(n))
+        return n;
+    // push esi; mov esi, [0x89db7c]; on at 5ff2a7
+    const uint32_t esp = c.reg(R_ESP);
+    put32(esp - 4, c.reg(R_ESI));
+    c.set_reg(R_ESI, U32(kSpriteList));
+    resume_original(c, 0x005ff2a7, esp - 4, 0);
+    return c.reg(R_EAX);
+}
+
+// D2_NATIVE_CHECK=1: the native's count, when it gives one, against the
+// original's (install_remap_check's trampoline 6). The original's is kept.
+uint32_t loads_pending_checked(Cpu &c)
+{
+    RemapCheck &k = g_remap_check[6];
+    uint32_t n;
+    const bool mine = loads_pending_count(n);
+    const uint32_t r0 = rt::guest_call(c, k.tramp, {});
+    if (mine) {
+        const bool bad = n != r0;
+        if (bad && k.bad < 20)
+            rt::logf("native check: LoadsPending gave %u, the game's %u", n, r0);
+        check_note(k, bad);
+    }
+    return r0;
+}
+
+// ---- the 1024-slot table's empty slots: 52fc20, 52fd90 ---------------------------------
+//
+// Two routines walk a table of 1024 slots (0x882d38 to 0x883d38) once a
+// frame each; nearly all slots are empty (0 or -1), and the empty slots'
+// test and step were 3.5% of the game's code in the lane's fight. Each
+// loop's step becomes a call to a native that goes on to the next slot
+// that is not empty and resumes the loop's top with it, or its exit:
+//   52fd2c  add ebx, 4; cmp ebx, 0x883d38; jl 0x52fc90         (the slot in ebx)
+//   52fe94  mov eax, [ebp+8]; add eax, 4; cmp eax, 0x883d38;
+//           mov [ebp+8], eax; jl 0x52fde5                      (the slot in [ebp+8] and eax)
+// become call <native> and nops, which run on to the exits, 52fd3b and
+// 52fea8 (each starts xor eax, eax; the flags are not read).
+constexpr uint32_t kSlots = 0x00882d38, kSlotsEnd = 0x00883d38;
+
+inline uint32_t next_slot(uint32_t p)
+{
+    for (p += 4; p < kSlotsEnd; p += 4) {
+        const uint32_t v = U32(p);
+        if (v && v != 0xffffffffu)
+            break;
+    }
+    return p;
+}
+
+uint32_t slot_step_ebx(Cpu &c)
+{
+    const uint32_t p = next_slot(c.reg(R_EBX));
+    c.set_reg(R_EBX, p);
+    if (p < kSlotsEnd)
+        rt::bridge().redirect_next(0x0052fc90);
+    return c.reg(R_EAX);
+}
+
+uint32_t slot_step_frame(Cpu &c)
+{
+    const uint32_t at = c.reg(R_EBP) + 8, p = next_slot(U32(at));
+    put32(at, p);
+    if (p < kSlotsEnd)
+        rt::bridge().redirect_next(0x0052fde5);
+    return p;
+}
+
+// The same for two walks of the room's cell grid (n x n cells of 0x24
+// bytes from +0xeaa8, n at +0xeab0; about 1000 cells a frame, nearly all
+// with empty lists), each a frame:
+//   4df1c0 (the cells' +0x14 and +0x18 lists): at 4df1f0, the cell's +0x14
+//     in edi, the cells left in ebx (also [ebp-0x34]), edi kept in [ebp-0x1c]:
+//       sub ebx, 1; cmp dword [edi], 0; mov [ebp-0x34], ebx; je 0x4df3f8
+//     4df3f8 goes on to the +0x18 list, and with neither, to the next cell
+//     at 4df446 (edi += 0x24), or the end, 4df454.
+//   4df510 (the +0x10 list, then a call if +0x14): at 4df543, the cells
+//     left in esi (also [ebp-0xc]), the cell in [ebp-8]:
+//       mov ecx, [ebp-8]; sub esi, 1; mov [ebp-0xc], esi;
+//       mov esi, [ecx+0x10]; test esi, esi; je 0x4df5ff
+//     4df5ff calls 4def80 if +0x14, then the next cell (esi = [ebp-8] +
+//     0x24, kept in [ebp-8]), or the end, 4df621.
+// The natives skip the cells with nothing to do, and resume where the
+// game's code would, with the registers it would have.
+uint32_t cells_step_a(Cpu &c)
+{
+    const uint32_t ebp = c.reg(R_EBP);
+    uint32_t left = c.reg(R_EBX), at = c.reg(R_EDI), next;
+    for (;;) {
+        put32(ebp - 0x34, --left);
+        if (U32(at)) {
+            next = 0x004df1ff;
+            break;
+        }
+        if (U32(at + 4)) {
+            next = 0x004df3f8;
+            break;
+        }
+        at += 0x24;
+        put32(ebp - 0x1c, at);
+        c.set_reg(R_ESI, 0);   // the empty +0x18 list
+        if (!left) {
+            next = 0x004df454;
+            break;
+        }
+    }
+    c.set_reg(R_EBX, left);
+    c.set_reg(R_EDI, at);
+    rt::bridge().redirect_next(next);
+    return c.reg(R_EAX);
+}
+
+uint32_t cells_step_b(Cpu &c)
+{
+    const uint32_t ebp = c.reg(R_EBP);
+    uint32_t left = c.reg(R_ESI), cell = U32(ebp - 8), next;
+    for (;;) {
+        put32(ebp - 0xc, --left);
+        c.set_reg(R_ECX, cell);
+        if (const uint32_t list = U32(cell + 0x10)) {
+            c.set_reg(R_ESI, list);
+            next = 0x004df557;
+            break;
+        }
+        if (U32(cell + 0x14)) {
+            c.set_reg(R_ESI, 0);
+            next = 0x004df5ff;
+            break;
+        }
+        cell += 0x24;
+        put32(ebp - 8, cell);
+        c.set_reg(R_ESI, cell);
+        if (!left) {
+            next = 0x004df621;
+            break;
+        }
+    }
+    rt::bridge().redirect_next(next);
+    return c.reg(R_EAX);
+}
+
+// And the floor's tiles: 4de730 goes through each room's tile records
+// (0x30 bytes) for each of 3 layers, calling 4de410 on each record of the
+// layer: 0.92 million calls in the lane's fight, nine in ten of which
+// return at once (the record's +0x14 & 0x408; its place outside the view's
+// rectangle, [this+0x24]+0x14; or its block's +0x14 set). At 4de91c, the
+// record in esi, the records left in [ebp-8], the layer in [ebp+8], this
+// in edi:
+//   mov eax, [ebp-8]; sub eax, 1; add esi, 0x30; test eax, eax;
+//   mov [ebp-8], eax; jne 0x4de8e0
+// The native passes over the records of other layers and those 4de410
+// would return on, and resumes the call's setup (4de8ee) with the next
+// other one, or the loop's end (4de92c).
+inline bool floor_record_idle(uint32_t self, uint32_t rec)
+{
+    if (U32(rec + 0x14) & 0x408)
+        return true;
+    const uint32_t rect = U32(self + 0x24) + 0x14;
+    if (!rect)
+        return false;   // the game's assertion
+    const int32_t x = (int32_t)(U32(self + 0x3c) + U32(rec)), y = (int32_t)(U32(rec + 4) + U32(self + 0x40));
+    if (x < I32(rect) || x >= I32(rect + 8) || y < I32(rect + 4) || y >= I32(rect + 0xc))
+        return true;
+    return U32(U32(rec + 0x18) + 0x14) != 0;
+}
+
+uint32_t floor_records_step(Cpu &c)
+{
+    const uint32_t ebp = c.reg(R_EBP), self = c.reg(R_EDI), layer = U32(ebp + 8);
+    uint32_t rec = c.reg(R_ESI), left = U32(ebp - 8);
+    for (;;) {
+        left--;
+        rec += 0x30;
+        if (!left) {
+            rt::bridge().redirect_next(0x004de92c);
+            break;
+        }
+        if (((U32(rec + 0x14) >> 14) & 7) == layer && !floor_record_idle(self, rec)) {
+            rt::bridge().redirect_next(0x004de8ee);
+            break;
+        }
+    }
+    put32(ebp - 8, left);
+    c.set_reg(R_ESI, rec);
+    return left;
+}
+
+bool install_slot_steps(Cpu &c)
+{
+    static const uint8_t kA[] = {0x83, 0xc3, 0x04, 0x81, 0xfb, 0x38, 0x3d, 0x88, 0x00, 0x0f, 0x8c, 0x55, 0xff, 0xff, 0xff};
+    static const uint8_t kB[] = {0x8b, 0x45, 0x08, 0x83, 0xc0, 0x04, 0x3d, 0x38, 0x3d, 0x88,
+                                 0x00, 0x89, 0x45, 0x08, 0x0f, 0x8c, 0x3d, 0xff, 0xff, 0xff};
+    struct Site {
+        uint32_t va;
+        const uint8_t *orig;
+        uint32_t n;
+        uint32_t (*fn)(Cpu &);
+        const char *name;
+    };
+    static const uint8_t kC[] = {0x83, 0xeb, 0x01, 0x83, 0x3f, 0x00, 0x89, 0x5d, 0xcc, 0x0f, 0x84, 0xf9, 0x01, 0x00, 0x00};
+    static const uint8_t kD[] = {0x8b, 0x4d, 0xf8, 0x83, 0xee, 0x01, 0x89, 0x75, 0xf4, 0x8b,
+                                 0x71, 0x10, 0x85, 0xf6, 0x0f, 0x84, 0xa8, 0x00, 0x00, 0x00};
+    static const uint8_t kE[] = {0x8b, 0x45, 0xf8, 0x83, 0xe8, 0x01, 0x83, 0xc6,
+                                 0x30, 0x85, 0xc0, 0x89, 0x45, 0xf8, 0x75, 0xb4};
+    const Site sites[] = {{0x0052fd2c, kA, sizeof kA, slot_step_ebx, "SlotStepA"},
+                          {0x0052fe94, kB, sizeof kB, slot_step_frame, "SlotStepB"},
+                          {0x004df1f0, kC, sizeof kC, cells_step_a, "CellStepA"},
+                          {0x004df543, kD, sizeof kD, cells_step_b, "CellStepB"},
+                          {0x004de91c, kE, sizeof kE, floor_records_step, "FloorRecordStep"}};
+    for (const Site &st : sites) {
+        uint8_t have[20];
+        if (!c.read(st.va, have, st.n) || std::memcmp(have, st.orig, st.n))
+            return false;
+    }
+    for (const Site &st : sites) {
+        const uint32_t trap = rt::native_entry(st.name, 0, st.fn);
+        if (!trap)
+            return false;
+        c.set_inline_shim(trap);
+        uint8_t p[20];
+        std::memset(p, 0x90, sizeof p);
+        p[0] = 0xe8;
+        const uint32_t rel = trap - (st.va + 5);
+        std::memcpy(p + 1, &rel, 4);
+        c.write(st.va, p, st.n);
+        c.invalidate_code(st.va, st.n);
+        rt::logf("native %s at %08x (in line)", st.name, st.va);
+    }
+    return true;
+}
+
+// ---- float to int: _ftol2_sse ------------------------------------------------------
+//
+// The C runtime's 32-bit float-to-int conversion (0x682fd0), 1.26 million
+// calls in the lane's fight. It takes cvttsd2si when the runtime found
+// SSE2 (0x994c88), else a long x87 path with a 64-bit fistp and fild. The
+// port reports no SIMD (RunOptions::cpuid_edx), so it was always the long
+// path. For every value an int holds, both give the truncated value (the
+// compiler calls _ftol2_sse only for 32-bit results), and the dynarec turns
+// fstp + cvttsd2si into one VFP conversion. So the check is jumped over:
+//   682fd0  83 3d 88 4c 99 00 00   cmp dword [0x994c88], 0
+//   682fd7  74 2d                  je 0x683006 (the x87 path)
+//   682fd9  push ebp; ...; fstp qword [esp]; cvttsd2si eax, [esp]; leave; ret
+// becomes jmp 0x682fd9. With D2_NATIVE_CHECK, a stub runs both on each
+// call instead, and FtolCheck compares them.
+constexpr uint32_t kFtol = 0x00682fd0, kFtolSse = 0x00682fd9, kFtolX87 = 0x00683006;
+uint32_t g_ftol_calls = 0, g_ftol_bad = 0;
+
+uint32_t ftol_check(Cpu &c)
+{
+    const uint32_t fast = c.reg(R_EAX), x87 = c.read_u32(c.reg(R_ESP) + 4);
+    g_ftol_calls++;
+    if (fast != x87) {
+        g_ftol_bad++;
+        if (g_ftol_bad <= 20)
+            rt::logf("native check: _ftol2_sse gave %08x, the x87 path %08x", fast, x87);
+    }
+    if ((g_ftol_calls & (g_ftol_calls - 1)) == 0 || (g_ftol_calls & 0xfffff) == 0)
+        rt::logf("native check: _ftol2_sse %u calls, %u differ", g_ftol_calls, g_ftol_bad);
+    return fast;
+}
+
+bool install_ftol(Cpu &c, bool check)
+{
+    static const uint8_t kOrig[] = {0x83, 0x3d, 0x88, 0x4c, 0x99, 0x00, 0x00, 0x74, 0x2d};
+    uint8_t have[sizeof kOrig];
+    if (!c.read(kFtol, have, sizeof have) || std::memcmp(have, kOrig, sizeof have))
+        return false;
+    auto rel = [](uint32_t from_end, uint32_t to) { return to - from_end; };
+    if (check) {
+        const uint32_t native = rt::native_entry("FtolCheck", 0, ftol_check), at = rt::va_alloc(0x1000, kFtol);
+        if (!native || !at)
+            return false;
+        // fld st0; call x87 (pops the copy); push eax; call sse (pops x);
+        // call FtolCheck (eax: sse's, [esp+4]: x87's); add esp, 4; ret
+        uint8_t t[24] = {0xd9, 0xc0, 0xe8, 0, 0, 0, 0, 0x50, 0xe8, 0, 0, 0, 0, 0xe8, 0, 0, 0, 0, 0x83, 0xc4, 0x04, 0xc3};
+        uint32_t r = rel(at + 7, kFtolX87);
+        std::memcpy(t + 3, &r, 4);
+        r = rel(at + 13, kFtolSse);
+        std::memcpy(t + 9, &r, 4);
+        r = rel(at + 18, native);
+        std::memcpy(t + 14, &r, 4);
+        c.write(at, t, 22);
+        c.invalidate_code(at, 22);
+        uint8_t j[5] = {0xe9};
+        r = rel(kFtol + 5, at);
+        std::memcpy(j + 1, &r, 4);
+        c.write(kFtol, j, 5);
+    } else {
+        static const uint8_t j[] = {0xeb, 0x07};   // jmp 0x682fd9
+        c.write(kFtol, j, sizeof j);
+    }
+    c.invalidate_code(kFtol, sizeof kOrig);
+    rt::logf("native: _ftol2_sse at %08x takes its cvttsd2si path%s", kFtol, check ? " (checked)" : "");
+    return true;
+}
+
 }  // namespace
 
 int install_d2_native(Cpu &c)
@@ -2767,6 +3111,15 @@ int install_d2_native(Cpu &c)
          "LightStampOccluded", !remap_check);
     HOOK(c, 0x004748d0, k4748d0, sizeof k4748d0, 1, remap_check ? light_checked<5> : light_stamp, "LightStamp",
          !remap_check);
+    if (mask & bit)   // the next bits of D2_NATIVE_MASK
+        n += install_ftol(c, check);
+    bit <<= 1;
+    static const uint8_t k5ff2a0[] = {0x56, 0x8b, 0x35, 0x7c, 0xdb, 0x89, 0x00, 0x57, 0x33, 0xff};
+    HOOK(c, 0x005ff2a0, k5ff2a0, sizeof k5ff2a0, 0, remap_check ? loads_pending_checked : loads_pending,
+         "LoadsPending", !remap_check);
+    if (mask & bit)
+        n += install_slot_steps(c) ? 5 : 0;
+    bit <<= 1;
 #undef DRAW
 #undef HOOK
     return n;

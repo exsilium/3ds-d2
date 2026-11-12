@@ -86,9 +86,10 @@ u32 __ctru_linear_heap_size = 2u << 20;
 // Translated code lives in a static pool in .bss (mman_ctr.c): the console
 // refused to make heap pages executable (every code allocation failed), and
 // .bss sits outside its 96 MiB heap window, in budget the heap cannot use.
-// The town needed 8 MiB of code in Azahar; the longest session measured
-// held 13.7 MiB (3DS-D2-12, 1 h 46 min), and past the pool the JIT evicts.
-// Box86 takes it in 2 MiB chunks, so its size is a multiple of 2 MiB.
+// The town needed 8 MiB of code in Azahar; issue #23's Act I session had
+// 14 MiB of chunks open after 28 minutes and 16 MiB after 2 h 52. What the
+// backend does with a full pool is #23's open question. Box86 takes it in
+// 2 MiB chunks, so its size is a multiple of 2 MiB.
 alignas(0x1000) uint8_t dyn86_ctr_jitpool[14u << 20];
 extern const uint32_t dyn86_ctr_jitpool_size = 14u << 20;
 // The tile prefetch's store (issue #89, rt::set_prefetch_arena), here for

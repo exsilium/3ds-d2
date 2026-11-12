@@ -635,7 +635,12 @@ This is the split of the New 3DS's 124 MiB application region in play. The figur
 **The heap's last MiB is shared.** The JIT's records stop growing at the 1 MiB reserve, and the JIT then evicts code to reuse records. With the tile prefetch's store taken from the heap (1 MiB, one allocation per range), 3DS-D2-1C's second event hit the reserve 12 times. Its first event and 3DS-D2-1A/1B never did. The heap's room fell to 8 KiB, against 1.5–2.5 MiB before.
 
 **What changed (issue #89, build `9bd7e09077c9`):**
-- The JIT pool went from 16 to 14 MiB. Box86 takes it in 2 MiB chunks, so 15 MiB would have used 14 anyway, and the longest session measured held 13.7 MiB.
+- The JIT pool went from 16 to 14 MiB. Box86 takes it in 2 MiB chunks, so 15 MiB would have used 14 anyway.
+  - **Not yet known: what happens when the pool is full** (issue #23, open).
+  - In #23's 3 h 51 min Act I session, the chunks opened (`jit=`) reached 14 MiB at t ≈ 1,706 s and 16 MiB at t ≈ 10,310 s. The frame rate didn't visibly change after that.
+  - At 14 MiB, a session like that fills the pool after about half an hour instead of nearly three hours.
+  - The code in use (`jitused=`) was 13.7 MiB after 1 h 46 in 3DS-D2-12.
+  - Before this ships, the full-pool path needs #23's lane run: a small pool, a long script, frame hashes against an unbounded run.
 - The tile prefetch's store is now a static 1 MiB (`g_prefetch_arena`), written as a ring.
 - The image's other freed MiB goes, through `__system_allocateHeaps`' leftover budget, to the linear heap for jump tables: 2,816 KiB of them in linear memory instead of 1,792.
 - `reserve_arena` took the larger `ctr-game-n3` layout (78,848 KiB) from 2 MiB of linear jump tables, which would have spent the two MiB on the arena. It now does so only from 3 MiB.
@@ -653,4 +658,4 @@ Ordered by how cheap they look.
    - First measurement: how many 4 KiB pages hold block entries after an hour's session.
 3. **JIT records** (3–4 MiB): trimming `dynablock_t` (the per-instruction size table, fields kept for debugging) helps long sessions. It's invasive.
 4. **Guest arena against the sprite cache**: the arena is fixed at 75 MiB. With sprites decoded natively and about 2.6 times faster (issue #83), a sprite cache 2 MiB smaller costs less than before. An arena 2 MiB smaller would hand that to the host. It needs a console comparison of the cache's evictions and decode time.
-5. **A larger JIT pool is the wrong way round:** at 14 MiB it holds a 1 h 46 session's code. Past that, the JIT evicts (issue #23), which costs little next to a heap that runs out.
+5. **The JIT pool's size** depends on issue #23. If the backend handles a full pool cheaply (flush or evict, measured on the lane), the pool can be smaller still, and its MiBs go to linear jump tables as above. If it doesn't, 14 MiB is already a risk for long sessions.

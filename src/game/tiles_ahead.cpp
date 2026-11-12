@@ -223,7 +223,7 @@ void tiles_ahead_scan(d2rt::Cpu &c)
             sent++;
         }
         g_sent_window += sent;
-        if (g_sent.size() > 16384)
+        if (g_sent.size() > 4096)
             g_sent.clear();
     }
     g_w.pending1 = g_w.pending2 = 0;
@@ -237,7 +237,7 @@ void tiles_ahead_scan(d2rt::Cpu &c)
         (a.ring == 1 ? g_w.pending1 : g_w.pending2)++;
         (a.ring == 1 ? g_w.pending_bytes1 : g_w.pending_bytes2) += a.bytes;
     }
-    if (g_seen.size() > 65536)
+    if (g_seen.size() > 4096)   // tiles of rooms passed by and never drawn: the host heap is tight
         g_seen.clear();
 }
 

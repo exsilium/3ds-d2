@@ -279,9 +279,10 @@ const FileStats &file_stats();
 // waiting (false: no worker, or 512 queued). In such a task, prefetch_raw
 // reads bytes of the file for the task itself, and prefetch_range reads
 // [pos, pos+n) into the store a read inside it is served from, before the
-// read cache and the card (1 MiB in all, least recently used replaced; a
-// range at most a quarter of that). False if it read nothing: already
-// stored, or the read failed.
+// read cache and the card: the arena set_prefetch_arena gave (before the
+// game runs), written as a ring, a range at most a quarter of it. False if
+// it read nothing: already stored, no arena, or the read failed.
+void set_prefetch_arena(void *arena, uint32_t size);
 int prefetch_file(const char *name);
 bool io_background(std::function<void()> task);
 bool prefetch_raw(int id, uint64_t pos, void *dst, uint32_t n);

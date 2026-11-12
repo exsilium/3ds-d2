@@ -340,12 +340,16 @@ FileStats g_file_stats;
 // nothing else to do (io_background), for reads the game will make soon:
 // a tile's compressed sectors, say, 2-10 KiB scattered through its DT1. A
 // read that falls inside a stored range is served from it (ReadCache's
-// try_read and read), before the cache's blocks and the card. Ranges stay,
-// least recently used replaced past kPfBytes, so one read again (Storm's
-// sector table, before each read of an MPQ file) keeps being served. The
-// files are the read-only game files a ReadCache was opened on, by name;
-// the worker reads them through descriptors of its own.
-constexpr uint32_t kPfBytes = 1u << 20, kPfRanges = 512, kPfFiles = 32;
+// try_read and read), before the cache's blocks and the card. The ranges
+// live in an arena the platform gives (set_prefetch_arena: on the console a
+// static 1 MiB, out of the heap), written as a ring: a new range replaces
+// the oldest ones where it lands. A range read again (Storm's sector table,
+// before each read of an MPQ file) is read ahead again once it has gone.
+// The files are the read-only game files a ReadCache was opened on, by
+// name; the worker reads them through descriptors of its own.
+constexpr uint32_t kPfRanges = 512, kPfFiles = 32;
+uint8_t *g_pf_arena = nullptr;
+uint32_t g_pf_arena_size = 0, g_pf_head = 0;   // the ring's next write (the worker's)
 struct PfFile {
     std::string path, base;   // the host path, and its file name in lower case
     int fd = -1;              // the worker's
@@ -355,11 +359,9 @@ std::atomic<int> g_pf_count{0};
 struct PfRange {
     int id = -1;
     uint64_t pos = 0;
-    uint32_t len = 0, used = 0;
-    std::unique_ptr<uint8_t[]> data;
+    uint32_t at = 0, len = 0;   // its bytes: g_pf_arena + at
 };
 PfRange g_pf[kPfRanges];
-uint32_t g_pf_clock = 0;
 std::atomic_flag g_pf_lock = ATOMIC_FLAG_INIT;
 struct PfGuard {
     PfGuard()
@@ -402,9 +404,8 @@ bool pf_serve(int id, uint64_t pos, uint8_t *dst, uint32_t n)
         return false;
     PfGuard g;
     for (PfRange &r : g_pf)
-        if (r.id == id && r.data && pos >= r.pos && pos + n <= r.pos + r.len) {
-            std::memcpy(dst, r.data.get() + (pos - r.pos), n);
-            r.used = ++g_pf_clock;
+        if (r.id == id && r.len && pos >= r.pos && pos + n <= r.pos + r.len) {
+            std::memcpy(dst, g_pf_arena + r.at + (pos - r.pos), n);
             g_file_stats.prefetch_hits++;
             return true;
         }
@@ -414,44 +415,49 @@ bool pf_serve(int id, uint64_t pos, uint8_t *dst, uint32_t n)
 bool pf_covered(int id, uint64_t pos, uint32_t n)
 {
     PfGuard g;
-    for (PfRange &r : g_pf)
-        if (r.id == id && r.data && pos >= r.pos && pos + n <= r.pos + r.len) {
-            r.used = ++g_pf_clock;   // wanted again: keep it
+    for (const PfRange &r : g_pf)
+        if (r.id == id && r.len && pos >= r.pos && pos + n <= r.pos + r.len)
             return true;
-        }
     return false;
 }
 
-// The worker's: a range into the store, the least recently used going until
-// it fits.
-void pf_put(int id, uint64_t pos, std::unique_ptr<uint8_t[]> data, uint32_t len)
+// The worker's: room for len bytes at the ring's head (from the start
+// again when the end is too near), the ranges there let go first, so that
+// the game thread never serves bytes being written; null without an arena
+// or a free slot. pf_commit then lists the range.
+uint8_t *pf_claim(uint32_t len, uint32_t &at)
+{
+    if (!g_pf_arena || len > g_pf_arena_size)
+        return nullptr;
+    if (g_pf_head + len > g_pf_arena_size)
+        g_pf_head = 0;
+    at = g_pf_head;
+    PfGuard g;
+    bool slot = false;
+    for (PfRange &r : g_pf) {
+        if (r.len && r.at < at + len && at < r.at + r.len) {
+            g_file_stats.prefetch_held -= r.len;
+            r.len = 0;
+            r.id = -1;
+        }
+        slot = slot || !r.len;
+    }
+    return slot ? g_pf_arena + at : nullptr;
+}
+
+void pf_commit(int id, uint64_t pos, uint32_t at, uint32_t len)
 {
     PfGuard g;
-    for (;;) {
-        PfRange *free_slot = nullptr, *old = nullptr;
-        for (PfRange &r : g_pf) {
-            if (!r.data) {
-                if (!free_slot)
-                    free_slot = &r;
-            } else if (!old || r.used < old->used) {
-                old = &r;
-            }
-        }
-        if (free_slot && g_file_stats.prefetch_held + len <= kPfBytes) {
-            free_slot->data = std::move(data);
-            free_slot->id = id;
-            free_slot->pos = pos;
-            free_slot->len = len;
-            free_slot->used = ++g_pf_clock;
+    for (PfRange &r : g_pf)
+        if (!r.len) {
+            r.id = id;
+            r.pos = pos;
+            r.at = at;
+            r.len = len;
             g_file_stats.prefetch_held += len;
+            g_pf_head = at + len;
             return;
         }
-        if (!old)
-            return;
-        g_file_stats.prefetch_held -= old->len;
-        old->data.reset();
-        old->id = -1;
-    }
 }
 
 bool pf_disk(int id, uint64_t pos, void *dst, uint32_t n, uint32_t &got)
@@ -924,15 +930,21 @@ bool prefetch_raw(int id, uint64_t pos, void *dst, uint32_t n)
     return pf_disk(id, pos, dst, n, got) && got == n;
 }
 
+void set_prefetch_arena(void *arena, uint32_t size)
+{
+    g_pf_arena = static_cast<uint8_t *>(arena);
+    g_pf_arena_size = size;
+}
+
 bool prefetch_range(int id, uint64_t pos, uint32_t n)
 {
-    if (id < 0 || !n || n > kPfBytes / 4 || pf_covered(id, pos, n))
+    if (id < 0 || !n || n > g_pf_arena_size / 4 || pf_covered(id, pos, n))
         return false;
-    std::unique_ptr<uint8_t[]> data(new (std::nothrow) uint8_t[n]);
-    uint32_t got;
-    if (!data || !pf_disk(id, pos, data.get(), n, got) || got != n)
+    uint32_t at, got;
+    uint8_t *dst = pf_claim(n, at);
+    if (!dst || !pf_disk(id, pos, dst, n, got) || got != n)
         return false;
-    pf_put(id, pos, std::move(data), n);
+    pf_commit(id, pos, at, n);
     return true;
 }
 

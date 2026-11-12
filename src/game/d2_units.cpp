@@ -13,7 +13,7 @@ namespace {
 constexpr uint32_t kPlayerUnitVa = 0x007A6A70;
 constexpr uint32_t kUnitTablesVa = 0x007A5E70;
 constexpr uint32_t kBuckets = 128;
-constexpr uint32_t kMonster = 1;
+constexpr uint32_t kMonster = 1, kObject = 2;
 constexpr uint32_t kListNext = 0xE4;
 constexpr uint32_t kPath = 0x2C;
 // The player's body on the screen (the view's centre, above the feet), and
@@ -34,30 +34,40 @@ uint32_t rd32(uint32_t va)
     return v;
 }
 
-// A unit's place in subtiles, with the fraction.
+// A unit's place in subtiles, with the fraction. An object (types 2, 4, 5)
+// has a static path: +0x0C x, +0x10 y (0x620b11).
 bool place(uint32_t unit, double &x, double &y)
 {
-    uint16_t p[4] = {};
     const uint32_t path = rd32(unit + kPath);
-    if (!path || !rt::guest_read(path, p, sizeof p))
+    if (!path)
+        return false;
+    const uint32_t type = rd32(unit);
+    if (type == 2 || type == 4 || type == 5) {
+        x = (int32_t)rd32(path + 0x0C);
+        y = (int32_t)rd32(path + 0x10);
+        return true;
+    }
+    uint16_t p[4] = {};
+    if (!rt::guest_read(path, p, sizeof p))
         return false;
     x = p[1] + p[0] / 65536.0;
     y = p[3] + p[2] / 65536.0;
     return true;
 }
 
-// Each monster in the client's table, with its offset from the player.
-template <class F> bool each_monster(F f)
+// Each unit of a type (1 monsters and NPCs, 2 objects) in the client's
+// table, with its offset from the player.
+template <class F> bool each_unit(uint32_t type, F f)
 {
     const uint32_t player = rd32(kPlayerUnitVa);
     double px, py;
     if (!player || !place(player, px, py))
         return false;
     for (uint32_t b = 0; b < kBuckets; b++) {
-        uint32_t u = rd32(kUnitTablesVa + (kMonster * kBuckets + b) * 4);
+        uint32_t u = rd32(kUnitTablesVa + (type * kBuckets + b) * 4);
         for (int n = 0; u && n < 64; n++, u = rd32(u + kListNext)) {
             double x, y;
-            if (rd32(u) != kMonster || !place(u, x, y))
+            if (rd32(u) != type || !place(u, x, y))
                 continue;
             UnitSpot s;
             s.cls = rd32(u + 0x04);
@@ -75,10 +85,10 @@ template <class F> bool each_monster(F f)
 
 }  // namespace
 
-bool find_unit(uint32_t cls, UnitSpot &out)
+bool find_unit(uint32_t cls, UnitSpot &out, uint32_t type)
 {
     bool found = false;
-    each_monster([&](const UnitSpot &s) {
+    each_unit(type, [&](const UnitSpot &s) {
         if (s.cls == cls && (!found || s.distance < out.distance)) {
             out = s;
             found = true;
@@ -112,12 +122,17 @@ uint32_t unit_class(const char *name)
 void log_units()
 {
     int n = 0;
-    const bool ok = each_monster([&](const UnitSpot &s) {
+    const bool ok = each_unit(kMonster, [&](const UnitSpot &s) {
         if (s.distance <= kNear) {
             rt::logf("units: class %u id %u mode %u, %.1f subtiles away, at %d,%d", s.cls, s.id, s.mode, s.distance,
                      s.x, s.y);
             n++;
         }
+    });
+    each_unit(kObject, [&](const UnitSpot &s) {
+        if (s.distance <= kNear)
+            rt::logf("units: object class %u id %u mode %u, %.1f subtiles away, at %d,%d", s.cls, s.id, s.mode,
+                     s.distance, s.x, s.y);
     });
     rt::logf(ok ? "units: %d near the player" : "units: not in a game", n);
 }

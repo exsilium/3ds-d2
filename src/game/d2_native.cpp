@@ -1841,9 +1841,10 @@ void cache_unlink(uint32_t cache, uint32_t e)
 // 5ff5b0(ecx=cache, edx=entry), a cache hit: if the cache is on (+0xc),
 // counts the hit (+0x4c), and under its lock (+0x30) moves the entry to the
 // recently used end of the main list, flag bit 0 cleared, stamped with
-// GetTickCount (+0x10). The stamp is now_ms, the value the GetTickCount
-// intrinsic gives: evictions go by it. Its only caller reads no register
-// after it.
+// GetTickCount (+0x10). The stamp is tick_ms, the value the GetTickCount
+// intrinsic gives (the slice's clock), without a host clock read per hit:
+// in a crowd this runs thousands of times a frame. Evictions go by it. Its
+// only caller reads no register after it.
 uint32_t cache_touch(Cpu &c)
 {
     const uint32_t cache = c.reg(R_ECX), e = c.reg(R_EDX);
@@ -1871,7 +1872,7 @@ uint32_t cache_touch(Cpu &c)
         put32(e + 0x18, U32(cache + 0x18));
     }
     put32(cache + 0x18, e);
-    put32(e + 0x10, (uint32_t)rt::now_ms());
+    put32(e + 0x10, rt::tick_ms());
     return 0;   // LeaveCriticalSection's
 }
 

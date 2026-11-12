@@ -24,14 +24,18 @@
 //   <ms> tapmenu <line>    tap line <line> (1: the first under the name) of the
 //                          menu of the NPC the last tapunit opened, where the
 //                          NPC is now, again every 1.5 s until the menu closes
-//   <ms> units             log the units near the player (class, id, screen spot)
+//   <ms> tapobject <class> [state]  as tapunit, for an object by its class
+//                          (a waypoint: 119 in the Rogue Encampment), until
+//                          <state> (ui20: the waypoint's panel)
+//   <ms> units             log the units and objects near the player (class, id, screen spot)
 //   <ms> skipvideos        from then on, press A (a click) as each cinematic plays: skips it
 //   <ms> closepanels [off] from then on, press START (Escape) while a panel is
 //                          open in the game: a walk that clicks into an NPC's
 //                          menu goes on walking ("off": no more)
 //   <ms> profile <names>   start a profiler run with these options (profiler.h's
 //                          names, comma-separated: frames,guest,...); "off" stops it
-//   states: textfield, ingame, menus, npcmenu, menuclosed, act1 to act5 (in a game, in that act)
+//   states: textfield, ingame, menus, npcmenu, menuclosed, act1 to act5 (in a game, in that act),
+//           ui<n> (in a game, the game's UI entry n open: 8 an NPC's menu, 20 the waypoints)
 //   # ...                  a comment line
 #ifndef D2_GAME_AUTOPLAY_H
 #define D2_GAME_AUTOPLAY_H
@@ -66,7 +70,8 @@ private:
     std::string waiting_for_;        // a wait in progress
     bool retry_tap_ = false;         // tapuntil: tap again while waiting
     int retry_x_ = 0, retry_y_ = 0;
-    uint32_t retry_unit_ = 0;        // tapunit: the class tapped, where it is
+    uint32_t retry_unit_ = 0;        // tapunit, tapobject: the class tapped, where it is
+    uint32_t retry_type_ = 1;        // its unit type: 1 monster or NPC, 2 object
     uint32_t menu_unit_ = 0;         // the last tapunit's class: whose menu tapmenu taps
     int retry_line_ = 0;             // tapmenu: the line
     uint64_t click_at_ = 0;          // a tap's click, after the cursor is in place

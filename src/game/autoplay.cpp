@@ -6,6 +6,7 @@
 #include "runtime/rt_host.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace game {
@@ -107,6 +108,8 @@ const Pad &Autoplay::step(uint64_t now_ms, Controls &controls, bool &shot, const
                          (waiting_for_ == "ingame" && state.in_game) || (waiting_for_ == "menus" && !state.in_game) ||
                          (waiting_for_ == "npcmenu" && state.in_game && (state.ui >> kNpcMenuUi & 1)) ||
                          (waiting_for_ == "menuclosed" && !(state.in_game && (state.ui >> kNpcMenuUi & 1))) ||
+                         (waiting_for_.size() > 2 && waiting_for_.compare(0, 2, "ui") == 0 && state.in_game &&
+                          (state.ui >> std::atoi(waiting_for_.c_str() + 2) & 1)) ||
                          (waiting_for_.size() == 4 && waiting_for_.compare(0, 3, "act") == 0 && state.in_game &&
                           player_act() == waiting_for_[3] - '0');
         if (!met) {
@@ -115,7 +118,7 @@ const Pad &Autoplay::step(uint64_t now_ms, Controls &controls, bool &shot, const
                 // walked towards (the spot at the edge in its direction).
                 // tapmenu: the line of its menu, where the unit is now.
                 UnitSpot u;
-                if (find_unit(retry_unit_, u)) {
+                if (find_unit(retry_unit_, u, retry_type_)) {
                     int x = u.x < kEdgeX0 ? kEdgeX0 : u.x > kEdgeX1 ? kEdgeX1 : u.x;
                     int y = u.y < kEdgeY0 ? kEdgeY0 : u.y > kEdgeY1 ? kEdgeY1 : u.y;
                     if (retry_line_)
@@ -203,6 +206,7 @@ const Pad &Autoplay::step(uint64_t now_ms, Controls &controls, bool &shot, const
                 continue;
             }
             retry_unit_ = menu_unit_;
+            retry_type_ = 1;
             retry_line_ = x;
             waiting_for_ = "menuclosed";
             wait_at_ = script_at;
@@ -211,9 +215,21 @@ const Pad &Autoplay::step(uint64_t now_ms, Controls &controls, bool &shot, const
             break;
         } else if (v == "units") {
             log_units();
+        } else if (v == "tapobject" && std::sscanf(ev, "%*s %*s %15s", arg) == 1) {
+            char state[16] = "ui20";   // the waypoint's panel
+            std::sscanf(ev, "%*s %*s %*s %15s", state);
+            retry_unit_ = (uint32_t)std::strtoul(arg, nullptr, 10);
+            retry_type_ = 2;
+            retry_line_ = 0;
+            waiting_for_ = state;
+            wait_at_ = script_at;
+            retry_tap_ = true;
+            next_retry_ms_ = now_ms;
+            break;
         } else if (v == "tapunit" && std::sscanf(ev, "%*s %*s %15s", arg) == 1) {
             char state[16] = "npcmenu";
             std::sscanf(ev, "%*s %*s %*s %15s", state);
+            retry_type_ = 1;
             retry_unit_ = menu_unit_ = unit_class(arg);
             if (!retry_unit_) {
                 rt::logf("autoplay: no unit named %s", arg);

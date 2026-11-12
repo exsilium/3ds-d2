@@ -25,9 +25,10 @@ struct UnitSpot {
     float distance = 0;        // from the player, in subtiles
 };
 
-// The monster (NPC) of class `cls` nearest the player. False if none, or
-// not in a game.
-bool find_unit(uint32_t cls, UnitSpot &out);
+// The unit of class `cls` nearest the player: a monster or NPC (type 1), or
+// an object (type 2: a waypoint is 119 in the Rogue Encampment). False if
+// none, or not in a game.
+bool find_unit(uint32_t cls, UnitSpot &out, uint32_t type = 1);
 
 // The act the player is in, 1 to 5; 0 when not in a game.
 int player_act();
@@ -42,7 +43,7 @@ void npc_menu_line(const UnitSpot &npc, int line, int &x, int &y);
 // number as it is; 0 if neither.
 uint32_t unit_class(const char *name);
 
-// Every monster near the player, to the runtime log: class, id, mode, place
+// Every monster and object near the player, to the runtime log: class, id, mode, place
 // and its spot on the screen ("units:" lines; autoplay's "units").
 void log_units();
 

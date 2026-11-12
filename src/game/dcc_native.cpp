@@ -5,7 +5,9 @@
 #include "runtime/cpu.h"
 #include "runtime/rt_host.h"
 
+#include <algorithm>
 #include <atomic>
+#include <string>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -142,7 +144,10 @@ uint32_t loop_native(d2rt::Cpu &c)
     }
     if (frame) {
         g_stats.on_frame++;
-        if (g_stats.on_frame <= 6) {   // who decodes on the frame thread: its EBP chain
+        // Who decodes on the frame thread: each different EBP chain, once
+        // (20 at the most).
+        static std::vector<std::string> chains;
+        if (chains.size() < 20) {
             char chain[160];
             int n = 0;
             uint32_t fp = c.read_u32(ebp);
@@ -151,7 +156,10 @@ uint32_t loop_native(d2rt::Cpu &c)
                 fp = c.read_u32(fp);
             }
             chain[n] = 0;
-            rt::logf("dcc: decoded on the frame thread from%s", chain);
+            if (std::find(chains.begin(), chains.end(), std::string(chain)) == chains.end()) {
+                chains.emplace_back(chain);
+                rt::logf("dcc: decoded on the frame thread from%s", chain);
+            }
         }
     }
     const uint64_t t0 = rt::now_us();

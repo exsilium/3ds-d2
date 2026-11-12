@@ -376,7 +376,95 @@ template <class Op> uint32_t dc6_remapped(Cpu &c, const Op &op)
     }
 }
 
+// 608110 (.., [10]=B), ret 0xc: d = B[d * 256 + s], the same EAX (and it
+// too keeps b & 7 in its [10] slot).
+struct OpBlendOnly {
+    const uint8_t *t;
+    void operator()(uint8_t *d, const uint8_t *s, int32_t n) const
+    {
+        for (int32_t i = 0; i < n; i++)
+            d[i] = t[d[i] * 256 + s[i]];
+    }
+};
+
 uint32_t dc6_remap(Cpu &c) { return dc6_remapped(c, OpRemap{H(c.arg(2))}); }
+uint32_t dc6_blend1(Cpu &c) { return dc6_remapped(c, OpBlendOnly{H(c.arg(2))}); }
+
+// 608d60(ecx=frame, edx=dst, [8]=x, [c]=clipL, [10]=clipR, [14]=width,
+// [18]=rows to skip / 2, [1c]=rows, [20]=T, [24]=c), ret 0x20: a sprite's
+// shadow, from 6017f9 for each unit. The frame's stream (+0x20) after its
+// first 2 * [18] rows, every other row, each row a pixel left of the one
+// before and a row up (the pitch is -width); a run's pixels clipped to
+// [clipL, clipR) unless both are 0, each d = T[d * 256 + c], or c without
+// T. Only the shape is read, not the pixels. EAX, its caller's return: x
+// less the rows drawn. `Put` draws a run, or notes its extent (the check).
+template <class Put> uint32_t dc6_shadow_run(Cpu &c, Put put)
+{
+    const uint32_t frame = c.reg(R_ECX);
+    const int32_t cl = (int32_t)c.arg(1), cr = (int32_t)c.arg(2);
+    const uint32_t pitch = 0u - c.arg(3);
+    uint32_t rows = c.arg(5);
+    const uint8_t *src = H(frame + 0x20);
+    for (uint32_t skip = 2 * c.arg(4); skip;) {
+        const int8_t b = (int8_t)*src++;
+        if (b >= 0)
+            src += b;
+        else if (!(b & 0x7f))
+            skip--;
+    }
+    int32_t x = (int32_t)c.arg(0), row_x = x;
+    uint32_t dst = c.reg(R_EDX), next = dst + pitch;
+    for (;;) {
+        const int8_t b = (int8_t)*src++;
+        if (b < 0) {
+            if (b & 0x7f) {
+                x += b & 0x7f;
+                dst += b & 0x7f;
+                continue;
+            }
+            dst = next - 1;
+            next = next + pitch - 1;
+            x = --row_x;
+            if (--rows == 0)
+                return (uint32_t)row_x;
+            for (;;) {   // the next row isn't drawn (a run of 0 ends it too)
+                const int8_t k = (int8_t)*src++;
+                if (k > 0)
+                    src += k;
+                else if (!(k & 0x7f))
+                    break;
+            }
+            continue;
+        }
+        int32_t n = b;
+        uint32_t at = dst;
+        if (cl || cr) {
+            const int32_t l = imax(cl - x, 0), r = imin(imax(cr - x, 0), (int32_t)b);
+            n = r - l;
+            at = dst + (uint32_t)l;
+        }
+        if (n > 0)
+            put(at, (uint32_t)n);
+        x += b;
+        dst += b;
+        src += b;
+    }
+}
+
+uint32_t dc6_shadow(Cpu &c)
+{
+    const uint8_t *t = c.arg(6) ? H(c.arg(6)) : nullptr;
+    const uint8_t v = (uint8_t)c.arg(7);
+    return dc6_shadow_run(c, [&](uint32_t at, uint32_t n) {
+        uint8_t *d = H(at);
+        if (t)
+            for (uint32_t i = 0; i < n; i++)
+                d[i] = t[d[i] * 256 + v];
+        else
+            std::memset(d, v, n);
+    });
+}
+
 uint32_t dc6_remap2(Cpu &c) { return dc6_remapped(c, OpRemap2{H(c.arg(3)), H(c.arg(2))}); }
 
 // D2_NATIVE_CHECK=1 (the lane): each call runs the native, keeps its pixels
@@ -389,10 +477,12 @@ struct RemapCheck {
     uint32_t orig, keep;   // the original, and its first whole instructions' bytes (5 or more) the trampoline copies
     uint32_t tramp = 0, calls = 0, bad = 0;
 };
-RemapCheck g_remap_check[7] = {{"Dc6Remap", 0x00607e20, 7},    {"Dc6RemapB", 0x00607680, 7},
+RemapCheck g_remap_check[11] = {{"Dc6Remap", 0x00607e20, 7},    {"Dc6RemapB", 0x00607680, 7},
                                {"Dc6Remap2", 0x006072f0, 7},   {"LightAdd", 0x004747c0, 6},
                                {"LightStampOccluded", 0x00475420, 6}, {"LightStamp", 0x004748d0, 6},
-                               {"LoadsPending", 0x005ff2a0, 7}};
+                               {"LoadsPending", 0x005ff2a0, 7},       {"Dc6Blend1", 0x00608110, 7},
+                               {"Dc6Shadow", 0x00608d60, 6},          {"StormHash", 0x00415330, 5},
+                               {"UnitPickFilter", 0x00466870, 6}};
 
 // Before the hooks go in: the trampolines copy the originals' first bytes.
 bool install_remap_check(Cpu &c)
@@ -400,7 +490,7 @@ bool install_remap_check(Cpu &c)
     const uint32_t at = rt::va_alloc(0x1000, 0x00607e20);
     if (!at)
         return false;
-    for (int k = 0; k < 7; k++) {
+    for (int k = 0; k < 11; k++) {
         RemapCheck &r = g_remap_check[k];
         r.tramp = at + 16 * k;
         uint8_t t[16];
@@ -410,7 +500,7 @@ bool install_remap_check(Cpu &c)
         std::memcpy(t + r.keep + 1, &rel, 4);
         c.write(r.tramp, t, r.keep + 5);
     }
-    c.invalidate_code(at, 16 * 7);
+    c.invalidate_code(at, 16 * 11);
     return true;
 }
 
@@ -448,7 +538,7 @@ template <int K> uint32_t dc6_remap_checked(Cpu &c)
     }
     const uint32_t len = hi > lo ? hi - lo : 0;
     std::vector<uint8_t> before(H(lo), H(lo) + len);
-    const uint32_t r = K == 2 ? dc6_remap2(c) : dc6_remap(c);
+    const uint32_t r = K == 2 ? dc6_remap2(c) : K == 7 ? dc6_blend1(c) : dc6_remap(c);
     std::vector<uint8_t> native(H(lo), H(lo) + len);
     std::memcpy(H(lo), before.data(), len);
     const uint32_t r0 = K == 2 ? rt::guest_call(c, k.tramp, {rows, pitch, c.arg(2), c.arg(3)})
@@ -459,6 +549,70 @@ template <int K> uint32_t dc6_remap_checked(Cpu &c)
     if (bad && k.bad < 20)
         rt::logf("native check: %s(%08x, %08x, rows %u, pitch %d) gave %08x, the game's %08x; pixels %s", k.name, ecx,
                  edx, rows, (int32_t)pitch, r, r0, std::memcmp(native.data(), H(lo), len) ? "differ" : "match");
+    check_note(k, bad);
+    return r0;
+}
+
+uint32_t storm_hash(Cpu &c);   // below, with Storm's other natives' neighbours
+
+// D2_NATIVE_CHECK=1: each unit the filter answers, through the game's code
+// too (trampoline 10), which must give 0. The game's answer is kept.
+uint32_t unit_pick_filter_checked(Cpu &c)
+{
+    RemapCheck &k = g_remap_check[10];
+    const uint32_t unit = c.reg(R_ECX), edx = c.reg(R_EDX);
+    const bool mine = unit && ((U32(unit + 0xc4) >> 21 & 1) || !(U32(unit + 0xc8) & 0x80));
+    const uint32_t r0 = rt::guest_call(c, k.tramp, {c.arg(0), c.arg(1)});
+    c.set_reg(R_ECX, unit);
+    c.set_reg(R_EDX, edx);
+    if (mine) {
+        const bool bad = r0 != 0;
+        if (bad && k.bad < 20)
+            rt::logf("native check: UnitPickFilter(%08x, type %u) gave 0, the game's %u", unit, U32(unit), r0);
+        check_note(k, bad);
+    }
+    return r0;
+}
+
+// D2_NATIVE_CHECK=1: Storm's hash against the game's (trampoline 9).
+uint32_t storm_hash_checked(Cpu &c)
+{
+    RemapCheck &k = g_remap_check[9];
+    const uint32_t r = storm_hash(c);
+    const uint32_t r0 = rt::guest_call(c, k.tramp, {c.arg(0)});
+    const bool bad = r != r0;
+    if (bad && k.bad < 20)
+        rt::logf("native check: StormHash(\"%s\", %u) gave %08x, the game's %08x",
+                 reinterpret_cast<const char *>(H(c.reg(R_EAX))), c.arg(0), r, r0);
+    check_note(k, bad);
+    return r0;
+}
+
+// D2_NATIVE_CHECK=1: the shadow's runs' extent, the native's bytes and EAX
+// against the game's (trampoline 8).
+uint32_t dc6_shadow_checked(Cpu &c)
+{
+    RemapCheck &k = g_remap_check[8];
+    uint32_t lo = ~0u, hi = 0;
+    dc6_shadow_run(c, [&](uint32_t at, uint32_t n) {
+        lo = std::min(lo, at);
+        hi = std::max(hi, at + n);
+    });
+    const uint32_t len = hi > lo ? hi - lo : 0;
+    std::vector<uint8_t> before(H(lo), H(lo) + len);
+    const uint32_t r = dc6_shadow(c);
+    std::vector<uint8_t> native(H(lo), H(lo) + len);
+    std::memcpy(H(lo), before.data(), len);
+    const uint32_t ecx = c.reg(R_ECX), edx = c.reg(R_EDX);
+    const uint32_t r0 = rt::guest_call(c, k.tramp, {c.arg(0), c.arg(1), c.arg(2), c.arg(3), c.arg(4), c.arg(5),
+                                                    c.arg(6), c.arg(7)});
+    c.set_reg(R_ECX, ecx);
+    c.set_reg(R_EDX, edx);
+    const bool bad = r != r0 || std::memcmp(native.data(), H(lo), len);
+    if (bad && k.bad < 20)
+        rt::logf("native check: Dc6Shadow(x %d, clip %d-%d, rows %u) gave %08x, the game's %08x; pixels %s",
+                 (int32_t)c.arg(0), (int32_t)c.arg(1), (int32_t)c.arg(2), c.arg(5), r, r0,
+                 std::memcmp(native.data(), H(lo), len) ? "differ" : "match");
     check_note(k, bad);
     return r0;
 }
@@ -2601,6 +2755,64 @@ bool install_check(Cpu &c)
     return true;
 }
 
+// ---- the unit under the cursor: 466870 ---------------------------------------------
+inline bool unit_pick_rejected(uint32_t unit)
+{
+    return unit && ((U32(unit + 0xc4) >> 21 & 1) || !(U32(unit + 0xc8) & 0x80));
+}
+
+//
+// Each frame the game looks for the unit under the cursor (467b40): every
+// unit in the rooms near it, through 467000 and then 466870(ecx=unit,
+// edx, [8], [c]), ret 8 — 920 thousand calls in a minute of the lane's
+// town walk. 466870 returns 0 for a unit with bit 21 of +0xc4 (the test
+// at 4668d6; before it only the game type's branch, which returns 0 or
+// goes on, and two loads: 0x7a6ab0, 0x7a5210), nine in ten of them. And
+// for one without bit 7 of +0xc8 (the test at 466974) whatever came before
+// it: every path before that test
+// either returns 0 or reaches it, and nothing on them writes memory (the
+// functions they call, 465c60, 464ec0, 464f70, 464310 and theirs, and the
+// table 4642b0 calls through, 0x711f34: no store outside their own stack
+// frames, by disassembly). So such a unit is answered at once; any other
+// goes on to the game's code: push ebp; mov ebp, esp; sub esp, 0x34 done
+// here (the hook's jmp covers 466870-466874, into the sub), on at 466876.
+uint32_t unit_pick_filter(Cpu &c)
+{
+    const uint32_t unit = c.reg(R_ECX);
+    if (unit_pick_rejected(unit))
+        return 0;
+    const uint32_t esp = c.reg(R_ESP);
+    put32(esp - 4, c.reg(R_EBP));
+    c.set_reg(R_EBP, esp - 4);
+    resume_original(c, 0x00466876, esp - 4 - 0x34, 2);
+    return c.reg(R_EAX);
+}
+
+// ---- Storm's name hash: 415330 ------------------------------------------------------
+//
+// 415330(eax=name, [8]=hash type), ret 4: the MPQ hash of a file name, each
+// character through the C runtime's toupper (685385: in the "C" locale,
+// a-z only) and the crypt table at [0x779048]. 659 thousand characters in
+// the lane's fight: each file open hashes its name three times.
+uint32_t storm_hash(Cpu &c)
+{
+    const uint8_t *str = H(c.reg(R_EAX));
+    const uint32_t *crypt = reinterpret_cast<const uint32_t *>(H(U32(0x00779048))) + (c.arg(0) << 8);
+    uint32_t seed1 = 0x7fed7fed, seed2 = 0xeeeeeeee;
+    if (!c.reg(R_EAX))
+        return seed1;
+    for (; *str; str++) {
+        uint32_t ch = *str;
+        if (ch >= 'a' && ch <= 'z')
+            ch -= 0x20;
+        uint32_t t;
+        std::memcpy(&t, crypt + ch, 4);
+        seed1 = (seed1 + seed2) ^ t;
+        seed2 = ch + seed2 + (seed2 << 5) + seed1 + 3;
+    }
+    return seed1;
+}
+
 // ---- loads pending: 5ff2a0 -----------------------------------------------------------
 //
 // The monsters' preloader (4700b0) asks, for each unit of each frame, how
@@ -2834,6 +3046,218 @@ uint32_t floor_records_step(Cpu &c)
     return left;
 }
 
+// And the walls' and objects' pass (4dea70: the cell grid once for each
+// of layers 1-4, the cell's +0x1c list; 6.1 million empty cells in a lane
+// run that stayed in the Rogue Encampment): at 4deb00, the cell's +0x1c
+// in eax (also [ebp-0x18]), the cells left in ecx (also [ebp-0x34]):
+//   mov ebx, [eax]; sub ecx, 1; test ebx, ebx; mov [ebp-0x34], ecx;
+//   mov [ebp-8], ebx; je 0x4decc5
+// 4decc5 steps eax by 0x24 to the next cell, or ends the layer (4decd6).
+uint32_t wall_cells_step(Cpu &c)
+{
+    const uint32_t ebp = c.reg(R_EBP);
+    uint32_t at = c.reg(R_EAX), left = c.reg(R_ECX), list;
+    for (;;) {
+        list = U32(at);
+        put32(ebp - 0x34, --left);
+        put32(ebp - 8, list);
+        if (list) {
+            rt::bridge().redirect_next(0x004deb18);
+            break;
+        }
+        at += 0x24;
+        put32(ebp - 0x18, at);
+        if (!left) {
+            rt::bridge().redirect_next(0x004decd6);
+            break;
+        }
+    }
+    c.set_reg(R_EBX, list);
+    c.set_reg(R_ECX, left);
+    return at;
+}
+
+// And the hit test's loop over the units of each room near the cursor
+// (467ac0, through 467000 and 466870 each; unit_pick_rejected): at its
+// step, 467d4d, the unit in esi:
+//   mov esi, [esi+0xe8]; test esi, esi; mov ebx, [ebp-0x1c];
+//   mov [ebp-8], esi; jne 0x467bd0         (else jmp 0x467da3, the room's end)
+// For each next unit the game's code would only note and pass over (not
+// type 3, which it passes at once; not type 5, the one 467000 can take;
+// rejected by 466870), the native does the same notes: [ebp-0x18] its
+// type, [ebp-0x20] the unit, [ebp-0x24] + 1, edi 0x7a6aa0. A unit seen
+// twice, the count past 30000, the cursor's own unit (ebx) or any other
+// goes to the game's code at the loop's top.
+uint32_t pick_units_step(Cpu &c)
+{
+    const uint32_t ebp = c.reg(R_EBP), own = U32(ebp - 0x1c);
+    uint32_t u = U32(c.reg(R_ESI) + 0xe8);
+    c.set_reg(R_EBX, own);
+    for (;; u = U32(u + 0xe8)) {
+        put32(ebp - 8, u);
+        if (!u) {
+            rt::bridge().redirect_next(0x00467da3);
+            break;
+        }
+        const uint32_t type = U32(u);
+        if (type == 3) {
+            put32(ebp - 0x18, 3);
+            continue;
+        }
+        if (U32(ebp - 0x20) == u || I32(ebp - 0x24) > 0x7530 || u == own || type == 5 || !unit_pick_rejected(u)) {
+            rt::bridge().redirect_next(0x00467bd0);
+            break;
+        }
+        put32(ebp - 0x18, type);
+        put32(ebp - 0x20, u);
+        put32(ebp - 0x24, U32(ebp - 0x24) + 1);
+        c.set_reg(R_EDI, 0x007a6aa0);
+    }
+    c.set_reg(R_ESI, u);
+    return c.reg(R_EAX);
+}
+
+// The weather's particles (4732c0, 390 thousand particle steps in the
+// lane's fight): its loop's head, 473330, the particle in esi (0x28 bytes),
+// its index in ebx, edi a scratch the loop leaves set:
+//   cmp word [esi], 0; je 0x473446          (no particle: the next)
+// becomes a call to a native that does the particles' steps itself until
+// one comes to its end (+0x1c set with +0x20 at 0: the game's 6bccd0 and
+// 473090 respawn it), which resumes the game's code at that point
+// (473396), or the loop's end (47345d). The float maths is the game's in
+// doubles, as the dynarec's x87 does it: [ebp-4] the frame's fall speed,
+// 0x707800 a table of 512 sines, 0x7a89c4 the wind's angle; each
+// truncation as _ftol2_sse (cvttsd2si) gives it.
+inline int32_t ftol_sse(double v)
+{
+    return v > -2147483649.0 && v < 2147483648.0 ? (int32_t)v : INT32_MIN;
+}
+
+inline double sine_at(uint32_t i)
+{
+    float f;
+    std::memcpy(&f, H(0x00707800 + (i & 0x1ff) * 4), 4);
+    return f;
+}
+
+// One particle's step on q (its 0x28 bytes, the guest's or a copy), as the
+// game's code from 47333a; false, with q as it is to 473396, at its end
+// (the game's code goes on with it). fa: the float the game leaves at
+// [ebp-8]; dx: what it leaves in edi.
+bool weather_particle(uint8_t *q, float speed, float &fa, int32_t &dx)
+{
+    auto rd = [&](uint32_t o) { int32_t v; std::memcpy(&v, q + o, 4); return v; };
+    auto wr = [&](uint32_t o, int32_t v) { std::memcpy(q + o, &v, 4); };
+    const int32_t a = ftol_sse((double)rd(0x14) * (double)speed);
+    fa = (float)a;
+    const uint32_t wind = U32(0x007a89c4);
+    dx = ftol_sse(sine_at(wind + 0x80) * (double)fa);
+    const int32_t dy = ftol_sse(sine_at(wind) * (double)fa);
+    wr(8, (int32_t)((uint32_t)rd(8) + (uint32_t)dy - U32(0x007a067c)));
+    if (rd(8) > rd(0xc))
+        wr(0x1c, 1);
+    if (rd(0x1c)) {
+        const int32_t left = rd(0x20);
+        if (!left)
+            return false;
+        dx = 0;
+        wr(0x14, 0);
+        wr(0x20, left - 1);
+    }
+    if (U32(0x007a8a14) && !rd(0x1c)) {
+        const uint32_t k = (uint32_t)(((uint64_t)(U32(0x007a8a34) << 9) * 0x51eb851fu) >> 35);
+        const double s2 = sine_at(k + (uint32_t)rd(0x18));
+        dx += ftol_sse(s2 + s2);
+    }
+    dx -= I32(0x007a0678);
+    const int32_t w = I32(0x0071146c);
+    int32_t x = (int32_t)((uint32_t)rd(4) + (uint32_t)dx);
+    if (x >= w)
+        x -= w;
+    if (x < 0)
+        x += w;
+    wr(4, x);
+    return true;
+}
+
+uint32_t weather_step(Cpu &c)
+{
+    const uint32_t ebp = c.reg(R_EBP), parts = U32(0x007a8a04);
+    float speed;
+    std::memcpy(&speed, H(ebp - 4), 4);
+    uint32_t i = c.reg(R_EBX), p = c.reg(R_ESI), scratch = c.reg(R_EDI);
+    for (;;) {
+        if (*reinterpret_cast<const uint16_t *>(H(p))) {
+            float fa;
+            int32_t dx;
+            const bool done = weather_particle(H(p), speed, fa, dx);
+            std::memcpy(H(ebp - 8), &fa, 4);
+            if (!done) {   // its end: the game's code, from 473396
+                c.set_reg(R_EBX, i);
+                c.set_reg(R_ESI, p);
+                c.set_reg(R_EDI, (uint32_t)dx);
+                rt::bridge().redirect_next(0x00473396);
+                return 0;
+            }
+            scratch = (uint32_t)dx;
+        }
+        i++;
+        p += 0x28;
+        if ((int32_t)i > I32(parts + 0x110))
+            break;
+    }
+    c.set_reg(R_EBX, i);
+    c.set_reg(R_ESI, p);
+    c.set_reg(R_EDI, scratch);
+    rt::bridge().redirect_next(0x0047345d);
+    return parts;
+}
+
+// D2_NATIVE_CHECK=1: at each head the game's code does the step; the
+// native's prediction for the particle before (on a copy) is checked
+// against what the game's code made of it, within the same loop.
+struct WeatherCheck {
+    bool pending = false;
+    uint32_t at = 0, ebp = 0;
+    uint8_t want[0x28];
+    float fa = 0;
+    int32_t dx = 0;
+    uint32_t calls = 0, bad = 0;
+} g_weather_check;
+
+uint32_t weather_step_checked(Cpu &c)
+{
+    WeatherCheck &k = g_weather_check;
+    const uint32_t ebp = c.reg(R_EBP), p = c.reg(R_ESI);
+    if (k.pending && c.reg(R_EBX) && k.ebp == ebp && p == k.at + 0x28) {
+        float fa;
+        std::memcpy(&fa, H(ebp - 8), 4);
+        const bool bad = std::memcmp(k.want, H(k.at), 0x28) || std::memcmp(&fa, &k.fa, 4) ||
+                         (int32_t)c.reg(R_EDI) != k.dx;
+        k.calls++;
+        k.bad += bad;
+        if (bad && k.bad <= 20)
+            rt::logf("native check: WeatherStep differs at particle %08x (x %d, the game's %d; y %d, the game's %d)",
+                     k.at, *(const int32_t *)(k.want + 4), I32(k.at + 4), *(const int32_t *)(k.want + 8),
+                     I32(k.at + 8));
+        if ((k.calls & (k.calls - 1)) == 0 || (k.calls & 0xffff) == 0)
+            rt::logf("native check: WeatherStep %u calls, %u differ", k.calls, k.bad);
+    }
+    k.pending = false;
+    if (*reinterpret_cast<const uint16_t *>(H(p))) {
+        float speed;
+        std::memcpy(&speed, H(ebp - 4), 4);
+        std::memcpy(k.want, H(p), 0x28);
+        k.pending = weather_particle(k.want, speed, k.fa, k.dx);
+        k.at = p;
+        k.ebp = ebp;
+        rt::bridge().redirect_next(0x0047333a);
+    } else {
+        rt::bridge().redirect_next(0x00473446);
+    }
+    return c.reg(R_EAX);
+}
+
 bool install_slot_steps(Cpu &c)
 {
     static const uint8_t kA[] = {0x83, 0xc3, 0x04, 0x81, 0xfb, 0x38, 0x3d, 0x88, 0x00, 0x0f, 0x8c, 0x55, 0xff, 0xff, 0xff};
@@ -2851,11 +3275,20 @@ bool install_slot_steps(Cpu &c)
                                  0x71, 0x10, 0x85, 0xf6, 0x0f, 0x84, 0xa8, 0x00, 0x00, 0x00};
     static const uint8_t kE[] = {0x8b, 0x45, 0xf8, 0x83, 0xe8, 0x01, 0x83, 0xc6,
                                  0x30, 0x85, 0xc0, 0x89, 0x45, 0xf8, 0x75, 0xb4};
+    static const uint8_t kG[] = {0x8b, 0x18, 0x83, 0xe9, 0x01, 0x85, 0xdb, 0x89, 0x4d, 0xcc,
+                                 0x89, 0x5d, 0xf8, 0x0f, 0x84, 0xb2, 0x01, 0x00, 0x00};
+    static const uint8_t kH[] = {0x8b, 0xb6, 0xe8, 0x00, 0x00, 0x00, 0x85, 0xf6, 0x8b, 0x5d,
+                                 0xe4, 0x89, 0x75, 0xf8, 0x0f, 0x85, 0x6f, 0xfe, 0xff, 0xff};
+    static const uint8_t kF[] = {0x66, 0x83, 0x3e, 0x00, 0x0f, 0x84, 0x0c, 0x01, 0x00, 0x00};
     const Site sites[] = {{0x0052fd2c, kA, sizeof kA, slot_step_ebx, "SlotStepA"},
                           {0x0052fe94, kB, sizeof kB, slot_step_frame, "SlotStepB"},
                           {0x004df1f0, kC, sizeof kC, cells_step_a, "CellStepA"},
                           {0x004df543, kD, sizeof kD, cells_step_b, "CellStepB"},
-                          {0x004de91c, kE, sizeof kE, floor_records_step, "FloorRecordStep"}};
+                          {0x004de91c, kE, sizeof kE, floor_records_step, "FloorRecordStep"},
+                          {0x004deb00, kG, sizeof kG, wall_cells_step, "WallCellStep"},
+                          {0x00467d4d, kH, sizeof kH, pick_units_step, "PickUnitStep"},
+                          {0x00473330, kF, sizeof kF, std::getenv("D2_NATIVE_CHECK") ? weather_step_checked : weather_step,
+                           "WeatherStep"}};
     for (const Site &st : sites) {
         uint8_t have[20];
         if (!c.read(st.va, have, st.n) || std::memcmp(have, st.orig, st.n))
@@ -2965,8 +3398,8 @@ int install_d2_native(Cpu &c)
     static const uint8_t k4f7580[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x10, 0x83, 0x7d, 0x14, 0x00};
     // D2_NATIVE_MASK (tests): bit k enables the k-th hook below; default all.
     const char *m = std::getenv("D2_NATIVE_MASK");
-    const unsigned mask = m ? (unsigned)std::strtoul(m, nullptr, 0) : ~0u;
-    unsigned bit = 1;
+    const uint64_t mask = m ? (uint64_t)std::strtoull(m, nullptr, 0) : ~0ull;   // more than 32 hooks: 64 bits
+    uint64_t bit = 1;
     int n = 0;
     // The last argument, true: served in line (rt::hook_function). Not for
     // LightBlock and FloorTile, which call back into the game's own code.
@@ -3118,8 +3551,20 @@ int install_d2_native(Cpu &c)
     HOOK(c, 0x005ff2a0, k5ff2a0, sizeof k5ff2a0, 0, remap_check ? loads_pending_checked : loads_pending,
          "LoadsPending", !remap_check);
     if (mask & bit)
-        n += install_slot_steps(c) ? 5 : 0;
+        n += install_slot_steps(c) ? 8 : 0;
     bit <<= 1;
+    // The blend-only DC6 copy and the sprites' shadows (dc6_blend1, dc6_shadow).
+    HOOK(c, 0x00608110, k607e20, sizeof k607e20, 3,
+         DRAW(remap_check ? dc6_remap_checked<7> : dc6_blend1, "Dc6Blend1"), !remap_check);
+    static const uint8_t k608d60[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x0c, 0x8b, 0x45, 0x08, 0x53, 0x56, 0x57};
+    HOOK(c, 0x00608d60, k608d60, sizeof k608d60, 8, DRAW(remap_check ? dc6_shadow_checked : dc6_shadow, "Dc6Shadow"),
+         !remap_check);
+    static const uint8_t k415330[] = {0x55, 0x8b, 0xec, 0x53, 0x56, 0x8b, 0xd8, 0x85, 0xdb, 0x57};
+    HOOK(c, 0x00415330, k415330, sizeof k415330, 1, remap_check ? storm_hash_checked : storm_hash, "StormHash",
+         !remap_check);
+    static const uint8_t k466870[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x34, 0x53, 0x8b, 0xd9, 0x56};
+    HOOK(c, 0x00466870, k466870, sizeof k466870, 2, remap_check ? unit_pick_filter_checked : unit_pick_filter,
+         "UnitPickFilter", !remap_check);
 #undef DRAW
 #undef HOOK
     return n;

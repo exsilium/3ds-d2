@@ -510,7 +510,24 @@ A first run with them reached 24 fps, but it never got into the crowd (8–10 mo
   Each loop's step is now a call to a native that skips the entries with nothing to do and resumes the game's code at the loop's body (or exit) with the registers it would have (`SlotStepA/B`, `CellStepA/B`, `FloorRecordStep`).
 - **The lane's fight, all in:** 4.52 billion bytes of x86 executed for the same 2,507 frames, against 7.63 billion before the first round (41% less).
 - **Azahar** (each game makes a new map, so the first windows' load waits, 0.2–2 s a window, differ from run to run): over the last three windows, once the loads have settled, 19.4 and 20.4 fps without either round, 22.0–22.7 with the first, 23.6 and 23.9 with both. The game's own cap is 25.
-- **Not yet:** `0x608540`, a clipped DC6 blitter with seven pixel modes. Its inner loops run inside one translated block, so the block counter undercounts it below its 3%.
+- **`0x608540`** turned out to be the dispatcher in front of the DC6 blitters. Its own clipped loops only run with `[0x8f03c8]` set, a toggle (`0x608520`) that is off in play. Its share is the block counter weighing its whole 1,093-byte block, of which only the dispatch runs.
+
+**Third round:**
+- **`Dc6Blend1` (`0x608110`)**, d = B[d·256 + s], the last unclipped DC6 leaf the dispatcher calls in play. Checked: 65,536+ calls.
+- **`Dc6Shadow` (`0x608d60`)**, every unit's shadow, 2.2%. A sheared silhouette: every other source row, each row a pixel left of the one before, runs clipped, `T[d·256 + c]` or a fill. Only the shape is read. Its EAX (x less the rows drawn) is its caller's return. Checked: 16,384+.
+- **`WeatherStep` (`0x4732c0`'s loop)**, the rain's particles, 2.4% plus their sine lookups and truncations. The floats are done in doubles in the game's order, as box86's x87 does. A particle at its end resumes the game's code, which respawns it. Checked in a different way: each particle's step is predicted on a copy, the game's code does the real one, and the two are compared, 327,680+.
+- **`StormHash` (`0x415330`)**, Storm's file-name hash, 1.8% plus a `toupper` call per character. Checked: 32,768+.
+- **`WallCellStep` (`0x4dea70`)**, the walls' and objects' pass over the cell grid, once per layer: 25% of a lane run that stayed in town, mostly empty cells.
+- **The unit under the cursor.** Each frame the game tests every unit of the rooms near the cursor (about 600 in town): 920k calls of `0x466870` in a minute of the town walk.
+  - `UnitPickFilter` answers 0 at once for a unit with bit 21 of `+0xc4`, or without bit 7 of `+0xc8`: nine in ten. The game's code gives 0 for those whatever else it checks. The paths before those tests either return 0 or reach them, and nothing they call writes memory: by disassembly of the whole call tree, the table of 7 functions `0x4642b0` calls through included. Checked: 851,968 units.
+  - `PickUnitStep`, at the loop's step, passes over the units both tests reject, keeping the loop's notes. A unit seen twice, the count past 30,000, or the cursor's own unit go to the game's code.
+- **`D2_NATIVE_MASK`** is 64 bits now. Past 32 hooks the 32-bit mask had silently skipped the newest ones.
+- **The lane:**
+  - The fight (`fight.txt`): with fewer guest instructions the virtual clock shifts the scripted input. One run never left town (a push landed on Kashya), so fight totals from here on aren't comparable.
+  - The town walk: 1.80 billion bytes of x86 for the same 1,507 frames, against 2.21 billion with the second round.
+  - All natives checked over the fight: none differ.
+- **Azahar**, round two against round three, can't separate them: the same build gave 19.4 and 22.6 fps over the settled windows in two runs. Near the 25 fps cap, the frame thread's run time floors at about 40 ms a frame, because the game polls the clock while it waits. Gains of a few percent need the console's frame trace, or the lane.
+- **A bug found on the way:** a native that falls back to the game's code must resume past the bytes its hook's jump covers. `UnitPickFilter` first resumed at `0x466873`, inside the jump. That ran two of the jump's bytes as code, and the lane's town run crashed (a guest thread at `0x40000c`). The checked run hadn't shown it, because the check's trampolines copy the original bytes.
 
 ## Blood Moor: VirtualAlloc ran out (2026-10-18)
 

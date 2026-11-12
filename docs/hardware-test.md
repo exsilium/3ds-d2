@@ -544,6 +544,18 @@ A first run with them reached 24 fps, but it never got into the crowd (8–10 mo
     | LightStamp | 75–110 |
   - **The floor queue's worker draws only 51–58% of the queued tiles.** The frame thread draws the rest itself at the flush, right after the floor pass (`0x476ce1`); it waits for the worker only 0.4 ms a frame. Deferring the flush to the first renderer call wouldn't buy much: the rain (`0x473c00` → `0x473a70`) and then the units' and walls' passes draw straight after the floor.
   - **The sprite fetch's cache hit (`0x6001f0`)** costs two natives (SpritePath, SpriteCacheTouch: 1–2% each, mostly the per-call price) plus its own code. One native for the whole hit path would need the cache lookup (`0x60ace0`), `0x5fe990`, `0x600cb0`, `0x5fec90` and `0x5fec50` as well: about 2–3%, the largest single item left.
+- **Act II (Lut Gholein, `tests/m4/scripts/act2-town.txt`, the DuringCh2Mid save with an aura on).** The natives above all apply: they're the engine's. But the town's top was different. Per frame, against the Act I fight and town:
+  - room lookups (`0x463740`): 698 against 70 and 66;
+  - collision tests (`0x64d4e0`): 458 against 32 and 20;
+  - stat queries: 285 against 76 and 53;
+  - skill-level calculations (`0x644180`, six stat queries each): 34 against 8 and 5. This is the aura, re-evaluated each frame, so it depends on the character rather than the act.
+
+  Three more natives:
+  - **`RoomFind` (`0x463740`)**, the room holding a subtile, from a room and its neighbours (158 callers). Checked: 1,441,792 calls.
+  - **`CollisionCross` (`0x64d4e0`)**, whether a subtile or one of its four neighbours is blocked for a mask, inside a room's collision grid: 99.97% of calls. On a room's edge it hands back to the game's code, which looks into the next room. Checked: 917,504.
+  - **`StatGet` (`0x625480`)**, a unit's stat: the stat table's row, then a binary search of the holder's base or full list, with the row's minimum for player-type owners. Three nested calls become one; only reads. Checked: 524,288.
+
+  Lut Gholein went from 3.20 to 2.56 billion bytes of x86 for the same 2,007 frames (−20%). What's left on top there is the unit walk `0x648120` (4.3%). It steps a unit toward its target a subtile at a time, using the direction from `0x678df0`, a collision test through `0x64d910` for the unit's size class (`0x64d450`, `0x64d4e0`, `0x64d7c0`), and two alternate directions to slide along. With its helpers that's about 10%.
 - **A bug found on the way:** a native that falls back to the game's code must resume past the bytes its hook's jump covers. `UnitPickFilter` first resumed at `0x466873`, inside the jump. That ran two of the jump's bytes as code, and the lane's town run crashed (a guest thread at `0x40000c`). The checked run hadn't shown it, because the check's trampolines copy the original bytes.
 
 ## Blood Moor: VirtualAlloc ran out (2026-10-18)

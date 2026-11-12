@@ -477,12 +477,13 @@ struct RemapCheck {
     uint32_t orig, keep;   // the original, and its first whole instructions' bytes (5 or more) the trampoline copies
     uint32_t tramp = 0, calls = 0, bad = 0;
 };
-RemapCheck g_remap_check[11] = {{"Dc6Remap", 0x00607e20, 7},    {"Dc6RemapB", 0x00607680, 7},
+RemapCheck g_remap_check[14] = {{"Dc6Remap", 0x00607e20, 7},    {"Dc6RemapB", 0x00607680, 7},
                                {"Dc6Remap2", 0x006072f0, 7},   {"LightAdd", 0x004747c0, 6},
                                {"LightStampOccluded", 0x00475420, 6}, {"LightStamp", 0x004748d0, 6},
                                {"LoadsPending", 0x005ff2a0, 7},       {"Dc6Blend1", 0x00608110, 7},
                                {"Dc6Shadow", 0x00608d60, 6},          {"StormHash", 0x00415330, 5},
-                               {"UnitPickFilter", 0x00466870, 6}};
+                               {"UnitPickFilter", 0x00466870, 6},     {"RoomFind", 0x00463740, 6},
+                               {"CollisionCross", 0x0064d4e0, 6},     {"StatGet", 0x00625480, 6}};
 
 // Before the hooks go in: the trampolines copy the originals' first bytes.
 bool install_remap_check(Cpu &c)
@@ -490,7 +491,7 @@ bool install_remap_check(Cpu &c)
     const uint32_t at = rt::va_alloc(0x1000, 0x00607e20);
     if (!at)
         return false;
-    for (int k = 0; k < 11; k++) {
+    for (int k = 0; k < 14; k++) {
         RemapCheck &r = g_remap_check[k];
         r.tramp = at + 16 * k;
         uint8_t t[16];
@@ -500,7 +501,7 @@ bool install_remap_check(Cpu &c)
         std::memcpy(t + r.keep + 1, &rel, 4);
         c.write(r.tramp, t, r.keep + 5);
     }
-    c.invalidate_code(at, 16 * 11);
+    c.invalidate_code(at, 16 * 14);
     return true;
 }
 
@@ -571,6 +572,59 @@ uint32_t unit_pick_filter_checked(Cpu &c)
             rt::logf("native check: UnitPickFilter(%08x, type %u) gave 0, the game's %u", unit, U32(unit), r0);
         check_note(k, bad);
     }
+    return r0;
+}
+
+// D2_NATIVE_CHECK=1: the room lookup and the collision cross against the
+// game's (trampolines 11 and 12); the game's answers are kept.
+uint32_t room_find(uint32_t room, int32_t x, int32_t y);
+bool collision_cross(uint32_t room, int32_t x, int32_t y, uint16_t mask, uint32_t &r);
+
+uint32_t room_find_checked(Cpu &c)
+{
+    RemapCheck &k = g_remap_check[11];
+    const uint32_t ecx = c.reg(R_ECX), edx = c.reg(R_EDX);
+    const uint32_t r = room_find(ecx, (int32_t)edx, (int32_t)c.arg(0));
+    const uint32_t r0 = rt::guest_call(c, k.tramp, {c.arg(0)});
+    c.set_reg(R_ECX, ecx);
+    c.set_reg(R_EDX, edx);
+    const bool bad = r != r0;
+    if (bad && k.bad < 20)
+        rt::logf("native check: RoomFind(%08x, %d, %d) gave %08x, the game's %08x", ecx, (int32_t)edx,
+                 (int32_t)c.arg(0), r, r0);
+    check_note(k, bad);
+    return r0;
+}
+
+uint32_t collision_cross_checked(Cpu &c)
+{
+    RemapCheck &k = g_remap_check[12];
+    uint32_t r;
+    const bool mine = collision_cross(c.arg(0), (int32_t)c.arg(1), (int32_t)c.arg(2), (uint16_t)c.reg(R_ESI), r);
+    const uint32_t r0 = rt::guest_call(c, k.tramp, {c.arg(0), c.arg(1), c.arg(2)});
+    if (mine) {
+        const bool bad = r != r0;
+        if (bad && k.bad < 20)
+            rt::logf("native check: CollisionCross(%08x, %d, %d, mask %04x) gave %u, the game's %u", c.arg(0),
+                     (int32_t)c.arg(1), (int32_t)c.arg(2), c.reg(R_ESI) & 0xffff, r, r0);
+        check_note(k, bad);
+    }
+    return r0;
+}
+
+// D2_NATIVE_CHECK=1: a unit's stat against the game's (trampoline 13).
+uint32_t stat_get(uint32_t unit, uint32_t stat, uint32_t layer);
+
+uint32_t stat_get_checked(Cpu &c)
+{
+    RemapCheck &k = g_remap_check[13];
+    const uint32_t r = stat_get(c.arg(0), c.arg(1), c.arg(2));
+    const uint32_t r0 = rt::guest_call(c, k.tramp, {c.arg(0), c.arg(1), c.arg(2)});
+    const bool bad = r != r0;
+    if (bad && k.bad < 20)
+        rt::logf("native check: StatGet(%08x, stat %u, layer %u) gave %d, the game's %d", c.arg(0), c.arg(1), c.arg(2),
+                 (int32_t)r, (int32_t)r0);
+    check_note(k, bad);
     return r0;
 }
 
@@ -739,6 +793,46 @@ uint32_t room_find(uint32_t room, int32_t x, int32_t y)
     }
     return 0;
 }
+
+// The room lookup itself as a native (158 callers; 1.4 million calls in a
+// minute of walking round Lut Gholein on the lane).
+uint32_t room_find_native(Cpu &c)
+{
+    return room_find(c.reg(R_ECX), (int32_t)c.reg(R_EDX), (int32_t)c.arg(0));
+}
+
+// 64d4e0([8]=room, [c]=x, [10]=y; esi=mask), ret 0xc: whether the subtile
+// (x, y) or one next to it is blocked for the mask: 1 blocked (also when no
+// room holds it, or the room has no collision grid), 0 free. The room's
+// collision ([room+0x20]: +0 x, +4 y, +8 width, +0xc height, +0x20 a word
+// per subtile). Inside the room, not on its edge, it tests the subtile and
+// its four neighbours (99.97% of 920 thousand calls in Lut Gholein); on an
+// edge, the neighbours outside go through 64ca50, the next room's: those
+// calls go on to the game's code (push ebp; mov ebp, esp; mov ecx, [ebp+8]
+// done here, on at 64d4e6). The pathfinding's (648120 and its callers).
+// Returns false where the game's code must run; else the answer in r.
+bool collision_cross(uint32_t room, int32_t x, int32_t y, uint16_t mask, uint32_t &r)
+{
+    r = 1;
+    const uint32_t rm = room_find(room, x, y);
+    if (!rm)
+        return true;
+    const uint32_t col = U32(rm + 0x20);
+    if (!col || !U32(col + 0x20))
+        return true;
+    const int32_t cx = I32(col), cy = I32(col + 4), w = I32(col + 8), h = I32(col + 0xc);
+    if (cx >= x || cy >= y || cx + w <= x + 1 || cy + h <= y + 1)
+        return false;   // on an edge
+    const uint8_t *p = H(U32(col + 0x20) + 2 * (uint32_t)((y - cy) * w - cx + x));
+    auto blocked = [&](int32_t at) {
+        uint16_t v;
+        std::memcpy(&v, p + at, 2);
+        return (v & mask) != 0;
+    };
+    r = blocked(0) || blocked(-2) || blocked(2) || blocked(-2 * w) || blocked(2 * w);
+    return true;
+}
+
 
 // 620bb0([8]=unit): the unit's room. Types 2, 4 and 5 (objects, items,
 // tiles) hold it at [[+0x2c]]; the others at [[+0x2c]+0x1c] when they have
@@ -2788,6 +2882,73 @@ uint32_t unit_pick_filter(Cpu &c)
     return c.reg(R_EAX);
 }
 
+// The collision cross (collision_cross, above) as the hook at 64d4e0.
+uint32_t collision_cross_native(Cpu &c)
+{
+    uint32_t r;
+    if (collision_cross(c.arg(0), (int32_t)c.arg(1), (int32_t)c.arg(2), (uint16_t)c.reg(R_ESI), r))
+        return r;
+    const uint32_t esp = c.reg(R_ESP);
+    put32(esp - 4, c.reg(R_EBP));
+    c.set_reg(R_EBP, esp - 4);
+    c.set_reg(R_ECX, c.arg(0));
+    resume_original(c, 0x0064d4e6, esp - 4, 3);
+    return c.reg(R_EAX);
+}
+
+// ---- a unit's stat: 625480 ---------------------------------------------------------
+//
+// 625480([8]=unit, [c]=stat, [10]=layer), ret 0xc: the unit's value of a
+// stat, through 624f60 and its binary search 624b90: three nested calls
+// for each of 546 thousand lookups in a minute of the lane in Lut Gholein
+// (an aura's skill level, 644180, makes six a time). Only reads:
+//   the unit's stat holder (+0x5c), else 0; the stat's row in the stat
+//   table ([0x744304]+0xbcc, 0x144 bytes each, [..]+0xbd4 of them), else 0;
+//   the holder's full list (+0x48) when +0x10's sign bit is set, else its
+//   base list (+0x24): an array ([list]) of (key, value) pairs sorted by
+//   key, (int16)[list+4] of them, the key stat << 16 | layer;
+//   not there: 0; a value below the row's minimum (+0x2c), for a row whose
+//   +5 has a bit of [0x6ce270], on a full list whose owner ([+0x44]) is of
+//   type 0 or 1: the minimum << the row's +0x18.
+uint32_t stat_get(uint32_t unit, uint32_t stat, uint32_t layer)
+{
+    if (!unit)
+        return 0;
+    const uint32_t holder = U32(unit + 0x5c);
+    const uint32_t table = U32(0x00744304);
+    if (!holder || (int32_t)stat < 0 || (int32_t)stat >= I32(table + 0xbd4))
+        return 0;
+    const uint32_t row = stat * 0x144 + U32(table + 0xbcc);
+    if (!row)
+        return 0;
+    const int32_t key = (int32_t)((stat << 16) + (layer & 0xffff));
+    const uint32_t full = U32(holder + 0x10) & 0x80000000u;
+    const uint32_t list = holder + (full ? 0x48 : 0x24);
+    const uint32_t pairs = U32(list);
+    int32_t lo = 0, hi = *reinterpret_cast<const int16_t *>(H(list + 4)), at = -1;
+    while (lo < hi) {
+        const int32_t mid = lo + (hi - lo) / 2;
+        const int32_t k = I32(pairs + 8 * (uint32_t)mid);
+        if (key > k)
+            lo = mid + 1;
+        else if (key == k) {
+            at = mid;
+            break;
+        } else
+            hi = mid;
+    }
+    if (at < 0 || !(pairs + 8 * (uint32_t)at))
+        return 0;
+    const int32_t v = I32(pairs + 8 * (uint32_t)at + 4);
+    const uint32_t owner = U32(holder + 0x44);
+    if ((*H(row + 5) & *H(0x006ce270)) && full && owner && (U32(owner) == 0 || U32(owner) == 1) &&
+        v < I32(row + 0x2c))
+        return U32(row + 0x2c) << (*H(row + 0x18) & 31);
+    return (uint32_t)v;
+}
+
+uint32_t stat_get_native(Cpu &c) { return stat_get(c.arg(0), c.arg(1), c.arg(2)); }
+
 // ---- Storm's name hash: 415330 ------------------------------------------------------
 //
 // 415330(eax=name, [8]=hash type), ret 4: the MPQ hash of a file name, each
@@ -3565,6 +3726,16 @@ int install_d2_native(Cpu &c)
     static const uint8_t k466870[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x34, 0x53, 0x8b, 0xd9, 0x56};
     HOOK(c, 0x00466870, k466870, sizeof k466870, 2, remap_check ? unit_pick_filter_checked : unit_pick_filter,
          "UnitPickFilter", !remap_check);
+    static const uint8_t k625480[] = {0x55, 0x8b, 0xec, 0x8b, 0x45, 0x08, 0x85, 0xc0, 0x75, 0x04};
+    HOOK(c, 0x00625480, k625480, sizeof k625480, 3, remap_check ? stat_get_checked : stat_get_native, "StatGet",
+         !remap_check);
+    // Rooms and collision (room_find, collision_cross): Act II's pathfinding.
+    static const uint8_t k463740[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x08, 0x56, 0x8b, 0xc1, 0x33, 0xf6};
+    HOOK(c, 0x00463740, k463740, sizeof k463740, 1, remap_check ? room_find_checked : room_find_native, "RoomFind",
+         !remap_check);
+    static const uint8_t k64d4e0[] = {0x55, 0x8b, 0xec, 0x8b, 0x4d, 0x08, 0x83, 0xec, 0x10, 0x53};
+    HOOK(c, 0x0064d4e0, k64d4e0, sizeof k64d4e0, 3, remap_check ? collision_cross_checked : collision_cross_native,
+         "CollisionCross", !remap_check);
 #undef DRAW
 #undef HOOK
     return n;

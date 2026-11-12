@@ -598,3 +598,59 @@ Every request the spare served was a group of sprite frames over 256 KiB (258–
 - *The writer* chased a busy trace at the game's exit: once a file was due it wrote what came in meanwhile too, 196 writes of ~150 B in 10 s. It now writes up to what was queued when it found the file due.
 
 **The sprite trace** cost 4.07 ms of a fight frame with its hooks in line (6.16 through the Bridge). Its use hook is now served without the GIL, as the lock calls are (#48), and takes the time from the game's own clock (`rt::tick_ms`) instead of a host clock read (~1 µs on the console) per use. On the lane (`fight.txt`) the trace's records are byte for byte the same, and the stub's share of the main thread's samples went from 3.6% (shim time included) to 0.8%.
+
+## Where the application memory goes (3DS-D2-1C, 2026-11-12)
+
+This is the split of the New 3DS's 124 MiB application region in play. The figures come from 3DS-D2-1C's second event (build `03a4d1656aea`, t = 400 s) and from the app's ELF (`dist/cia/*.elf`, the sections and the `.bss` symbols).
+
+| Part | Size | What's in it |
+| --- | --- | --- |
+| Main heap at `0x08000000` | 95.0 MiB | The kernel maps no more: its heap window ends at `0x0E000000` |
+| Linear heap | 3.75 MiB | Framebuffers, sound, and the first jump tables (1,792 KiB then); 990 KiB free |
+| The app's image | 25.2 MiB | `.text` 4.6 MiB, `.rodata` 0.2 MiB, `.bss` 19.7 MiB |
+| Unclaimed | 420 KiB | |
+
+**The main heap**:
+
+| Part | Size | Notes |
+| --- | --- | --- |
+| Guest arena (`ctr-game-n3-heap`) | 75.0 MiB | Fixed at start: Game.exe and the low 12 MiB, the game's heap face (8.4 MiB in use, peak 9.5) and its VirtualAlloc face (48.5 MiB, peak 49.4) of one pool, 4.2 MiB free. The sprite cache (12–16 MiB, frames blocks 13.1 MiB here), the 2 MiB spare and the 2 MiB large-block zone are in the VirtualAlloc face. |
+| Jump tables outside linear memory | 10.0 MiB | Box86's second-level tables, 256 KiB each, 12 MiB in play. Each holds one entry per byte of a 64 KiB stretch of guest code, about 3 MiB of Game.exe. |
+| JIT records (`meta=`) | 3.1 MiB | They grow through a session (4 MiB after 1 h 46 in 3DS-D2-12). Held at the 1 MiB reserve (issue #24). |
+| The port's own (newlib malloc) | ~5.8 MiB | The read cache (up to 1 MiB), the tile prefetch store (1 MiB in that build), the native decoder's two scratch buffers (~0.5 MiB each), sound, the second screen, the writers' rings, the profiler's and the logs' tables. Not measured one by one. |
+| Free | ~1 MiB | 0.9–1.1 MiB, the heap's room to grow 8–80 KiB |
+
+**The `.bss`**, its largest symbols:
+
+| Symbol | Size | What it is |
+| --- | --- | --- |
+| `dyn86_ctr_jitpool` | 16 MiB | The translated code's pool (`src/app/ctr_game.cpp`) |
+| `static_insts` | 896 KiB | Box86's scratch while translating a block |
+| `weight.5` | 512 KiB | A function-static table in the backend; not identified yet |
+| `g_hp_addr`, `g_hp_count` | 256 KiB each | Probably the profiler's hot-path tables; not checked |
+| `idx.4` | 256 KiB | Not identified yet |
+| `mi_vbuf` | 256 KiB | The memory intrinsics' verify buffer (`dyn86_memintrin.c`) |
+| `box86_jmptbl`, `box86_jmptbl_default` | 256 KiB each | The first-level jump tables |
+
+**The heap's last MiB is shared.** The JIT's records stop growing at the 1 MiB reserve, and the JIT then evicts code to reuse records. With the tile prefetch's store taken from the heap (1 MiB, one allocation per range), 3DS-D2-1C's second event hit the reserve 12 times. Its first event and 3DS-D2-1A/1B never did. The heap's room fell to 8 KiB, against 1.5–2.5 MiB before.
+
+**What changed (issue #89, build `9bd7e09077c9`):**
+- The JIT pool went from 16 to 14 MiB. Box86 takes it in 2 MiB chunks, so 15 MiB would have used 14 anyway, and the longest session measured held 13.7 MiB.
+- The tile prefetch's store is now a static 1 MiB (`g_prefetch_arena`), written as a ring.
+- The image's other freed MiB goes, through `__system_allocateHeaps`' leftover budget, to the linear heap for jump tables: 2,816 KiB of them in linear memory instead of 1,792.
+- `reserve_arena` took the larger `ctr-game-n3` layout (78,848 KiB) from 2 MiB of linear jump tables, which would have spent the two MiB on the arena. It now does so only from 3 MiB.
+
+In Azahar, on the same 90 s walk through Lut Gholein at t = 200 s, the heap had **4,621 KiB free (3,768 KiB of room)**, against 2,579 (2,100) with the store on the heap.
+
+### Ideas for more host memory (not started)
+
+Ordered by how cheap they look.
+
+1. **Debug and profiler buffers in `.bss`** (~0.5–1.5 MiB): `mi_vbuf` is only for the memory intrinsics' verify mode. The hot-path tables, if they are the profiler's, could be allocated when a profiler run starts. `weight.5`, `idx.4` and `static_insts` need identifying first.
+   - The heap can't grow past its window, so memory taken out of the image only reaches the host as linear memory: more jump tables there (as above), or the port's own buffers moved to `linearAlloc`.
+2. **Jump tables** (12 MiB, 10 on the heap): the largest translator item. A third level, leaves of 4 KiB pages for only the pages that hold translated code's entry points, would save whatever share of Game.exe's ~3 MiB of code the game never runs.
+   - The cost is one more load on every indirect jump, call and return dispatch, Box86's hottest path, so it needs a lane measurement for speed.
+   - First measurement: how many 4 KiB pages hold block entries after an hour's session.
+3. **JIT records** (3–4 MiB): trimming `dynablock_t` (the per-instruction size table, fields kept for debugging) helps long sessions. It's invasive.
+4. **Guest arena against the sprite cache**: the arena is fixed at 75 MiB. With sprites decoded natively and about 2.6 times faster (issue #83), a sprite cache 2 MiB smaller costs less than before. An arena 2 MiB smaller would hand that to the host. It needs a console comparison of the cache's evictions and decode time.
+5. **A larger JIT pool is the wrong way round:** at 14 MiB it holds a 1 h 46 session's code. Past that, the JIT evicts (issue #23), which costs little next to a heap that runs out.

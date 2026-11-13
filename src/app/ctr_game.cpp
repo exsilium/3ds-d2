@@ -87,11 +87,13 @@ u32 __ctru_linear_heap_size = 2u << 20;
 // refused to make heap pages executable (every code allocation failed), and
 // .bss sits outside its 96 MiB heap window, in budget the heap cannot use.
 // The town needed 8 MiB of code in Azahar; issue #23's Act I session had
-// 14 MiB of chunks open after 28 minutes and 16 MiB after 2 h 52. What the
-// backend does with a full pool is #23's open question. Box86 takes it in
-// 2 MiB chunks, so its size is a multiple of 2 MiB.
+// 14 MiB of chunks open after 28 minutes and 16 MiB after 2 h 52. A full
+// pool refuses new chunks without trying the heap (issue #90), and the JIT
+// evicts old code (#23: exact at 6 MiB of the fight's 7.2 on the lane).
+// Box86 takes it in 2 MiB chunks, so its size is a multiple of 2 MiB.
 alignas(0x1000) uint8_t dyn86_ctr_jitpool[14u << 20];
 extern const uint32_t dyn86_ctr_jitpool_size = 14u << 20;
+extern uint32_t dyn86_ctr_jitpool_refused;   // mman_ctr.c: chunks refused, the pool full
 // The tile prefetch's store (issue #89, rt::set_prefetch_arena), here for
 // the same reason: out of the heap, whose last MiB the JIT's records and
 // the port's own allocations share. The pool's other MiB goes to the budget
@@ -2285,6 +2287,14 @@ void hitch_heartbeat(const game::SpriteCacheWindow &w)
         logline_held(l.c_str());
     for (const std::string &l : game::tiles_ahead_lines())
         logline_held(l.c_str());
+    // The JIT pool full (issue #90): chunks refused, so the JIT evicts.
+    static uint32_t refused_seen = 0;
+    if (dyn86_ctr_jitpool_refused != refused_seen) {
+        refused_seen = dyn86_ctr_jitpool_refused;
+        std::snprintf(line, sizeof line, "[rt] jit pool full: %u chunk requests refused (%u MiB pool)",
+                      (unsigned)refused_seen, (unsigned)(dyn86_ctr_jitpool_size >> 20));
+        logline_held(line);
+    }
 }
 
 }  // namespace

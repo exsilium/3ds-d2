@@ -100,12 +100,45 @@ Pull requests are welcome, from typo fixes to new features. Please open them aga
 - **Update the docs** that describe what you changed: controls in [docs/controls.md](docs/controls.md) and the README, and the HELP page for button changes.
 - **Never commit the game's files.** No Diablo II files or assets go in the repository.
 
+### Project conventions
+
+These apply to everyone who works on the code, by hand or with tools.
+
+**Branches and issues**
+- Start feature branches from `origin/development`, and open pull requests with `development` as the base. `master` changes only through the release merge from `development`.
+- **Only the maintainer closes issues.** `Closes #<n>` in a pull request is welcome, but GitHub acts on it only on the default branch (`master`), so issues stay open after a merge into `development` until the maintainer closes them. Don't close issues yourself.
+
+**Commits and pull requests**
+- They carry the author's own words. No tool-generated footers ("Generated with …") or co-author trailers for AI assistants.
+- When copying the format of an older commit or pull request, leave such lines out.
+
+**Building**
+- Build and test only through `scripts/docker.sh`. It runs the containers as your user, with networking off.
+  - Files made by a plain `docker run` (as root), or by git on the host inside the backend's work tree, can't be rewritten by later builds.
+  - [docs/build-and-run.md](docs/build-and-run.md#the-backends-work-tree) explains the backend's work tree and how to change its patch series.
+- Build CIAs for testing with the game directory: `scripts/docker.sh package-cia <game-dir>`. Without it, the CIA gets drawn placeholder art instead of the game's own icon, banner and tune.
+  - Check that the output says `art:` from the game, not `drawn`.
+
+**Console options and measurements**
+- **A switch or measurement meant for a console run must be reachable on the bottom screen:** the OPTIONS page, or the profiler run's checklist. Console testers don't edit `settings.txt` by hand, so a `settings.txt`-only key is fine for Azahar runs (`measure-smoothness.sh --setting`) but gives nothing on hardware.
+- **Post measurements as a comment on their issue:** the build ID, the Sentry short ID (`3DS-D2-…`), the tables and the caveats. The issue is where the work's evidence is kept. A section in [docs/hardware-test.md](docs/hardware-test.md) is welcome as well, not instead.
+
+**Game code and third-party code**
+- **Our code and our tools may be distributed; Blizzard's code may not.**
+  - This includes Game.exe translated or decompiled by our tools: tools such as the planned ahead-of-time recompiler (#111) run on the user's own Game.exe, on the user's machine, and their output only ever goes into the user's own CIA.
+  - Natives are written from an understanding of the game's behaviour and cite addresses, not copied code.
+- **Third-party code is pinned at a commit, listed in [third_party/deps.lock](third_party/deps.lock), and described in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).**
+  - It keeps its licence, and patches on top of it share the licence of the files they change.
+  - If GPL code is linked into the app, the CIA as a whole is distributed under the GPL, while our own files stay BSD-2. Code used only by tests doesn't affect the CIA.
+
 ### Useful reading
 
-- [docs/build-and-run.md](docs/build-and-run.md): building, the test suites, running on a console and in Azahar.
-- [docs/architecture.md](docs/architecture.md): how the pieces fit together, and why.
+- [docs/build-and-run.md](docs/build-and-run.md): building, the test suites, running on a console and in Azahar, debugging, and reading console reports.
+- [docs/architecture.md](docs/architecture.md): how the pieces fit together, and where the project is heading.
+- [docs/natives.md](docs/natives.md): replacing a game routine with native code, checking it and measuring it.
 - [docs/controls.md](docs/controls.md): every button, and the bottom screen.
-- [docs/hardware-test.md](docs/hardware-test.md): building the CIA and testing it on a New 3DS.
+- [docs/hardware-test.md](docs/hardware-test.md): building the CIA, testing it on a New 3DS, and the measurements so far.
+- [docs/memory-budget.md](docs/memory-budget.md): where the 124 MiB go.
 - [docs/compatibility.md](docs/compatibility.md): what has been tested, on which build and where.
 
 ## How we work together

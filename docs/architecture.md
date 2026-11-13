@@ -1,4 +1,51 @@
-# Architecture — M2 audit
+# Architecture
+
+## How it works today (v0.4.0, 2026-11-13)
+
+The game is the user's own Diablo II 1.14d `Game.exe`. It runs unmodified, inside a Win32 runtime, on a New 3DS.
+
+| Layer | What it is | Where |
+| --- | --- | --- |
+| Translation | Box86's dynarec, ported to the ARM11 (ARMv6K), translates the game's x86 code at run time. It sits inside WinVita's runtime (the `third_party/winx86` submodule, MIT) with this project's patch series. | `tests/cpu/patches/armv6/`; the work tree [build-and-run.md](build-and-run.md#the-backends-work-tree) |
+| Win32 runtime | The PE loader, the import bridge, and shims for kernel32 and the files, user32, advapi32, gdi32, winmm, the network, Bink and Smacker (`src/runtime/rt_shims_*.cpp`), with WinVita's DirectSound (`ds_emul`). The game draws in its software (GDI) mode and hands each 8-bit frame over through `StretchBlt`/`BitBlt`. The game's threads run one at a time under a cooperative scheduler. | `src/runtime/`, and WinVita's |
+| Natives | 49 of the game's hottest routines and loops in C++ (drawing, lighting, decoding, the sprite cache, stats, collision, movement, path search), each checked against the game's own code | `src/game/`, [natives.md](natives.md) |
+| Intrinsics | Uncontended locks and the clock, served from the translated code without the runtime's lock | backend patches |
+| The app | Start-up, the game files (romfs or SD), the screens, sound (ndsp), the controls, the bottom screen's tabs, problem reports, the profiler | `src/app/`, `src/game/` |
+
+**The cores (New 3DS):**
+- **Core 0:** the game's threads, translated code and natives.
+- **Core 2,** or core 1 at a 30% time share when core 2 isn't available:
+  - the render thread: copies the game's frame, scales it, and presents it at 50 Hz;
+  - the floor queue's worker (floor tiles drawn beside the game's thread);
+  - the I/O worker (file reads, DCC decoding off the read thread, tiles read ahead);
+  - the sound thread;
+  - the SD writer for logs and traces;
+  - a stall watcher.
+
+**Memory:** about 124 MiB in all. The guest arena is 75 MiB (the game's heap and VirtualAlloc space, with the sprite cache in it), and the translation layer about 31 MiB (code pool, jump tables, block records). [memory-budget.md](memory-budget.md) has the details and their history.
+
+**Measuring:**
+- every build counts hitches and memory on a 10 s heartbeat;
+- a profiler run adds frame timing, the guest code profile, the sprite and file-read traces, and an SD card benchmark;
+- reports go to Sentry ([build-and-run.md](build-and-run.md#reading-console-reports-in-sentry)).
+
+The m4 lane runs the real Game.exe under qemu with scripted play, for exact block counts and per-call checks ([hardware-test.md](hardware-test.md)).
+
+### Where it is heading
+
+The game thread's profile is flat now (#92), and the translation layer is a quarter of all memory. The next steps:
+
+- **Ahead-of-time compilation (#111).**
+  - A recompiler run inside `package-cia`, on the user's machine, translates the user's Game.exe to C and compiles it into the user's own CIA. Box86 stays as the fallback.
+  - **We distribute the recompiler, never its output.** Translated or decompiled game code is Blizzard's, and stays with the user.
+- **d2decomped as `third_party` (#105).** Its maps of Game.exe's functions and structs, its reference implementations, and its emulator-made test cases are used for natives, tests and the AOT work. It is GPL-3.0: code used only by tests leaves the CIA's licence alone, while code linked into the app makes the CIA GPL-3.0 as a whole.
+- **GPU rendering through a Glide path (#120),** under study.
+
+The rest of this document is the M2 audit from before the port was written. It is kept for its reasoning; parts of it no longer describe the code.
+
+---
+
+## M2 audit (2026-10-16)
 
 Status: M2 audit complete (2026-10-16). **Decision (2026-10-16): the main route is the ARMv6K port of the Box86 backend inside WinVita. DOSBox dynrec is reference material only.** Memory feasibility (§2) is measured before the port starts. Sources were read at the commits in [third_party/deps.lock](../third_party/deps.lock). Every claim cites a file in those trees. Nothing here has been measured on the 3DS.
 

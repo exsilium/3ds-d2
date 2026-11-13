@@ -570,7 +570,16 @@ A first run with them reached 24 fps, but it never got into the crowd (8–10 mo
   - `M4_HOTPROF_LEVEL=43` starts the block count 5 s after reaching the oasis.
   - **Profile there:** monster pathfinding leads. `0x67b200` adds or updates a neighbour node of the search (9%, 3.9M calls); `0x67b440` is 3.5%; the open and closed sets' hash lookups `0x67ae00` and `0x67ae50` are 2.0% and 1.4%. About 17% together, plus the collision tests they call (now native).
   - All natives checked over it, none differ. CollisionCross ran 3.3 million times and RoomFind 3.9 million.
-  - A native for the search is the next large item. It writes the search's node lists, and node order matters, so it's a bigger job than anything so far.
+  - **`PathSearch` (`0x67b850`)**, the whole search as one native. The search's state is a 0x32f4-byte local, so the native keeps it in host memory and writes only the path: the points where the step direction changes, at most 77, to the unit's `+0x9c`. It reproduces the game's details, including:
+    - the eight-point pre-check around the goal;
+    - the neighbour order;
+    - g + 2 for a straight step, + 3 for a diagonal;
+    - an improved open node kept where it is in the f-sorted list;
+    - a closed node passing its improvement down its children (stopping at the first empty child slot);
+    - the best-so-far rule (least h, or equal h with g more than 5 higher);
+    - the pool of 200 nodes and the path's 1–77 rule.
+
+    A size class other than 1, 3 and 5, or a test on a room's edge, hands the whole call back to the game's code before anything is written. Checked: 2,048+ searches, the same count and points as the game's. The Far Oasis: 14.42 → 11.45 billion bytes of x86 for the same frames (−21%), and the search's routines left the profile.
 - **A bug found on the way:** a native that falls back to the game's code must resume past the bytes its hook's jump covers. `UnitPickFilter` first resumed at `0x466873`, inside the jump. That ran two of the jump's bytes as code, and the lane's town run crashed (a guest thread at `0x40000c`). The checked run hadn't shown it, because the check's trampolines copy the original bytes.
 
 ## Blood Moor: VirtualAlloc ran out (2026-10-18)

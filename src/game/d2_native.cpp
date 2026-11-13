@@ -477,14 +477,14 @@ struct RemapCheck {
     uint32_t orig, keep;   // the original, and its first whole instructions' bytes (5 or more) the trampoline copies
     uint32_t tramp = 0, calls = 0, bad = 0;
 };
-RemapCheck g_remap_check[15] = {{"Dc6Remap", 0x00607e20, 7},    {"Dc6RemapB", 0x00607680, 7},
+RemapCheck g_remap_check[16] = {{"Dc6Remap", 0x00607e20, 7},    {"Dc6RemapB", 0x00607680, 7},
                                {"Dc6Remap2", 0x006072f0, 7},   {"LightAdd", 0x004747c0, 6},
                                {"LightStampOccluded", 0x00475420, 6}, {"LightStamp", 0x004748d0, 6},
                                {"LoadsPending", 0x005ff2a0, 7},       {"Dc6Blend1", 0x00608110, 7},
                                {"Dc6Shadow", 0x00608d60, 6},          {"StormHash", 0x00415330, 5},
                                {"UnitPickFilter", 0x00466870, 6},     {"RoomFind", 0x00463740, 6},
                                {"CollisionCross", 0x0064d4e0, 6},     {"StatGet", 0x00625480, 6},
-                               {"UnitWalk", 0x00648120, 6}};
+                               {"UnitWalk", 0x00648120, 6},           {"PathSearch", 0x0067b850, 8}};
 
 // Before the hooks go in: the trampolines copy the originals' first bytes.
 bool install_remap_check(Cpu &c)
@@ -492,7 +492,7 @@ bool install_remap_check(Cpu &c)
     const uint32_t at = rt::va_alloc(0x1000, 0x00607e20);
     if (!at)
         return false;
-    for (int k = 0; k < 15; k++) {
+    for (int k = 0; k < 16; k++) {
         RemapCheck &r = g_remap_check[k];
         r.tramp = at + 16 * k;
         uint8_t t[16];
@@ -502,7 +502,7 @@ bool install_remap_check(Cpu &c)
         std::memcpy(t + r.keep + 1, &rel, 4);
         c.write(r.tramp, t, r.keep + 5);
     }
-    c.invalidate_code(at, 16 * 15);
+    c.invalidate_code(at, 16 * 16);
     return true;
 }
 
@@ -3135,6 +3135,315 @@ uint32_t unit_walk_checked(Cpu &c)
     return r0;
 }
 
+// ---- the monsters' path search: 67b850 ---------------------------------------------
+//
+// 67b850(ecx=search), ret: a unit's path toward a goal, an A* over subtiles,
+// 20% of the game's code in the Far Oasis on the lane (566 thousand node
+// expansions in two minutes). The search record: +0 the start (x, y words),
+// +4 the goal, +8 the room, +0x28 the size class, +0x2c the collision mask,
+// +0x30 the unit (+0x58: check the goal first; +0x9c: the path's points).
+// Its working state is a local of 0x32f4 bytes (two hashes of nodes, an
+// open list sorted by f, a pool of 200 nodes of 0x38 bytes, a stack), so
+// the native keeps it in host memory and writes only the path:
+//   67b740: with the unit's +0x58, the search fails (0) unless one of the
+//     eight points two subtiles from the goal is free.
+//   The start node: g 0, h = f = the heuristic (67adc0: 2 max + min of the
+//     two distances). Each pass takes the open list's head (67af40); the
+//     best node so far is the one of least h, or of equal h and a g more
+//     than 5 above the best's; h 0 ends the search, as does a full pool.
+//   67b440: the node's neighbours, (-1,-1) (-1,1) (1,-1) (1,1) (-1,0) (0,-1)
+//     (1,0) (0,1), each free one (64d910) through 67b200: g = the node's +
+//     2 straight or 3 diagonal; a node there already (open first, then
+//     closed) becomes one of the node's 8 children and, if this g is less,
+//     takes the node as parent, the g and f = h + g (an open one stays where
+//     it is in the list; a closed one passes the new g on to its children,
+//     and theirs, 67afe0); else a new node (none left: the search ends) with
+//     h, f, in the open list before the first of f no less (67aed0).
+//   67b690: from the best node back to the start (its parents), the points
+//     where the step's direction changes, at most 78; with 1 to 77, they go
+//     to the unit's +0x9c in walking order, and their count is the result.
+// A size class not of the cross test, or a test on a room's edge, leaves
+// the whole call to the game's code (nothing written yet).
+struct PathNode {
+    uint16_t x, y;
+    int16_t f, h, g;
+    int16_t parent, next;   // next: the open list
+    int16_t child[8];
+    bool closed;
+};
+
+struct PathSearch {
+    PathNode node[200];
+    int count = 0, head = -1;
+    int16_t slot[512];   // node by place: open addressing, at most 200 in 512
+    int16_t stack[200];
+
+    static uint32_t key(uint16_t x, uint16_t y) { return (uint32_t)x | (uint32_t)y << 16; }
+    static uint32_t hash(uint32_t k) { return (k * 0x9e3779b1u) >> 23; }
+    int find(uint16_t x, uint16_t y) const
+    {
+        const uint32_t k = key(x, y);
+        for (uint32_t i = hash(k);; i = (i + 1) & 511) {
+            const int n = slot[i];
+            if (n < 0)
+                return -1;
+            if (node[n].x == x && node[n].y == y)
+                return n;
+            (void)k;
+        }
+    }
+    void remember(int n)
+    {
+        for (uint32_t i = hash(key(node[n].x, node[n].y));; i = (i + 1) & 511)
+            if (slot[i] < 0) {
+                slot[i] = (int16_t)n;
+                return;
+            }
+    }
+    void open_insert(int n)
+    {
+        int prev = -1, cur = head;
+        while (cur >= 0 && node[cur].f < node[n].f) {
+            prev = cur;
+            cur = node[cur].next;
+        }
+        node[n].next = (int16_t)cur;
+        if (prev >= 0)
+            node[prev].next = (int16_t)n;
+        else
+            head = n;
+    }
+    int pop()
+    {
+        const int n = head;
+        if (n >= 0) {
+            head = node[n].next;
+            node[n].closed = true;
+        }
+        return n;
+    }
+    void add_child(int p, int n)
+    {
+        for (int16_t &c : node[p].child)
+            if (c < 0) {
+                c = (int16_t)n;
+                return;
+            }
+    }
+    static int16_t step_cost(const PathNode &a, uint16_t x, uint16_t y) { return a.x == x || a.y == y ? 2 : 3; }
+};
+
+inline int16_t path_heuristic(uint16_t x, uint16_t y, uint32_t goal)
+{
+    int32_t a = (int32_t)x - (int32_t)(goal & 0xffff), b = (int32_t)y - (int32_t)(goal >> 16);
+    a = a < 0 ? -a : a;
+    b = b < 0 ? -b : b;
+    return (int16_t)(a >= b ? 2 * a + b : a + 2 * b);
+}
+
+// -1: the game's code; else the result, with the path's points to write.
+int path_search_plan(uint32_t search, PathSearch &ps, uint32_t *points)
+{
+    const uint32_t cls = U32(search + 0x28);
+    if (cls != 1 && cls != 3 && cls != 5)
+        return -1;
+    const uint32_t room = U32(search + 8), unit = U32(search + 0x30), goal = U32(search + 4);
+    const uint16_t mask = (uint16_t)U32(search + 0x2c);
+    bool edge = false;
+    auto free_at = [&](uint16_t x, uint16_t y) {
+        uint32_t r;
+        if (!collision_cross(room, x, y, mask, r)) {
+            edge = true;
+            return false;
+        }
+        return r == 0;
+    };
+    if (U32(unit + 0x58)) {   // 67b740
+        const uint16_t gx = (uint16_t)goal, gy = (uint16_t)(goal >> 16);
+        static const int8_t kAround[8][2] = {{-2, -2}, {-2, 2}, {2, -2}, {2, 2}, {-2, 0}, {0, -2}, {2, 0}, {0, 2}};
+        bool any = false;
+        for (const auto &d : kAround) {
+            if (free_at((uint16_t)(gx + d[0]), (uint16_t)(gy + d[1]))) {
+                any = true;
+                break;
+            }
+            if (edge)
+                return -1;
+        }
+        if (!any)
+            return 0;
+    }
+    ps.count = 0;
+    ps.head = -1;
+    std::memset(ps.slot, 0xff, sizeof ps.slot);
+    const uint32_t start = U32(search);
+    PathNode &s0 = ps.node[ps.count++];
+    std::memset(&s0, 0, sizeof s0);
+    std::memset(s0.child, 0xff, sizeof s0.child);
+    s0.parent = -1;
+    s0.x = (uint16_t)start;
+    s0.y = (uint16_t)(start >> 16);
+    s0.h = s0.f = path_heuristic(s0.x, s0.y, goal);
+    ps.remember(0);
+    ps.open_insert(0);
+    // 67afe0: a closed node's lower g, on to its children.
+    auto propagate = [&](int from) {
+        int top = 0;
+        ps.stack[top++] = (int16_t)from;
+        while (top) {
+            if (top > 200)
+                return false;
+            const PathNode &c = ps.node[ps.stack[--top]];
+            const int ci = (int)(&c - ps.node);
+            for (int16_t d : c.child) {
+                if (d < 0)
+                    break;
+                PathNode &n = ps.node[d];
+                const int16_t g = (int16_t)(c.g + PathSearch::step_cost(c, n.x, n.y));
+                if (g < n.g) {
+                    n.parent = (int16_t)ci;
+                    n.g = g;
+                    n.f = (int16_t)(n.h + g);
+                    if (top >= 200)
+                        return false;
+                    ps.stack[top++] = d;
+                }
+            }
+        }
+        return true;
+    };
+    // 67b200: 1 done, 0 the pool full, -1 the game's code.
+    auto add = [&](int p, uint16_t x, uint16_t y) {
+        const int16_t g = (int16_t)(ps.node[p].g + PathSearch::step_cost(ps.node[p], x, y));
+        const int k = ps.find(x, y);
+        if (k >= 0) {
+            ps.add_child(p, k);
+            PathNode &n = ps.node[k];
+            if (g < n.g) {
+                n.f = (int16_t)(n.h + g);
+                n.parent = (int16_t)p;
+                n.g = g;
+                if (n.closed && !propagate(k))
+                    return -1;
+            }
+            return 1;
+        }
+        if (ps.count == 200)
+            return 0;
+        const int n = ps.count++;
+        PathNode &nn = ps.node[n];
+        std::memset(&nn, 0, sizeof nn);
+        std::memset(nn.child, 0xff, sizeof nn.child);
+        nn.parent = (int16_t)p;
+        nn.g = g;
+        nn.h = path_heuristic(x, y, goal);
+        nn.x = x;
+        nn.y = y;
+        nn.f = (int16_t)(nn.h + g);
+        ps.remember(n);
+        ps.open_insert(n);
+        ps.add_child(p, n);
+        return 1;
+    };
+    static const int8_t kNear[8][2] = {{-1, -1}, {-1, 1}, {1, -1}, {1, 1}, {-1, 0}, {0, -1}, {1, 0}, {0, 1}};
+    int best = -1;
+    int k = ps.pop();
+    if (k < 0)
+        return 0;
+    for (;;) {
+        if (best < 0 || ps.node[k].h < ps.node[best].h ||
+            (ps.node[k].h == ps.node[best].h && (int32_t)ps.node[k].g > (int32_t)ps.node[best].g + 5))
+            best = k;
+        if (ps.node[k].h == 0)
+            break;
+        bool full = false;
+        for (const auto &d : kNear) {   // 67b440
+            const uint16_t x = (uint16_t)(ps.node[k].x + d[0]), y = (uint16_t)(ps.node[k].y + d[1]);
+            if (!free_at(x, y)) {
+                if (edge)
+                    return -1;
+                continue;
+            }
+            const int r = add(k, x, y);
+            if (r < 0)
+                return -1;
+            if (!r) {
+                full = true;
+                break;
+            }
+        }
+        if (full)
+            break;
+        k = ps.pop();
+        if (k < 0)
+            break;
+    }
+    // 67b690
+    int n = 0;
+    int32_t pdx = -2, pdy = -2;
+    uint32_t back[78];
+    for (int at = best; at >= 0 && n < 0x4e; at = ps.node[at].parent) {
+        const int par = ps.node[at].parent;
+        if (par < 0)
+            continue;
+        const int32_t dx = (int32_t)ps.node[at].x - (int32_t)ps.node[par].x;
+        const int32_t dy = (int32_t)ps.node[at].y - (int32_t)ps.node[par].y;
+        if (dx == pdx && dy == pdy)
+            continue;
+        back[n++] = PathSearch::key(ps.node[at].x, ps.node[at].y);
+        pdx = dx;
+        pdy = dy;
+    }
+    if ((uint32_t)(n - 1) > 0x4c)
+        return 0;
+    for (int i = 0; i < n; i++)
+        points[i] = back[n - 1 - i];
+    return n;
+}
+
+uint32_t path_search(Cpu &c)
+{
+    static PathSearch ps;   // the game thread's only
+    uint32_t points[78];
+    const uint32_t search = c.reg(R_ECX);
+    const int r = path_search_plan(search, ps, points);
+    if (r >= 0) {
+        if (r > 0)
+            std::memcpy(H(U32(search + 0x30) + 0x9c), points, 4 * (uint32_t)r);
+        return (uint32_t)r;
+    }
+    // push ebp; mov ebp, esp; mov eax, 0x32f4 (the hook's jmp covers
+    // 67b850-67b854), on at 67b858.
+    const uint32_t esp = c.reg(R_ESP);
+    put32(esp - 4, c.reg(R_EBP));
+    c.set_reg(R_EBP, esp - 4);
+    c.set_reg(R_EAX, 0x32f4);
+    resume_original(c, 0x0067b858, esp - 4, 0);
+    return 0x32f4;
+}
+
+// D2_NATIVE_CHECK=1: the plan's result and points against the game's
+// (trampoline 15). The game's are kept.
+uint32_t path_search_checked(Cpu &c)
+{
+    static PathSearch ps;
+    RemapCheck &k = g_remap_check[15];
+    uint32_t points[78];
+    const uint32_t search = c.reg(R_ECX);
+    const int r = path_search_plan(search, ps, points);
+    const uint32_t r0 = rt::guest_call(c, k.tramp, {});
+    c.set_reg(R_ECX, search);
+    if (r >= 0) {
+        bool bad = (uint32_t)r != r0;
+        if (!bad && r > 0)
+            bad = std::memcmp(points, H(U32(search + 0x30) + 0x9c), 4 * (uint32_t)r) != 0;
+        if (bad && k.bad < 20)
+            rt::logf("native check: PathSearch(%08x) gave %d points, the game's %u", search, r, r0);
+        check_note(k, bad);
+    }
+    return r0;
+}
+
 // ---- Storm's name hash: 415330 ------------------------------------------------------
 //
 // 415330(eax=name, [8]=hash type), ret 4: the MPQ hash of a file name, each
@@ -3917,6 +4226,9 @@ int install_d2_native(Cpu &c)
          !remap_check);
     static const uint8_t k648120[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x3c, 0x53, 0x56, 0x8b, 0xf0};
     HOOK(c, 0x00648120, k648120, sizeof k648120, 0, remap_check ? unit_walk_checked : unit_walk, "UnitWalk",
+         !remap_check);
+    static const uint8_t k67b850[] = {0x55, 0x8b, 0xec, 0xb8, 0xf4, 0x32, 0x00, 0x00, 0xe8};
+    HOOK(c, 0x0067b850, k67b850, sizeof k67b850, 0, remap_check ? path_search_checked : path_search, "PathSearch",
          !remap_check);
     // Rooms and collision (room_find, collision_cross): Act II's pathfinding.
     static const uint8_t k463740[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x08, 0x56, 0x8b, 0xc1, 0x33, 0xf6};

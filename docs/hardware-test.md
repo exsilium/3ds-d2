@@ -556,6 +556,21 @@ A first run with them reached 24 fps, but it never got into the crowd (8–10 mo
   - **`StatGet` (`0x625480`)**, a unit's stat: the stat table's row, then a binary search of the holder's base or full list, with the row's minimum for player-type owners. Three nested calls become one; only reads. Checked: 524,288.
 
   Lut Gholein went from 3.20 to 2.56 billion bytes of x86 for the same 2,007 frames (−20%). What's left on top there is the unit walk `0x648120` (4.3%). It steps a unit toward its target a subtile at a time, using the direction from `0x678df0`, a collision test through `0x64d910` for the unit's size class (`0x64d450`, `0x64d4e0`, `0x64d7c0`), and two alternate directions to slide along. With its helpers that's about 10%.
+- **`UnitWalk` (`0x648120`)**, a unit's step toward its target:
+  - the main direction from a 5×5 table of clamped offsets (`0x678c10`/`0x678df0`), else two alternate directions, each from its own running place;
+  - then, for the units whose `+0x30` record's first dword is 0 (all the walkers in Lut Gholein), `0x648050`'s settle: within 5 subtiles of the target, on by the 9×9 table at `0x6eb490` while the way is free.
+
+  It's planned without side effects, and handed to the game's code for size classes other than 1, 3 and 5 (the cross test) or a room's edge. Checked: 16,384+ calls, none differ. Lut Gholein: 2.56 → 2.31 billion bytes, 28% less than before the Act II natives.
+- **Act II outdoors: the Far Oasis** (`tests/m4/scripts/act2-oasis.txt`).
+  - New autoplay commands get the script there:
+    - `seek Waypoint` finds the waypoint by its objects.txt name. Lut Gholein's rooms list their objects only once loaded, so it walks toward unloaded rooms, tapping at the screen's edge so that the game finds the path.
+    - `tapobject last` taps what `seek` found.
+    - `goto <class>` walks to a preset object, and `units all` lists every loaded unit and the level's presets.
+  - Lut Gholein's waypoint is class 156. This save's enabled waypoints are Lut Gholein, Sewers 2, Dry Hills, Halls of the Dead 2 and Far Oasis (the last, on the fifth line).
+  - `M4_HOTPROF_LEVEL=43` starts the block count 5 s after reaching the oasis.
+  - **Profile there:** monster pathfinding leads. `0x67b200` adds or updates a neighbour node of the search (9%, 3.9M calls); `0x67b440` is 3.5%; the open and closed sets' hash lookups `0x67ae00` and `0x67ae50` are 2.0% and 1.4%. About 17% together, plus the collision tests they call (now native).
+  - All natives checked over it, none differ. CollisionCross ran 3.3 million times and RoomFind 3.9 million.
+  - A native for the search is the next large item. It writes the search's node lists, and node order matters, so it's a bigger job than anything so far.
 - **A bug found on the way:** a native that falls back to the game's code must resume past the bytes its hook's jump covers. `UnitPickFilter` first resumed at `0x466873`, inside the jump. That ran two of the jump's bytes as code, and the lane's town run crashed (a guest thread at `0x40000c`). The checked run hadn't shown it, because the check's trampolines copy the original bytes.
 
 ## Blood Moor: VirtualAlloc ran out (2026-10-18)

@@ -39,6 +39,7 @@
 #include "game/dcc_native.h"
 #include "game/frame_reads.h"
 #include "game/autoplay.h"
+#include "game/d2_units.h"
 #include "game/automap.h"
 #include "game/cinematics.h"
 #include "game/controls.h"
@@ -558,7 +559,13 @@ int main(int argc, char **argv)
             if (g_cpu && sprite_frames)
                 game::install_sprite_frames(*g_cpu);
         }
-        if (in_game_since && !reset_done && now - in_game_since > 10000 && std::getenv("WX86_HOTPROF")) {
+        // M4_HOTPROF_LEVEL=<n>: from 5 s after first reaching level n instead.
+        static const int hot_level = std::getenv("M4_HOTPROF_LEVEL") ? std::atoi(std::getenv("M4_HOTPROF_LEVEL")) : 0;
+        static uint64_t level_since = 0;
+        if (hot_level && !level_since && gs.in_game && game::player_level() == hot_level)
+            level_since = now;
+        if (in_game_since && !reset_done && std::getenv("WX86_HOTPROF") &&
+            (hot_level ? level_since && now - level_since > 5000 : now - in_game_since > 10000)) {
             dyn86_hotprof_reset();
             reset_done = true;
             std::fprintf(stderr, "[rt] hotprof: counting from here (in game)\n");

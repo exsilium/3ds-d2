@@ -477,13 +477,14 @@ struct RemapCheck {
     uint32_t orig, keep;   // the original, and its first whole instructions' bytes (5 or more) the trampoline copies
     uint32_t tramp = 0, calls = 0, bad = 0;
 };
-RemapCheck g_remap_check[14] = {{"Dc6Remap", 0x00607e20, 7},    {"Dc6RemapB", 0x00607680, 7},
+RemapCheck g_remap_check[15] = {{"Dc6Remap", 0x00607e20, 7},    {"Dc6RemapB", 0x00607680, 7},
                                {"Dc6Remap2", 0x006072f0, 7},   {"LightAdd", 0x004747c0, 6},
                                {"LightStampOccluded", 0x00475420, 6}, {"LightStamp", 0x004748d0, 6},
                                {"LoadsPending", 0x005ff2a0, 7},       {"Dc6Blend1", 0x00608110, 7},
                                {"Dc6Shadow", 0x00608d60, 6},          {"StormHash", 0x00415330, 5},
                                {"UnitPickFilter", 0x00466870, 6},     {"RoomFind", 0x00463740, 6},
-                               {"CollisionCross", 0x0064d4e0, 6},     {"StatGet", 0x00625480, 6}};
+                               {"CollisionCross", 0x0064d4e0, 6},     {"StatGet", 0x00625480, 6},
+                               {"UnitWalk", 0x00648120, 6}};
 
 // Before the hooks go in: the trampolines copy the originals' first bytes.
 bool install_remap_check(Cpu &c)
@@ -491,7 +492,7 @@ bool install_remap_check(Cpu &c)
     const uint32_t at = rt::va_alloc(0x1000, 0x00607e20);
     if (!at)
         return false;
-    for (int k = 0; k < 14; k++) {
+    for (int k = 0; k < 15; k++) {
         RemapCheck &r = g_remap_check[k];
         r.tramp = at + 16 * k;
         uint8_t t[16];
@@ -501,7 +502,7 @@ bool install_remap_check(Cpu &c)
         std::memcpy(t + r.keep + 1, &rel, 4);
         c.write(r.tramp, t, r.keep + 5);
     }
-    c.invalidate_code(at, 16 * 14);
+    c.invalidate_code(at, 16 * 15);
     return true;
 }
 
@@ -2949,6 +2950,191 @@ uint32_t stat_get(uint32_t unit, uint32_t stat, uint32_t layer)
 
 uint32_t stat_get_native(Cpu &c) { return stat_get(c.arg(0), c.arg(1), c.arg(2)); }
 
+// ---- a unit's walk: 648120 -----------------------------------------------------------
+//
+// 648120(eax=path), ret: one step of a unit along its path toward its
+// target, 0 when there (or already there), else 1; the pathfinding's inner
+// step, a loop of collision tests through 64d910 (920 thousand in a minute
+// of Lut Gholein). The path: +0 the target (x, y words), +4 where the unit
+// is (x, y), +8 its room, +0x28 its size class, +0x2c the collision mask,
+// +0x30 the unit. The directions toward the target (678df0, through 678c10
+// and the table at 0x6f1648: a main one, two alternatives, 0xff none),
+// each a step of the table at 0x6eb398. The main step from where the unit
+// is; if blocked, the first alternative's from its own running place, then
+// the second's; all blocked, the main direction again from the blocked
+// main step, and on. The first free step is where the unit goes.
+// The plan below makes no change until it is done: a size class not of
+// the cross test (1, 3, 5), a test on a room's edge, the assertion's case
+// or a walk past 100000 tests all leave the call to the game's code. The
+// unit kind whose +0x30's first dword is 0 settles after a step (648050,
+// done in the plan too).
+inline uint32_t walk_dirs(uint32_t from, uint32_t to)
+{
+    int32_t dx = (int32_t)(to & 0xffff) - (int32_t)(from & 0xffff);
+    int32_t dy = (int32_t)(to >> 16) - (int32_t)(from >> 16);
+    const int32_t ax = dx < 0 ? -dx : dx, ay = dy < 0 ? -dy : dy;
+    int32_t sx = dx, sy = dy;
+    bool clamp_x = true;
+    if (ax >= 2 * ay) {
+        sy = dy < 0 ? -1 : (dy & 1);
+    } else if (ay >= 2 * ax) {
+        sx = dx < 0 ? -1 : (dx & 1);
+        clamp_x = false;
+    }
+    if (clamp_x)
+        sx = sx < -1 ? -2 : sx > 1 ? 2 : sx;
+    sy = sy < -1 ? -2 : sy > 1 ? 2 : sy;
+    const uint32_t i = (uint32_t)(5 * sx + sy + 12);
+    const uint8_t *t = H(0x006f1648 + 3 * i);
+    return t[0] | t[1] << 8 | t[2] << 16;
+}
+
+inline uint16_t step_dx(uint32_t d) { return *reinterpret_cast<const uint16_t *>(H(0x006eb398 + 8 * d)); }
+inline uint16_t step_dy(uint32_t d) { return *reinterpret_cast<const uint16_t *>(H(0x006eb39c + 8 * d)); }
+
+// -1: the game's code; else the result, with the place to write (moved).
+// Why the plan left calls to the game's code (D2_NATIVE_CHECK logs them):
+// 0 the unit or the assertion, 1 (no longer: 648050 is done here), 2 the
+// size class, 3 a room's edge, 4 too long.
+uint32_t g_walk_left[5];
+
+int unit_walk_plan(uint32_t path, bool &moved, uint16_t &nx, uint16_t &ny)
+{
+    moved = false;
+    const uint32_t unit = U32(path + 0x30);
+    if (!unit || (U32(unit + 0x34) & 0x40000))
+        return g_walk_left[0]++, -1;
+    const uint32_t inner = U32(unit + 0x30);
+    const bool settle = inner && !U32(inner);   // 648050 after a step (below)
+    const uint32_t cls = U32(path + 0x28);
+    if (cls != 1 && cls != 3 && cls != 5)
+        return g_walk_left[2]++, -1;
+    const uint16_t tx = *reinterpret_cast<const uint16_t *>(H(path)), ty = *reinterpret_cast<const uint16_t *>(H(path + 2));
+    const uint32_t room = U32(path + 8);
+    const uint16_t mask = (uint16_t)U32(path + 0x2c);
+    uint16_t x = *reinterpret_cast<const uint16_t *>(H(path + 4)), y = *reinterpret_cast<const uint16_t *>(H(path + 6));
+    uint16_t a1x = x, a1y = y, a2x = x, a2y = y;
+    const uint32_t dirs = walk_dirs(U32(path + 4), U32(path));
+    uint32_t main = dirs & 0xff;
+    const uint32_t alt1 = dirs >> 8 & 0xff, alt2 = dirs >> 16 & 0xff;
+    auto free_at = [&](uint16_t px, uint16_t py, int &out) {
+        uint32_t r;
+        if (!collision_cross(room, px, py, mask, r))
+            return false;
+        out = r == 0;
+        return true;
+    };
+    for (int n = 0; n < 100000; n++) {
+        if (x == tx && y == ty)
+            return 0;
+        x = (uint16_t)(x + step_dx(main));
+        y = (uint16_t)(y + step_dy(main));
+        int ok;
+        if (!free_at(x, y, ok))
+            return g_walk_left[3]++, -1;
+        uint16_t px = x, py = y;
+        if (!ok) {
+            a1x = (uint16_t)(a1x + step_dx(alt1));
+            a1y = (uint16_t)(a1y + step_dy(alt1));
+            if (!free_at(a1x, a1y, ok))
+                return g_walk_left[3]++, -1;
+            px = a1x;
+            py = a1y;
+            if (!ok && alt2 != 0xff) {
+                a2x = (uint16_t)(a2x + step_dx(alt2));
+                a2y = (uint16_t)(a2y + step_dy(alt2));
+                if (!free_at(a2x, a2y, ok))
+                    return g_walk_left[3]++, -1;
+                px = a2x;
+                py = a2y;
+            }
+        }
+        if (ok) {
+            moved = true;
+            nx = px;
+            ny = py;
+            if (px == tx && py == ty)
+                return 0;
+            if (settle) {
+                // 648050: within 5 subtiles of the target (not on it), on by
+                // the table's step for the offset (0x6eb490, 9 x 9 dwords
+                // about its centre: x's at dx + 9 dy, y's at dy + 9 dx) while
+                // the way is free, until 5 from the start of the count.
+                const int32_t dx = (int32_t)px - (int32_t)tx, dy = (int32_t)py - (int32_t)ty;
+                const int32_t ax = dx < 0 ? -dx : dx, ay = dy < 0 ? -dy : dy;
+                if (ax < 5 && ay < 5 && (ax || ay)) {
+                    const int32_t sx = I32(0x006eb490 + 4 * (uint32_t)(dx + 9 * dy));
+                    const int32_t sy = I32(0x006eb490 + 4 * (uint32_t)(dy + 9 * dx));
+                    int32_t wx = px, wy = py;
+                    for (int32_t k = ax > ay ? ax : ay; k < 5; k++) {
+                        uint32_t r;
+                        if (!collision_cross(room, wx + sx, wy + sy, mask, r))
+                            return g_walk_left[3]++, -1;
+                        if (r)
+                            break;
+                        wx += sx;
+                        wy += sy;
+                        nx = (uint16_t)wx;
+                        ny = (uint16_t)wy;
+                    }
+                }
+            }
+            return 1;
+        }
+        main = walk_dirs((uint32_t)x | (uint32_t)y << 16, U32(path)) & 0xff;
+    }
+    return g_walk_left[4]++, -1;
+}
+
+uint32_t unit_walk(Cpu &c)
+{
+    const uint32_t path = c.reg(R_EAX);
+    bool moved;
+    uint16_t nx, ny;
+    const int r = unit_walk_plan(path, moved, nx, ny);
+    if (r >= 0) {
+        if (moved) {
+            std::memcpy(H(path + 4), &nx, 2);
+            std::memcpy(H(path + 6), &ny, 2);
+        }
+        return (uint32_t)r;
+    }
+    // push ebp; mov ebp, esp; sub esp, 0x3c (the hook's jmp covers 648120-
+    // 648124), on at 648126.
+    const uint32_t esp = c.reg(R_ESP);
+    put32(esp - 4, c.reg(R_EBP));
+    c.set_reg(R_EBP, esp - 4);
+    resume_original(c, 0x00648126, esp - 4 - 0x3c, 0);
+    return c.reg(R_EAX);
+}
+
+// D2_NATIVE_CHECK=1: the plan (where it has one) against the game's code,
+// the result and the place (trampoline 14). The game's walk is kept.
+uint32_t unit_walk_checked(Cpu &c)
+{
+    RemapCheck &k = g_remap_check[14];
+    const uint32_t path = c.reg(R_EAX);
+    const uint32_t before = U32(path + 4);
+    bool moved;
+    uint16_t nx, ny;
+    const int r = unit_walk_plan(path, moved, nx, ny);
+    const uint32_t r0 = rt::guest_call(c, k.tramp, {});
+    c.set_reg(R_EAX, path);
+    static uint32_t calls = 0;
+    if ((++calls & (calls - 1)) == 0)
+        rt::logf("native check: UnitWalk %u calls, left to the game: unit %u, kind %u, size class %u, edge %u, long %u",
+                 calls, g_walk_left[0], g_walk_left[1], g_walk_left[2], g_walk_left[3], g_walk_left[4]);
+    if (r >= 0) {
+        const uint32_t want = moved ? ((uint32_t)nx | (uint32_t)ny << 16) : before;
+        const bool bad = (uint32_t)r != r0 || U32(path + 4) != want;
+        if (bad && k.bad < 20)
+            rt::logf("native check: UnitWalk(%08x) gave %d at %08x, the game's %u at %08x", path, r, want, r0,
+                     U32(path + 4));
+        check_note(k, bad);
+    }
+    return r0;
+}
+
 // ---- Storm's name hash: 415330 ------------------------------------------------------
 //
 // 415330(eax=name, [8]=hash type), ret 4: the MPQ hash of a file name, each
@@ -3728,6 +3914,9 @@ int install_d2_native(Cpu &c)
          "UnitPickFilter", !remap_check);
     static const uint8_t k625480[] = {0x55, 0x8b, 0xec, 0x8b, 0x45, 0x08, 0x85, 0xc0, 0x75, 0x04};
     HOOK(c, 0x00625480, k625480, sizeof k625480, 3, remap_check ? stat_get_checked : stat_get_native, "StatGet",
+         !remap_check);
+    static const uint8_t k648120[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x3c, 0x53, 0x56, 0x8b, 0xf0};
+    HOOK(c, 0x00648120, k648120, sizeof k648120, 0, remap_check ? unit_walk_checked : unit_walk, "UnitWalk",
          !remap_check);
     // Rooms and collision (room_find, collision_cross): Act II's pathfinding.
     static const uint8_t k463740[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x08, 0x56, 0x8b, 0xc1, 0x33, 0xf6};

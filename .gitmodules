@@ -1,3 +1,6 @@
 [submodule "third_party/winx86"]
 	path = third_party/winx86
 	url = https://github.com/Franckrst/WinVita.git
+[submodule "third_party/d2d"]
+	path = third_party/d2d
+	url = https://github.com/psi29a/d2decomped.git

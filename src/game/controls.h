@@ -89,7 +89,7 @@ private:
     bool walk_left_ = false;      // walking holds the left button (A and taps are other sources)
     bool select_used_ = false;    // Select was used with R or the D-pad: no zoom toggle on release
     uint8_t start_vk_ = 0;
-    uint8_t bound_[16] = {};      // the key each binding pressed (chosen by the R layer at press time)
+    uint8_t bound_[16] = {};      // the key each binding pressed (chosen by the R or ZR layer at press time)
     // Touch.
     bool touch_prev_ = false;
     uint64_t touch_start_ms_ = 0;

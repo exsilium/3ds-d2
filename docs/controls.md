@@ -25,7 +25,8 @@ The mapping lives in `src/game/controls.cpp`. It follows the ideas D2Vita proved
 | Y | Show items on the ground (Alt, held) |
 | L | Stand still (Shift, held) |
 | D-pad | Belt potions 1–4 (up, right, down, left) |
-| ZL / ZR (New 3DS) | Weapon swap (W) / automap (Tab) |
+| ZL (New 3DS) | Weapon swap (W) |
+| ZR (New 3DS) | A layer key (below); alone it does nothing |
 | Start | Escape: game menu, closes panels |
 | Select | Top screen: whole frame ↔ 1:1 zoom (on release, when no D-pad button was pressed with it) |
 
@@ -37,10 +38,22 @@ The mapping lives in `src/game/controls.cpp`. It follows the ideas D2Vita proved
 | B | Skill tree (T) |
 | X | Automap (Tab) |
 | Y | Quests (Q) |
-| D-pad | Skill hotkeys F1–F4 |
+| D-pad | Skill hotkeys F1–F4 (also ZR + A / B / Y / X) |
 | Start | Enter: confirm, e.g. OK after typing a character name |
 | Select | On-screen keyboard (it also opens by itself when the game focuses a text field) |
 | L + Select | Screenshot into the Camera album (see below) |
+
+**ZR is a layer key too** (New 3DS). While ZR is held:
+
+| ZR + | Action |
+| --- | --- |
+| A | Skill 1 (F1) |
+| B | Skill 2 (F2) |
+| Y | Skill 3 (F3) |
+| X | Skill 4 (F4) |
+| D-pad | Nothing yet: left free for later shortcuts |
+
+L and ZL do as they always do with ZR held.
 
 **Select is a layer key for the bottom screen.** While Select is held (without R), the D-pad does not use the belt:
 

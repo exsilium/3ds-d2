@@ -56,9 +56,22 @@ RUN rm -f /etc/apt/sources.list.d/* \
  && apt-get install -y --no-install-recommends \
       gcc-arm-linux-gnueabi libc6-dev-armel-cross qemu-user make ca-certificates \
       gcc-i686-linux-gnu libc6-dev-i386-cross binutils-i686-linux-gnu \
-      g++-arm-linux-gnueabi g++-arm-linux-gnueabihf git patch python3 \
+      g++-arm-linux-gnueabi g++-arm-linux-gnueabihf git patch python3 python3-pip \
       gcc-mingw-w64-i686 binutils-mingw-w64-i686 \
  && rm -rf /var/lib/apt/lists/*
+# d2d's Game.exe harness (third_party/d2d/tools/emu; issues #105, #108): the
+# versions in its tools/emu/uv.lock at the pinned commit, as wheels checked
+# against that lock's hashes (Linux arm64 and amd64). Debian's python3-unicorn
+# (2.1.1) and python3-capstone (5.0.7) are older than d2d asks for.
+RUN printf '%s\n' \
+      'unicorn==2.1.4 --hash=sha256:bd1fb0c9af5f57e356d8a96928b4fe045b2e18f308ef23b481d5f970008aa722 --hash=sha256:9d6e6dea140560de4ebd8446661f7ef84a357d428c14a3ef09dacd306ec8c239' \
+      'capstone==5.0.9 --hash=sha256:41772ad0c71aa5d3e97d541e802593c2e71fb94ac7e20d4202f97ce2a3eb8ed5 --hash=sha256:273fd8d747d2e35c88f91450be51a603ecfaafb00d96d9f315dcb8689c86193e' \
+      'pefile==2024.8.26 --hash=sha256:76f8b485dcd3b1bb8166f1128d395fa3d87af26360c2358fb75b80019b957c6f' \
+      > /tmp/emu-requirements.txt \
+ && pip install --break-system-packages --no-cache-dir --no-deps --only-binary=:all: \
+      --require-hashes -r /tmp/emu-requirements.txt \
+ && rm /tmp/emu-requirements.txt \
+ && python3 -c "import unicorn, capstone, pefile"
 WORKDIR /work
 
 # --- HOME-menu banner lane ------------------------------------------------------

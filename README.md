@@ -150,7 +150,7 @@ Nothing is sent unless you press A or X. Up to 32 reports wait to be sent; of th
 
 Everything builds inside Docker containers with a pinned toolchain (devkitARM, libctru, makerom). The host needs only **Docker** and **git**: Docker Desktop on macOS (Apple Silicon or Intel) or Windows, or Docker Engine on Linux. You don't need the game files to build the app.
 
-1. **Get the source with its submodule.** The CPU backend (WinVita, with Box86) is a git submodule, so clone recursively:
+1. **Get the source with its submodules.** The CPU backend (WinVita, with Box86) is a git submodule, so clone recursively. This also fetches d2decomped (`third_party/d2d`, about 60 MB with its history), which only the tests use:
 
    ```sh
    git clone --recursive https://github.com/exsilium/3ds-d2.git
@@ -164,6 +164,7 @@ Everything builds inside Docker containers with a pinned toolchain (devkitARM, l
    ```sh
    git -c core.autocrlf=false clone --recursive https://github.com/exsilium/3ds-d2.git
    git -C 3ds-d2/third_party/winx86 config core.autocrlf false
+   git -C 3ds-d2/third_party/d2d config core.autocrlf false
    ```
 
 2. **Build the toolchain images, once.** This downloads and builds the pinned tools, and takes a few minutes the first time:
@@ -214,6 +215,7 @@ Projects this one builds on, learned from or uses.
 
 **Inspiration and reference**
 - [D2Vita](https://github.com/Franckrst/D2Vita) (GPL-3.0): Diablo II 1.14d on the PlayStation Vita, built on WinVita. It proved the approach on this exact executable. It was used only as a behavioural reference, for game facts such as memory addresses and the sprite-cache sizing, and for its control ideas. None of its code is in this project.
+- [d2decomped](https://github.com/psi29a/d2decomped) (GPL-3.0-or-later): a behaviour-matching reimplementation of Diablo II 1.14d, checked against Game.exe in an emulator. It is the submodule `third_party/d2d`, used only by tests and tools: its test cases check our natives, and its maps name the game's functions in our profile tools. None of its code is in the 3DS builds.
 - [DOSBox-3DS](https://github.com/MrHuu/dosbox-3ds) (GPL-2.0): read to confirm how a 3DS homebrew app makes JIT memory executable (`svcControlProcessMemory`). None of its code is used.
 - [DOSBox-X](https://dosbox-x.com/) and [M-HT/SR](https://github.com/M-HT/SR) (static recompilation of DOS and Windows games): evaluated as alternative CPU approaches while planning.
 

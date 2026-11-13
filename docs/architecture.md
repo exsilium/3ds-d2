@@ -39,7 +39,7 @@ The game thread's profile is flat now (#92), and the translation layer is a quar
   - A recompiler run inside `package-cia`, on the user's machine, translates the user's Game.exe to C and compiles it into the user's own CIA. Box86 stays as the fallback.
   - **We distribute the recompiler, never its output.** Translated or decompiled game code is Blizzard's, and stays with the user.
   - The design, before any code: [aot.md](aot.md) (#112).
-- **d2decomped as `third_party` (#105).** Its maps of Game.exe's functions and structs, its reference implementations, and its emulator-made test cases are used for natives, tests and the AOT work. It is GPL-3.0: code used only by tests leaves the CIA's licence alone, while code linked into the app makes the CIA GPL-3.0 as a whole.
+- **d2decomped as `third_party` (#105).** It is pinned as the submodule `third_party/d2d` (#106), for tests and tools only so far. Its maps of Game.exe's functions and structs, its reference implementations, and its emulator-made test cases are used for natives, tests and the AOT work. It is GPL-3.0: code used only by tests leaves the CIA's licence alone, while code linked into the app makes the CIA GPL-3.0 as a whole.
 - **GPU rendering through a Glide path (#120),** under study.
 
 The rest of this document is the M2 audit from before the port was written. It is kept for its reasoning; parts of it no longer describe the code.

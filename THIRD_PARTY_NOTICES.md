@@ -45,6 +45,16 @@ A CIA packaged with a game directory (`package-cia <game-dir>`, `--slim`, `--ful
 
 The repository holds the code that extracts them, never the artwork. Without a game directory the CIA gets `make_art.py`'s drawn art and a silent tune.
 
+## Used only by tests and tools
+
+- **d2d** ([psi29a/d2decomped](https://github.com/psi29a/d2decomped), GPL-3.0-or-later) is the git submodule `third_party/d2d`, pinned at `0a70175` (issue #106).
+  - It is a behaviour-matching reimplementation of Diablo II 1.14d. Its tools check its code against the user's own Game.exe in a Unicorn harness (`tools/emu`). Its `LEGAL.md` states that the repository holds no Blizzard files and no copied code.
+  - This project uses it only for tests and tools: its test cases against our natives (#108) and its function and struct names in our profile tools (#107). Nothing of it is linked into the CIA or the `.3dsx`, so the 3DS builds' licence is unchanged.
+  - Its files stay in the submodule, and in the work tree `build/d2d/d2d` that `scripts/docker.sh test d2d` prepares from it. They are read from there, not copied into this repository.
+  - This project's patch series on top of it (`tests/d2d/patches/`, empty for now) changes GPL-3.0 files, so the patches are GPL-3.0-or-later.
+  - If d2d code is ever linked into the app, the CIA as a whole is distributed under the GPL-3.0, while this project's own files stay BSD-2. Such a build will keep a switch for a CIA without d2d code.
+  - The `hosttest` image installs its harness's Python modules at the versions in its `tools/emu/uv.lock`: Unicorn 2.1.4 (the engine is GPL-2.0; the Python package's metadata says BSD and the wheel carries no licence file), Capstone 5.0.9 (BSD-3-Clause, `LICENSE.TXT` in the wheel) and pefile 2024.8.26 (MIT). The image is local and never distributed.
+
 ## Used only for measurement
 
 `containers/d2vita-ref` clones D2Vita (GPL-3.0), WinVita (MIT) and StormLib (MIT) at pinned commits inside a local Docker image. That image is never distributed. It applies a one-line logging patch to D2Vita for the measurements. None of this code is in the repository or in any 3DS build.
@@ -52,6 +62,7 @@ The repository holds the code that extracts them, never the artwork. Without a g
 ## Facts that matter for future combination
 
 - D2Vita: GPL-3.0.
+- d2d: GPL-3.0-or-later. Used only by tests and tools (above).
 - WinVita: MIT (`LICENSE`); see also its `THIRD-PARTY-NOTICES.md`.
 - DOSBox-3DS: GPL-2.0-or-later. Its `ctr_memory.c` (credited to PicoDrive) was only read, to confirm how `svcControlProcessMemory` is called. None of its code is used.
 - D2Vita (GPL-3.0) was used only as a behavioural reference for the 1.14d game, read inside the measurement image. No D2Vita source is copied or translated into this repository; the few game facts taken from it (memory addresses, behaviour) are documented where they are used.

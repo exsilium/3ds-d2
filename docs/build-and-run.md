@@ -15,6 +15,7 @@ scripts/docker.sh test cpu armv7   # the same fixtures through upstream Box86 (C
 scripts/docker.sh test cpu armv6   # the ARMv6 port (ARM11 model); must be byte-identical to the baseline
 AZAHAR=/path/to/azahar scripts/run-cpu-lane-azahar.sh   # the port as a 3DS app, in Azahar
 scripts/docker.sh test m3          # PE32 fixture through the Win32 runtime (M3_REAL_CLOCK=1: console clock mode)
+scripts/docker.sh test d2d         # d2d's work tree (build/d2d/d2d), prepared and patched; its emulator harness's modules
 scripts/docker.sh test m4 <game-dir> [guest-ms] [cmdline]   # the real Game.exe on the runtime; dir mounted read-only, shots in build/m4/shots
 # build/cpu/ctr/m3.3dsx (built with the CPU-lane apps) runs the same fixture in Azahar;
 # output: sdmc:/3ds/3ds-d2/m3/out.txt
@@ -44,6 +45,14 @@ The Box86 backend is built from `build/cpu/armv6/winx86`: a copy of the `third_p
 - Commit the changed `.patch` files as usual.
 
 **Don't run git, or a plain `docker run`, on the tree from the host.** Files made as root, or by another user, can't be rewritten by later builds. If the tree is ever in a state `prepare.sh` refuses, delete `build/cpu/armv6/winx86` from the host and build again.
+
+### d2d's work tree
+
+d2decomped (`third_party/d2d`, GPL-3.0-or-later, #105) is used the same way, for tests and tools only: `build/d2d/d2d` is a copy of the submodule as a git work tree, with this project's series (`tests/d2d/patches/*.patch`, empty for now) applied on top. `scripts/docker.sh test d2d` prepares it, with the same `prepare.sh`. To change d2d, commit in that tree inside the container (`scripts/docker.sh shell hosttest`), then run `make -C tests/d2d export`.
+
+- d2d's files stay in the submodule and in this tree. Tests read them from there; they are never copied into ours.
+- The `hosttest` image has its emulator harness's Python modules (`tools/emu`: Unicorn, Capstone, pefile), at the versions in its `uv.lock`. It has none of d2d's desktop dependencies.
+- The submodule is fetched with its history: about 27 MB of git objects and 30 MB of files, about 10 s to fetch when measured (2026-11-13). A shallow fetch is no smaller, because the pin is not upstream's newest commit: `clone --recursive` then fetched 58 MB. A new pin is a deliberate change, made with that history (`git log <old>..<new>`); it also updates `third_party/deps.lock` and THIRD_PARTY_NOTICES.md.
 
 ## Run in Azahar
 

@@ -133,4 +133,8 @@ deb gcc-i686-linux-gnu 4:14.2.0-1
 deb libc6-dev-armel-cross 2.41-11cross1
 deb libc6-dev-i386-cross 2.41-11cross1
 deb make 4.4.1-2
+deb python3 3.13.5-1
 deb qemu-user 1:10.0.13+ds-0+deb13u1
+pip unicorn 2.1.4
+pip capstone 5.0.9
+pip pefile 2024.8.26

@@ -74,6 +74,11 @@ list only the busiest EIPs, so the tail of a thread's samples is not seen
 there. `listed` is the share of the samples the lists and buckets cover, and
 the shares are of all the thread's samples. The profiler costs core 0
 time of its own (~12% in issue #3), so per-frame times read high.
+
+Functions are named where a name is known (issue #107, tools/game_names.py):
+our natives' first, then d2decomped's (the third_party/d2d submodule) when it
+is checked out, as `0x67b850` (PathSearch). The folding into functions is our
+own finder's either way.
 """
 import argparse
 import bisect
@@ -84,6 +89,7 @@ import struct
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import game_names  # noqa: E402
 import profile_windows  # noqa: E402
 
 PROF = re.compile(r"prof: (\d+) ms, frames (\d+), idle (\d+) ms(?:, switches (\d+))?(?:, cache syncs (\d+))?")
@@ -152,6 +158,7 @@ class Binary:
     def _starts(self, reloc_rva, reloc_size):
         data, text, lo, hi = self.data, self.text, self.lo, self.hi
         starts = set()
+        self.relocated = {}   # every relocated pointer into .text: target -> the addresses holding it
         body = data[text[3]:text[3] + text[4]]
         for i in range(len(body) - 4):   # every E8 whose target lands in .text; the strays are harmless
             if body[i] == 0xe8:
@@ -172,12 +179,14 @@ class Binary:
                 fo = self.file_off(at)
                 if fo is None:
                     continue
+                target = struct.unpack_from("<I", data, fo)[0]
+                if lo <= target < hi:
+                    self.relocated.setdefault(target, []).append(self.base + at)
                 if text[1] <= at < text[1] + text[2]:
                     # In code, only a push or mov of an address (a thread's entry, a
                     # callback): the jump tables' entries are not functions.
                     if not (data[fo - 1] == 0x68 or 0xb8 <= data[fo - 1] <= 0xbf):
                         continue
-                target = struct.unpack_from("<I", data, fo)[0]
                 if lo <= target < hi:
                     starts.add(target)
             off += block
@@ -359,6 +368,8 @@ def main():
         if not windows:
             return 1
     exe = Binary(args.exe)
+    names = game_names.Names()
+    print(names.summary())
 
     ms = sum(w["ms"] for w in windows)
     frames = sum(w["frames"] for w in windows)
@@ -432,7 +443,7 @@ def main():
         print("| Function | Return address | Reads | A frame |")
         print("| --- | --- | --- | --- |")
         for ret, n in clock_at.most_common(8):
-            f = f"`{exe.function(ret):#x}`" if exe.lo <= ret < exe.hi else "outside Game.exe"
+            f = names.label(exe.function(ret)) if exe.lo <= ret < exe.hi else "outside Game.exe"
             print(f"| {f} | `{ret:#x}` | {n} | {n / max(frames, 1):.1f} |")
 
     locks, locks_at = [0, 0, 0], collections.Counter()
@@ -448,7 +459,7 @@ def main():
         print("| Function | Return address | Calls | A frame |")
         print("| --- | --- | --- | --- |")
         for ret, n in locks_at.most_common(8):
-            f = f"`{exe.function(ret):#x}`" if exe.lo <= ret < exe.hi else "outside Game.exe"
+            f = names.label(exe.function(ret)) if exe.lo <= ret < exe.hi else "outside Game.exe"
             print(f"| {f} | `{ret:#x}` | {n} | {n / max(frames, 1):.1f} |")
 
     tid = args.thread if args.thread is not None else main_tid
@@ -505,7 +516,7 @@ def main():
         return f"{per_frame:.2f} | {100 * per_frame / frame_ms:.1f}%"
 
     label = lambda f: ("outside Game.exe" if f == "outside" else "the sprite trace's stubs (the profiler)"
-                       if f == "trace" else f"`{f:#x}`")
+                       if f == "trace" else names.label(f))
     print("\nTranslated functions (the exact lists and the tail buckets):\n")
     print("| # | Function | Samples | In the tail | Share of thread | ms a frame | Share of a frame | Hottest EIPs |")
     print("| --- | --- | --- | --- | --- | --- | --- | --- |")
@@ -531,7 +542,7 @@ def main():
     print("| Caller | Call site | Samples | Share of thread | ms a frame | Share of a frame |")
     print("| --- | --- | --- | --- | --- | --- |")
     for (f, site), hits in indirect.most_common(10):
-        print(f"| `{f:#x}` | `{site:#x}` | {hits} | {pct(hits)} | {ms_frame(hits)} |")
+        print(f"| {names.label(f)} | `{site:#x}` | {hits} | {pct(hits)} | {ms_frame(hits)} |")
 
     # The profiler's own cost (issue #73): the sprite trace's natives, by
     # their shim time. Their samples land on the stubs' returns, so those are
@@ -547,24 +558,24 @@ def main():
               "cost is not counted (~12% in issue #3).")
 
     if args.routines:
-        routines(args.routines, exe, windows, frames, frame_ms, shims, returns, funcs, tid)
+        routines(args.routines, exe, names, windows, frames, frame_ms, shims, returns, funcs, tid)
     return 0
 
 
-def routines(specs, exe, windows, frames, frame_ms, shims, returns, funcs, tid):
+def routines(specs, exe, names, windows, frames, frame_ms, shims, returns, funcs, tid):
     """Each routine's ms a frame, whatever --top cut (issue #73): its shim
     time as timed (only a window's 12 busiest shims are logged, so the windows
     that listed it are counted), and its samples on the thread: the returns
     from it (a shim or native), its function's samples (a function start), or
     that EIP's (any other address), or a range's: the exact EIPs and the tail
     buckets that start in it."""
-    names = [r.strip() for spec in specs for r in spec.split(",") if r.strip()]
+    asked = [r.strip() for spec in specs for r in spec.split(",") if r.strip()]
     per = lambda ms: f"{ms / max(frames, 1):.2f}"
     share = lambda ms: f"{100 * ms / max(frames, 1) / frame_ms:.1f}%"
     print(f"\nRoutines asked for, thread {tid}, {len(windows)} windows, {frames} frames:\n")
     print("| Routine | What | ms a frame | Share of a frame | Listed in |")
     print("| --- | --- | --- | --- | --- |")
-    for name in names:
+    for name in asked:
         try:
             lo, _, hi = name.partition("-")
             addr, end = int(lo, 16), int(hi, 16) if hi else None
@@ -586,11 +597,11 @@ def routines(specs, exe, windows, frames, frame_ms, shims, returns, funcs, tid):
                   f"{hits} samples |")
         elif addr in exe.starts:
             hits = funcs[addr]
-            print(f"| `{addr:#x}` | function, its samples (the lists and the tail) | {per(hits * TICK_MS)} | "
+            print(f"| {names.label(addr)} | function, its samples (the lists and the tail) | {per(hits * TICK_MS)} | "
                   f"{share(hits * TICK_MS)} | {hits} samples |")
         else:
             hits = sum(w["eips"][tid][addr] for w in windows)
-            print(f"| `{addr:#x}` | EIP `{addr:#x}` (in `{exe.function(addr):#x}`), its samples | "
+            print(f"| `{addr:#x}` | EIP `{addr:#x}` (in {names.label(exe.function(addr))}), its samples | "
                   f"{per(hits * TICK_MS)} | {share(hits * TICK_MS)} | "
                   f"{sum(1 for w in windows if w['eips'][tid][addr])} of {len(windows)} windows |")
 

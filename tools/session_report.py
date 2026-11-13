@@ -40,6 +40,11 @@ ms, and the windows with the longest frames are listed with what else
 happened in them. The first sessions' logs (3DS-D2-E) had the frame
 thread's read wait in place of wait, ready, host and heartbeat, and a ready
 time that included much of its own running.
+
+The sites the frame thread waited longest from are guest return addresses.
+They are named by the function they are in, where d2decomped's function list
+(the third_party/d2d submodule) knows it and a native or d2d names it (issue
+#107, tools/game_names.py): `0x5ff5f3` (in SpriteCacheTouch +0x43).
 """
 import argparse
 import collections
@@ -50,6 +55,7 @@ import statistics
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import game_names  # noqa: E402
 import profile_windows  # noqa: E402
 
 PROF = re.compile(r"prof: (\d+) ms, frames (\d+), idle (\d+) ms, switches (\d+), cache syncs (\d+) \((\d+) us\)")
@@ -170,6 +176,23 @@ def parse(path):
     return rows
 
 
+NAMES = None   # game_names.Names, loaded by main()
+
+
+def sites(text):
+    """The wait sites ("0052f7a2:350 ...") with the functions they are in."""
+    if NAMES is None:
+        return text
+    out = []
+    for pair in text.split():
+        addr, _, ms = pair.partition(":")
+        try:
+            out.append(f"{NAMES.label(int(addr, 16), code=False)}:{ms}")
+        except ValueError:
+            out.append(pair)
+    return " ".join(out)
+
+
 def pct(values, p):
     s = sorted(values)
     return s[min(len(s) - 1, int(len(s) * p))] if s else 0.0
@@ -254,7 +277,7 @@ def report(rows):
                       (f"   | {r['ft_run']:18d} {r['ft_ready']:5d} {r['ft_host']:5d} {r['ft_sleep']:5d} "
                        f"{r['ft_critsec']:7d} {r['ft_event']:5d} {r['ft_fileio']:6d} "
                        f"{r['ft_multi'] + r['ft_thread'] + r['ft_other']:5d}"
-                       if sampled else "") + (f"  {r['ft_sites']}" if r["ft_sites"] else ""))
+                       if sampled else "") + (f"  {sites(r['ft_sites'])}" if r["ft_sites"] else ""))
             n = sum(r["ms"] for r in timed) or 1
             print(f"  all play: waited {sum(r['wait_ms'] for r in timed) / n:.1%} of the time "
                   f"(frame thread {sum(r['wait_frame_ms'] for r in timed) / n:.1%}), stalled "
@@ -313,6 +336,8 @@ def main():
     ap.add_argument("--windows", choices=profile_windows.KINDS,
                     help="only these windows (tools/profile_windows.py): fights, quiet play, play, area loads")
     args = ap.parse_args()
+    global NAMES
+    NAMES = game_names.Names()
     rows = parse(args.log)
     if args.windows:
         rows, how = profile_windows.select(rows, args.windows)

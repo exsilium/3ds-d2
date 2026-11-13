@@ -43,14 +43,27 @@ struct PortOptionInfo {
     const char *note;    // under it: what it does
 };
 
+// In the OPTIONS page's order (issue #97): the drawing and the screen's
+// timing together, then the reading. settings.txt names them, so the order
+// is the page's only.
 inline constexpr PortOptionInfo kPortOptions[] = {
     {kPortCore2Draw, "core2draw", "draw on core 2", "floor and frame copy on core 2"},
     {kPortScreen50, "screen50", "screen at 50 Hz", "each frame 40 ms on the screen"},
+    {kPortFrameLock, "framelock", "frame lock at 50 Hz", "game frames timed by the screen"},
     {kPortNativeDcc, "dcc", "native sprite decoder", "new sprites decoded off core 0"},
-    {kPortFrameLock, "framelock", "frame lock at 50 Hz", "the game's frames timed by the screen"},
     {kPortTilePrefetch, "tiles", "read tiles ahead", "tiles near the player read on core 2"},
 };
 inline constexpr int kPortOptionCount = sizeof kPortOptions / sizeof kPortOptions[0];
+
+// The page draws a label and its note from x = 32 in the 8-pixel font: 36
+// characters fit on the 320-pixel screen (issue #97: a 37th was cut off).
+constexpr bool port_text_fits(const char *t, int n = 0) { return *t ? port_text_fits(t + 1, n + 1) : n <= 36; }
+constexpr bool port_options_fit(int i = 0)
+{
+    return i == kPortOptionCount ||
+           (port_text_fits(kPortOptions[i].label) && port_text_fits(kPortOptions[i].note) && port_options_fit(i + 1));
+}
+static_assert(port_options_fit(), "an OPTIONS label or note is longer than the 36 characters the page shows");
 inline constexpr uint32_t kPortDefault = kPortCore2Draw | kPortScreen50 | kPortNativeDcc | kPortTilePrefetch;
 inline constexpr uint32_t kPortAll = kPortCore2Draw | kPortScreen50 | kPortNativeDcc | kPortFrameLock | kPortTilePrefetch;
 // The options of the first "port=" lines, which named only those on.

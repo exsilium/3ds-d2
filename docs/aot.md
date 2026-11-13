@@ -15,7 +15,7 @@ All counts are for 1.14d's Game.exe, measured on 2026-11-13.
 | `.text` | 2,928,640 bytes at `0x401000`–`0x6cc000` | the PE headers |
 | Function starts, ours | 13,170 | `tools/profile_report.py`'s `Binary` (call targets, relocated pointers, the natives' sites) |
 | Functions with sizes, d2d's | 13,048, 2,600,618 bytes in all (median 106 bytes, the largest 15,513) | `third_party/d2d/docs/research/re/game-functions.tsv` at `0a70175` |
-| In both lists / only ours / only d2d's | 11,365 / 1,805 / 1,683 | the two lists compared by start address (a first look; #107 reports it properly) |
+| In both lists / only ours / only d2d's | 11,365 / 1,805 / 1,683 | `tools/function_starts.py` (#107) |
 | Instructions in d2d's functions | 878,540 (2.96 bytes on average) | linear disassembly with Capstone, function by function |
 | Direct calls, indirect calls, `ret`s | 72,481 / 4,622 / 22,243 | the same pass |
 | Indirect `jmp`s, of them through a `[reg*4 + table]` | 710 / 550 | the same pass |
@@ -47,7 +47,8 @@ The recompiler needs to know where functions start, where they end, and which by
   - The other 5,926 relocated words in `.text` that point into `.text` are mostly switch-table entries (below). They are jump targets inside a function, not function starts.
 - **d2d's list (#107).** Its 13,048 functions come with sizes, which our finder doesn't have. The recompiler reads `game-functions.tsv` from the submodule at build time when it is there. It never copies it into our tree.
 - **What the game was seen to run.** The lane's block counts (`WX86_HOTPROF`) and Box86's jump tables after a session list the entry points that actually ran, indirect targets included.
-- **The cross-check.** A start that only one source has is reported (#107's list), and checked by hand while the coverage grows (#115).
+- **The cross-check.** A start that only one source has is reported (`tools/function_starts.py`, #107), and checked by hand while the coverage grows (#115).
+  - Of d2d's 1,683 starts that ours lacks, 245 are reached through a relocated pointer in a `mov [mem], imm32`, which our finder doesn't take yet, and 185 only by a `jmp`. The recompiler's finder should take both.
 
 **Switch tables and data in the code.** MSVC puts a switch's jump table (and sometimes a byte index table before it) in `.text`, right after the function. The 550 `jmp [reg*4 + table]` instructions are those switches.
 - The recompiler reads each table's entries through its relocations. It bounds the table by the `cmp`/`ja` that guards the index.

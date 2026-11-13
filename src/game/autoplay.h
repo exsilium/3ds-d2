@@ -4,6 +4,7 @@
 //   <ms> tap <x> <y>       put the cursor on game pixel x,y and click it (A, the
 //                          left button, for 100 ms) 300 ms later; every tap waits
 //                          so: a slow frame rate still sees the spot hovered
+//   <ms> hover <x> <y>     put the cursor on game pixel x,y, without a click
 //   <ms> touch <x> <y> [ms] touch the bottom screen at x,y (its pixels) for ms (100)
 //   <ms> press <button>    hold a button: A B X Y L R ZL ZR START SELECT UP DOWN LEFT RIGHT
 //   <ms> release <button>

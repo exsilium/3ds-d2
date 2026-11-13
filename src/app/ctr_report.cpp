@@ -486,15 +486,17 @@ void draw_offer(const Offer &o)
             std::printf("\x1b[36m  ...\x1b[0m\n");
     }
     // The last action's outcome; once sent, Sentry's ID for it.
-    draw_status(!o.status.empty() || o.state != "sent" ? o.status : "Sent. Sentry's event ID: " + o.event_id);
+    draw_status(!o.status.empty() || o.state != "sent" ? o.status : "Sent. Sentry's event ID:\n" + o.event_id);
     if (o.state == "sent")
         draw_keys({{"SELECT", "delete"}, {"B", "back to the list"}});
     else if (o.state.empty())
-        draw_keys({{"A", "send"}, {"Y", "edit description"}, {"R", asked_for(o) ? "edit title" : "edit topic"},
-                   {"L", "screenshots"}, {"X", "don't send"}, {"SELECT", "delete"}, {"B", "back to the list"}});
+        draw_keys({{"A", "send"}, {"Y", "edit description"}, {"L", "screenshots"},
+                   {"R", asked_for(o) ? "edit title" : "edit topic"}, {"X", "don't send"}, {"SELECT", "delete"},
+                   {"B", "back to the list"}});
     else
-        draw_keys({{"A", "send"}, {"Y", "edit description"}, {"R", asked_for(o) ? "edit title" : "edit topic"},
-                   {"L", "screenshots"}, {"SELECT", "delete"}, {"B", "back to the list"}});
+        draw_keys({{"A", "send"}, {"Y", "edit description"}, {"L", "screenshots"},
+                   {"R", asked_for(o) ? "edit title" : "edit topic"}, {"SELECT", "delete"},
+                   {"B", "back to the list"}});
 }
 
 // The game's own keyboard on the bottom screen: when the system's keyboard
@@ -1033,8 +1035,14 @@ bool post(const Host &host, const game::report::Dsn &dsn, const std::string &bod
         if (end != std::string::npos && end - id - 6 <= 32)
             event_id = printable(answer.substr(id + 6, end - id - 6));
     }
-    say(host, "report: " + url + " (" + std::to_string((body.size() + 1023) >> 10) + " KiB, " +
-                  std::to_string(took_ms) + " ms): " + msg + (event_id.empty() ? "" : " Event " + event_id + "."));
+    // The bottom screen's lines hold 39 characters: the outcome, then the
+    // event ID on a line of its own.
+    say(host, "report: " + msg + " (" + std::to_string((body.size() + 1023) >> 10) + " KiB, " +
+                  std::to_string(took_ms) + " ms)");
+    if (!event_id.empty()) {
+        say(host, "Sentry's event ID:");
+        say(host, "  " + event_id);
+    }
     return answered && status == 200;
 }
 
@@ -1054,9 +1062,13 @@ bool confirm_sent(const Offer &o, const std::string &event_id)
             std::printf("%s\n", l.c_str());
         std::printf("\n");
     }
-    std::printf("Its files stay on the SD card:\n");
-    for (const std::string &l : wrap(o.dir.substr(o.dir.find(':') + 1), 47))
-        std::printf("  %s\n", l.c_str());
+    // The folder on two lines (the reports folder, then the report's own
+    // name): on one, its last characters went to a line of their own.
+    std::printf("Its files stay on the SD card, in\n");
+    const std::string path = o.dir.substr(o.dir.find(':') + 1);
+    const size_t slash = path.rfind('/');
+    std::printf("  %s\n", path.substr(0, slash + 1).c_str());
+    std::printf("  %s\n", path.substr(slash + 1).c_str());
     draw_keys({{"A", "continue"}});
     while (aptMainLoop()) {
         hidScanInput();
@@ -1122,10 +1134,22 @@ bool send(const Host &host, Offer &o, const game::report::Dsn &dsn, std::string 
 
 // One report's screen, until B. False: the app is closing. `sent`: it was
 // sent from here; `status`: what the list says about it afterwards.
+// Set by offer_one: the next load_offer, the session just kept, is timed
+// into its game.log (issue #96).
+bool g_time_load = false;
+
 bool detail(const Host &host, const game::report::Dsn &dsn, const std::string &dir, bool &sent, std::string &status)
 {
     sent = false;
+    const uint64_t t0 = osGetTime();
     Offer o = load_offer(dir);
+    if (g_time_load) {
+        g_time_load = false;
+        if (FILE *f = std::fopen((dir + "/game.log").c_str(), "a")) {
+            std::fprintf(f, "[rt] report: preparing it: read for the report %u ms\n", (unsigned)(osGetTime() - t0));
+            std::fclose(f);
+        }
+    }
     bool redraw = true;
     while (aptMainLoop()) {
         if (redraw) {
@@ -1385,15 +1409,46 @@ std::string keep_unclosed_session()
 
 // After the game, with game.log closed: a copy of the session's logs, for
 // `reason`. Returns the folder.
-std::string keep_session(const char *reason)
+// "412 KiB", "3.2 MiB".
+std::string size_text(uint64_t bytes)
+{
+    char t[24];
+    if (bytes < (1u << 20))
+        std::snprintf(t, sizeof t, "%u KiB", (unsigned)((bytes + 1023) >> 10));
+    else
+        std::snprintf(t, sizeof t, "%.1f MiB", bytes / 1048576.0);
+    return t;
+}
+
+// The session's files into a report folder. Each copy is said on the
+// bottom screen (a long run's traces take a while on the SD card), and the
+// steps' times go at the end of the report's game.log (issue #96), with
+// `before_ms`, the app's own closing before this.
+std::string keep_session(const Host &host, const char *reason, uint32_t before_ms)
 {
     std::fflush(stderr);
     const std::string dir = make_report_dir(unix_now(), D2_BUILD_ID);
-    copy_file(std::string(kLogDir) + "/game.log", dir + "/game.log");
-    copy_file(std::string(kLogDir) + "/stderr.txt", dir + "/stderr.txt");
-    copy_file(std::string(kLogDir) + "/sprites.trc", dir + "/sprites.trc");
-    copy_file(std::string(kLogDir) + "/files.trc", dir + "/files.trc");
-    copy_file(std::string(kLogDir) + "/frames.trc", dir + "/frames.trc");
+    std::string times = "[rt] report: preparing it: closing the session " + std::to_string(before_ms) + " ms";
+    uint64_t total = 0;
+    const uint64_t t0 = osGetTime();
+    for (const char *name : {"game.log", "stderr.txt", "sprites.trc", "files.trc", "frames.trc"}) {
+        const std::string from = std::string(kLogDir) + "/" + name;
+        struct stat st;
+        if (stat(from.c_str(), &st) != 0)
+            continue;
+        say(host, std::string("Copying ") + name + ", " + size_text((uint64_t)st.st_size) + "...");
+        const uint64_t t = osGetTime();
+        copy_file(from, dir + "/" + name);
+        total += (uint64_t)st.st_size;
+        times += std::string(", ") + name + " " + size_text((uint64_t)st.st_size) + " " +
+                 std::to_string(osGetTime() - t) + " ms";
+    }
+    const uint64_t took = osGetTime() - t0;
+    say(host, "Copied " + size_text(total) + " in " + std::to_string((took + 500) / 1000) + " s.");
+    if (FILE *f = std::fopen((dir + "/game.log").c_str(), "a")) {
+        std::fprintf(f, "%s\n", times.c_str());
+        std::fclose(f);
+    }
     write_all(dir + "/report.txt", std::string("reason=") + reason + "\nbuild=" + D2_BUILD_ID + "\n");
     prune_reports();
     return dir;
@@ -1406,6 +1461,8 @@ bool offer_one(const Host &host, const std::string &dir)
 {
     if (!have_dsn())
         return true;
+    say(host, "Reading the session for the report...");
+    g_time_load = true;
     return manage(host, dir);
 }
 

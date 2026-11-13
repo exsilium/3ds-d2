@@ -288,7 +288,7 @@ struct Host {
 std::string start_line();
 const char *closed_line();
 std::string keep_unclosed_session();
-std::string keep_session(const char *reason);
+std::string keep_session(const Host &host, const char *reason, uint32_t before_ms);
 bool enabled();
 bool offer_one(const Host &host, const std::string &dir);
 bool offer_pending(const Host &host);
@@ -317,12 +317,14 @@ uint32_t g_pal_wide[256];
 
 // ---- bottom screen -------------------------------------------------------------------
 //
-// Until the game shows its first frame: two console windows, statistics
-// (rows 0-10) and the startup messages (rows 12-29). From then on the bottom
+// Until the game shows its first frame: one console, the startup messages,
+// on the whole bottom screen from its top (issue #98; it had a statistics
+// window above, which nothing wrote to any more). From then on the bottom
 // screen is game::SecondScreen's (second_screen.h), drawn in pixels with
-// each frame; the statistics and messages become its INFO tab.
+// each frame; the messages become its INFO tab. The game's end and a fatal
+// message bring the console back (console_again).
 
-PrintConsole g_stats_con, g_log_con;
+PrintConsole g_log_con;
 game::SecondScreen g_ss;
 game::Osk g_osk;
 bool g_ss_active = false;    // the second screen owns the bottom framebuffer
@@ -660,13 +662,11 @@ void console_again()
         g_bottom_double = false;
         g_bottom_shown = nullptr;
         u16 *fb = (u16 *)gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, nullptr, nullptr);
-        g_stats_con.frameBuffer = g_log_con.frameBuffer = fb;
+        g_log_con.frameBuffer = fb;
     }
     // All of it: the consoles' clears left the bottom row of the second
     // screen's last picture (MAP's corner button) showing.
     std::memset(g_log_con.frameBuffer, 0, 320 * 240 * sizeof(u16));
-    consoleSelect(&g_stats_con);
-    consoleClear();
     consoleSelect(&g_log_con);
     consoleClear();
 }
@@ -2364,10 +2364,7 @@ int main()
 #endif
     osSetSpeedupEnable(true);   // New 3DS: 804 MHz and the L2 cache
     gfxInit(GSP_RGB565_OES, GSP_RGB565_OES, false);
-    consoleInit(GFX_BOTTOM, &g_stats_con);
-    consoleInit(GFX_BOTTOM, &g_log_con);
-    consoleSetWindow(&g_stats_con, 0, 0, 40, 12);
-    consoleSetWindow(&g_log_con, 0, 13, 40, 17);
+    consoleInit(GFX_BOTTOM, &g_log_con);   // all 40 x 30 of it: text from the top, scrolling once full
     consoleSelect(&g_log_con);
     g_ss.set_keyboard(&g_osk);
     mkdir("sdmc:/3ds", 0777);
@@ -2683,13 +2680,24 @@ int main()
                       : g_ss.report_requested()    ? "asked for by the player"
                       : g_prof_used                ? "a profiler run"
                                                    : nullptr;
+    // What follows can take a minute or two (a long run's traces copied on
+    // the SD card, then read for the report): said on the bottom screen, so
+    // that it doesn't look like a hang (issue #96).
+    const bool reporting = why && report::enabled();
+    if (reporting) {
+        status("Preparing the report. This can take a");
+        status("minute or two; please wait.");
+    }
+    const uint64_t closing_ms = osGetTime();
     close_log();
 #ifdef D2_CIA
     give_back_arena();
 #endif
-    if (why && report::enabled()) {
-        const std::string dir = report::keep_session(why);
-        if (!report::offer_one(report_host(game_dir), dir)) {
+    if (reporting) {
+        const report::Host host = report_host(game_dir);
+        const std::string dir =
+            report::keep_session(host, why, (uint32_t)(osGetTime() - closing_ms));
+        if (!report::offer_one(host, dir)) {
             gfxExit();   // closing: offered again at the next start
             return 0;
         }

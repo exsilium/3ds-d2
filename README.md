@@ -108,7 +108,7 @@ If the app shows "Game.exe ... is not Diablo II 1.14d" or "... is from a Diablo 
 
 ### Problem reports
 
-If 3ds-d2 crashes (Luma3DS shows its exception screen), the next start keeps that session's `game.log`, `stderr.txt` and the Luma3DS crash dump in `/3ds/3ds-d2/reports/<time>-<build>/` before anything is overwritten. The top screen then shows the report and asks whether to send it. It does the same after a session that ended on a fatal error, after a session in which you tapped **report a problem** at the bottom of the INFO tab, and after a session with a **profiler run** (INFO's other button: a checklist of measurements to run, see [docs/controls.md](docs/controls.md#bottom-screen)). The report is made only after the game has ended, never while you play.
+If 3ds-d2 crashes (Luma3DS shows its exception screen), the next start keeps that session's `game.log`, `stderr.txt` and the Luma3DS crash dump in `/3ds/3ds-d2/reports/<time>-<build>/` before anything is overwritten. The top screen then shows the report and asks whether to send it. It does the same after a session that ended on a fatal error, after a session in which you tapped **report** at the bottom of the INFO tab, and after a session with a **profiler run** (INFO's other button: a checklist of measurements to run, see [docs/controls.md](docs/controls.md#bottom-screen)). The report is made only after the game has ended, never while you play.
 
 The screen lists what would be sent:
 

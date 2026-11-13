@@ -288,7 +288,7 @@ struct Host {
 std::string start_line();
 const char *closed_line();
 std::string keep_unclosed_session();
-std::string keep_session(const char *reason);
+std::string keep_session(const Host &host, const char *reason, uint32_t before_ms);
 bool enabled();
 bool offer_one(const Host &host, const std::string &dir);
 bool offer_pending(const Host &host);
@@ -2683,13 +2683,24 @@ int main()
                       : g_ss.report_requested()    ? "asked for by the player"
                       : g_prof_used                ? "a profiler run"
                                                    : nullptr;
+    // What follows can take a minute or two (a long run's traces copied on
+    // the SD card, then read for the report): said on the bottom screen, so
+    // that it doesn't look like a hang (issue #96).
+    const bool reporting = why && report::enabled();
+    if (reporting) {
+        status("Preparing the report. This can take a");
+        status("minute or two; please wait.");
+    }
+    const uint64_t closing_ms = osGetTime();
     close_log();
 #ifdef D2_CIA
     give_back_arena();
 #endif
-    if (why && report::enabled()) {
-        const std::string dir = report::keep_session(why);
-        if (!report::offer_one(report_host(game_dir), dir)) {
+    if (reporting) {
+        const report::Host host = report_host(game_dir);
+        const std::string dir =
+            report::keep_session(host, why, (uint32_t)(osGetTime() - closing_ms));
+        if (!report::offer_one(host, dir)) {
             gfxExit();   // closing: offered again at the next start
             return 0;
         }

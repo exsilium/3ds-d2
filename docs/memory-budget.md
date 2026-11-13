@@ -521,3 +521,147 @@ The memory was never the cause. One diagnostic build at a time (each on its own 
 | `7822fd1577fb` | 2 ms of integer work per packet in the decoder's place | 4/4 fine with 30 s of video |
 
 So the trigger was the soundtrack decoder's floating point on the game's thread, in game. Its memory use was clean (AddressSanitizer and UndefinedBehaviorSanitizer over the whole Act II file), and the heap was never short (`heap_refused` 0, 3 MiB free). The audio decoder is now fixed point ([cinematics.md](cinematics.md#decoder-correctness)). What links floating point to page tables found damaged across the system was not found.
+
+### The JIT's records outgrow the host heap (issue #24, 3DS-D2-12, 2026-11-06)
+
+After 1 h 47 min of play with the profiler on (sprites, guest code, file reads), the game ended in the Rocky Waste: `FATAL: abort() called from 0055bfe0`. That address is `std::terminate`, and the registers held `std::bad_alloc`'s vtable. A C++ `new` in the heartbeat's guest-code report had found no memory. Growth of the heap was never refused (`heap refused 0`): newlib's malloc had used up the heap's window, not been refused more.
+
+Box86 keeps a record (`dynablock_t`) for every translated block, in its own 64 KiB blocks taken from the host heap (`meta=` on the heartbeat). They are freed only when their blocks are, and nothing frees blocks while the JIT pool has room (#23). Over the session:
+
+| t (s) | meta (KiB) | jitused (KiB) | host heap free (KiB) | room above the top (KiB) |
+| --- | --- | --- | --- | --- |
+| 260 | 2,240 | 7,575 | 2,004 | 776 |
+| 1,754 | 2,432 | 8,256 | 2,859 | 1,972 |
+| 3,032 | 3,584 | 12,099 | 1,508 | 588 |
+| 5,783 | 4,032 | 13,428 | 1,034 | 104 |
+| 6,362 | 4,096 | 13,744 | 941 | 48 |
+
+`meta=` grew by 1.6 MiB in the session's second hour. The rest of the host's use moved by 0.3 MiB. The profiler's own buffers come to about 200 KiB.
+
+What the app does since then:
+
+- **A reserve for the app:** before box86 takes a new 64 KiB block for a block's record, it asks the app (`d2rt_meta_may_grow`, patch 0058). The app refuses while less than **1 MiB** of host heap would be left. That covers what it allocates while the game runs: the heartbeat's and the profiler's tables, the bottom screen's strings, and the trace and report buffers, tens of KiB each. The report's pictures at the game's end come after the guest arena is given back.
+- **Refused, the JIT evicts:** the refusal takes box86's existing eviction path (D2Vita's: retire a wave of blocks from the jump tables, free them once no thread can still be in them, retranslate on demand), whose freed records are reused. Two fixes made it work under this port's cooperative scheduler: DynaRun leaves and retries on a refused record as it does on a refused translation (it killed the thread before), and it leaves as a preemption (`dyn86_bbreak`), because `CpuBox86::run()` takes a plain `quit` for the thread's end.
+- **Logged:** `host heap: JIT records held at the 1024 KiB reserve (<n> refusals), heap <h> KiB free, room <r> KiB` the first time, then at most once a minute while it goes on. The JIT's own `JIT eviction:` lines are in `stderr.txt`.
+- **Cinematics:** a video that cannot have its buffers (about 2 MiB) is skipped, `cinematic: no host memory for it, skipped`, instead of ending the game.
+
+On the Linux lane, `M4_META_CAP_KB=<n>` holds the records at n KiB to run the same path. At 1,280 KiB (the lane reaches about 2 MiB uncapped), `fight.txt` ran its whole route in the same 2,987 frames as without the cap, with 3,072 eviction rounds and 1.57 million blocks freed. `act2-east.txt` reached Act II with 6,144 rounds. No thread died and the use-after-free check found nothing. On the console the records would have reached the reserve after about 50 minutes of 3DS-D2-12's session, and grow slowly after that, so rounds should be rare. The cost per round on the console is still to be measured.
+
+
+### The cache held at its minimum: 1 frame per second in the Halls of the Dead (issue #24, 3DS-D2-10, 2026-11-07)
+
+Build `c082bfe0e4ff`, profiler on (sprites, guest code, file reads), 40 minutes into Act II. In the Halls of the Dead the game fell to 9 to 12 frames per 10 s and stayed there for three minutes, until the player saved and quit. The game did not crash. Sentry event `d8dbc19e41875bcce3636f4f11dfb3a5`.
+
+The heartbeats:
+
+| t (s) | frames / 10 s | cache used / limit (KiB) | pool free (KiB) | sprites in / 10 s | decode wait (ms) |
+| --- | --- | --- | --- | --- | --- |
+| 800 | | 12,834 / 4,096 | 4,968 | | the spare taken: limit to the minimum |
+| 990 | | | 14,623 | | the spare emptied: the first raise, 256 KiB |
+| 1,932 | 190 | 12,370 / 12,374 | 3,806 | 11 | 63 |
+| 2,190 | | / 4,096 | 5,233 | | the spare taken again (10 requests), 1,024 KiB of it still in use |
+| 2,252 | 14 | 4,093 / 4,096 | 11,899 | 592 | 4,899 |
+| 2,412 | 11 | 4,106 / 4,096 | 12,000 | 586 | 4,765 |
+
+The governor read "a request was served from the spare" from whether the spare *held* anything. So it set the minimum again on every heartbeat for as long as anything stayed in the spare. The first time, the spare emptied after 190 s. The second time, it never did. The cache sat at 4 MiB with 12 MiB of the pool free, and the area's working set was about 12 MiB. Each 10 s the game decoded about 550 sprites again (3.5 to 4.4 s of decoding) and its drawing thread waited for them for 4.5 to 5 s. Even after the first episode, raising the limit one 256 KiB step per heartbeat took 9 minutes (t = 990 to 1,542 s) to get from 4 to 12.8 MiB, with re-decodes all along.
+
+Memory was not short. The spare was taken because the pool was fragmented: 5.2 MiB free, but its largest piece was 801 KiB. The JIT's records (`meta=`) were at 3.7 MiB with 1.1 to 1.4 MiB of host heap free, just above the 1 MiB reserve, so 3DS-D2-12's limit had not acted yet.
+
+Changes:
+
+- **The spare cuts the cache once per new request.** The heartbeat compares the spare's count of requests with the last heartbeat's. A new one sets the cache to the minimum, as before. A request still sitting in the spare holds nothing back.
+- **Raises by half of what the pool has over the reserve**, in 256 KiB steps and at least one (it was one step per heartbeat). If the cache fills each raise, the pool still stays above the reserve. From the minimum with 12 MiB free, the limit reaches about 9.5 MiB (where the pool sits at the reserve, as before the cut) in five heartbeats, not 22.
+
+Not changed: the pool's fragmentation, which is what makes the spare necessary in the first place.
+
+### Act I on 3DS-D2-B's route: the pool's pieces and the SD card's writes (issues #44, #70, #71, #72, 3DS-D2-13, 2026-11-07)
+
+A 30-minute profiled run from the Rogue Encampment to the Stony Field on build `a30f32516b7d`, which logs the pool's pieces at a spare take (#70) and the heartbeat's steps (#71).
+
+**The pool.** 6 sprite-frames fallbacks and 4 spare takes, at t = 470–480 s and 980–990 s. In 3DS-D2-B, on the same route, the spare was never used. At each of them the pool had 4–8 MiB free, but in 40–46 pieces of 64–256 KiB, none larger than 256 KiB. The requests were 247–396 KiB. The game's pool system (`0x409687`, ~210 blocks of 128 KiB) and the frames allocator (`0x60c108`, ~160 blocks) hold most of the VA, and their freed blocks leave holes of their own sizes. Four groups over 256 KiB went to the C heap; one of them, the Brute's death group (396,203 bytes), took the spare. Two requests of 247 and 253 KiB were refused while a 256 KiB piece was free: `rt::va_alloc` asked for 64 KiB to spare in case the piece was misaligned. It now asks the pool's own question (`src/runtime/pool_fit.h`, checked against `GuestRegion` by `scripts/docker.sh test pool`).
+
+Every request the spare served was a group of sprite frames over 256 KiB (258–396 KiB, three in it at once: 1152 KiB in 64 KiB granules). The governor runs the pool down to its 6 MiB reserve by design, so the free space left is whatever the churn of 128 KiB pool blocks and 64–256 KiB frames blocks leaves between live ones. Now 1.5 MiB (2 MiB since 3DS-D2-15) of the pool is set aside at the start as a zone for VirtualAlloc blocks over 256 KiB (`rt::RunOptions::pool_large`, `game::kCtrPoolLarge`): `rt::va_alloc` serves those from it first, then from the pool as before. Nothing smaller goes there, so nothing can cut it up. To the governor the zone is used space, so its 6 MiB reserve stays in the rest of the pool and the cache holds at most 1.5 MiB less. Counting the zone's free bytes would have let the rest of the pool run down to ~4.5 MiB, where 3DS-D2-13's fallbacks came. `pool large zone:` lines say what it holds, at a heartbeat after it served a block, and with the pool's pieces.
+
+**The heartbeat** took 246 ms at the median while profiling. Of that, 213 ms was writing about 11 KiB of game.log to the SD card, about 20 ms per KiB, and one write took 2.4 s. Formatting the profile's lines took 9 ms. A line logged in play carried the buffered lines with it: every one of the 23 heartbeats whose memory step took over 100 ms had logged a line straight to the card. Since then game.log, the sprite trace and the file trace go through rings in memory, written by a thread of their own on the drawing core (`src/app/ctr_writer.h`). The game's threads only copy. With the profiler on, an `sd writes:` line per heartbeat gives each file's bytes, writes, time and anything dropped.
+
+**3DS-D2-14 (2026-11-08)**, 34 minutes of Act II on build `aabb80dfb3dc`, the first with the large-block zone and the SD writer:
+
+- *The pool.* No sprite frames went to the pool system (6 in 3DS-D2-13). The zone served 12 blocks of 320–448 KiB; 11 more found it full (4 blocks of 320 KiB in it) and came from the pool. The spare was taken once, at t = 1307 s: a 318 KiB heap block of the game's own during an area load, with 3.4 MiB of the pool free and no piece over 320 KiB. The zone serves only VirtualAlloc blocks.
+- *"Ran out of memory" was the zone's.* Its misses went through the pool's failure handler, which counted them as refused requests: the session ended with "11 requests refused" and none had been. The handler now leaves the zone out.
+- *The SD card ended the session.* A write cost the card 10–13 ms whatever its size, and the writer made ~70 small ones every 10 s. From t ≈ 1260 s single writes took 1–3 s, from t ≈ 1677 s 9–14 s, and the game's file reads waited behind them (a frame of 6.7 s, heartbeats 20–30 s apart). The writer now writes a file in batches of 16 KiB, or 5 s after its last write: a few writes every 10 s.
+- *game.log after a HOME suspend* was reopened in append mode, and each of its writes cost 55–90 ms from then on (newlib seeks to the end and libctru asks the FS for the size, on every write). It is now reopened read-write at its end; the traces' second runs too.
+
+**3DS-D2-15 (2026-11-08)**, 53 minutes of Act II on build `80ed77cf324f`, played to the end at 25 fps with 2–3 SD writes per file every 10 s:
+
+- *The spare was taken 6 times*, each by one of the game's own heap blocks (282–533 KiB) at an area load, while the pool had 1.8–4.5 MiB free in pieces of at most 260–448 KiB; once by a VirtualAlloc block of exactly 256 KiB. Each take cut the sprite cache's limit to 4 MiB, and filling it again was a 1–2 s hitch. The zone held up to four 320 KiB frames blocks at once (1280 of its 1536 KiB), so 34 of 85 frames groups over 256 KiB came from the pool.
+- *Now:* the game's heap blocks over 256 KiB that no free piece of the pool holds (`rt::pool_fits_bottom`, the heap face's rule as `pool_fits_top` is the VirtualAlloc face's) take the zone before the spare. rt registers its own HeapAlloc, HeapReAlloc, HeapFree and HeapSize after WinVita's for that. A heap block the pool does hold stays there, so the game's long-lived blocks don't keep the zone from the frames. The zone is 2 MiB: four frames blocks and one heap block.
+- *The writer* chased a busy trace at the game's exit: once a file was due it wrote what came in meanwhile too, 196 writes of ~150 B in 10 s. It now writes up to what was queued when it found the file due.
+
+**The sprite trace** cost 4.07 ms of a fight frame with its hooks in line (6.16 through the Bridge). Its use hook is now served without the GIL, as the lock calls are (#48), and takes the time from the game's own clock (`rt::tick_ms`) instead of a host clock read (~1 µs on the console) per use. On the lane (`fight.txt`) the trace's records are byte for byte the same, and the stub's share of the main thread's samples went from 3.6% (shim time included) to 0.8%.
+
+## Where the application memory goes (3DS-D2-1C, 2026-11-12)
+
+This is the split of the New 3DS's 124 MiB application region in play. The figures come from 3DS-D2-1C's second event (build `03a4d1656aea`, t = 400 s) and from the app's ELF (`dist/cia/*.elf`, the sections and the `.bss` symbols).
+
+| Part | Size | What's in it |
+| --- | --- | --- |
+| Main heap at `0x08000000` | 95.0 MiB | The kernel maps no more: its heap window ends at `0x0E000000` |
+| Linear heap | 3.75 MiB | Framebuffers, sound, and the first jump tables (1,792 KiB then); 990 KiB free |
+| The app's image | 25.2 MiB | `.text` 4.6 MiB, `.rodata` 0.2 MiB, `.bss` 19.7 MiB |
+| Unclaimed | 420 KiB | |
+
+**The main heap**:
+
+| Part | Size | Notes |
+| --- | --- | --- |
+| Guest arena (`ctr-game-n3-heap`) | 75.0 MiB | Fixed at start: Game.exe and the low 12 MiB, the game's heap face (8.4 MiB in use, peak 9.5) and its VirtualAlloc face (48.5 MiB, peak 49.4) of one pool, 4.2 MiB free. The sprite cache (12–16 MiB, frames blocks 13.1 MiB here), the 2 MiB spare and the 2 MiB large-block zone are in the VirtualAlloc face. |
+| Jump tables outside linear memory | 10.0 MiB | Box86's second-level tables, 256 KiB each, 12 MiB in play. Each holds one entry per byte of a 64 KiB stretch of guest code, about 3 MiB of Game.exe. |
+| JIT records (`meta=`) | 3.1 MiB | They grow through a session (4 MiB after 1 h 46 in 3DS-D2-12). Held at the 1 MiB reserve (issue #24). |
+| The port's own (newlib malloc) | ~5.8 MiB | The read cache (up to 1 MiB), the tile prefetch store (1 MiB in that build), the native decoder's two scratch buffers (~0.5 MiB each), sound, the second screen, the writers' rings, the profiler's and the logs' tables. Not measured one by one. |
+| Free | ~1 MiB | 0.9–1.1 MiB, the heap's room to grow 8–80 KiB |
+
+**The `.bss`**, its largest symbols:
+
+| Symbol | Size | What it is |
+| --- | --- | --- |
+| `dyn86_ctr_jitpool` | 16 MiB | The translated code's pool (`src/app/ctr_game.cpp`) |
+| `static_insts` | 896 KiB | Box86's scratch while translating a block |
+| `weight.5` | 512 KiB | A function-static table in the backend; not identified yet |
+| `g_hp_addr`, `g_hp_count` | 256 KiB each | Probably the profiler's hot-path tables; not checked |
+| `idx.4` | 256 KiB | Not identified yet |
+| `mi_vbuf` | 256 KiB | The memory intrinsics' verify buffer (`dyn86_memintrin.c`) |
+| `box86_jmptbl`, `box86_jmptbl_default` | 256 KiB each | The first-level jump tables |
+
+**The heap's last MiB is shared.** The JIT's records stop growing at the 1 MiB reserve, and the JIT then evicts code to reuse records. With the tile prefetch's store taken from the heap (1 MiB, one allocation per range), 3DS-D2-1C's second event hit the reserve 12 times. Its first event and 3DS-D2-1A/1B never did. The heap's room fell to 8 KiB, against 1.5–2.5 MiB before.
+
+**What changed (issue #89, build `9bd7e09077c9`):**
+- The JIT pool went from 16 to 14 MiB. Box86 takes it in 2 MiB chunks, so 15 MiB would have used 14 anyway.
+  - **When the pool is full** (issue #23): in #23's 3 h 51 min Act I session, the chunks opened (`jit=`) reached 14 MiB at t ≈ 1,706 s and 16 MiB at t ≈ 10,310 s. At 14 MiB, a session like that fills the pool after about half an hour. 3DS-D2-12 had 13.7 MiB of code in use after 1 h 46, accumulated over many areas.
+  - **The backend's policy:** it refuses the chunk, retires waves of up to 512 blocks, frees them after a grace period, and translates again. After 24 rounds that free nothing, the thread dies with a named error.
+  - **The lane** (`fight.txt` on the virtual clock, 5,077 frames, 7.2 MiB of code in use unbounded, `D2_JITFAILAFTER`):
+    - bounded at 6 MiB, every frame was the same as an unbounded run, in the same wall time (248 against 250 s);
+    - bounded at 4 MiB, it ran the whole route and drew correctly, but took 6.3 times the wall time, and the frames differed from frame 896.
+    - Two unbounded runs can also differ (from frame 864 here), so a repeat of the reference is needed.
+    - So eviction is exact and cheap while the pool holds the working set with some room, and thrashes when it can't. The console's 14 MiB pool holds about twice a fight's working set.
+  - **On the console, a full pool** used to make `mmap` (`mman_ctr.c`) try a 2 MiB heap block, which the console won't make executable, then free it: no leak, but a brief 2 MiB of heap per refused chunk. In Azahar the heap block was accepted and kept. Since issue #90 (backend patch 0060), a full static pool refuses straight away (`ENOMEM`), and the heap fallback is only for a missing or refused pool. The heartbeat says `jit pool full: N chunk requests refused` once it happens. The backend's own `[mman]` line goes to stderr, which the console's log doesn't capture.
+    - In Azahar, with a 4 MiB test pool and the DuringCh2Mid save's walk to the Far Oasis, 570 requests were refused in 260 s. The chunks opened stayed at 4 MiB (`jit=4096`, code in use 3.8–4.0 MiB as the JIT evicted), and host memory stayed at about 84.6 MB.
+    - 4 MiB is half of what Lut Gholein's code needs, so the game thrashed (about 1 frame a second), as #23's 4 MiB lane run did. The real pool is 14 MiB.
+  - **Not measured yet:** a console session that fills the pool, and the cost of an eviction round on the console.
+- The tile prefetch's store is now a static 1 MiB (`g_prefetch_arena`), written as a ring.
+- The image's other freed MiB goes, through `__system_allocateHeaps`' leftover budget, to the linear heap for jump tables: 2,816 KiB of them in linear memory instead of 1,792.
+- `reserve_arena` took the larger `ctr-game-n3` layout (78,848 KiB) from 2 MiB of linear jump tables, which would have spent the two MiB on the arena. It now does so only from 3 MiB.
+
+In Azahar, on the same 90 s walk through Lut Gholein at t = 200 s, the heap had **4,621 KiB free (3,768 KiB of room)**, against 2,579 (2,100) with the store on the heap.
+
+### Ideas for more host memory (not started)
+
+Ordered by how cheap they look.
+
+1. **Debug and profiler buffers in `.bss`** (~0.5–1.5 MiB): `mi_vbuf` is only for the memory intrinsics' verify mode. The hot-path tables, if they are the profiler's, could be allocated when a profiler run starts. `weight.5`, `idx.4` and `static_insts` need identifying first.
+   - The heap can't grow past its window, so memory taken out of the image only reaches the host as linear memory: more jump tables there (as above), or the port's own buffers moved to `linearAlloc`.
+2. **Jump tables** (12 MiB, 10 on the heap): the largest translator item. A third level, leaves of 4 KiB pages for only the pages that hold translated code's entry points, would save whatever share of Game.exe's ~3 MiB of code the game never runs.
+   - The cost is one more load on every indirect jump, call and return dispatch, Box86's hottest path, so it needs a lane measurement for speed.
+   - First measurement: how many 4 KiB pages hold block entries after an hour's session.
+3. **JIT records** (3–4 MiB): trimming `dynablock_t` (the per-instruction size table, fields kept for debugging) helps long sessions. It's invasive.
+4. **Guest arena against the sprite cache**: the arena is fixed at 75 MiB. With sprites decoded natively and about 2.6 times faster (issue #83), a sprite cache 2 MiB smaller costs less than before. An arena 2 MiB smaller would hand that to the host. It needs a console comparison of the cache's evictions and decode time.
+5. **The JIT pool's size** depends on issue #23. If the backend handles a full pool cheaply (flush or evict, measured on the lane), the pool can be smaller still, and its MiBs go to linear jump tables as above. If it doesn't, 14 MiB is already a risk for long sessions.

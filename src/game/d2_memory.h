@@ -47,6 +47,10 @@ struct SpriteCacheWindow {
     uint32_t decodes, decode_ms;
 };
 SpriteCacheWindow sprite_cache_window(d2rt::Cpu &c);
+// The sprites the frame thread decoded since the start, and the time it
+// took (us), for the frame trace (the heartbeat's window counts every
+// thread's).
+void sprite_decode_totals(uint32_t &decodes, uint64_t &us);
 // The sprites the cache has taken since the start (wrapping).
 uint32_t sprite_cache_taken();
 
@@ -58,9 +62,10 @@ uint32_t sprite_cache_taken();
 // evicts down to a lowered limit as it takes new sprites, and the memory it
 // lets go of stays in the game's pool system for its other data, which then
 // stops taking more of the guest pool. Call it once per heartbeat with the
-// pool's free bytes, whether a request was served from the pool's spare,
-// and sprite_cache_window's evictions. Logs each change; returns the limit
-// in force.
+// pool's free bytes, whether a request was served from the pool's spare
+// since the last call (not whether the spare still holds one), and
+// sprite_cache_window's evictions. Logs each change; returns the limit in
+// force.
 //
 // The reserve was 10 MiB with a 1 MiB spare. In 4 h 25 min of Act I
 // (2026-10-29) the pool then stayed at 6.5 to 9.9 MiB free for three and a
@@ -78,7 +83,18 @@ constexpr uint32_t kCtrPoolRelease = 10u << 20;
 // (rt::RunOptions::pool_spare): the heap blocks the console was refused at
 // the end of long sessions were 262 to 656 KiB.
 constexpr uint32_t kCtrPoolSpare = 2u << 20;
-uint32_t govern_sprite_cache(d2rt::Cpu &c, uint32_t pool_free, bool spare_used, uint32_t evicted, uint32_t reserve,
+// Of the pool, set aside for the sprites' frames over 256 KiB
+// (rt::RunOptions::pool_large): in 3DS-D2-13 (30 min of Act I) every request
+// the spare served was one of them, 258 to 396 KiB, while the pool had 4-8
+// MiB free in 64-256 KiB pieces. Three were in the spare at once, 1152 KiB
+// in 64 KiB granules. To the governor it is used space: the reserve is
+// kept in the rest of the pool, so the cache holds at most this much less.
+// In 3DS-D2-15 (53 min of Act II) the frames held up to four 320 KiB blocks
+// at once, 1280 of the 1536 KiB then, and the six spare takes were the
+// game's own heap blocks of 282-533 KiB, which the zone now serves too when
+// the pool holds no piece for them: four frame blocks and one of those.
+constexpr uint32_t kCtrPoolLarge = 2048u << 10;
+uint32_t govern_sprite_cache(d2rt::Cpu &c, uint32_t pool_free, bool spare_taken, uint32_t evicted, uint32_t reserve,
                              uint32_t min_limit);
 
 // Makes the game's fatal exit, exit(-1) after an internal error (an

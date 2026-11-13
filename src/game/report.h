@@ -179,7 +179,9 @@ struct Event {
     std::string level;       // "fatal" (a crash), "error", "info" (asked for by the player)
     std::string version;     // the version the session was played on ("0.4.0", "0.4.0-dev"; "" unknown)
     std::string release;     // 3ds-d2@<version>
-    std::string dist;        // the build ID: which build of the release
+    std::string dist;        // the build ID: which build of the release (the session's: it went
+                             // wrong on it), also the runtime context's version
+    std::string environment; // what the report was sent from: "console", "azahar", "unknown" ("" none)
     std::string started;     // when the session started, by the console's clock (may be empty)
     std::string note;        // the player's description (may be empty): context, not the title (issue #61)
     std::string topic;       // the player's own part of the title ("#24"; may be empty), kept between reports

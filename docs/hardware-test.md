@@ -55,16 +55,18 @@ The diagnostics are on the bottom screen's INFO tab (tap INFO in the tab bar; [c
 4. A red **JIT MEMORY FULL** line, if it ever appears.
 5. **hitch** and **wait**: the last 10 s's frames over 100 and 250 ms and the longest, and what stops frames: the drawing thread's time blocked (`wait`, mostly on Storm's reads from the SD card), `ready` while another game thread runs, `host` work on its core (the scheduler, the heartbeat), and `hb`, the last heartbeat's length; on the `files` line, frames not drawn (`skip`) and sound starved (`fam`).
 
-To measure more, tap **profiler run** on INFO, tick what to measure and start the run (sprite trace, guest code profile, file-read trace, SD card benchmark). The session is then offered as a report with what the run wrote. There is no separate profiling build any more.
+To measure more, tap **profiler run** on INFO, tick what to measure and start the run (sprite trace, guest code profile, file-read trace, SD card benchmark, frame timing). The session is then offered as a report with what the run wrote. There is no separate profiling build any more.
 
-The checklist's last row, **trace writes**, sets how the traces reach the SD card, and a tap steps it on, during a run too:
-- **buffered** (the default, as before): large writes as the buffers fill; a crash loses what they still hold, minutes of reads.
-- **every second**: what the traces hold is written out once a second.
-- **at once**: every record is written as it is made, so a crash loses nothing before it. This costs an SD card write per file read and per sprite use, so use it to chase a crash (issue #66), not to measure the frame rate.
+The checklist's last row, **log writes**, sets how all logging reaches the SD card, game.log and the traces alike, whether a profiler run is on or not, and a tap steps it on. game.log and the traces go through rings in memory, written by a thread of their own (`src/app/ctr_writer.h`):
+- **batched** (the default): a file is written once 16 KiB is queued, or 5 s after its last write. The card's cost is per write, and a long session of small writes ended in stalls of 9–14 s (3DS-D2-14). A crash the app catches writes out what is queued; a freeze or a power-off loses up to 5 s of it.
+- **every second**: what is queued is written once a second.
+- **at once**: every log line and trace record is written as it is made, from the thread that makes it, so a freeze or a power-off loses nothing before it. This costs an SD card write per line, file read and sprite use, so use it to chase a crash or a freeze (issue #66), not to measure the frame rate.
 
-The setting is saved, logged as `profiler run: trace writes <buffered|second|now>`, and a report carries it as the `trace_writes` tag.
+The setting is saved (`tracewrites=` in settings.txt), logged as `profiler run: trace writes <buffered|second|now>`, and a report carries it as the `trace_writes` tag.
 
 Logs are on the SD card in `3ds/3ds-d2/logs/`: `game.log` for the runtime, and `stderr.txt` for the CPU backend, including its arena line. Saves and settings are in `3ds/3ds-d2/save/`. `python3 -I tools/session_report.py game.log` summarises a session from its heartbeats: the frame rate by game state, the slowest windows and what they were doing (sprite re-loads, new code, SD reads), memory over time (with the sprites' frames' blocks and units, issue #44), and the hitches (`prof hitch:` lines: frames by interval, the longest, sprites taken and let go of, the frame thread's read wait, frames not drawn, starved sound grains) with the slowest windows' causes.
+
+A profiler run with the guest code profile on is read with `python3 -I tools/profile_report.py game.log dist/game/Game.exe`: each thread's share of core 0, the shims' and natives' time, and the translated functions that took the most of a thread's time, with the sprite trace's own cost given apart. Both tools take `--windows fights|quiet|play|loads` (issue #73, `tools/profile_windows.py`). Fights are the slowest 15% of the steady in-game windows, quiet play the fastest 25%. A steady window has over 50 frames, under 10 sprites decoded, under 50 cache syncs, and the unit timers reading the clock 50 times a frame or more. Each tool prints the rule and the window count with its result. `profile_report.py --routines SpriteCacheTouch,0x470c30-0x470d80,0x534658` gives a frame's ms for each routine named, whether or not the tables' `--top` rows reach it. For example, on Sentry 3DS-D2-10, `--windows fights --routines SpriteCacheTouch,SpritePath` gives #37's 1.43 and 0.22 ms of a 59.0 ms fight frame.
 
 ## Things that differ from Azahar, and may fail first
 
@@ -154,10 +156,445 @@ Two more settings matter for these checks:
 - **`M4_HASHMEM=<va>:<bytes>`** hashes a guest memory range with every frame, for native code whose result the pixels may not show. The light grid is `0x7b0e68:0x4800`.
 - **`D2_NATIVE_CHECK=1`** runs the original next to the sprite cache's two natives (`SpriteCacheTouch`, `SpritePath`, issue #37) and the locked lookups (`LockedLookup`, `CurrentLookup`, issue #38) on every call they take, from trampolines in `.text`'s slack at `0x6cb7e0`, and logs any difference (`native check: ... differ`). Over `fight.txt`: 65,536 hits and 32,768 paths (the counts it logs at powers of two), none differ; 4,096 and 2,048 lookups, entry and lock state alike, none differ. With and without the lookups (`D2_NATIVE_MASK=0xfffff` against the default), all 4,332 frames of `fight.txt` hash the same. Unlike frame hashes, it doesn't depend on timing: removing guest instructions changes the scheduler's slices, so scripted input in the game world can land on another frame.
 - **`M4_SPRITE_FRAMES=0`** leaves the sprites' frames in the pool system, as the game does (issue #44; on the 3DS layouts they are otherwise in blocks of their own, `game::install_sprite_frames`). With `M4_NATIVE=late` the allocator is installed on arrival in the game world too. Over `fight.txt`, with and without it, all 4,705 frames hash the same. A sprite trace started before a late install says the frames are the pool system's (its header's flag is read when it starts).
+- **`M4_POOL_PIECES=1`** logs the guest pool's free pieces at every heartbeat: how many, by size, and the largest few, with the blocks in its spare and the VirtualAlloc owners (`rt::log_pool_pieces`, issue #70). The console logs the same lines whenever a request is served from the spare or sprite frames fall back to the pool system. Use it to compare how fragmented the pool gets under two pool policies on the same script.
+- **`M4_POOL_BALLAST_MB=<n>`** takes n MiB of the pool at the first heartbeat and keeps it, so a short script runs the sprite governor into its reserve. With 24 MiB on `fight.txt` (layout `ctr-n3`) the pool sits at ~5.5 MiB free, but still in 2–3 large pieces: the console's 64–256 KiB pieces come from half an hour of the cache churning across areas, which the fight does not do.
+- **`M4_POOL_LARGE_KB=<n>`** sizes the pool's large-block zone (`rt::RunOptions::pool_large`; 0: none; the 3DS layouts otherwise have `game::kCtrPoolLarge`, 2 MiB), and **`M4_POOL_LARGE_MIN_KB=<n>`** sets what goes there (blocks over 256 KiB by default). The fight has no sprite frames over 256 KiB, so `M4_POOL_LARGE_MIN_KB=64` sends the frames' 128–256 KiB blocks there instead, to run the zone at all: with it, all 3,960 frames of `fight.txt` hash the same as with no zone.
 
 Scripts for these runs are in `tests/m4/scripts/` (`M4_SCRIPT="$(cat tests/m4/scripts/fight.txt)"`): `town-walk.txt` walks around the Rogue Encampment, `fight.txt` crosses the bridge into Blood Moor and fights the quill rats there, and `act2-east.txt` takes a character that has finished Act I (`dist/save/BeforeCh1End`) to Warriv and East to Lut Gholein (issue #66). It finds Warriv in the game's units (`tapunit`, `src/game/d2_units.h`), so it does not depend on the frame rate. The fight's route is the map the virtual clock gives. The same file works on the console as `sdmc:/3ds/3ds-d2/autoplay.txt`.
 
 Example: the native light grid (`LightGrid`, mask bit 8), with the town walk script, `WX86_FAKETSC=1` and `M4_HASHMEM=0x7b0e68:0x4800`. Masks `0xff` and `0x1ff` give the same 2,372 frames, pixels and grid alike, over 185 distinct grid states.
+
+## Frame pacing (issue #76)
+
+Walking around a town felt jumpy, and the 10 s frame rate did not show it: most frames took 40 ms, then one took 70–150 ms. This is measured off the console, in Azahar, and only the result is checked on the console. The jumpiness Azahar showed in town matched the console's.
+
+**The frame trace.** The profiler's **frame timing** option writes `logs/frames.trc`, a line per frame presented (`src/game/frame_trace.h` has the format), and a report attaches it. Each line gives:
+- the gap since the last frame, and how far the game's clock moved;
+- the frame thread's time running, ready while another guest thread ran (and which one), in host work, sleeping, waiting on a lock, an event or a file read;
+- its sprite decodes;
+- for its longest wait: the game code it waited from, the thread that held the lock, and the return addresses on its EBP chain;
+- the frame thread's scheduler slices: a slice is a few ms of guest code, so a long frame with many slices ran the game's own code long, and one with few was held in a host call;
+- a stall: in a frame that has gone 150 ms without a present (`stallms=` in settings.txt), a watcher thread on the second core samples the frame thread every 20 ms, up to 8 times. It tells the thread to stop at its next block (the dynarec writes EIP back only at exits and traps) and keeps where it stopped: its EIP and the dword on top of its stack, the call's return after a host call. It costs the game's core nothing in a normal frame.
+
+The trace is buffered and written by the log writer thread, so it does not make frames uneven itself. `python3 tools/frame_report.py frames.trc` counts the frames in game with no panel open and gives:
+- the gap percentiles and the share past 50, 60 and 100 ms;
+- the jitter (the mean change from one gap to the next);
+- the share of frame pairs near 40 ms;
+- what the slow frames did instead, with the threads and wait sites behind them.
+
+**An unattended walk in Azahar.** This runs a CIA and writes `frames.trc`, `game.log` and `report.txt` to `build/smooth/<time>/`:
+
+    scripts/measure-smoothness.sh --save DuringCh2Mid [--setting stormdirect=0] [--cia <file>]
+
+It plays `tests/m4/scripts/smooth-walk.txt`:
+1. the first character into the game;
+2. a profiler run with the frame trace only;
+3. 90 s of circle-pad loops around the town. A panel the walk clicks open (an NPC's menu) is closed with START (`closepanels`).
+
+`--save` picks the starting point: `BeforeCh1End` (the Rogue Encampment) or `DuringCh2Mid` (Lut Gholein, the busier one). The zips beside the saves in `dist/save/` restore them.
+
+Two runs of the same build differ by a few points, so compare settings over alternating runs, two or more each. Azahar is slower than the console per guest instruction, so its figures compare builds with each other; they are not the console's.
+
+**What made the frames uneven, and the changes.** All guest threads take turns on one core.
+1. Storm's read thread (thread 4, entry `0x41a550`) decompresses what it reads with the Huffman, ADPCM and PKWARE natives. A turn was 300,000 guest instructions, and time in natives did not count toward it, so one long decode kept the core for 10–16 ms.
+   - Turns of other threads are now 40,000 instructions (backend patch 0059; `bgquantum=` in settings.txt, `M4_BG_QUANTUM` on the lane).
+   - A background thread past 2 ms yields once a native returns, when the frame thread is waiting to run (`bgslice=`).
+   - The read thread's decoders run on the I/O worker's core while it waits (`rt::offload_job`). Each job takes under 1 ms there.
+2. The frame thread's own small reads (a sprite file's header at `0x5fdf2c`, sounds) waited about 35 ms at `0x41af0d`, Storm's wait for its read thread. The read thread serves them next (`install_storm_read_priority`), but first finishes what it is doing: after reading a load, its completion callback decodes the whole sprite group in guest code (`0x5ff6e0` → `0x60bff0`), 30–60 ms in Azahar. Storm's request size made no difference (16 against 4 KiB).
+   - A caller with no OVERLAPPED now reads on its own thread under Storm's lock whenever the read thread is not inside its own read (`install_storm_direct_reads`, `src/game/storm_reads.cpp`), as Storm does for an archive opened for synchronous reads. The read thread marks its read with a flag. It cannot start another without the lock, so the archive's handle is never used by both at once.
+   - `stormdirect=0` in settings.txt (`M4_STORM_DIRECT=0` on the lane) leaves those reads queued. The heartbeat logs `storm reads: <n> read by their caller, <n> queued`.
+
+Lut Gholein, 90 s walks in Azahar:
+
+| Build | Past 50 ms | Past 60 ms | Jitter | Pairs near 40 ms |
+| --- | --- | --- | --- | --- |
+| Before (two runs) | 21.2%, 18.8% | 9.3%, 7.6% | 10.0, 9.3 ms | 61%, 65% |
+| Shorter turns and the time limit | 18.5%, 14.9% | | 7.4, 6.8 ms | |
+| ...and the decoders on the I/O core (five runs) | 6.6%, 9.5%, 5.8%, 6.6%, 9.6% | 3.3–5.3% | 4.7–5.8 ms | 83–88% |
+| ...and direct reads (two runs, against four without them on the same build) | 9.6%, 6.5% (without: 10.6%, 9.1%, 8.3%, 11.3%) | 4.7%, 3.2% (without: 3.9–6.2%) | 6.0, 4.8 ms (without: 5.0–7.3) | 82%, 87% (without: 78–85%) |
+
+Direct reads are a small gain in Azahar, where a read from the emulated SD card costs about 5.6 ms; the waits they remove are the 35 ms ones at `0x41af0d`. Reads that find the read thread mid-read are still queued: having the caller wait for that read instead, the lock held, made the frames much worse (15.6% and 22.3% past 50 ms).
+
+What the slow frames left in Azahar did instead, roughly a third each:
+- **run**: the frame thread's own work running long (new sprites' decodes on its own thread, the game's logic);
+- **ready**: the read thread running, mostly its callbacks' sprite decodes in guest code;
+- **wait**: reads queued behind the read thread, and the frame thread's own reads from the card.
+
+**The console (3DS-D2-17, New 3DS XL, build `b6a947728230`, 251 s in Lut Gholein):**
+
+| | Past 50 ms | Past 100 ms | Median frame | Jitter |
+| --- | --- | --- | --- | --- |
+| Whole run | 6.0% | 0.49% | 39.8 ms | 7.3 ms |
+| First 70 s in town (loading) | 10–20% a window | up to 8 a window | | |
+| From 110 s on | 2.4% | almost none | | |
+
+- **Slow frames.** The read thread's turns barely matter on the console (16 of 356 slow frames, against a third in Azahar). The rest:
+  - the frame thread's own work (217);
+  - its own SD reads (85), 20–27 ms each: a disk read costs 6–9 ms there, about as in Azahar.
+- **Stalls of a fixed ~640 ms** (one of 1.3 s): pure run, with no read, wait or new sprite, and the JIT translated nothing new meanwhile. Eight in the 40 s after arriving in town, then one every 40–90 s. Azahar never shows them.
+  - They often fall in the same window as a slow SD write by the log writer: 600–1,400 ms writes of `frames.trc` and `game.log`, about every other heartbeat, likely as the files grow by a cluster.
+  - But they last 640 ms whatever the write's length, and some come with no slow write.
+  - The stall column above was added to name them on the next console run.
+
+**Loading: the game's file calls (Azahar, `tests/m4/scripts/act-load.txt`).** The Act I save goes to Warriv and on to Lut Gholein with the frame trace on (`--save BeforeCh1End --script tests/m4/scripts/act-load.txt --seconds 300`, then `tools/frame_report.py --all --timeline`). The act change's longest frame was 4.3 s. The stall samples put it after `GetFileAttributesA`, `CreateDirectoryA`, `CreateFileA` and `ReadFile`: the game's save at the act change.
+- Every lookup is a stat on the card, 30–90 ms each in Azahar. The game repeats the same ones: its save folder's three levels at each save (9 times in this run), a file in the write root and then the data root before each open, the MPQs' names. It also reads its settings one key a call (`GetPrivateProfileIntA`), each a read of the whole INI file.
+- File calls past 2 ms took **13.4 s** of the run: `GetFileAttributesA` 4.3 s, `CreateFileA` 3.8 s, `GetPrivateProfileIntA` 1.7 s, `CreateDirectoryA` 1.2 s.
+- The file shims now keep:
+  - each host path's stat ("absent" included);
+  - each directory's listing (`FindFirstFileA`);
+  - each INI file parsed.
+
+  The game's files change only through these shims, and each change forgets the path, its directory's listing and the INI files (`touched`). A rename forgets everything.
+- After: file calls past 2 ms took **2.9 s** (`GetFileAttributesA` 0.57 s, `CreateFileA` 1.07 s, `GetPrivateProfileIntA` 0.03 s). The act change's longest frame is **2.4 s**, and the arrival's worst 10 s window went from 1,018 ms to about 200 ms at its longest. What is left is mostly each path's first lookup and the save's own writes and reads.
+- A file call of 20 ms or more is logged (`slow file call: CreateFileA("...") 48 ms`).
+
+**The console with the file caches (3DS-D2-17, build `e7386f3e01c1`):** Lut Gholein, Rocky Waste and back, 253 s. The player felt the area change and the small mobs much smoother, and the return to town held 25 fps.
+
+| Part | Frames past 50 ms per 10 s window |
+| --- | --- |
+| Arriving in Lut Gholein (0–40 s) | 10–25% |
+| Rocky Waste (90–125 s) | up to 46%, one frame of 515 ms |
+| Back in town (130–240 s) | 1–6%, nothing past 100 ms |
+
+On the whole run, 7.7% of frames went past 50 ms.
+- The median frame is 38.9 ms of the frame thread's own work: there is no slack in a 40 ms frame, so any read or load in one makes it late.
+- In the #70 session's guest profile (an older build, same town), the frame thread ran 9.3 s of 10, of which 2.5 s in shims and natives; the other ~6.8 s is translated game code. A stable 25 fps needs that time down.
+
+**Tried and dropped on the way (each measured, none a gain):**
+- **The I/O worker serving the frame thread's reads first** (a second ring). The console's next run (build `339e8dcc60c0`) had the frame thread's own reads wait as long as before (23.7 ms over 141 frames, 76.9 ms over 58). The cost is each read's chain of small Storm reads, not the queue. Reverted.
+- **The dynarec's translation knobs** (`callret=`, `nopend=`, `budgettail=`, `forward=` in settings.txt; `M4_CALLRET`, `M4_NOPEND`, `M4_BUDGETTAIL`, `M4_FORWARD` on the lane). On the CPU-bound lane (town walk, `-one-insn-per-tb`), none changed the frames per 10 s (32–34 either way). `nopend` and `budgettail` keep `fight.txt`'s 3,215 frames byte for byte; `callret` moves the scheduling from the menus on. Kept as settings, off.
+- **Storm's read thread's rate limit** (`stormrate=`, the game's 256 KiB/s): the act load in Azahar took as long with 4 MiB/s. Kept as a setting.
+- **Storm's request size** (16 against 4 KiB), **shorter background turns** (10,000 instructions, 1 ms), **a caller waiting for the read thread's read under Storm's lock** (much worse), **a word-wide shade remap and an identity-table copy for the floor** (5.9 against 6.0 µs a tile): no gain, not kept.
+- **Per-call shim timing for the stall column**: Azahar lost 2 fps to it; replaced by the sampling watcher.
+
+## Floor tiles on the second core (issue #80)
+
+The frame thread had no slack in a 40 ms frame. Drawing is most of its work, and the draw natives write only the frame buffer. So some of that work can move to core 2, as long as the game's own drawing never sees the buffer half done.
+
+**Where a frame's drawing can move: the draw census (lane).** `D2_DRAW_CENSUS=<n>` takes every n-th frame. At each draw native, it compares the frame buffer with a copy taken after the last one. A difference means the game's own code drew in between. `python3 -I tools/draw_census.py build/m4/err.txt` groups each frame's natives into runs with no game drawing among them, with each run's callers.
+- After the screen is cleared, the floor is one run: about 96 `FloorTile` calls with nothing else drawn among them. They come from the world's draw (`0x476bc0`) through its call to `0x4ded10` at `0x476cdc`.
+- The very next call (`0x476ce1`, to `0x473c00`) draws over the floor.
+- After that, the game's own drawing (the walls' smaller blitters, the UI) comes in between the wall and sprite natives every 1–20 calls. A queue there would wait at each one.
+
+**What a frame spends: the draw phases.** `drawphases=1` in settings.txt (`D2_DRAW_PHASES` on the lane) times each draw native and the frame's parts with the host clock. It logs `draw phases:` every 250 frames. A 41 ms town frame in Azahar (Lut Gholein):
+
+| Part of the frame | ms |
+| --- | --- |
+| From the last blit to the floor | 12.3 |
+| The floor run | 10.2 (`FloorTile` 8.1, the frame thread's own work between tiles 2.1) |
+| From the floor to the blit (walls, units, UI) | 18.7 |
+| Present (copying the frame for the render thread) | 1.1 |
+
+**Draw on core 2.** The INFO tab's OPTIONS page switches it on and off, at once, during a profiler run too. The page holds the port's own engine options (`src/game/port_options.h`), apart from the profiler's measurements. It is on by default on a New 3DS, saved as `port=core2draw`; it is off with no core 2. Each switch is noted in the frame trace. It does two things.
+
+**1. The floor queue** (`D2_FLOOR_QUEUE` on the lane), in `src/game/d2_native.cpp`:
+- The call at `0x476cdc` arms it, and the call at `0x476ce1` empties it. Both are redirected to natives that then go on to the call's own target.
+- While it is armed, `FloorTile` queues a tile whose blocks all have flat light. Each tile is queued with a copy of the light cells it reads and of the renderer's globals it was called with: the frame buffer, its pitch, the clip window and the light flags.
+- A worker thread on core 2 draws each tile as soon as it is queued. When the queue is emptied, the frame thread draws whatever is left beside the worker, then waits for the worker's last tile.
+- The worker runs one priority below the game's thread, so below the I/O worker and the render thread. At the I/O worker's own priority (3DS-D2-18), a finished SD read waited out the worker's tiles: threads of one priority do not preempt each other on the 3DS. It is woken once each time it sleeps, not once per tile.
+- Floor tiles do not overlap, so the order they are drawn in does not matter.
+- Any other draw native empties the queue first. In the measured runs none had to.
+- A tile with interpolated light needs the game's own blitters, so it is drawn at once, after the queue is emptied. The console sets "Light Quality" to 0, so it has none.
+- The ring's counts (tiles published, taken and drawn) only ever grow. Reset each frame, they let a worker paused between reading a count and its compare-and-swap take a slot of the frame before again. That was the one-frame difference `fight.txt` showed in 2 of 7 runs with the worker.
+
+**2. The frame's copy.** Present used to copy the frame for the render thread on the game's thread, about 1 ms a frame in Azahar. Now present leaves the frame in the game's buffer, and the render thread copies it first, on core 2.
+- Until the copy is done, each of the renderer table's 54 entries (`0x74c4a8`, through `[0x7c8cc0]`) holds a native that waits for it, then goes on to the renderer's own function. All the game's drawing goes through that table.
+- The render thread puts the table back as soon as it has copied, so a normal frame never stops.
+- `copycheck=1` in settings.txt (Azahar) compares each copy with the frame as present saw it. With only `BeginScene` guarded, 2–9 copies a run differed, around loads, where the game draws a moment after present. With the whole table guarded, a walk and an act load had none. 11–16 frames a run waited, at most 5.5 ms.
+
+**The frame trace** (version 5) gives each frame:
+- `floor`: the floor's time on the game's thread;
+- `flush`: the part of that spent drawing the queue's last tiles and waiting for the worker;
+- `cwait`: the time waited for the last frame's copy.
+
+`tools/frame_report.py` prints their medians, and reports each part of a run apart when the switch was changed in it.
+
+**Checks on the lane** (virtual clock, `M4_NATIVE=late`, `M4_FRAMEHASH`):
+- `D2_FLOOR_QUEUE=2` draws the queue in reverse order at the end of the floor. `town-walk.txt` (1,726 frames) and `fight.txt` (2,843 frames) hash the same as with the queue off.
+- `D2_FLOOR_QUEUE=1` (the worker) hashes the same in both.
+- `D2_FLOOR_QUEUE=3` uses the worker, then draws every tile again in order and counts any pixel change. 26,276 flushes changed nothing.
+
+**Azahar.** At its full speed, Azahar's town frames have slack in their 40 ms. The game spends what is left waiting for its next tick. The queue saves the game's thread 2.7 ms a frame (the floor takes 5.6 ms on it, against 8.4), but the gaps barely move: 6.6% against 6.3% of frames past 50 ms. An earlier comparison that showed 13% against 6–8% had the draw phases' timing on, which put the queue-off frames over budget.
+
+The console has no such slack: its town frame ran 38.9 ms of 40. `scripts/measure-smoothness.sh --cpu 70` runs Azahar at 70% of its emulated CPU clock, short of time as the console is (rather more so). Lut Gholein, two runs each:
+
+| 70% CPU | fps | Median gap | Past 60 ms | Frame thread's run, median | Floor on the game's thread |
+| --- | --- | --- | --- | --- | --- |
+| Off | 15.0, 15.0 | 62.0, 62.2 ms | 61.3%, 60.2% | 60.6 ms | 12.6 ms |
+| On | 17.0, 16.9 | 53.1, 53.5 ms | 21.2%, 21.7% | 51.9, 52.1 ms | 7.84 ms (3.7 at the flush) |
+
+**3DS-D2-18, draw on core 2 on for 160 s and then off.** The "on" part looked worse (12.6% against 8.3% of frames past 50 ms), but it covered the arrival, a busier area and a mob fight, and the "off" part did not. The mob's frames of 1-2 s came from the sprite governor (`src/game/sprite_governor.h`):
+- The pool's spare was taken with 13.4 MiB of sprites held, and the governor cut the cache to its 4 MiB minimum.
+- 887 sprites were let go of, and 426, 227 and 104 decoded again over the next three windows.
+- A spare take now cuts by the pool's shortfall, not to the minimum.
+
+Three alternating act loads in Azahar each way, after the worker's priority change: 4.9–6.2% of frames past 50 ms with it on, 5.8–7.6% off.
+
+**3DS-D2-18, build `2e2a8a0d5714`: off, then a reload and on, over the same kind of route.** Each half starts with arriving in town.
+
+| Part | Off | On |
+| --- | --- | --- |
+| Floor on the game's thread, median | 6.33 ms | 3.76 ms |
+| The 70 s after arriving, past 50 ms | 18.1% (jitter 13.7 ms) | 14.1% (jitter 12.2 ms) |
+| Town after that, past 50 ms | 4.1% (jitter 4.5 ms) | 2.6% (jitter 5.5 ms) |
+| Whole half, past 50 ms | 9.2% | 6.5% |
+
+- The player felt it smooth with it on. One floor tile south of a torch in town flickered at one corner; not looked into yet.
+- The arrival's 10 s windows lose 0.9–1.2 s each to:
+  - the frame thread's own reads (`io`, 400–600 ms), each a chain of Storm's small reads, about 20 ms in all, at `0x4154d8` (Storm's `ReadFile`);
+  - Storm's read thread taking core 0 (`ready`, 200–450 ms), mostly the load callbacks' sprite decodes (`0x5ff6e0` → `0x60bff0`) in game code;
+  - reads queued behind it (`wait`, 70–280 ms).
+- In town, the slow frames are the game's own work running past 40 ms (`run`).
+- The `run` column is not the game's work alone. The game waits for its next tick by polling the clock, and that counts as running, so a frame's median `run` is about 39 ms whatever the load.
+
+**Not done:** LightBlock on the worker.
+- Between LightBlock and the floor tile, the floor loop passes the light buffer through four of the game's own functions: `0x4de190`, `0x4de260`, `0x4ddfd0` and `0x4de070`, the dynamic lights.
+- They would all have to be native, with their light sources copied, for about 1 ms in Azahar (0.5 ms on the console).
+
+**The walls, with the console's video settings.** The census with `M4_FAST=1` (Light Quality 0, 640×480) on the town walk:
+- 244 draw natives a frame in 10.9 runs, against 34.6 runs with the PC settings. 60% of the natives are in runs of 65 or more.
+- After the floor, the walls and many sprites form one run of about 100 natives.
+- A queue for it would have to draw in order, because walls and sprites overlap. The sprite natives' return values would have to be worked out on the game's thread. And a stretch would have to end where the sprite cache lets a sprite go.
+
+**Not kept:** native versions of the four interpolated-light blitters (`0x4f6bb0`, `0x4f71a0`, `0x4f7850`, and `0x4f89f0`'s iso branch), so that those tiles could be queued too.
+- Checked block by block on the lane against the game's own blitters, they drew the same pixels.
+- A few frames still differed, because the lane's virtual clock counts the guest instructions they no longer run.
+- The console never draws interpolated light, so they would only help a player who raises Light Quality.
+- Parked as [parked/gouraud-natives.patch](parked/gouraud-natives.patch), against commit `d9c08c1`. Take it up if a player raising Light Quality is reported, or asked for. With Light Quality up, interpolated tiles are drawn at once on the game's thread, as before issue #80.
+
+## The screen at 50 Hz (issue #84)
+
+The top LCD refreshes at 59.83 Hz, and a swap shows at the next refresh. So each of the game's 25 frames a second stays on screen for two or three refreshes (33 or 50 ms), however evenly the frames come. At 50 Hz each can stay exactly two.
+
+- **Switching it:** the OPTIONS page's **screen at 50 Hz** row, on by default. settings.txt saves every option, with `-` in front of one that is off (`port=core2draw,-screen50`). An older line that only names the options that are on (`port=core2draw`) leaves the screen at its default.
+- **What it changes:** one register, the top screen's VTotal (PDC0 +0x24, GSP register `0x400424`), from 413 (59.83 Hz) to 494 (50.04 Hz). It does so only if 413 is what it reads there.
+- **When 60 Hz comes back:** the HOME menu, sleep and the game's end get 413 back. A return to the game sets 50 Hz again.
+- **Holding frames back:** at 50 Hz, a frame ready less than a refresh after the last one was shown waits one more refresh. The game sends frames 35 and 45 ms apart as often as 40. The timing starts when the render thread wakes after the refresh, and it allows 0.3 ms of slack for that wake. The heartbeat's `ready in a refresh's last 2 ms N (held N)` counts the frames that came close to the next refresh.
+- **What the render thread measures:** after each swap it waits for the refresh that shows it. Each heartbeat logs `screen: <rate>, refresh <Hz> measured; frames on it for 1 refresh …, 2 …, 3 …, 4+ …; held back a refresh …`. At 60 Hz, steady play shows about 60% of frames for 2 refreshes and 40% for 3.
+- **The frame's copy:** if the render thread has not begun copying a frame by the time the game draws again, the game's thread now copies it itself (about 1 ms) instead of waiting out a refresh.
+- **Azahar:** it reads 413 and takes the write, but keeps refreshing at about 59 Hz. Only the console can show whether the LCD runs at 50 Hz: then the measured refresh reads about 50.0 and nearly every frame stays 2 refreshes.
+
+### On the console: 3DS-D2-19 (build `c4aeb1076ec6`)
+
+The run spent 20 s at 59.83 Hz, then switched to 50 Hz for about 9 minutes. Every heartbeat after the switch measured **50.01 Hz**, and VTotal read 413 before the write. The player found it much smoother.
+
+| | frames | 1 refresh | 2 refreshes | 3 refreshes | 4+ |
+|---|---|---|---|---|---|
+| 59.83 Hz | 340 | 2.6% | 56.8% | 39.7% | 0.9% |
+| 50 Hz | 12,604 | 2.8% | **93.3%** | 3.3% | 0.5% |
+
+- **What 50 Hz fixes:** the frames that were on screen for 3 refreshes at 59.83 Hz.
+- **What it leaves:** the 1-refresh and 3-refresh frames came as pairs, 20 ms then 60 ms. In 43 of the 52 windows the two counts were nearly equal.
+- **Why the pairs happened:** in that build the hold rule allowed 2 ms of slack, so a frame ready 18–20 ms after the last one went to the very next refresh. Build `5d72456c0e41` cuts the slack to 0.3 ms.
+- **The 4+ frames:** the game's own slow frames during loading, which no refresh rate can fix.
+
+### The frame lock (issue #86)
+
+The game starts a frame when its clock passes the next 40 ms. A pair of refreshes at 50 Hz lasts 39.97 ms, so the point within a refresh where the frames are swapped drifts by about 34 µs a frame and passes a refresh's edge every 30 s or so. The frames swapped near the edge come out as the 20 ms / 60 ms pairs counted in 3DS-D2-1A.
+
+- **What it does:** the render thread measures where in a refresh each swap falls, and keeps the swaps near the middle of the refresh by moving the game's clock ahead by 0–80 µs a frame (`rt::advance_guest_clock`). The clock never goes back. With no push the swaps drift later; with the most push they drift earlier by about 46 µs a frame.
+- **Which frames count:** only frames that come 35–45 ms after the previous one count, so the catch-up frames after a late one, which land anywhere in a refresh, are ignored. A swap more than 3 ms from the middle counts as 3 ms.
+- **When it pushes:** only in game, at 50 Hz, with the render thread (draw on core 2). Cinematics time their video by the guest clock against sound the DSP plays, so they keep the host's pace.
+- **Switching it:** the OPTIONS page's **frame lock at 50 Hz** row (`framelock` in `port=`), off by default.
+- **Heartbeat:** `[rt] frame lock: on|off; swaps in a refresh's 0-5 ms N, 5-10 N, 10-15 N, 15-20 N; clock moved for N frames, X ms ahead in all`.
+- **Azahar:** it keeps 59.83 Hz, so `locktest=1` in settings.txt measures the swaps against a 50 Hz lattice of the host clock instead.
+
+**Azahar, `locktest=1`** (`smooth-walk.txt`, the Rogue Encampment, 10 s windows at full speed):
+
+| | 0–5 ms | 5–10 ms | 10–15 ms | 15–20 ms |
+| --- | --- | --- | --- | --- |
+| Lock off (13 windows) | 26.0% | 25.3% | 23.9% | 24.8% |
+| Lock on (15 windows) | 4.4% | 25.2% | 58.5% | 11.9% |
+
+- **Steady play:** with the lock on, 91–95% of swaps in each window fell in the middle half of the refresh. The clock moved ahead 12–13 ms per 10 s, about 0.13%.
+- **When it can't hold:** in a run where Azahar fell behind (1–7% of frames past 50 ms), the swaps stayed spread out until the game was back on time. A game that is behind starts each frame as soon as the last one ends, so its clock leaves the lock nothing to move. The lock only matters where the game has time to spare, which is where the bursts happen.
+
+**On the console, 3DS-D2-1B** (build `bb3e8c277367`): about 3.5 min with the lock off, then about 9 min with it on. These are the quiet windows, with at most 6 slow frames and at most 2 new sprites:
+
+| | Frames | 1 refresh | Ready in a refresh's last 2 ms | Swaps in 5–10 ms |
+| --- | --- | --- | --- | --- |
+| Off | 2,018 | 0.64% | 5.3% | 55% |
+| On | 2,989 | **0.10%** | 1.6% | **78%** |
+
+- **Busy play:** the swaps don't drift even with the lock off. A late frame makes the game start from wherever it ended, and that end is set by the render thread's wait for the refresh, so the game's grid re-anchors to the screen by itself. Swaps drift only in quiet play, where the first minute in town went round the whole refresh in 30–40 s.
+- **The push:** small, 85 ms in about 9 minutes (0.016%). The refresh measures 50.01 Hz, so the natural drift is about 8 µs a frame. The lock holds the swaps at about 9 ms into the refresh.
+- **The whole stretch after the arrival:** frames on screen for exactly 2 refreshes went from 95.9% with the lock off to 97.9% with it on. Most of that difference is the game's own slow frames: 5.9% against 3.2%, over play that wasn't the same.
+
+## The native sprite decoder (issue #83)
+
+0x60bff0 decodes a DCC sprite group into the sprite cache's run-length frames. `src/game/dcc_decode.cpp` does the same in native code, byte for byte, and `src/game/dcc_native.cpp` puts it in the game.
+
+- **Where it hooks:** at `0x60c10a`, once 0x60bff0 has taken its lock and allocated the group's frames, a call to the native replaces the per-direction loop. It returns the loop's end when it has decoded the group, so the game's own compare jumps to the function's end. It returns the first direction when the game's code should decode instead.
+- **Where it runs:** when Storm's read thread decodes (a load's callback), the work goes to the I/O worker on core 2 (`rt::offload_job`). When the frame thread decodes (the game's synchronous fetch, `0x5ff760` → `0x5ff6e0`), it decodes in place.
+- **Switching it:** INFO → options → **native sprite decoder** (`port=…,dcc`), on by default. On the lane, `D2_DCC`: 1 in place, 2 on the worker, 3 checked.
+
+**The lane's check** (`D2_DCC=3`): the native decodes into a copy of the group's buffer, the game's code decodes into the buffer itself, and the load's callback (`0x5ff723`) compares every byte. The town walk ran too, but its log was overwritten before it was read.
+
+| Script | Groups | Differ |
+| --- | --- | --- |
+| `fight.txt` | 446, and 439 after the reader change | 0 |
+| `act2-east.txt` (Act I to Lut Gholein) | 252 | 0 |
+
+A native broken on purpose (one skip byte changed) differs in every group.
+
+**Azahar, Act I → Act II** (`act-load.txt`, 300 s), three alternating runs each way:
+
+| | Frames past 50 ms | The read thread's turns on core 0 (`ready`) | Decode time a group |
+| --- | --- | --- | --- |
+| Off | 7.5%, 6.6%, 6.4% | 3.6, 3.7, 3.4 s | about 24 ms (the game's code) |
+| On | 6.1%, 6.0%, 5.5% | 2.6, 2.7, 2.6 s | about 18 ms |
+| On, 8-byte bit reads (one run) | 5.0% | | 9.3 ms |
+
+- **Where the groups were decoded:** about 280 of the run's ~350 groups were decoded on the frame thread. Nearly all of those (207 in one window) are the act change's load, the game's synchronous fetch.
+- **In play:** 13–26 groups per 10 s go to the worker, and 0–2 stay on the frame thread.
+- **On the console:** game.log's `dcc:` heartbeat line counts each window's groups by where they were decoded.
+
+### On the console: 3DS-D2-1A (build `1c7ca22d9f49`)
+
+The run had the decoder on first, then off, each time for an area arrival followed by a few minutes of play. The screen was at 50 Hz throughout. The arrival is the 50 s after the area appeared, from the frame trace's 10 s windows:
+
+| | Frames past 50 ms | Read thread's turns on core 0 (`ready`, per 10 s) | Groups decoded |
+| --- | --- | --- | --- |
+| Decoder on | **9.3%** (114 of 1227) | 124–146 ms | 77: 62 on the worker, 15 on the frame thread |
+| Decoder off | 15.1% (176 of 1162) | 148–452 ms | 145, by the game's code |
+
+- **Baseline:** with no sprites decoding, `ready` is 105–125 ms a window, so with the decoder on almost all the decode time is off core 0. With it off, each group adds about 7 ms of the read thread's time on core 0. The off arrival decoded nearly twice as many groups (the route was not the same), so part of its extra slow frames is the route.
+- **Time a group on the console** (the heartbeat's `sprite cache … decoded N in M ms`, timed at the load's callback): 6.8 ms natively (337 groups), against 18.0 ms by the game's code (379 groups; 19.1 ms in 3DS-D2-18, 17.3 ms in 3DS-D2-19). The load's 200 groups, decoded natively on the frame thread, took 808 ms; at the game's 18 ms a group they would take about 3.6 s.
+- **What's left in an arrival:** the frame thread's own Storm reads, `io` at 480–670 ms a window.
+- **The screen:** with 0.3 ms of slack, frames on screen for 1 refresh fell from 2.8% (3DS-D2-19) to 0.36%, and frames on for exactly 2 rose from 93.3% to 96.4%. Frames ready within 2 ms of a refresh come in bursts of about 50 every 30 s or so. That is the game's 40 ms clock drifting against the panel's 39.97 ms refresh pair, which issue #86's frame lock would remove.
+
+## Crowds: the lights' stamps and the lit sprites (2026-11-12)
+
+**The bench:** `tests/m4/scripts/coldplains.txt`, for the BeforeCh1End save: the Rogue Encampment's waypoint to the Cold Plains, then 84 s of walking loops among its monsters. Its 10 s windows from `52000` to `136000` are the crowd. In Azahar the game there was processing-bound, at 17–19 fps with 33–48% of frames past 50 ms.
+
+**Finding the hot code:** the timer profiles (`prof eip` and the stall samples) can't do it.
+- Both record where the thread is at its next block boundary. Translated blocks that chain to each other never stop at one, but every return from a native does.
+- So time in long runs of translated code is charged to the native that comes next. `SpriteCacheTouch` looked like 12% of the game thread in the crowd, but its own timing is 3–5%.
+- The lane's block counter is exact instead: `WX86_HOTPROF=1 D2_NOLINK=1`, with the console's video settings (`M4_FAST=1`) and decoder (`D2_DCC=1`), over `fight.txt`. Counts times block sizes, rolled up into functions:
+
+| Routine | Share of the game's x86 bytes executed | What it is |
+| --- | --- | --- |
+| `0x607e20` (and its copy `0x607680`) | 8.8% (+0.5%) | DC6 sprite through a remap table: a lit or tinted sprite |
+| `0x4747c0` | 5.9% | one light added to one cell of the 48×48 light grid, 1.7 million calls |
+| `0x475420` | 4.1% | a light with its occlusion map stamped onto the grid |
+| `0x4748d0`, `0x474080`, `0x4740d0` | 1.6%, 1.1%, 1.1% | the plain stamp, and the two copies of its distance |
+| `0x6072f0` | 0.9% | DC6 sprite through two remap tables |
+
+- With the PC's video settings, the interpolated-light floor (`0x4f6bb0`) is 29% on its own. The console never draws it (see issue #80's parked patch).
+
+**Natives** (`d2_native.cpp`, served in line):
+- `Dc6Remap`, `Dc6RemapB` and `Dc6Remap2`, beside the other DC6 natives.
+- `LightStampOccluded` and `LightStamp`, the two stamps whole, with the cell add and the distance inside. `LightAdd` is the cell add on its own, for the shadow-casting stamp (`0x474d70`), which keeps its own code.
+
+**Checked** with `D2_NATIVE_CHECK=1` over `fight.txt`:
+- Each call ran the native, then the game's routine from a trampoline (in a `va_alloc` block) on the same input, and the results were compared. For the sprites that was the pixels and EAX; for the lights, the whole grid.
+- No call differed: more than 32,768 / 4,096 / 8,192 calls of the three sprite natives, 2.1 million of `LightAdd`, 8,192 and 4,096 of the stamps.
+
+**Azahar, alternating builds** (`00b32b833641` without, `ab2159a31744` with), the crowd's windows:
+
+| Build | fps | Frames past 50 ms |
+| --- | --- | --- |
+| Without | 18.3, 17.5 | 41.8%, 47.8% |
+| With | 19.5, 19.3 | 29.4%, 30.8% |
+
+A first run with them reached 24 fps, but it never got into the crowd (8–10 monsters near the player against about 30) and isn't counted.
+
+**Second round**, from the profile with the first round in:
+- **`_ftol2_sse` (`0x682fd0`)**, 2.8%. The C runtime's float-to-int conversion takes `cvttsd2si` when it found SSE2 (`0x994c88`), else a long x87 path through a 64-bit `fistp`/`fild`. The port reports no SIMD, so it always took the long path. Its check is now jumped over. For every value an `int` holds both give the truncated value, and `fstp` + `cvttsd2si` translate to one VFP conversion. Checked on the lane: both paths on each call, 1,048,576 calls, none differ.
+- **`LoadsPending` (`0x5ff2a0`)**, 3.2%. The monsters' preloader asks for each unit of each frame how many sprite loads are pending, and the game walks the sprite cache's whole list to answer: 1.3 million entries in the fight. The native counts loads that are done, and loads whose event isn't signalled (probed with `Waitable::ready`, which consumes nothing). On anything else, a signalled event (whose poll finishes the load) or an assert's case, it runs the game's code. Checked: 8,192+ counts, none differ.
+- **Loop steps over empty slots.** Four of the game's per-frame walks are mostly over empty entries:
+  - the 1024-slot table at `0x882d38` (`0x52fc20`, `0x52fd90`), 3.5%;
+  - the room's cell grid (`0x4df1c0`, `0x4df510`), 3.7%;
+  - the floor's tile records (`0x4de730`), where nine in ten of `0x4de410`'s 922k calls returned at once: flagged, outside the view's rectangle, or with its block already drawn.
+  
+  Each loop's step is now a call to a native that skips the entries with nothing to do and resumes the game's code at the loop's body (or exit) with the registers it would have (`SlotStepA/B`, `CellStepA/B`, `FloorRecordStep`).
+- **The lane's fight, all in:** 4.52 billion bytes of x86 executed for the same 2,507 frames, against 7.63 billion before the first round (41% less).
+- **Azahar** (each game makes a new map, so the first windows' load waits, 0.2–2 s a window, differ from run to run): over the last three windows, once the loads have settled, 19.4 and 20.4 fps without either round, 22.0–22.7 with the first, 23.6 and 23.9 with both. The game's own cap is 25.
+- **`0x608540`** turned out to be the dispatcher in front of the DC6 blitters. Its own clipped loops only run with `[0x8f03c8]` set, a toggle (`0x608520`) that is off in play. Its share is the block counter weighing its whole 1,093-byte block, of which only the dispatch runs.
+
+**Third round:**
+- **`Dc6Blend1` (`0x608110`)**, d = B[d·256 + s], the last unclipped DC6 leaf the dispatcher calls in play. Checked: 65,536+ calls.
+- **`Dc6Shadow` (`0x608d60`)**, every unit's shadow, 2.2%. A sheared silhouette: every other source row, each row a pixel left of the one before, runs clipped, `T[d·256 + c]` or a fill. Only the shape is read. Its EAX (x less the rows drawn) is its caller's return. Checked: 16,384+.
+- **`WeatherStep` (`0x4732c0`'s loop)**, the rain's particles, 2.4% plus their sine lookups and truncations. The floats are done in doubles in the game's order, as box86's x87 does. A particle at its end resumes the game's code, which respawns it. Checked in a different way: each particle's step is predicted on a copy, the game's code does the real one, and the two are compared, 327,680+.
+- **`StormHash` (`0x415330`)**, Storm's file-name hash, 1.8% plus a `toupper` call per character. Checked: 32,768+.
+- **`WallCellStep` (`0x4dea70`)**, the walls' and objects' pass over the cell grid, once per layer: 25% of a lane run that stayed in town, mostly empty cells.
+- **The unit under the cursor.** Each frame the game tests every unit of the rooms near the cursor (about 600 in town): 920k calls of `0x466870` in a minute of the town walk.
+  - `UnitPickFilter` answers 0 at once for a unit with bit 21 of `+0xc4`, or without bit 7 of `+0xc8`: nine in ten. The game's code gives 0 for those whatever else it checks. The paths before those tests either return 0 or reach them, and nothing they call writes memory: by disassembly of the whole call tree, the table of 7 functions `0x4642b0` calls through included. Checked: 851,968 units.
+  - `PickUnitStep`, at the loop's step, passes over the units both tests reject, keeping the loop's notes. A unit seen twice, the count past 30,000, or the cursor's own unit go to the game's code.
+- **`D2_NATIVE_MASK`** is 64 bits now. Past 32 hooks the 32-bit mask had silently skipped the newest ones.
+- **The lane:**
+  - The fight (`fight.txt`): with fewer guest instructions the virtual clock shifts the scripted input. One run never left town (a push landed on Kashya), so fight totals from here on aren't comparable.
+  - The town walk: 1.80 billion bytes of x86 for the same 1,507 frames, against 2.21 billion with the second round.
+  - All natives checked over the fight: none differ.
+- **Azahar**, round two against round three, can't separate them: the same build gave 19.4 and 22.6 fps over the settled windows in two runs. Near the 25 fps cap, the frame thread's run time floors at about 40 ms a frame, because the game polls the clock while it waits. Gains of a few percent need the console's frame trace, or the lane.
+- **What's left (2026-11-12, after the third round):**
+  - **The guest profile is flat.** In town nothing is above 2.8%. Of the top entries, `0x608540` and `0x4f8120` are dispatchers whose shares come from their big blocks, and the rest are small functions called a few hundred thousand times. A native costs a fixed price per call (registers saved, the bridge, the C++ call), probably more than a 5–10-instruction getter's whole translated body. So natives pay off for loops and long bodies, not for leaves.
+  - **The natives' own time** (Azahar, Cold Plains crowd, the `profile frames,guest` script, ms per 10 s):
+
+    | Native | ms per 10 s |
+    | --- | --- |
+    | FloorQueueEnd | 310–570 |
+    | Dc6Copy | 160–260 |
+    | StretchBlt (the present) | 135–210 |
+    | FloorTile | 130–200 |
+    | LightBlock | 100–150 |
+    | SpriteCacheTouch | 90–170 |
+    | Dc6Shadow | 95–150 |
+    | LightGrid | 75–110 |
+    | LightStamp | 75–110 |
+  - **The floor queue's worker draws only 51–58% of the queued tiles.** The frame thread draws the rest itself at the flush, right after the floor pass (`0x476ce1`); it waits for the worker only 0.4 ms a frame. Deferring the flush to the first renderer call wouldn't buy much: the rain (`0x473c00` → `0x473a70`) and then the units' and walls' passes draw straight after the floor.
+  - **The sprite fetch's cache hit (`0x6001f0`)** costs two natives (SpritePath, SpriteCacheTouch: 1–2% each, mostly the per-call price) plus its own code. One native for the whole hit path would need the cache lookup (`0x60ace0`), `0x5fe990`, `0x600cb0`, `0x5fec90` and `0x5fec50` as well: about 2–3%, the largest single item left.
+- **Act II (Lut Gholein, `tests/m4/scripts/act2-town.txt`, the DuringCh2Mid save with an aura on).** The natives above all apply: they're the engine's. But the town's top was different. Per frame, against the Act I fight and town:
+  - room lookups (`0x463740`): 698 against 70 and 66;
+  - collision tests (`0x64d4e0`): 458 against 32 and 20;
+  - stat queries: 285 against 76 and 53;
+  - skill-level calculations (`0x644180`, six stat queries each): 34 against 8 and 5. This is the aura, re-evaluated each frame, so it depends on the character rather than the act.
+
+  Three more natives:
+  - **`RoomFind` (`0x463740`)**, the room holding a subtile, from a room and its neighbours (158 callers). Checked: 1,441,792 calls.
+  - **`CollisionCross` (`0x64d4e0`)**, whether a subtile or one of its four neighbours is blocked for a mask, inside a room's collision grid: 99.97% of calls. On a room's edge it hands back to the game's code, which looks into the next room. Checked: 917,504.
+  - **`StatGet` (`0x625480`)**, a unit's stat: the stat table's row, then a binary search of the holder's base or full list, with the row's minimum for player-type owners. Three nested calls become one; only reads. Checked: 524,288.
+
+  Lut Gholein went from 3.20 to 2.56 billion bytes of x86 for the same 2,007 frames (−20%). What's left on top there is the unit walk `0x648120` (4.3%). It steps a unit toward its target a subtile at a time, using the direction from `0x678df0`, a collision test through `0x64d910` for the unit's size class (`0x64d450`, `0x64d4e0`, `0x64d7c0`), and two alternate directions to slide along. With its helpers that's about 10%.
+- **`UnitWalk` (`0x648120`)**, a unit's step toward its target:
+  - the main direction from a 5×5 table of clamped offsets (`0x678c10`/`0x678df0`), else two alternate directions, each from its own running place;
+  - then, for the units whose `+0x30` record's first dword is 0 (all the walkers in Lut Gholein), `0x648050`'s settle: within 5 subtiles of the target, on by the 9×9 table at `0x6eb490` while the way is free.
+
+  It's planned without side effects, and handed to the game's code for size classes other than 1, 3 and 5 (the cross test) or a room's edge. Checked: 16,384+ calls, none differ. Lut Gholein: 2.56 → 2.31 billion bytes, 28% less than before the Act II natives.
+- **Act II outdoors: the Far Oasis** (`tests/m4/scripts/act2-oasis.txt`).
+  - New autoplay commands get the script there:
+    - `seek Waypoint` finds the waypoint by its objects.txt name. Lut Gholein's rooms list their objects only once loaded, so it walks toward unloaded rooms, tapping at the screen's edge so that the game finds the path.
+    - `tapobject last` taps what `seek` found.
+    - `goto <class>` walks to a preset object, and `units all` lists every loaded unit and the level's presets.
+  - Lut Gholein's waypoint is class 156. This save's enabled waypoints are Lut Gholein, Sewers 2, Dry Hills, Halls of the Dead 2 and Far Oasis (the last, on the fifth line).
+  - `M4_HOTPROF_LEVEL=43` starts the block count 5 s after reaching the oasis.
+  - **Profile there:** monster pathfinding leads. `0x67b200` adds or updates a neighbour node of the search (9%, 3.9M calls); `0x67b440` is 3.5%; the open and closed sets' hash lookups `0x67ae00` and `0x67ae50` are 2.0% and 1.4%. About 17% together, plus the collision tests they call (now native).
+  - All natives checked over it, none differ. CollisionCross ran 3.3 million times and RoomFind 3.9 million.
+  - **`PathSearch` (`0x67b850`)**, the whole search as one native. The search's state is a 0x32f4-byte local, so the native keeps it in host memory and writes only the path: the points where the step direction changes, at most 77, to the unit's `+0x9c`. It reproduces the game's details, including:
+    - the eight-point pre-check around the goal;
+    - the neighbour order;
+    - g + 2 for a straight step, + 3 for a diagonal;
+    - an improved open node kept where it is in the f-sorted list;
+    - a closed node passing its improvement down its children (stopping at the first empty child slot);
+    - the best-so-far rule (least h, or equal h with g more than 5 higher);
+    - the pool of 200 nodes and the path's 1–77 rule.
+
+    A size class other than 1, 3 and 5, or a test on a room's edge, hands the whole call back to the game's code before anything is written. Checked: 2,048+ searches, the same count and points as the game's. The Far Oasis: 14.42 → 11.45 billion bytes of x86 for the same frames (−21%), and the search's routines left the profile.
+- **`SkillLevel` (`0x644180`)**, a skill's level with the unit's bonuses (an aura's, each frame): the base, +2 for state 0x86, and the +all skills, class, tab, single-skill (capped at 3 for a player of the skill's class), `+0x1dc` and 0x6b stats, through `StatGet`. Only reads. Checked: 65,536+ calls in Lut Gholein and in the Far Oasis.
+- **`UnitRelation` (`0x465c60`)**, whether the player may act on a unit, from the cursor's hit test: 530k calls in the Far Oasis. Outside a town (`0x6426a0`'s table of levels) it uses:
+  - the roster (`0x7bb5bc`) and the "owned" bit;
+  - the monstats flags 4 and 5;
+  - "player against object or item";
+  - the alignment test (`0x650d70`, `0x6259b0`: stat 0xac of the state 0x69 stat list).
+
+  Towns and player against player go to the game's code. Checked: 1,638,400 calls, none differ.
+- **Act II on the lane, all in:**
+
+  | Area | x86 bytes, before the Act II natives → now | Change |
+  | --- | --- | --- |
+  | Lut Gholein | 3.20 → 2.27 billion | −29% |
+  | Far Oasis | 14.42 → 10.89 billion | −24.5% |
+- **A bug found on the way:** a native that falls back to the game's code must resume past the bytes its hook's jump covers. `UnitPickFilter` first resumed at `0x466873`, inside the jump. That ran two of the jump's bytes as code, and the lane's town run crashed (a guest thread at `0x40000c`). The checked run hadn't shown it, because the check's trampolines copy the original bytes.
 
 ## Blood Moor: VirtualAlloc ran out (2026-10-18)
 

@@ -6,6 +6,7 @@
 //       game.log, stderr.txt   the session's logs, as they were
 //       sprites.trc            a profiler run's sprite trace (issue #18)
 //       files.trc              a profiler run's file-read trace (issue #21)
+//       frames.trc             a profiler run's frame trace (game/frame_trace.h)
 //       crash_dump_*.dmp       Luma3DS's dumps saved during it (copies)
 //       report.txt             why there is a report (key=value)
 //       note.txt               the player's description
@@ -83,6 +84,8 @@ struct Host {
     const char *game_files;          // "sdcard", "romfs-slim", "romfs-full"
 };
 
+std::string environment(std::string &detail);   // below: what the app runs on
+
 namespace {
 
 using game::report::LogSummary;
@@ -114,6 +117,8 @@ constexpr uint64_t kTraceMax = 32u << 20, kTraceRecord = 16;
 // The file-read trace (rt::set_file_trace): text, its first 16 MiB. A line
 // per read of the game's; it compresses about 5:1.
 constexpr uint64_t kFileTraceMax = 16u << 20;
+// The frame trace: ~4 MiB an hour; its start and end past 8 MiB.
+constexpr uint64_t kFrameTraceMax = 8u << 20, kFrameTraceHead = 2u << 20;
 
 void say(const Host &host, const std::string &s)
 {
@@ -452,6 +457,10 @@ void draw_offer(const Offer &o)
     if (trace > 0)
         std::printf(" sprites.trc (%s%s)\n", kib(trace < (long)kTraceMax ? trace : (long)kTraceMax).c_str(),
                     trace > (long)kTraceMax ? ", its start" : "");
+    const long frames = file_size(o.dir + "/frames.trc");
+    if (frames > 0)
+        std::printf(" frames.trc (%s%s)\n", kib(frames < (long)kFrameTraceMax ? frames : (long)kFrameTraceMax).c_str(),
+                    frames > (long)kFrameTraceMax ? ", its start and end" : "");
     const long reads = file_size(o.dir + "/files.trc");
     if (reads > 0)
         std::printf(" files.trc (%s%s)\n", kib(reads < (long)kFileTraceMax ? reads : (long)kFileTraceMax).c_str(),
@@ -479,15 +488,17 @@ void draw_offer(const Offer &o)
             std::printf("\x1b[36m  ...\x1b[0m\n");
     }
     // The last action's outcome; once sent, Sentry's ID for it.
-    draw_status(!o.status.empty() || o.state != "sent" ? o.status : "Sent. Sentry's event ID: " + o.event_id);
+    draw_status(!o.status.empty() || o.state != "sent" ? o.status : "Sent. Sentry's event ID:\n" + o.event_id);
     if (o.state == "sent")
         draw_keys({{"SELECT", "delete"}, {"B", "back to the list"}});
     else if (o.state.empty())
-        draw_keys({{"A", "send"}, {"Y", "edit description"}, {"R", asked_for(o) ? "edit title" : "edit topic"},
-                   {"L", "screenshots"}, {"X", "don't send"}, {"SELECT", "delete"}, {"B", "back to the list"}});
+        draw_keys({{"A", "send"}, {"Y", "edit description"}, {"L", "screenshots"},
+                   {"R", asked_for(o) ? "edit title" : "edit topic"}, {"X", "don't send"}, {"SELECT", "delete"},
+                   {"B", "back to the list"}});
     else
-        draw_keys({{"A", "send"}, {"Y", "edit description"}, {"R", asked_for(o) ? "edit title" : "edit topic"},
-                   {"L", "screenshots"}, {"SELECT", "delete"}, {"B", "back to the list"}});
+        draw_keys({{"A", "send"}, {"Y", "edit description"}, {"L", "screenshots"},
+                   {"R", asked_for(o) ? "edit title" : "edit topic"}, {"SELECT", "delete"},
+                   {"B", "back to the list"}});
 }
 
 // The game's own keyboard on the bottom screen: when the system's keyboard
@@ -918,6 +929,8 @@ bool build_envelope(const Host &host, const Offer &o, const game::report::Dsn &d
     if (!version.empty())
         e.release = "3ds-d2@" + version;
     e.dist = o.build;
+    std::string env_detail;
+    e.environment = environment(env_detail);
     e.note = o.note;
     e.topic = o.topic;
     e.player_report = asked;
@@ -963,6 +976,8 @@ bool build_envelope(const Host &host, const Offer &o, const game::report::Dsn &d
               {"app_version", D2_VERSION}};
     if (system_s[0])
         e.tags.push_back({"firmware", system_s});
+    if (!env_detail.empty())   // Luma3DS's version on a console, the emulator's in one
+        e.tags.push_back({e.environment == "console" ? "luma" : "emulator", env_detail});
     if (!o.log.trace_writes().empty())
         e.tags.push_back({"trace_writes", o.log.trace_writes()});   // how complete the traces are (issue #66)
     e.device = {{"model", model_name(model)}, {"family", "Nintendo 3DS"}, {"arch", "armv6k"}};
@@ -974,6 +989,7 @@ bool build_envelope(const Host &host, const Offer &o, const game::report::Dsn &d
     add_file_item(gz, o.dir + "/stderr.txt", "stderr.txt", "text/plain", kStderrMax, 0);
     add_trace_item(gz, o.dir + "/sprites.trc");
     add_file_item(gz, o.dir + "/files.trc", "files.trc", "text/plain", kFileTraceMax, kFileTraceMax);
+    add_file_item(gz, o.dir + "/frames.trc", "frames.trc", "text/plain", kFrameTraceMax, kFrameTraceHead);
     for (const std::string &d : o.dumps)
         add_file_item(gz, o.dir + "/" + d, d, "application/octet-stream", kDumpMax, kDumpMax);
     // a/b: Sentry lists attachments by name, so a pair's top comes first.
@@ -1025,8 +1041,14 @@ bool post(const Host &host, const game::report::Dsn &dsn, const std::string &bod
         if (end != std::string::npos && end - id - 6 <= 32)
             event_id = printable(answer.substr(id + 6, end - id - 6));
     }
-    say(host, "report: " + url + " (" + std::to_string((body.size() + 1023) >> 10) + " KiB, " +
-                  std::to_string(took_ms) + " ms): " + msg + (event_id.empty() ? "" : " Event " + event_id + "."));
+    // The bottom screen's lines hold 39 characters: the outcome, then the
+    // event ID on a line of its own.
+    say(host, "report: " + msg + " (" + std::to_string((body.size() + 1023) >> 10) + " KiB, " +
+                  std::to_string(took_ms) + " ms)");
+    if (!event_id.empty()) {
+        say(host, "Sentry's event ID:");
+        say(host, "  " + event_id);
+    }
     return answered && status == 200;
 }
 
@@ -1046,9 +1068,13 @@ bool confirm_sent(const Offer &o, const std::string &event_id)
             std::printf("%s\n", l.c_str());
         std::printf("\n");
     }
-    std::printf("Its files stay on the SD card:\n");
-    for (const std::string &l : wrap(o.dir.substr(o.dir.find(':') + 1), 47))
-        std::printf("  %s\n", l.c_str());
+    // The folder on two lines (the reports folder, then the report's own
+    // name): on one, its last characters went to a line of their own.
+    std::printf("Its files stay on the SD card, in\n");
+    const std::string path = o.dir.substr(o.dir.find(':') + 1);
+    const size_t slash = path.rfind('/');
+    std::printf("  %s\n", path.substr(0, slash + 1).c_str());
+    std::printf("  %s\n", path.substr(slash + 1).c_str());
     draw_keys({{"A", "continue"}});
     while (aptMainLoop()) {
         hidScanInput();
@@ -1114,10 +1140,22 @@ bool send(const Host &host, Offer &o, const game::report::Dsn &dsn, std::string 
 
 // One report's screen, until B. False: the app is closing. `sent`: it was
 // sent from here; `status`: what the list says about it afterwards.
+// Set by offer_one: the next load_offer, the session just kept, is timed
+// into its game.log (issue #96).
+bool g_time_load = false;
+
 bool detail(const Host &host, const game::report::Dsn &dsn, const std::string &dir, bool &sent, std::string &status)
 {
     sent = false;
+    const uint64_t t0 = osGetTime();
     Offer o = load_offer(dir);
+    if (g_time_load) {
+        g_time_load = false;
+        if (FILE *f = std::fopen((dir + "/game.log").c_str(), "a")) {
+            std::fprintf(f, "[rt] report: preparing it: read for the report %u ms\n", (unsigned)(osGetTime() - t0));
+            std::fclose(f);
+        }
+    }
     bool redraw = true;
     while (aptMainLoop()) {
         if (redraw) {
@@ -1343,6 +1381,46 @@ bool manage(const Host &host, const std::string &open_dir)
 }  // namespace
 
 // game.log's first line: when and which build, for the next start.
+// What the app runs on:
+//   "azahar": Citra's family of emulators, of which Azahar is the one kept
+//     up: their svcGetSystemInfo answers type 0x20000 (CITRA_INFORMATION),
+//     sub-type 0 non-zero (Citra 1, Azahar 2126.2 2); a console has no such
+//     type. `detail`: sub-type 11's 8 characters, the emulator's version
+//     ("2126.2").
+//   "console": Luma3DS answers its own type 0x10000 with its version, in
+//     `detail` (the CIA needs custom firmware, so a console has it; Azahar
+//     answers it too, with 0).
+//   "unknown": neither (another emulator, most likely).
+// The device model can't tell them apart: an emulator reports the model it
+// is set to.
+std::string environment(std::string &detail)
+{
+    detail.clear();
+    s64 v = 0;
+    if (R_SUCCEEDED(svcGetSystemInfo(&v, 0x20000, 0)) && v != 0) {
+        s64 version = 0;
+        if (R_SUCCEEDED(svcGetSystemInfo(&version, 0x20000, 11))) {
+            char t[9] = {};
+            std::memcpy(t, &version, 8);
+            for (char *c = t; *c; c++)
+                if (*c < 0x20 || *c > 0x7e)
+                    *c = '?';
+            detail = t;
+        }
+        return "azahar";
+    }
+    v = 0;
+    if (R_SUCCEEDED(svcGetSystemInfo(&v, 0x10000, 0)) && v) {
+        const u32 ver = (u32)v;
+        char t[24];
+        std::snprintf(t, sizeof t, "%lu.%lu.%lu", (unsigned long)GET_VERSION_MAJOR(ver),
+                      (unsigned long)GET_VERSION_MINOR(ver), (unsigned long)GET_VERSION_REVISION(ver));
+        detail = t;
+        return "console";
+    }
+    return "unknown";
+}
+
 std::string start_line()
 {
     return std::string(game::report::kSessionStart) + " " + std::to_string(unix_now()) + " build " + D2_BUILD_ID +
@@ -1366,6 +1444,7 @@ std::string keep_unclosed_session()
     move_file(std::string(kLogDir) + "/stderr.txt", dir + "/stderr.txt");
     move_file(std::string(kLogDir) + "/sprites.trc", dir + "/sprites.trc");
     move_file(std::string(kLogDir) + "/files.trc", dir + "/files.trc");
+    move_file(std::string(kLogDir) + "/frames.trc", dir + "/frames.trc");
     const int dumps = s.start_time() ? copy_new_dumps(dir, s.start_time()) : 0;
     write_all(dir + "/report.txt", "reason=" + reason_of(s, dumps) + "\nbuild=" + build + "\n");
     if (!have_dsn())
@@ -1376,14 +1455,46 @@ std::string keep_unclosed_session()
 
 // After the game, with game.log closed: a copy of the session's logs, for
 // `reason`. Returns the folder.
-std::string keep_session(const char *reason)
+// "412 KiB", "3.2 MiB".
+std::string size_text(uint64_t bytes)
+{
+    char t[24];
+    if (bytes < (1u << 20))
+        std::snprintf(t, sizeof t, "%u KiB", (unsigned)((bytes + 1023) >> 10));
+    else
+        std::snprintf(t, sizeof t, "%.1f MiB", bytes / 1048576.0);
+    return t;
+}
+
+// The session's files into a report folder. Each copy is said on the
+// bottom screen (a long run's traces take a while on the SD card), and the
+// steps' times go at the end of the report's game.log (issue #96), with
+// `before_ms`, the app's own closing before this.
+std::string keep_session(const Host &host, const char *reason, uint32_t before_ms)
 {
     std::fflush(stderr);
     const std::string dir = make_report_dir(unix_now(), D2_BUILD_ID);
-    copy_file(std::string(kLogDir) + "/game.log", dir + "/game.log");
-    copy_file(std::string(kLogDir) + "/stderr.txt", dir + "/stderr.txt");
-    copy_file(std::string(kLogDir) + "/sprites.trc", dir + "/sprites.trc");
-    copy_file(std::string(kLogDir) + "/files.trc", dir + "/files.trc");
+    std::string times = "[rt] report: preparing it: closing the session " + std::to_string(before_ms) + " ms";
+    uint64_t total = 0;
+    const uint64_t t0 = osGetTime();
+    for (const char *name : {"game.log", "stderr.txt", "sprites.trc", "files.trc", "frames.trc"}) {
+        const std::string from = std::string(kLogDir) + "/" + name;
+        struct stat st;
+        if (stat(from.c_str(), &st) != 0)
+            continue;
+        say(host, std::string("Copying ") + name + ", " + size_text((uint64_t)st.st_size) + "...");
+        const uint64_t t = osGetTime();
+        copy_file(from, dir + "/" + name);
+        total += (uint64_t)st.st_size;
+        times += std::string(", ") + name + " " + size_text((uint64_t)st.st_size) + " " +
+                 std::to_string(osGetTime() - t) + " ms";
+    }
+    const uint64_t took = osGetTime() - t0;
+    say(host, "Copied " + size_text(total) + " in " + std::to_string((took + 500) / 1000) + " s.");
+    if (FILE *f = std::fopen((dir + "/game.log").c_str(), "a")) {
+        std::fprintf(f, "%s\n", times.c_str());
+        std::fclose(f);
+    }
     write_all(dir + "/report.txt", std::string("reason=") + reason + "\nbuild=" + D2_BUILD_ID + "\n");
     prune_reports();
     return dir;
@@ -1396,6 +1507,8 @@ bool offer_one(const Host &host, const std::string &dir)
 {
     if (!have_dsn())
         return true;
+    say(host, "Reading the session for the report...");
+    g_time_load = true;
     return manage(host, dir);
 }
 

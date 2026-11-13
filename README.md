@@ -12,7 +12,7 @@ Diablo II: Lord of Destruction 1.14d on the New 3DS.
 - **Luma3DS** custom firmware.
 - **FBI** (or another CIA installer).
 - About **2 GB free** on the SD card for the game files.
-- Your own **Diablo II + Lord of Destruction**, patched to **1.14d**. The current Blizzard installers for Diablo II and Lord of Destruction install 1.14d.
+- Your own **Diablo II + Lord of Destruction**, patched to **1.14d**. The current Blizzard installers for Diablo II and Lord of Destruction install 1.14c, not 1.14d, so patch the installed game before copying its files: update it to 1.14d through Battle.net ([Blizzard support](https://support.blizzard.com/en/help/article/13867)), or apply the offline [1.14d patch](https://www.moddb.com/games/diablo-2-lod/downloads/diablo-ii-lord-of-destruction-v114d-patch). The app refuses any other `Game.exe` (see [step 1](#1-copy-the-game-files-to-the-sd-card)).
 - For sound: a **DSP firmware dump** at `sdmc:/3ds/dspfirm.cdc` (see [step 2](#2-dump-the-dsp-firmware-for-sound)).
 
 ## Setup
@@ -55,7 +55,7 @@ SD card
 
 The app creates `save/` (characters and settings) and `logs/` (`game.log`, `stderr.txt`) next to `game/` the first time it runs.
 
-To check that your `Game.exe` is the 1.14d build this project is tested with, its SHA-256 should be `631066c1649c4ea9ffe48bf97e24c00bca1f7a6759c21150f1a79982589adaaf`. The app does not check the hash itself. The patches it applies check the bytes they replace and skip anything that does not match, so other builds of `Game.exe` are not supported.
+To check that your `Game.exe` is the 1.14d build this project is tested with, its SHA-256 should be `631066c1649c4ea9ffe48bf97e24c00bca1f7a6759c21150f1a79982589adaaf`. The app checks the `Game.exe` before starting it and refuses any other build, older 1.14 builds (1.14c from the current installers) and the small `Game.exe` of the versions before 1.14 included, with what to do on the top screen. It tells 1.14d by where the program starts (its entry point), not by the hash.
 
 ### 2. Dump the DSP firmware (for sound)
 
@@ -84,15 +84,16 @@ Start 3ds-d2 from the HOME menu. The game appears on the top screen. The bottom 
 | Touch screen | Touchpad: drag moves the cursor, a short tap clicks |
 | A / B | Left / right mouse button |
 | X | Inventory |
-| Y | Show items on the ground (held) |
+| Y | Show items on the ground (held); in a shop, sells the item under the cursor; with the inventory open, drops it |
 | L | Stand still (held) |
 | D-pad | Belt potions 1–4 |
-| ZL / ZR | Weapon swap / automap |
+| ZL | Weapon swap |
 | Start | Game menu, close panels |
 | Select | Top screen: whole frame ↔ 1:1 zoom for reading text |
 | A, B, Start or a tap | During a cinematic: skip it |
 | R + A / B / X / Y | Character screen / skill tree / automap / quests |
-| R + D-pad | Skill hotkeys F1–F4 |
+| ZR + A / B / Y / X | Skill hotkeys F1–F4 |
+| R + D-pad | Skill hotkeys F1–F4 too |
 | R + Start | Enter (confirm) |
 | R + Select | On-screen keyboard |
 | L + R + Select | Screenshot into the Camera album |
@@ -103,9 +104,11 @@ When the game asks for text, such as a character name, a keyboard opens on the b
 
 If the app shows "Game.exe not found", check the folder name and that `Game.exe` is inside `/3ds/3ds-d2/game/`.
 
+If the app shows "Game.exe ... is not Diablo II 1.14d" or "... is from a Diablo II before 1.14", the `Game.exe` on the SD card is another version: patch the game to 1.14d ([requirements](#requirements)) and copy its `Game.exe` and `patch_d2.mpq` again.
+
 ### Problem reports
 
-If 3ds-d2 crashes (Luma3DS shows its exception screen), the next start keeps that session's `game.log`, `stderr.txt` and the Luma3DS crash dump in `/3ds/3ds-d2/reports/<time>-<build>/` before anything is overwritten. The top screen then shows the report and asks whether to send it. It does the same after a session that ended on a fatal error, after a session in which you tapped **report a problem** at the bottom of the INFO tab, and after a session with a **profiler run** (INFO's other button: a checklist of measurements to run, see [docs/controls.md](docs/controls.md#bottom-screen)). The report is made only after the game has ended, never while you play.
+If 3ds-d2 crashes (Luma3DS shows its exception screen), the next start keeps that session's `game.log`, `stderr.txt` and the Luma3DS crash dump in `/3ds/3ds-d2/reports/<time>-<build>/` before anything is overwritten. The top screen then shows the report and asks whether to send it. It does the same after a session that ended on a fatal error, after a session in which you tapped **report** at the bottom of the INFO tab, and after a session with a **profiler run** (INFO's other button: a checklist of measurements to run, see [docs/controls.md](docs/controls.md#bottom-screen)). The report is made only after the game has ended, never while you play.
 
 The screen lists what would be sent:
 

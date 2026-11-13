@@ -8,7 +8,7 @@
 # Logs: <sdmc>/3ds/3ds-d2/logs/game.log; saves: <sdmc>/3ds/3ds-d2/save/.
 # Sound needs <sdmc>/3ds/dspfirm.cdc, copied from dist/dspfirm.cdc when it is there.
 #
-#   scripts/run-game-azahar.sh [--install <game-dir>] [--save <dir>] [--autoplay <file> | --no-autoplay] [--no-build]
+#   scripts/run-game-azahar.sh [--install <game-dir>] [--save <dir>] [--autoplay <file> | --no-autoplay] [--keep-reports] [--no-build]
 #                              [--cia <file> | --3dsx] [--system-azahar]
 #
 #   --no-build         the newest dist/cia/*.cia (or the .3dsx) as it is
@@ -19,6 +19,10 @@
 #                      dist/save/BeforeCh1End/save); the save folder there is kept as save.bak-<time>
 #   --autoplay <file>  scripted input from the start (game/autoplay.h), as <sdmc>/3ds/3ds-d2/autoplay.txt
 #   --no-autoplay      remove an autoplay.txt left there by an earlier run
+#   --keep-reports     leave the emulated card's reports/ and logs/ as they are. By default they
+#                      move to build/azahar-old/<time>/ first: a session Azahar was closed on
+#                      never ended in order, and the next start would stop on its report screen
+#                      (which scripted input can't answer)
 #
 # Azahar is the project's own portable copy (scripts/fetch-azahar.sh, fetched on
 # first use into build/azahar/<version>/, its SD card in user/sdmc next to the
@@ -28,13 +32,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 die() { echo "run-game-azahar.sh: $*" >&2; exit 1; }
 
-install="" save="" autoplay="" no_autoplay=0 build=1 system=0 cia="" use_3dsx=0
+install="" save="" autoplay="" no_autoplay=0 build=1 system=0 cia="" use_3dsx=0 keep_reports=0
 while [ $# -gt 0 ]; do
     case "$1" in
     --install) install="$2"; shift 2 ;;
     --save) save="$2"; shift 2 ;;
     --autoplay) autoplay="$2"; shift 2 ;;
     --no-autoplay) no_autoplay=1; shift ;;
+    --keep-reports) keep_reports=1; shift ;;
     --no-build) build=0; shift ;;
     --cia) cia="$2"; build=0; shift 2 ;;
     --3dsx) use_3dsx=1; shift ;;
@@ -115,6 +120,16 @@ elif [ "$no_autoplay" = 1 ]; then
     rm -f "$SD/autoplay.txt"
 elif [ -f "$SD/autoplay.txt" ]; then
     echo "note: $SD/autoplay.txt from an earlier run will play (--no-autoplay removes it)"
+fi
+if [ "$keep_reports" = 0 ]; then
+    old="$ROOT/build/azahar-old/$(date +%Y%m%d-%H%M%S)"
+    for d in reports logs; do
+        if [ -d "$SD/$d" ] && [ -n "$(ls -A "$SD/$d" 2>/dev/null)" ]; then
+            mkdir -p "$old"
+            mv "$SD/$d" "$old/$d"
+            echo "$d: the earlier runs' -> $old/$d"
+        fi
+    done
 fi
 
 echo "log: $SD/logs/game.log"

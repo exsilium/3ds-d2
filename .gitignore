@@ -9,3 +9,4 @@ Game.exe
 *.d2s
 .DS_Store
 /containers/d2vita-ref/patches-armv6/
+__pycache__/

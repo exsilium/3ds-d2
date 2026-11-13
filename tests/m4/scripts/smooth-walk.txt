@@ -1,0 +1,39 @@
+# Smoothness while walking (frame pacing): the first character in the list
+# into the game, a profiler run with the frame trace only, then 90 s of
+# walking loops round the town the character is in, no fights; a panel the
+# walk clicks open (an NPC's menu) is closed with START. For a
+# character such as dist/save/BeforeCh1End's (the Rogue Encampment) or
+# DuringCh2Mid's (Lut Gholein); the trace is logs/frames.trc, read with
+# tools/frame_report.py. Azahar:
+#   scripts/run-game-azahar.sh --save dist/save/BeforeCh1End/save --autoplay tests/m4/scripts/smooth-walk.txt
+# The same file runs on the console as sdmc:/3ds/3ds-d2/autoplay.txt.
+0 skipvideos
+35000 tap 400 307
+40000 tapuntil ingame 690 555
+40500 profile frames
+40500 closepanels
+# 5 s standing still first: the trace's baseline.
+47000 circle 120 0
+51000 circle 0 120
+55000 circle -120 0
+59000 circle 0 -120
+63000 circle 120 120
+67000 circle -120 -120
+71000 circle 120 -120
+75000 circle -120 120
+79000 circle 120 0
+83000 circle 0 120
+87000 circle -120 0
+91000 circle 0 -120
+95000 circle 120 120
+99000 circle -120 -120
+103000 circle 120 -120
+107000 circle -120 120
+111000 circle 120 0
+115000 circle 0 120
+119000 circle -120 0
+123000 circle 0 -120
+127000 circle 120 120
+131000 circle -120 -120
+135000 circle 0 0
+140000 profile off

@@ -144,6 +144,13 @@ int main()
         // No timestamp unless given (Sentry's receipt time); the build as the dist.
         CHECK(j.find("\"timestamp\"") == std::string::npos);
         CHECK(j.find("\"dist\":\"0123456789ab\"") != std::string::npos);
+        // The session's build as the runtime (Sentry's Runtime column); no environment unless given.
+        CHECK(j.find("\"runtime\":{\"type\":\"runtime\",\"name\":\"3ds-d2\",\"version\":\"0123456789ab\"}") !=
+              std::string::npos);
+        CHECK(j.find("\"environment\"") == std::string::npos);
+        e.environment = "azahar";
+        CHECK(event_json(e).find("\"environment\":\"azahar\"") != std::string::npos);
+        e.environment.clear();
         CHECK(j.find("\"session_started_console_clock\":\"2026-10-28 01:23:45\"") != std::string::npos);
         CHECK(j.find("\"release\"") == std::string::npos);   // no version known: no release
         e.timestamp = 1793000000;

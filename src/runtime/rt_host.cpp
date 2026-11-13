@@ -1,12 +1,14 @@
 // See rt_host.h.
 #include "runtime/rt_host.h"
 #include "runtime/rt_layout.h"
+#include "runtime/pool_fit.h"
 
 #include "runtime/bridge.h"
 #include "runtime/ds_emul.h"
 #include "runtime/cpu.h"
 #include "runtime/guest_region.h"
 #include "runtime/guest_scratch.h"
+#include "runtime/guest_sync.h"
 #include "runtime/guest_thread.h"
 #include "runtime/guest_thread_ctx.h"
 #include "runtime/host_clock.h"
@@ -56,6 +58,11 @@ extern uint64_t dyn86_ctr_cache_sync_ticks __attribute__((weak));
 
 using namespace d2rt;
 
+// The dynarec's translation knobs (third_party/winx86 src/dynarec86/dyn86.c).
+extern "C" {
+extern int box86_dynarec_callret, dyn86_nopend, box86_dynarec_budgettail, box86_dynarec_forward;
+}
+
 namespace rt {
 namespace {
 
@@ -75,6 +82,16 @@ thread_local bool t_runs_guest = false;
 bool g_in_service = false;
 uint64_t g_last_service_ms = 0;   // real clock (wx86_now_ms)
 uint64_t g_t0_ms = 0;   // real clock at run start: guest time starts at 0 in both modes
+// How far the platform has moved the real clock's guest time ahead of the
+// host's (advance_guest_clock, issue #86's frame lock), in us. Only ever
+// grows, so the guest's clock never runs back. 32 bits: a lock at its most
+// (2000 ppm) takes 25 days to wrap it.
+std::atomic<uint32_t> g_clock_ahead_us{0};
+// The real clock's guest time for a host clock read (wx86_now_us).
+inline uint64_t guest_us_at(uint64_t host_us)
+{
+    return host_us - g_t0_ms * 1000ull + g_clock_ahead_us.load(std::memory_order_relaxed);
+}
 // GetTickCount and timeGetTime as the in-line intrinsic serves them (issue
 // #39): on the real clock, the clock at the start of the current slice,
 // raised by every now_ms read in it, so it never runs behind a time the guest
@@ -157,6 +174,12 @@ uint32_t g_pool_size = 0;   // 0: separate ranges
 // and the takes from it the heartbeat has logged.
 wx86::GuestRegion g_spare;
 uint32_t g_spare_size = 0, g_spare_logged = 0;
+// RunOptions::pool_large: a block of the VirtualAlloc face, carved up by
+// va_alloc for its large blocks only.
+wx86::GuestRegion g_large;
+uint32_t g_large_base = 0, g_large_size = 0, g_large_takes = 0, g_large_missed = 0;
+uint32_t g_large_heap = 0;   // of g_large_takes: the heap's blocks (heap_alloc)
+bool in_large(uint32_t va) { return g_large_size && va - g_large_base < g_large_size; }
 
 // VirtualAlloc blocks by the guest code that allocated them (the return
 // address of its VirtualAlloc call), so an allocation failure can say who
@@ -209,6 +232,171 @@ void log_va_owners()
     logf("%s", line.c_str());
 }
 
+// What the large-block zone holds (RunOptions::pool_large), by size.
+void log_large_zone()
+{
+    if (!g_large_size)
+        return;
+    std::string blocks;
+    for (const auto &u : g_large.used_map())
+        blocks += " " + std::to_string(u.second >> 10);
+    logf("pool large zone: %u of %u KiB in use [%s ], largest free %u KiB, %u blocks served (%u heap), %u not",
+         g_large.cur() >> 10, g_large_size >> 10, blocks.c_str(), g_large.largest_free() >> 10, g_large_takes,
+         g_large_heap, g_large_missed);
+}
+
+// The pool's free space in pieces, and what sits in its spare (issue #70):
+// a request goes to the spare only when no free piece of the pool holds it,
+// and in a long session that happened with 10 MiB of the pool free. Two
+// lines and the VirtualAlloc owners; `why` says what asked for them. Reads
+// the regions' maps of used blocks, so only at a take or a fallback.
+void pool_pieces(const char *why)
+{
+    if (!g_pool_size)
+        return;
+    // The pool's free pieces: the gaps between its used blocks (the faces'
+    // blocks and the spare's record).
+    const uint32_t base = g_pool.base(), end = base + g_pool_size;
+    uint32_t total = 0, pieces = 0, slack = 0, slack_n = 0;
+    uint32_t n_by[4] = {}, kib_by[4] = {};   // < 64 KiB, < 256 KiB, < 1 MiB, the rest
+    std::vector<uint32_t> sizes;
+    uint32_t at = base;
+    for (const auto &u : g_pool.used_map()) {
+        if (u.first > at) {
+            const uint32_t sz = u.first - at;
+            total += sz;
+            pieces++;
+            sizes.push_back(sz);
+        }
+        at = std::max(at, u.first + u.second);
+    }
+    if (end > at) {
+        total += end - at;
+        pieces++;
+        sizes.push_back(end - at);
+    }
+    std::sort(sizes.rbegin(), sizes.rend());
+    // Gaps under 1 KiB are small heap blocks freed between live ones: room
+    // for small requests only, and many of them, so counted apart.
+    while (!sizes.empty() && sizes.back() < 1024) {
+        slack += sizes.back();
+        slack_n++;
+        pieces--;
+        sizes.pop_back();
+    }
+    for (uint32_t sz : sizes) {
+        const int k = sz < (64u << 10) ? 0 : sz < (256u << 10) ? 1 : sz < (1u << 20) ? 2 : 3;
+        n_by[k]++;
+        kib_by[k] += sz >> 10;
+    }
+    std::string line;
+    for (size_t i = 0; i < sizes.size() && i < 6; i++)
+        line += " " + std::to_string(sizes[i] >> 10);
+    logf("pool pieces (%s): %u KiB free in %u pieces, the largest%s KiB; under 64 KiB %u (%u KiB), 64-256 KiB %u (%u "
+         "KiB), 256 KiB-1 MiB %u (%u KiB), 1 MiB and more %u (%u KiB); %u gaps under 1 KiB (%u B)",
+         why, total >> 10, pieces, line.c_str(), n_by[0], kib_by[0], n_by[1], kib_by[1], n_by[2], kib_by[2], n_by[3],
+         kib_by[3], slack_n, slack);
+    log_large_zone();
+    if (!g_spare_size)
+        return;
+    // The blocks in the spare: each face's, by size; VirtualAlloc's with
+    // the guest code that asked for them.
+    const uint32_t s0 = g_spare.base(), s1 = s0 + g_spare_size;
+    va_owner_sync();
+    std::string heap, va;
+    uint32_t heap_n = 0, heap_kib = 0, va_n = 0, va_kib = 0;
+    for (auto it = g_heap.used_map().lower_bound(s0); it != g_heap.used_map().end() && it->first < s1; ++it) {
+        heap_kib += it->second >> 10;
+        if (heap_n++ < 8)
+            heap += " " + std::to_string((it->second + 1023) >> 10);
+    }
+    for (auto it = g_va.used_map().lower_bound(s0); it != g_va.used_map().end() && it->first < s1; ++it) {
+        va_kib += it->second >> 10;
+        if (va_n++ < 8) {
+            char item[40];
+            const auto o = g_va_owner.find(it->first);
+            std::snprintf(item, sizeof item, " %u by %08x", it->second >> 10, o != g_va_owner.end() ? o->second : 0);
+            va += item;
+        }
+    }
+    logf("pool spare holds: heap %u blocks %u KiB [%s ], VirtualAlloc %u blocks %u KiB [%s ]", heap_n, heap_kib,
+         heap.c_str(), va_n, va_kib, va.c_str());
+    log_va_owners();
+}
+
+// Whether a VirtualAlloc block of `bytes` fits in a free piece of the
+// pool, as GuestRegion::carve places it (pool_fit.h). Without a pool, the
+// VA region's largest piece with 64 KiB to spare.
+bool va_fits(uint32_t bytes)
+{
+    if (!g_pool_size)
+        return g_va.largest_free() >= bytes + 0xffff;
+    return pool_fits_top(g_pool.used_map(), g_pool.base(), g_pool_size, bytes, 0x10000);
+}
+
+// The game's heap, through the large-block zone (issue #70). Its blocks over
+// pool_large_min come and go at area loads (282-533 KiB in 3DS-D2-15). One
+// that no free piece of the pool held took the spare: six times in 53 min,
+// and each take cut the sprite cache to 4 MiB, a 1-2 s hitch while it
+// filled again. Such a block now takes the zone first, as the sprite frames
+// do. Only then: a heap block the pool holds stays there, so long-lived ones
+// do not keep the zone from the frames.
+uint32_t heap_alloc(uint32_t n)
+{
+    if (g_large_size && g_pool_size && n > g_opt.pool_large_min &&
+        !pool_fits_bottom(g_pool.used_map(), g_pool.base(), g_pool_size, n, 16))
+        if (const uint32_t a = g_large.alloc(n)) {
+            g_large_takes++;
+            g_large_heap++;
+            return a;
+        }
+    return g_heap.alloc(n);
+}
+bool heap_free(uint32_t a) { return in_large(a) ? g_large.free(a) : g_heap.free(a); }
+uint32_t heap_size(uint32_t a) { return in_large(a) ? g_large.size_of(a) : g_heap.size_of(a); }
+
+// WinVita's heap shims (win32_shims_memory.cpp) again, through heap_alloc:
+// registered after them, these win.
+void install_heap(Bridge &br)
+{
+    auto K = [&](const char *name, uint32_t argc, std::function<uint32_t(Cpu &)> fn) {
+        Shim s;
+        s.argc = argc;
+        s.stdcall_cleanup = true;
+        s.tag = std::string("KERNEL32.dll!") + name;
+        s.fn = std::move(fn);
+        br.register_shim("KERNEL32.dll", name, s);
+    };
+    K("HeapAlloc", 3, [](Cpu &c) {
+        const uint32_t n = c.arg(2), a = heap_alloc(n);
+        if (a && (c.arg(1) & 0x8u))   // HEAP_ZERO_MEMORY
+            wx86_gzero(c, a, n);
+        return a;
+    });
+    K("HeapReAlloc", 4, [](Cpu &c) {
+        const uint32_t old = c.arg(2), n = c.arg(3), a = heap_alloc(n);
+        if (old && a) {
+            const uint32_t osz = heap_size(old), cp = osz && osz < n ? osz : n;
+            void *dhp = c.hostptr(a, cp), *shp = c.hostptr(old, cp);
+            if (dhp && shp) {
+                c.invalidate_code(a, cp);
+                std::memcpy(dhp, shp, cp);
+            } else {
+                std::vector<uint8_t> tmp(cp, 0);
+                c.read(old, tmp.data(), cp);
+                c.write(a, tmp.data(), cp);
+            }
+            heap_free(old);
+        }
+        return a;
+    });
+    K("HeapFree", 3, [](Cpu &c) {
+        heap_free(c.arg(2));
+        return 1u;
+    });
+    K("HeapSize", 3, [](Cpu &c) { return heap_size(c.arg(2)); });
+}
+
 // VirtualQuery support for WinVita's memory shims: report the arena regions.
 bool vquery(uint32_t addr, uint32_t &base, uint32_t &size, uint32_t &state, uint32_t &type, uint32_t &protect,
             uint32_t &allocbase)
@@ -242,8 +430,27 @@ const Layout &layout() { return *g_opt.layout; }
 wx86::GuestRegion &va_region() { return g_va; }
 uint32_t va_alloc(uint32_t bytes, uint32_t owner)
 {
-    // A free piece that large may still not hold it at the VA's alignment.
-    if (g_va.largest_free() < bytes + 0xffff)
+    // Only from a free piece of the pool: a request no piece holds would be
+    // served from the spare, which is kept for the game's own (issue #70).
+    // The test is the pool's own (guest_region.h, carve from the top): the
+    // block, rounded to 64 KiB, at the highest 64 KiB boundary that leaves
+    // it room in the piece. It asked for 64 KiB to spare before, and turned
+    // down two requests of 247 and 253 KiB with a 256 KiB piece free
+    // (3DS-D2-13); the game's pool system then took that piece for them.
+    // A large block from the zone kept for them, if it has room; else from
+    // the pool as any other.
+    if (g_large_size && bytes > g_opt.pool_large_min) {
+        // The owners map holds the zone as one block of its own (the first
+        // block in it has the zone's address): its blocks are not recorded.
+        if (const uint32_t a = g_large.alloc(bytes)) {
+            g_large_takes++;
+            return a;
+        }
+        if (g_large_missed++ < 8)
+            logf("pool large zone: %u KiB does not fit (%u of %u KiB in use), from the pool", (bytes + 1023) >> 10,
+                 g_large.cur() >> 10, g_large_size >> 10);
+    }
+    if (!va_fits(bytes))
         return 0;
     va_owner_sync();   // the last VirtualAlloc's block takes its own owner first
     const uint32_t a = g_va.alloc(bytes);
@@ -253,6 +460,10 @@ uint32_t va_alloc(uint32_t bytes, uint32_t owner)
 }
 void va_free(uint32_t va)
 {
+    if (in_large(va)) {
+        g_large.free(va);
+        return;
+    }
     g_va_owner.erase(va);
     g_va.free(va);
 }
@@ -391,13 +602,19 @@ void crash_report(const uint32_t r[16], uint32_t far, void (*line)(const char *)
     }
 }
 
+void background_slice_check();   // after the frame thread's state, below
+
 uint32_t native_entry(const char *name, uint32_t stack_args, std::function<uint32_t(Cpu &)> fn)
 {
     Shim s;
     s.argc = stack_args;
     s.stdcall_cleanup = true;
     s.tag = std::string("3DSD2NATIVE!") + name;
-    s.fn = std::move(fn);
+    s.fn = [fn = std::move(fn)](Cpu &c) {
+        const uint32_t r = fn(c);
+        background_slice_check();
+        return r;
+    };
     g_br->register_shim("3DSD2NATIVE", name, s);
     return g_br->shim_trap("3DSD2NATIVE", name);
 }
@@ -431,9 +648,13 @@ MemoryReport memory_report()
     const Layout &L = layout();
     const uint32_t heap = g_heap.used_bytes(), va = g_va.used_bytes();
     // The pool's own count holds the spare whole, and not the blocks in it.
+    // The large-block zone is one VirtualAlloc block to the pool, so its
+    // free bytes are not in `free`: the governor keeps its reserve in the
+    // rest of the pool, as before the zone.
+    const uint32_t large_used = g_large_size ? g_large.used_bytes() : 0;
     const uint32_t free = g_pool_size ? g_pool_size - g_pool.used_bytes() : L.heap_size + L.va_size - heap - va;
     return {heap, g_heap.peak(), L.heap_size, va, g_va.peak(), L.va_size, free, g_va.largest_free(),
-            g_spare_size ? g_spare.used_bytes() : 0, g_spare_size ? g_pool.spare_takes() : 0,
+            g_spare_size ? g_spare.used_bytes() : 0, g_spare_size ? g_pool.spare_takes() : 0, large_used, g_large_size,
             (uint32_t)d2rt_box86_dynarec_kb(), (uint32_t)d2rt_box86_dynarec_used_kb(),
             (uint32_t)d2rt_box86_custommalloc_kb(), (uint32_t)d2rt_box86_jmptbl_kb()};
 }
@@ -497,14 +718,25 @@ enum : size_t { kFrameRun, kFrameReady, kFrameHost, kFrameSleep, kFrameWaits };
 uint64_t g_frame_us[kFrameKindCount] = {}, g_frame_mark[kFrameKindCount] = {};
 size_t g_frame_was = kFrameKindCount;   // what it was doing at the last sample (none yet)
 uint64_t g_frame_at = 0;
+// Its ready time by the guest thread that ran meanwhile (ids under 16), for
+// the frame trace: who kept it from its frame.
+uint64_t g_ready_by[16] = {};
+uint64_t g_slice_start_us = 0;   // the running slice's start (real clock)
 int g_slice_tid = -1;          // the guest thread whose slice runs, -1 between slices
 bool g_slice_sink = false;     // the scheduler reports its slices
 bool g_host_work = false;      // the heartbeat or the app's service runs
 uint64_t g_heartbeat_us = 0;   // the last heartbeat's length
+uint64_t g_prof_report_us = 0;   // of which the profile's lines (issue #71)
 // Its blocked time by where it waits from (the guest code it resumes in),
 // for the heartbeat's few largest.
 uint32_t g_frame_where = 0;
 std::map<uint32_t, uint64_t> g_frame_wait_at;
+// The same for the frame trace, since its last frame: a few sites, each with
+// the owner of the critical section it waited for (0: not a critsec, or free).
+struct FrameWaitSite { uint32_t site, owner; uint64_t us; uint32_t from[kWaitFrom]; };
+FrameWaitSite g_frame_waits[8] = {};
+uint32_t g_frame_owner = 0;   // at the last sample: the critsec's owner
+uint32_t g_frame_from[kWaitFrom] = {};   // ...and the game's calls it waits under (frame_wait_callers)
 
 // Where a blocked guest thread waits from: its saved EIP when that is in the
 // game's image, else (a shim's trap) the return address on its stack.
@@ -515,6 +747,31 @@ uint32_t wait_site(const GuestThread &t)
         return eip;
     Cpu *c = g_tick_cpu.load(std::memory_order_relaxed);
     return c ? c->read_u32(t.ctx.gpr[R_ESP]) : eip;
+}
+
+// The return addresses on a blocked thread's EBP chain (the game's and
+// Storm's functions keep frames), up to 4 into the game's image: who waits
+// under a site shared by many (Storm's read wait at 0x41af0d). From the
+// wait's start only.
+void frame_wait_callers(const GuestThread &t, uint32_t out[kWaitFrom])
+{
+    for (size_t i = 0; i < kWaitFrom; i++)
+        out[i] = 0;
+    Cpu *c = g_tick_cpu.load(std::memory_order_relaxed);
+    if (!c)
+        return;
+    const uint32_t esp = t.ctx.gpr[R_ESP];
+    uint32_t ebp = t.ctx.gpr[R_EBP], n = 0;
+    for (int i = 0; i < 12 && n < kWaitFrom; i++) {
+        if (ebp < esp || ebp - esp > (1u << 20) || (ebp & 3))
+            break;
+        const uint32_t ret = c->read_u32(ebp + 4), next = c->read_u32(ebp);
+        if (ret >= g_exe_base && ret < g_exe_base + g_exe_size)
+            out[n++] = ret;
+        if (next <= ebp)
+            break;
+        ebp = next;
+    }
 }
 
 size_t frame_thread_doing()
@@ -534,10 +791,16 @@ size_t frame_thread_doing()
     case GuestThread::State::Blocked: break;
     default: return kFrameKindCount;
     }
-    g_frame_where = wait_site(*t);
+    const uint32_t where = wait_site(*t);
+    if (where != g_frame_where || g_frame_was < kFrameSleep)
+        frame_wait_callers(*t, g_frame_from);   // a new wait
+    g_frame_where = where;
+    g_frame_owner = 0;
     if (!t->wait_obj)
         return kFrameSleep;
     const char *k = static_cast<Waitable *>(t->wait_obj)->kind();
+    if (std::strcmp(k, "critsec") == 0)
+        g_frame_owner = static_cast<WxCrit *>(t->wait_obj)->owner & ~WX86_CRIT_WAITERS;
     for (size_t i = kFrameWaits; i + 1 < kFrameKindCount; i++)
         if (std::strcmp(k, kFrameKinds[i]) == 0)
             return i;
@@ -551,8 +814,28 @@ uint64_t charge_frame_thread()
     const uint64_t us = wx86_now_us();
     if (g_frame_was < kFrameKindCount && us > g_frame_at) {
         g_frame_us[g_frame_was] += us - g_frame_at;
-        if (g_frame_was >= kFrameSleep)
+        if (g_frame_was == kFrameReady && g_slice_tid >= 0 && g_slice_tid < 16)
+            g_ready_by[g_slice_tid] += us - g_frame_at;
+        if (g_frame_was >= kFrameSleep) {
             g_frame_wait_at[g_frame_where] += us - g_frame_at;
+            if (g_frame_was > kFrameSleep) {
+                FrameWaitSite *w = nullptr;
+                for (FrameWaitSite &e : g_frame_waits)
+                    if (e.us && e.site == g_frame_where && e.owner == g_frame_owner) {
+                        w = &e;
+                        break;
+                    }
+                for (FrameWaitSite &e : g_frame_waits)
+                    if (!w && !e.us)
+                        w = &e;
+                if (w) {
+                    w->site = g_frame_where;
+                    w->owner = g_frame_owner;
+                    w->us += us - g_frame_at;
+                    std::memcpy(w->from, g_frame_from, sizeof w->from);
+                }
+            }
+        }
     }
     g_frame_at = us;
     return us;
@@ -565,15 +848,42 @@ void sample_frame_thread()
 }
 
 // The scheduler's slice sink (its thread).
+void stall_capture(uint32_t tid);
+
 void on_slice(uint32_t tid, bool start)
 {
     const uint64_t us = charge_frame_thread();
+    if (!start)
+        stall_capture(tid);
+    if (start)
+        g_slice_start_us = us;
     if (start && g_opt.real_clock)
-        raise_tick(us / 1000 - g_t0_ms);   // now_ms's value, from the clock read just made
+        raise_tick(guest_us_at(us) / 1000);   // now_ms's value, from the clock read just made
     g_slice_sink = true;
     g_slice_tid = start ? (int)tid : -1;
+
     g_frame_was = frame_thread_doing();
 }
+
+}  // namespace
+
+// RunOptions::background_slice_us, after a native: a background thread
+// past its time yields when the frame thread waits to run.
+void background_slice_check()
+{
+    const int frame = g_stats.frame_thread;
+    // Real clock only: on the virtual clock a run must not depend on host time.
+    if (!g_opt.background_slice_us || !g_opt.real_clock || !g_sched || frame < 0 || g_slice_tid < 0 ||
+        g_slice_tid == frame)
+        return;
+    if (wx86_now_us() - g_slice_start_us < g_opt.background_slice_us)
+        return;
+    GuestThread *t = g_sched->thread_by_id((uint32_t)frame);
+    if (t && t->state == GuestThread::State::Ready)
+        g_sched->yield();
+}
+
+namespace {
 
 // Host work on the guest's core, from the scheduler's thread.
 void host_work(bool on)
@@ -692,6 +1002,10 @@ void prof_report(uint64_t ms)
          (unsigned long long)(f.cache_bytes >> 10), (unsigned long long)((f.wait_us - f0.wait_us) / 1000),
          (unsigned long long)(f.waits - f0.waits), (unsigned long long)((f.wait_frame_us - f0.wait_frame_us) / 1000),
          (unsigned long long)((f.stall_us - f0.stall_us) / 1000));
+    if (f.jobs != f0.jobs)
+        logf("prof jobs: %llu on the I/O worker, %llu ms (%llu past 5 ms), %llu ms queued",
+             (unsigned long long)(f.jobs - f0.jobs), (unsigned long long)((f.job_us - f0.job_us) / 1000),
+             (unsigned long long)(f.job_long - f0.job_long), (unsigned long long)((f.job_queued_us - f0.job_queued_us) / 1000));
     log_frame_thread();
 #ifdef PROF_COUNTERS
     now.run_ns = prof::run_ns;
@@ -807,6 +1121,7 @@ void check_time_limit(uint64_t ms)
         host_work(true);
         const uint64_t beat_t0 = wx86_now_us();
         prof_report(ms);
+        g_prof_report_us = wx86_now_us() - beat_t0;
 #ifdef __GLIBC__
         const size_t host_used = mallinfo2().uordblks;
 #else
@@ -824,10 +1139,21 @@ void check_time_limit(uint64_t ms)
              (unsigned)d2rt_box86_dynarec_kb(),
              (unsigned)d2rt_box86_custommalloc_kb(), (unsigned)d2rt_box86_jmptbl_kb(), (unsigned)(host_used >> 10),
              (unsigned)d2rt_box86_dynarec_used_kb());
+        {
+            const std::string loop = loop_line();   // the game's main loop: frame and idle passes
+            if (!loop.empty())
+                logf("%s", loop.c_str());
+        }
         if (g_spare_size && g_pool.spare_takes() != g_spare_logged) {
             g_spare_logged = g_pool.spare_takes();
             logf("pool spare: %u requests taken so far, %u of %u KiB in use, pool largest free %u KiB", g_spare_logged,
                  g_spare.cur() >> 10, g_spare_size >> 10, g_pool.largest_free() >> 10);
+            pool_pieces("spare taken");
+        }
+        static uint32_t large_logged = 0;
+        if (g_large_size && g_large_takes != large_logged) {
+            large_logged = g_large_takes;
+            log_large_zone();
         }
         if (g_opt.heartbeat)
             g_opt.heartbeat();
@@ -897,21 +1223,187 @@ FrameThreadTimes frame_thread_times()
     return t;
 }
 
+void frame_thread_ready_by(uint64_t out[16])
+{
+    for (int i = 0; i < 16; i++)
+        out[i] = g_ready_by[i];
+}
+uint32_t guest_thread_entry(uint32_t tid)
+{
+    GuestThread *t = g_sched ? g_sched->thread_by_id(tid) : nullptr;
+    return t ? t->entry : 0;
+}
+
+void frame_thread_us(uint64_t out[kFrameThreadKinds])
+{
+    static_assert(kFrameThreadKinds == kFrameKindCount, "rt_host.h's kinds are kFrameKinds");
+    charge_frame_thread();
+    for (size_t i = 0; i < kFrameKindCount; i++)
+        out[i] = g_frame_us[i];
+}
+
+namespace {
+// stall_probe's samples of a long frame: the watching thread nudges the
+// frame thread to stop at its next block; the slice's end (on_slice) takes
+// where it stopped, the context saved. Up to kStallSamples a frame.
+constexpr int kStallSamples = 8;
+std::atomic<bool> g_stall_pending{false};
+std::atomic<uint64_t> g_present_us{0};   // the frame thread's last present (note_present)
+uint32_t g_stall[kStallSamples][2] = {};  // eip, the dword on top of the stack
+std::atomic<int> g_stall_n{0};
+}  // namespace
+
+void advance_guest_clock(uint32_t us) { g_clock_ahead_us.fetch_add(us, std::memory_order_relaxed); }
+uint32_t guest_clock_ahead_us() { return g_clock_ahead_us.load(std::memory_order_relaxed); }
+
+void note_present() { g_present_us.store(wx86_now_us(), std::memory_order_release); }
+
+// See rt_host.h. The frame thread's (a shim's), and the heartbeat's.
+struct LoopWindow {
+    uint32_t idle = 0, frames = 0;
+    uint64_t idle_us = 0, frame_us = 0, idle_max_us = 0;
+};
+LoopWindow g_loop;
+uint64_t g_loop_last_us = 0;
+
+void note_loop_pass()
+{
+    if (!on_frame_thread())
+        return;
+    const uint64_t now = wx86_now_us();
+    if (g_loop_last_us && now > g_loop_last_us) {
+        const uint64_t d = now - g_loop_last_us;
+        if (g_present_us.load(std::memory_order_acquire) > g_loop_last_us) {
+            g_loop.frames++;
+            g_loop.frame_us += d;
+        } else {
+            g_loop.idle++;
+            g_loop.idle_us += d;
+            if (d > g_loop.idle_max_us)
+                g_loop.idle_max_us = d;
+        }
+    }
+    g_loop_last_us = now;
+}
+
+std::string loop_line()
+{
+    const LoopWindow w = g_loop;
+    g_loop = LoopWindow{};
+    if (!w.idle && !w.frames)
+        return "";
+    char line[200];
+    std::snprintf(line, sizeof line,
+                  "main loop: %u frame passes %u ms; %u idle passes %u ms (longest %u us, %u us each)", w.frames,
+                  (unsigned)(w.frame_us / 1000), w.idle, (unsigned)(w.idle_us / 1000), (unsigned)w.idle_max_us,
+                  w.idle ? (unsigned)(w.idle_us / w.idle) : 0);
+    return line;
+}
+
+void stall_probe(uint64_t min_us)
+{
+    const int frame = g_stats.frame_thread;
+    const uint64_t present = g_present_us.load(std::memory_order_acquire);
+    if (frame < 0 || !present || g_slice_tid != frame || g_stall_pending.load(std::memory_order_acquire) ||
+        g_stall_n.load(std::memory_order_acquire) >= kStallSamples || wx86_now_us() - present < min_us)
+        return;
+    Cpu *c = g_tick_cpu.load(std::memory_order_acquire);
+    if (!c)
+        return;
+    g_stall_pending.store(true, std::memory_order_release);
+    c->nudge_thread_budget(nullptr);   // stops at the next block: where it is, not the last trap
+}
+
+namespace {
+// on_slice, at a slice's end: the nudged slice's EIP and top of stack.
+void stall_capture(uint32_t tid)
+{
+    if (!g_stall_pending.load(std::memory_order_acquire) || (int)tid != g_stats.frame_thread)
+        return;
+    GuestThread *t = g_sched ? g_sched->thread_by_id(tid) : nullptr;
+    Cpu *c = g_tick_cpu.load(std::memory_order_acquire);
+    const int n = g_stall_n.load(std::memory_order_acquire);
+    if (t && c && n < kStallSamples) {
+        g_stall[n][0] = t->ctx.eip;
+        g_stall[n][1] = c->read_u32(t->ctx.gpr[R_ESP]);
+        g_stall_n.store(n + 1, std::memory_order_release);
+    }
+    g_stall_pending.store(false, std::memory_order_release);
+}
+}  // namespace
+
+int take_stall(uint32_t out[][2], int max)
+{
+    const int n = std::min(g_stall_n.load(std::memory_order_acquire), max);
+    std::memcpy(out, g_stall, sizeof g_stall[0] * (size_t)n);
+    g_stall_n.store(0, std::memory_order_release);
+    return n;
+}
+
+
+
+void set_dynarec_knobs(int callret, int nopend, int budgettail, int forward)
+{
+    if (callret >= 0)
+        box86_dynarec_callret = callret;
+    if (nopend >= 0)
+        dyn86_nopend = nopend;
+    if (budgettail >= 0)
+        box86_dynarec_budgettail = budgettail;
+    if (forward >= 0)
+        box86_dynarec_forward = forward;
+}
+
+int current_thread_id() { return g_sched ? (int)g_sched->current_id() : -1; }
+
+bool on_frame_thread()
+{
+    return g_sched && g_stats.frame_thread >= 0 && (int)g_sched->current_id() == g_stats.frame_thread;
+}
+
+uint64_t frame_thread_wait_top(uint32_t &site, uint32_t &owner, uint32_t from[kWaitFrom])
+{
+    charge_frame_thread();
+    uint64_t most = 0;
+    site = owner = 0;
+    for (size_t i = 0; i < kWaitFrom; i++)
+        from[i] = 0;
+    for (FrameWaitSite &e : g_frame_waits) {
+        if (e.us > most) {
+            most = e.us;
+            site = e.site;
+            owner = e.owner;
+            std::memcpy(from, e.from, sizeof e.from);
+        }
+        e = FrameWaitSite{};
+    }
+    return most;
+}
+
 uint64_t last_heartbeat_us() { return g_heartbeat_us; }
+uint64_t last_prof_report_us() { return g_prof_report_us; }
+void log_pool_pieces(const char *why) { pool_pieces(why); }
 
 void count_lock_site(uint32_t ret) { g_lock_sites.count(ret); }
 
 uint64_t now_ms()
 {
-    uint64_t ms = (g_opt.real_clock || !g_sched) ? wx86_now_ms() - g_t0_ms : g_sched->virt_ms();
+    uint64_t ms = (g_opt.real_clock || !g_sched) ? guest_us_at(wx86_now_us()) / 1000 : g_sched->virt_ms();
     check_time_limit(ms);
     return ms;
+}
+
+uint32_t tick_ms()
+{
+    if (!g_sched)
+        return (uint32_t)now_ms();
+    return g_opt.real_clock ? g_tick.load(std::memory_order_relaxed) : (uint32_t)g_sched->virt_ms();
 }
 
 uint64_t now_us()
 {
     if (g_opt.real_clock || !g_sched)
-        return wx86_now_us() - g_t0_ms * 1000ull;
+        return guest_us_at(wx86_now_us());
     // Virtual time has millisecond steps; a per-call tick keeps QPC strictly
     // increasing between them, as on a real machine.
     static uint64_t last = 0;
@@ -1011,6 +1503,7 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
     g_stats = Stats();
     g_next_beat = g_opt.heartbeat_ms;
     g_t0_ms = wx86_now_ms();
+    g_clock_ahead_us.store(0, std::memory_order_relaxed);
     g_last_service_ms = g_t0_ms;
     struct RunsGuest {
         RunsGuest() { t_runs_guest = true; }
@@ -1066,6 +1559,11 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
     // Allocation failures: the first few of each region are logged with its
     // state, so an "Out of memory" from the game can be traced to its cause.
     wx86::region_set_fail_handler([](const wx86::RegionFail &f) {
+        // The large-block zone turning a block down is not a failure: it goes
+        // to the pool (va_alloc logs it). Counted, those misses ended a
+        // session with "ran out of memory" and nothing refused (3DS-D2-14).
+        if (std::strcmp(f.name, "large") == 0)
+            return;
         static unsigned n = 0;
         g_stats.alloc_failures++;
         if (++n <= 16)
@@ -1091,6 +1589,19 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
                 g_spare_size = g_spare.largest_free();   // all of it, still unused
             logf("pool spare: %u KiB%s", g_opt.pool_spare >> 10, g_spare_size ? "" : " does not fit, none");
         }
+        g_large_size = g_large_base = g_large_takes = g_large_missed = g_large_heap = 0;
+        if (g_opt.pool_large) {
+            const uint32_t bytes = (g_opt.pool_large + 0xffff) & ~0xffffu;
+            if (const uint32_t a = g_va.alloc(bytes)) {
+                g_large = wx86::GuestRegion();
+                g_large.init(a, bytes, 0x10000, "large");
+                g_large_base = a;
+                g_large_size = bytes;
+                g_va_owner[a] = 0x1a26e;   // "VirtualAlloc by caller": the zone itself
+            }
+            logf("pool large zone: %u KiB for blocks over %u KiB%s", bytes >> 10, g_opt.pool_large_min >> 10,
+                 g_large_size ? "" : ": does not fit, none");
+        }
     } else {
         g_heap.init(L.heap_base, L.heap_size, 16, "heap");
         g_va.init(L.va_base, L.va_size, 0x10000, "va");
@@ -1107,6 +1618,7 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
     plan.va = &g_va;
     plan.vquery = vquery;
     win32_shims_memory_install(*br, plan);
+    install_heap(*br);
     if (g_opt.total_phys_mb)
         wx86_mem_set_total_phys_mb(g_opt.total_phys_mb);
     win32_shims_sync_install(*br);
@@ -1183,6 +1695,8 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
         for (int i = 0; i < 1000; i++)
             (void)wx86_now_us();
         logf("clock: a host clock read costs %llu ns", (unsigned long long)(wx86_now_us() - t0));
+        logf("dynarec: callret %d, nopend %d, budgettail %d, forward %d", box86_dynarec_callret, dyn86_nopend,
+             box86_dynarec_budgettail, box86_dynarec_forward);
     }
     // The hottest other imports go through the bridge without leaving the
     // dynarec loop (WinVita's in-line shim path): same shim, no trap. Under
@@ -1222,12 +1736,17 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
     }
     g_sched = &sched;
     if (opt.real_clock && opt.sleep_ms)
-        sched.set_real_clock([] { return wx86_now_ms() - g_t0_ms; }, opt.sleep_ms);
+        sched.set_real_clock([] { return guest_us_at(wx86_now_us()) / 1000; }, opt.sleep_ms);
     if (!opt.real_clock && opt.virtual_tick_us)
         sched.set_virtual_tick_us(opt.virtual_tick_us);
     sched.set_max_switches(~0ull);   // runs end by exit or max_ms, never by a switch count
     sched.set_time_sink([](uint64_t ms) { check_time_limit(ms); });
     sched.set_slice_sink(on_slice);
+    if (opt.background_quantum)
+        sched.set_quantum_for([](uint32_t tid) -> uint32_t {
+            const int frame = g_stats.frame_thread;   // -1 until the first frame
+            return frame >= 0 && tid != (uint32_t)frame ? g_opt.background_quantum : 0;
+        });
     wx86_set_scheduler(&sched);
     sched.set_main(img->entry_va(), L.main_stack + 0x200000 - 0x100, L.main_tib);
     g_tick_cpu.store(cpu, std::memory_order_release);

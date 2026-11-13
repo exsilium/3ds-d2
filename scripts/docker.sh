@@ -10,7 +10,7 @@
 #   scripts/docker.sh test cpu [armv7|armv6]  the same fixtures through the Box86 backend
 #   scripts/docker.sh test m3            a PE32 through the Win32 runtime on the ARMv6 backend
 #   scripts/docker.sh test tls           the reports' TLS module under qemu-arm: a test event to Sentry (network)
-#   scripts/docker.sh test d2d           d2d's work tree (third_party/d2d + tests/d2d/patches) and its harness's modules
+#   scripts/docker.sh test d2d [<game-dir>]   d2d's work tree and its harness's modules; with Game.exe, its cases vs our natives
 #   scripts/docker.sh package           release build -> dist/<build-id>/ with manifest
 #   scripts/docker.sh package-cia [<game-dir>]   the hardware build: dist/cia/3ds-d2-<version>-<build-id>.cia (~2 MB),
 #                                             reading the game files from sdmc:/3ds/3ds-d2/game/; with
@@ -117,7 +117,15 @@ test)
     gameexe) run_in "$HOSTTEST_IMAGE" make -C tests/gameexe run ;;   # 1.14d's Game.exe told from the others
     frames) run_in "$HOSTTEST_IMAGE" make -C tests/frames run ;;   # the allocator of the sprite cache's frames
     pool) run_in "$HOSTTEST_IMAGE" make -C tests/pool run ;;   # where the pool's VirtualAlloc face fits a block without the spare
-    d2d)  run_in "$HOSTTEST_IMAGE" make -C tests/d2d run ;;   # d2d's work tree, prepared and patched (issue #106)
+    d2d)  # [<game-dir>]: d2d's work tree, prepared and patched (issue #106); with the game directory
+          # (mounted read-only), d2d's emulator-made cases against our natives (issue #108)
+        if [ -n "${2:-}" ]; then
+            [ -f "$2/Game.exe" ] || die "test d2d [<game-dir with Game.exe>]"
+            RUN_EXTRA=(-v "$(host_path "$(cd "$2" && pwd)"):/game:ro")
+            run_in "$HOSTTEST_IMAGE" make -C tests/d2d run cases
+        else
+            run_in "$HOSTTEST_IMAGE" make -C tests/d2d run
+        fi ;;
     tls)  # the TLS module (tls.bin) loaded as on the console: one test event to Sentry, an untrusted server refused
         ensure_image toolchain "$TOOLCHAIN_IMAGE"
         run_in "$TOOLCHAIN_IMAGE" make -s -C tests/cpu/ctr ../../../build/cpu/ctr/tls.bin
@@ -129,7 +137,7 @@ test)
         RUN_EXTRA=(-v "$(host_path "$(cd "$2" && pwd)"):/game:ro")
         for v in M4_LAYOUT M4_VIRTUAL_CLOCK M4_SCRIPT M4_BOTTOM RT_MSGLOG M4_PHYS_MB M4_FAST M4_QEMU_FLAGS WX86_SON WX86_SONDUMP WX86_SONMAXS WX86_HOTPROF D2_NOLINK M4_FRAMEHASH M4_NATIVE D2_NATIVE_MASK M4_DUMPFRAME M4_VIDEO M4_VIDEO_WAV M4_PROF RT_FILETRACE M4_HASHMEM WX86_FAKETSC M4_ASYNCIO M4_SPRITE_MB M4_POOL_RESERVE_MB M4_POOL_SPARE_KB M4_SPRITE_TRACE M4_STORM_PRIO M4_STORM_DIRECT D2_NATIVE_CHECK M4_SPRITE_FRAMES M4_META_CAP_KB D2_JITEVICT D2_JITFAILAFTER D2_JITCHUNK_KB M4_POOL_PIECES M4_POOL_BALLAST_MB M4_POOL_LARGE_KB M4_POOL_LARGE_MIN_KB M4_BG_QUANTUM M4_CALLRET M4_NOPEND M4_BUDGETTAIL M4_FORWARD M4_HOTPROF_LEVEL D2_DRAW_CENSUS D2_FLOOR_QUEUE D2_DCC; do [ -n "${!v:-}" ] && RUN_EXTRA+=(-e "$v=${!v}"); done
         run_in "$HOSTTEST_IMAGE" make "${make_args[@]}" ;;
-    *)    die "test host | test x86 [golden] | test cpu [armv7|armv6] | test m3 | test report | test governor | test gameexe | test frames | test pool | test d2d | test tls | test m4 <game-dir>" ;;
+    *)    die "test host | test x86 [golden] | test cpu [armv7|armv6] | test m3 | test report | test governor | test gameexe | test frames | test pool | test d2d [<game-dir>] | test tls | test m4 <game-dir>" ;;
     esac
     ;;
 package)

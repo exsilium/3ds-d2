@@ -15,8 +15,36 @@ OUT     := $(ROOT)/build/d2d
 SRC     := $(OUT)/d2d
 SUBMOD  := $(ROOT)/third_party/d2d
 
-.PHONY: run prepare export FORCE
+.PHONY: run prepare export cases FORCE
 FORCE:
+
+# d2d's emulator-made cases against our natives (issue #108): needs the
+# user's Game.exe (GAME, mounted read-only by scripts/docker.sh test d2d
+# <game-dir>). Built as the m4 lane builds the game (ARMv6K, run on qemu's
+# ARM11 model), the test file including d2_native.cpp in place of its own
+# object, and d2d's case files read from the work tree.
+W       := $(ROOT)/build/cpu/armv6/winx86
+CXX     := arm-linux-gnueabi-g++
+ARCH    := -marm -march=armv6k -mtune=mpcore -mfpu=vfp -mfloat-abi=softfp
+INC     := -I$(ROOT)/src -I$(W)/src -I$(W)/src/dynarec86 -I$(W)/src/dynarec86/shim \
+           -I$(W)/third_party/box86-dynarec/include -I$(W)/third_party/box86-dynarec -I$(SRC)/tests
+QEMU    := qemu-arm -cpu arm11mpcore
+GAME    ?= /game
+NATIVE_SRCS := $(filter-out $(ROOT)/src/game/d2_native.cpp,$(wildcard $(ROOT)/src/runtime/rt_*.cpp) \
+               $(wildcard $(ROOT)/src/game/*.cpp) $(wildcard $(ROOT)/src/game/bink/*.cpp))
+LIB     := $(W)/build-arm/libwinx86.a
+
+$(LIB): FORCE
+	$(MAKE) -C ../cpu VARIANT=armv6 lib
+
+$(OUT)/walk_back: walk_back.cpp $(SRC)/.prepared $(NATIVE_SRCS) $(wildcard $(ROOT)/src/game/*.h) \
+                  $(wildcard $(ROOT)/src/runtime/rt_*.h) $(LIB)
+	$(CXX) -std=gnu++17 -O2 -g $(ARCH) -DD2RT_CPU_BOX86 -Wall -Wextra -Wno-unused-parameter -Wno-psabi $(INC) \
+	  -static -o $@ walk_back.cpp $(NATIVE_SRCS) $(LIB) -lpthread -lm
+
+cases: $(OUT)/walk_back
+	@test -f $(GAME)/Game.exe || { echo "no Game.exe in $(GAME)"; exit 2; }
+	@$(QEMU) $(OUT)/walk_back $(GAME)/Game.exe
 
 run: $(SRC)/.prepared
 	@echo "d2d $$(cat $(OUT)/prepare.id) in build/d2d/d2d ($$(ls patches/*.patch 2>/dev/null | wc -l) patches)"

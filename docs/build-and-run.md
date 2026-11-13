@@ -15,7 +15,7 @@ scripts/docker.sh test cpu armv7   # the same fixtures through upstream Box86 (C
 scripts/docker.sh test cpu armv6   # the ARMv6 port (ARM11 model); must be byte-identical to the baseline
 AZAHAR=/path/to/azahar scripts/run-cpu-lane-azahar.sh   # the port as a 3DS app, in Azahar
 scripts/docker.sh test m3          # PE32 fixture through the Win32 runtime (M3_REAL_CLOCK=1: console clock mode)
-scripts/docker.sh test d2d         # d2d's work tree (build/d2d/d2d), prepared and patched; its emulator harness's modules
+scripts/docker.sh test d2d [<game-dir>]   # d2d's work tree (build/d2d/d2d) and its harness's modules; with Game.exe (read-only), d2d's cases against our natives
 scripts/docker.sh test m4 <game-dir> [guest-ms] [cmdline]   # the real Game.exe on the runtime; dir mounted read-only, shots in build/m4/shots
 # build/cpu/ctr/m3.3dsx (built with the CPU-lane apps) runs the same fixture in Azahar;
 # output: sdmc:/3ds/3ds-d2/m3/out.txt

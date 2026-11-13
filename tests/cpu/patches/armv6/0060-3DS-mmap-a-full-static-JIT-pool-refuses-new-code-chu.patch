@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Fri, 13 Nov 2026 07:07:05 +0000
+Subject: [PATCH] 3DS mmap: a full static JIT pool refuses new code chunks
+ without the heap fallback
+
+With the static pool in use (made executable) and full, an executable request returns MAP_FAILED (ENOMEM) at once: the heap fallback lent 2 MiB, zeroed it and asked the kernel for RWX, which the console refuses for heap pages (Azahar accepts, and kept the chunk), only for the JIT to evict anyway. The heap path stays for a missing or refused pool. Logged once; dyn86_ctr_jitpool_refused counts the refusals (issue #90).
+---
+ src/dynarec86/shim/ctr/mman_ctr.c | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/src/dynarec86/shim/ctr/mman_ctr.c b/src/dynarec86/shim/ctr/mman_ctr.c
+index 890d03e..9dffe05 100755
+--- a/src/dynarec86/shim/ctr/mman_ctr.c
++++ b/src/dynarec86/shim/ctr/mman_ctr.c
+@@ -139,12 +139,18 @@ static int arena_free(void* p)
+  * carved from it with a bump pointer (Box86 never returns its code chunks);
+  * the whole pool is made executable once. It lives in the program's .bss,
+  * outside the console's 96 MiB heap window, and a console that will not make
+- * heap pages executable may accept it. When the pool is missing, refused or
+- * full, chunks come from the heap as before. */
++ * heap pages executable may accept it. When the pool is missing or refused,
++ * chunks come from the heap as before. When it is in use and full, a new
++ * chunk is refused (ENOMEM) without trying the heap (issue #90): the heap
++ * would have to lend 2 MiB and zero it only for the kernel to refuse to
++ * make it executable on the console (Azahar accepts it, and would keep it),
++ * and the JIT evicts on a refusal anyway. dyn86_ctr_jitpool_refused counts
++ * them, for the app's heartbeat. */
+ extern uint8_t dyn86_ctr_jitpool[] __attribute__((weak));
+ extern const uint32_t dyn86_ctr_jitpool_size __attribute__((weak));
+ static uint32_t g_pool_used = 0;
+ static int g_pool_state = 0;   /* 0 untried, 1 executable, -1 unusable */
++uint32_t dyn86_ctr_jitpool_refused = 0;
+ 
+ static void* jitpool_take(size_t len)
+ {
+@@ -199,6 +205,14 @@ void* mmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset)
+         p = jitpool_take(len);
+         if (p)
+             return p;
++        if (g_pool_state > 0) {   /* the pool in use, and full: no heap (issue #90) */
++            if (!dyn86_ctr_jitpool_refused++) {
++                fprintf(stderr, "[mman] static JIT pool full: chunks refused, the JIT evicts\n");
++                fflush(stderr);
++            }
++            errno = ENOMEM;
++            return MAP_FAILED;
++        }
+     }
+     if ((flags & MAP_NORESERVE) && !(prot & PROT_EXEC)) {
+         p = dyn86_ctr_arena_take(len);

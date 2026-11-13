@@ -574,7 +574,7 @@ int main(int argc, char **argv)
         if (shot)
             shot_now = true;
         second_screen.update(pad, gs, controls.cursor_x(), controls.cursor_y(), now);
-        controls.set_context(gs.in_game, gs.panel_open);
+        controls.set_context(gs.in_game, gs.panel_open, gs.ui, gs.in_game && game::holding_item());
         controls.update(pad, now);
         second_screen.request(controls.take_bottom_request());
     };

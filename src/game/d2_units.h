@@ -44,6 +44,9 @@ void npc_menu_line(const UnitSpot &npc, int line, int &x, int &y);
 // number as it is; 0 if neither.
 uint32_t unit_class(const char *name);
 
+// An item is on the cursor (picked up in the inventory, a shop...).
+bool holding_item();
+
 // The level the player is in (levels.txt's number: 1 the Rogue Encampment,
 // 40 Lut Gholein, 43 the Far Oasis), 0 if not in a game.
 int player_level();

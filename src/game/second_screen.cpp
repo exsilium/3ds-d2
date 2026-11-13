@@ -53,7 +53,7 @@ const HelpRow kHelp[] = {
     {"Circle pad", "walk; cursor in menus"},
     {"C-stick", "move the cursor"},
     {"A / B", "left / right mouse button"},
-    {"X / Y", "inventory / items (held)"},
+    {"X / Y", "inv. / items; sell or drop"},
     {"L", "stand still (held)"},
     {"D-pad", "belt potions 1-4"},
     {"ZL", "weapon swap"},

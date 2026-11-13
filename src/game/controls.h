@@ -10,14 +10,17 @@
 //   Touch        a touchpad: drag moves the cursor, a short tap is a left click
 //                at the cursor
 //   A / B        left / right mouse button (held)
-//   X            inventory (I)        Y   show items (Alt, held)
+//   X            inventory (I)        Y   show items (Alt, held); with the
+//                inventory open, sells (a shop open) or drops the item under
+//                the cursor (issue #99)
 //   L            stand still (Shift, held)
 //   R            layer: R+A character (C), R+B skill tree (T), R+X automap (Tab),
 //                R+Y quests (Q), R+D-pad skill hotkeys F1-F4, R+Start Enter,
 //                R+Select on-screen keyboard (opens by itself on a text field)
 //   L+R+Select   screenshot into the Camera album
 //   D-pad        belt potions 1-4
-//   ZL / ZR      weapon swap (W) / automap (Tab)            (New 3DS)
+//   ZL           weapon swap (W)                            (New 3DS)
+//   ZR           layer: ZR+A/B/Y/X skill hotkeys F1-F4 (New 3DS)
 //   Start        Escape (game menu)
 //   Select       top screen: whole frame <-> 1:1 zoom around the cursor
 #ifndef D2_GAME_CONTROLS_H
@@ -60,8 +63,9 @@ public:
     void update(const Pad &pad, uint64_t now_ms);
 
     // What the game is showing (from game::GameState): the circle pad walks
-    // only in the game world with no panel open.
-    void set_context(bool in_game, bool panel_open);
+    // only in the game world with no panel open. ui: GameState::ui (the
+    // panels open); holding: an item is on the cursor (d2_units.h).
+    void set_context(bool in_game, bool panel_open, uint64_t ui = 0, bool holding = false);
     // Puts the cursor at x,y (scripted tests; a touchpad has no absolute position).
     void warp_cursor(int x, int y);
     int cursor_x() const { return cx_; }
@@ -79,6 +83,8 @@ private:
     void move_cursor(int x, int y);
     void key(uint8_t vk, bool down);
     void stick_cursor(int sx, int sy, float speed_800, float &acc_x, float &acc_y);
+    void item_move_start(bool sell, uint64_t now_ms);
+    bool item_move_step(uint64_t now_ms);   // the left button for this poll
 
     int w_ = 800, h_ = 600;
     int cx_ = 400, cy_ = 300;     // cursor, game pixels
@@ -97,7 +103,17 @@ private:
     float touch_acc_x_ = 0, touch_acc_y_ = 0;
     uint64_t tap_hold_until_ms_ = 0;
     float cstick_acc_x_ = 0, cstick_acc_y_ = 0, circle_acc_x_ = 0, circle_acc_y_ = 0;
-    bool in_game_ = false, panel_open_ = false;
+    bool in_game_ = false, panel_open_ = false, holding_ = false;
+    uint64_t ui_ = 0;
+    // Y with the inventory open (issue #99): the item under the cursor
+    // picked up, put on the shop's panel (sell) or the ground (drop), the
+    // cursor back. A step a poll at most, kItemStepMs apart: the game sees
+    // each move and each button state for a frame.
+    int item_step_ = 0;           // 0: none
+    bool item_sell_ = false;
+    int item_x_ = 0, item_y_ = 0;  // where the cursor was
+    uint64_t item_at_ms_ = 0;     // the next step's time
+    bool item_left_ = false;      // the left button as the last step left it
     bool zoom_toggle_ = false, keyboard_ = false, screenshot_ = false;
     Bottom bottom_ = Bottom::kNone;
     uint8_t keys_[256] = {};      // which virtual keys this layer holds down

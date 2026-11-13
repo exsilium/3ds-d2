@@ -191,6 +191,15 @@ bool find_unit(uint32_t cls, UnitSpot &out, uint32_t type)
     return found;
 }
 
+bool holding_item()
+{
+    // The player's inventory (+0x60; its first dword the 0x01020304
+    // signature) holds the item on the cursor at +0x20.
+    const uint32_t player = rd32(kPlayerUnitVa);
+    const uint32_t inv = player ? rd32(player + 0x60) : 0;
+    return inv && rd32(inv) == 0x01020304u && rd32(inv + 0x20) != 0;
+}
+
 int player_level()
 {
     const uint32_t player = rd32(kPlayerUnitVa);

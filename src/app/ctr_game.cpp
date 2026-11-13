@@ -29,6 +29,7 @@
 #include "game/d2_memory.h"
 #include "game/d2_native.h"
 #include "game/d2_state.h"
+#include "game/d2_units.h"
 #include "game/draw_census.h"
 #include "game/dcc_native.h"
 #include "game/frame_reads.h"
@@ -1899,7 +1900,7 @@ void poll()
     g_ss.update(pad, gs, g_controls.cursor_x(), g_controls.cursor_y(), rt::now_ms());
     if (g_ss.take_settings_changed())
         save_settings();
-    g_controls.set_context(gs.in_game, gs.panel_open);
+    g_controls.set_context(gs.in_game, gs.panel_open, gs.ui, gs.in_game && game::holding_item());
     g_lock_in_game.store(gs.in_game, std::memory_order_relaxed);
     g_controls.update(pad, rt::now_ms());
     if (g_controls.take_zoom_toggle())

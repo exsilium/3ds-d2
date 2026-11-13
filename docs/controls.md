@@ -22,7 +22,7 @@ The mapping lives in `src/game/controls.cpp`. It follows the ideas D2Vita proved
 | A | Left mouse button (held) |
 | B | Right mouse button (held): cast the right skill |
 | X | Inventory (I) |
-| Y | Show items on the ground (Alt, held) |
+| Y | Show items on the ground (Alt, held). With a shop open: sells the item under the cursor. With the inventory open (and no other panel on the left): drops it on the ground. If the cursor isn't on an item, nothing happens. |
 | L | Stand still (Shift, held) |
 | D-pad | Belt potions 1–4 (up, right, down, left) |
 | ZL (New 3DS) | Weapon swap (W) |

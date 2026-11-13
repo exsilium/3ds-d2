@@ -273,6 +273,8 @@ const Pad &Autoplay::step(uint64_t now_ms, Controls &controls, bool &shot, const
             pad_.touch_x = x;
             pad_.touch_y = y;
             touch_until_ = now_ms + (uint64_t)ms;
+        } else if (v == "hover" && std::sscanf(ev, "%*s %*s %d %d", &x, &y) == 2) {
+            controls.warp_cursor(x, y);
         } else if (v == "circle" && std::sscanf(ev, "%*s %*s %d %d", &x, &y) == 2) {
             pad_.circle_x = x;
             pad_.circle_y = y;

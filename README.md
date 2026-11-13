@@ -84,7 +84,7 @@ Start 3ds-d2 from the HOME menu. The game appears on the top screen. The bottom 
 | Touch screen | Touchpad: drag moves the cursor, a short tap clicks |
 | A / B | Left / right mouse button |
 | X | Inventory |
-| Y | Show items on the ground (held) |
+| Y | Show items on the ground (held); in a shop, sells the item under the cursor; with the inventory open, drops it |
 | L | Stand still (held) |
 | D-pad | Belt potions 1–4 |
 | ZL | Weapon swap |

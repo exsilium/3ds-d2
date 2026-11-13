@@ -2967,6 +2967,10 @@ uint32_t stat_get_native(Cpu &c) { return stat_get(c.arg(0), c.arg(1), c.arg(2))
 // is; if blocked, the first alternative's from its own running place, then
 // the second's; all blocked, the main direction again from the blocked
 // main step, and on. The first free step is where the unit goes.
+// d2decomped names the same fields the other way round: +0 the path's start
+// and +4 its end, which 648120 walks back toward the start when it is blocked
+// (rules::end_walk_back); its "under 5 off the start" is our offset from the
+// target below. Its 800 walk-back cases pass (tests/d2d, issue #108).
 // The plan below makes no change until it is done: a size class not of
 // the cross test (1, 3, 5), a test on a room's edge, the assertion's case
 // or a walk past 100000 tests all leave the call to the game's code. The
@@ -3002,7 +3006,11 @@ inline uint16_t step_dy(uint32_t d) { return *reinterpret_cast<const uint16_t *>
 // size class, 3 a room's edge, 4 too long.
 uint32_t g_walk_left[5];
 
-int unit_walk_plan(uint32_t path, bool &moved, uint16_t &nx, uint16_t &ny)
+// `cross` is the collision test the plan asks (collision_cross's signature),
+// in place of the game's 64d910 for these size classes. The host test
+// answers it from d2decomped's walk-back cases instead (tests/d2d, #108).
+template <class Cross>
+int unit_walk_plan(uint32_t path, bool &moved, uint16_t &nx, uint16_t &ny, Cross cross)
 {
     moved = false;
     const uint32_t unit = U32(path + 0x30);
@@ -3023,7 +3031,7 @@ int unit_walk_plan(uint32_t path, bool &moved, uint16_t &nx, uint16_t &ny)
     const uint32_t alt1 = dirs >> 8 & 0xff, alt2 = dirs >> 16 & 0xff;
     auto free_at = [&](uint16_t px, uint16_t py, int &out) {
         uint32_t r;
-        if (!collision_cross(room, px, py, mask, r))
+        if (!cross(room, px, py, mask, r))
             return false;
         out = r == 0;
         return true;
@@ -3072,7 +3080,7 @@ int unit_walk_plan(uint32_t path, bool &moved, uint16_t &nx, uint16_t &ny)
                     int32_t wx = px, wy = py;
                     for (int32_t k = ax > ay ? ax : ay; k < 5; k++) {
                         uint32_t r;
-                        if (!collision_cross(room, wx + sx, wy + sy, mask, r))
+                        if (!cross(room, wx + sx, wy + sy, mask, r))
                             return g_walk_left[3]++, -1;
                         if (r)
                             break;
@@ -3095,7 +3103,7 @@ uint32_t unit_walk(Cpu &c)
     const uint32_t path = c.reg(R_EAX);
     bool moved;
     uint16_t nx, ny;
-    const int r = unit_walk_plan(path, moved, nx, ny);
+    const int r = unit_walk_plan(path, moved, nx, ny, collision_cross);
     if (r >= 0) {
         if (moved) {
             std::memcpy(H(path + 4), &nx, 2);
@@ -3121,7 +3129,7 @@ uint32_t unit_walk_checked(Cpu &c)
     const uint32_t before = U32(path + 4);
     bool moved;
     uint16_t nx, ny;
-    const int r = unit_walk_plan(path, moved, nx, ny);
+    const int r = unit_walk_plan(path, moved, nx, ny, collision_cross);
     const uint32_t r0 = rt::guest_call(c, k.tramp, {});
     c.set_reg(R_EAX, path);
     static uint32_t calls = 0;

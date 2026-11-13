@@ -99,7 +99,7 @@ grep -r "native check" build/m4/
 - `M4_FRAMEHASH=<file>` writes one hash per presented frame. The same script must give the same hashes with and without a native that is meant to be exact.
 - The scripts in [tests/m4/scripts/](../tests/m4/scripts/) cover the Act I town walk, a fight, the Cold Plains, area loads, and Act II's town, oasis and the way east.
 
-The natives in `g_remap_check`, and the sprite cache's and the locked lookups' own checks, all ran with no difference before they were merged. Their call counts are in their PRs and in [hardware-test.md](hardware-test.md). Planned additions: d2decomped's emulator-made cases (#108), and generated cases for every native (#109).
+The natives in `g_remap_check`, and the sprite cache's and the locked lookups' own checks, all ran with no difference before they were merged. Their call counts are in their PRs and in [hardware-test.md](hardware-test.md). d2decomped's emulator-made cases check natives on the host too (#108): `scripts/docker.sh test d2d <game-dir>` runs `UnitWalk`'s plan on its 800 walk-back cases (`tests/d2d/walk_back.cpp`). d2d has such cases for no other native of ours; generated cases for every native are planned (#109).
 
 ## Measuring
 

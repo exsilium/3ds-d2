@@ -580,6 +580,20 @@ A first run with them reached 24 fps, but it never got into the crowd (8–10 mo
     - the pool of 200 nodes and the path's 1–77 rule.
 
     A size class other than 1, 3 and 5, or a test on a room's edge, hands the whole call back to the game's code before anything is written. Checked: 2,048+ searches, the same count and points as the game's. The Far Oasis: 14.42 → 11.45 billion bytes of x86 for the same frames (−21%), and the search's routines left the profile.
+- **`SkillLevel` (`0x644180`)**, a skill's level with the unit's bonuses (an aura's, each frame): the base, +2 for state 0x86, and the +all skills, class, tab, single-skill (capped at 3 for a player of the skill's class), `+0x1dc` and 0x6b stats, through `StatGet`. Only reads. Checked: 65,536+ calls in Lut Gholein and in the Far Oasis.
+- **`UnitRelation` (`0x465c60`)**, whether the player may act on a unit, from the cursor's hit test: 530k calls in the Far Oasis. Outside a town (`0x6426a0`'s table of levels) it uses:
+  - the roster (`0x7bb5bc`) and the "owned" bit;
+  - the monstats flags 4 and 5;
+  - "player against object or item";
+  - the alignment test (`0x650d70`, `0x6259b0`: stat 0xac of the state 0x69 stat list).
+
+  Towns and player against player go to the game's code. Checked: 1,638,400 calls, none differ.
+- **Act II on the lane, all in:**
+
+  | Area | x86 bytes, before the Act II natives → now | Change |
+  | --- | --- | --- |
+  | Lut Gholein | 3.20 → 2.27 billion | −29% |
+  | Far Oasis | 14.42 → 10.89 billion | −24.5% |
 - **A bug found on the way:** a native that falls back to the game's code must resume past the bytes its hook's jump covers. `UnitPickFilter` first resumed at `0x466873`, inside the jump. That ran two of the jump's bytes as code, and the lane's town run crashed (a guest thread at `0x40000c`). The checked run hadn't shown it, because the check's trampolines copy the original bytes.
 
 ## Blood Moor: VirtualAlloc ran out (2026-10-18)

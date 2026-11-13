@@ -84,6 +84,8 @@ struct Host {
     const char *game_files;          // "sdcard", "romfs-slim", "romfs-full"
 };
 
+std::string environment(std::string &detail);   // below: what the app runs on
+
 namespace {
 
 using game::report::LogSummary;
@@ -927,6 +929,8 @@ bool build_envelope(const Host &host, const Offer &o, const game::report::Dsn &d
     if (!version.empty())
         e.release = "3ds-d2@" + version;
     e.dist = o.build;
+    std::string env_detail;
+    e.environment = environment(env_detail);
     e.note = o.note;
     e.topic = o.topic;
     e.player_report = asked;
@@ -972,6 +976,8 @@ bool build_envelope(const Host &host, const Offer &o, const game::report::Dsn &d
               {"app_version", D2_VERSION}};
     if (system_s[0])
         e.tags.push_back({"firmware", system_s});
+    if (!env_detail.empty())   // Luma3DS's version on a console, the emulator's in one
+        e.tags.push_back({e.environment == "console" ? "luma" : "emulator", env_detail});
     if (!o.log.trace_writes().empty())
         e.tags.push_back({"trace_writes", o.log.trace_writes()});   // how complete the traces are (issue #66)
     e.device = {{"model", model_name(model)}, {"family", "Nintendo 3DS"}, {"arch", "armv6k"}};
@@ -1375,6 +1381,46 @@ bool manage(const Host &host, const std::string &open_dir)
 }  // namespace
 
 // game.log's first line: when and which build, for the next start.
+// What the app runs on:
+//   "azahar": Citra's family of emulators, of which Azahar is the one kept
+//     up: their svcGetSystemInfo answers type 0x20000 (CITRA_INFORMATION),
+//     sub-type 0 non-zero (Citra 1, Azahar 2126.2 2); a console has no such
+//     type. `detail`: sub-type 11's 8 characters, the emulator's version
+//     ("2126.2").
+//   "console": Luma3DS answers its own type 0x10000 with its version, in
+//     `detail` (the CIA needs custom firmware, so a console has it; Azahar
+//     answers it too, with 0).
+//   "unknown": neither (another emulator, most likely).
+// The device model can't tell them apart: an emulator reports the model it
+// is set to.
+std::string environment(std::string &detail)
+{
+    detail.clear();
+    s64 v = 0;
+    if (R_SUCCEEDED(svcGetSystemInfo(&v, 0x20000, 0)) && v != 0) {
+        s64 version = 0;
+        if (R_SUCCEEDED(svcGetSystemInfo(&version, 0x20000, 11))) {
+            char t[9] = {};
+            std::memcpy(t, &version, 8);
+            for (char *c = t; *c; c++)
+                if (*c < 0x20 || *c > 0x7e)
+                    *c = '?';
+            detail = t;
+        }
+        return "azahar";
+    }
+    v = 0;
+    if (R_SUCCEEDED(svcGetSystemInfo(&v, 0x10000, 0)) && v) {
+        const u32 ver = (u32)v;
+        char t[24];
+        std::snprintf(t, sizeof t, "%lu.%lu.%lu", (unsigned long)GET_VERSION_MAJOR(ver),
+                      (unsigned long)GET_VERSION_MINOR(ver), (unsigned long)GET_VERSION_REVISION(ver));
+        detail = t;
+        return "console";
+    }
+    return "unknown";
+}
+
 std::string start_line()
 {
     return std::string(game::report::kSessionStart) + " " + std::to_string(unix_now()) + " build " + D2_BUILD_ID +

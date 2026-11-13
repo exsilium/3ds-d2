@@ -287,6 +287,7 @@ struct Host {
     const char *game_files;
 };
 std::string start_line();
+std::string environment(std::string &detail);
 const char *closed_line();
 std::string keep_unclosed_session();
 std::string keep_session(const Host &host, const char *reason, uint32_t before_ms);
@@ -2385,6 +2386,14 @@ int main()
     threadOnException(on_cpu_exception, g_exc_stack + sizeof g_exc_stack, WRITE_DATA_TO_HANDLER_STACK);
     status("3ds-d2: Diablo II on the 3DS");
     logline(report::start_line().c_str());
+    {
+        std::string luma;
+        const std::string env = report::environment(luma);
+        char line[64];
+        std::snprintf(line, sizeof line, "environment: %s%s%s", env.c_str(),
+                      luma.empty() ? "" : env == "console" ? ", Luma3DS " : " ", luma.c_str());
+        logline(line);
+    }
     if (!kept.empty())
         status("The last session did not end normally. Its logs: %s", kept.c_str() + std::strlen(kRoot) + 1);
     status("heap %u KiB at %08lx, linear %u KiB, app memory %u KiB", (unsigned)(__ctru_heap_size >> 10),

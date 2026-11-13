@@ -463,6 +463,139 @@ The run had the decoder on first, then off, each time for an area arrival follow
 - **What's left in an arrival:** the frame thread's own Storm reads, `io` at 480–670 ms a window.
 - **The screen:** with 0.3 ms of slack, frames on screen for 1 refresh fell from 2.8% (3DS-D2-19) to 0.36%, and frames on for exactly 2 rose from 93.3% to 96.4%. Frames ready within 2 ms of a refresh come in bursts of about 50 every 30 s or so. That is the game's 40 ms clock drifting against the panel's 39.97 ms refresh pair, which issue #86's frame lock would remove.
 
+## Crowds: the lights' stamps and the lit sprites (2026-11-12)
+
+**The bench:** `tests/m4/scripts/coldplains.txt`, for the BeforeCh1End save: the Rogue Encampment's waypoint to the Cold Plains, then 84 s of walking loops among its monsters. Its 10 s windows from `52000` to `136000` are the crowd. In Azahar the game there was processing-bound, at 17–19 fps with 33–48% of frames past 50 ms.
+
+**Finding the hot code:** the timer profiles (`prof eip` and the stall samples) can't do it.
+- Both record where the thread is at its next block boundary. Translated blocks that chain to each other never stop at one, but every return from a native does.
+- So time in long runs of translated code is charged to the native that comes next. `SpriteCacheTouch` looked like 12% of the game thread in the crowd, but its own timing is 3–5%.
+- The lane's block counter is exact instead: `WX86_HOTPROF=1 D2_NOLINK=1`, with the console's video settings (`M4_FAST=1`) and decoder (`D2_DCC=1`), over `fight.txt`. Counts times block sizes, rolled up into functions:
+
+| Routine | Share of the game's x86 bytes executed | What it is |
+| --- | --- | --- |
+| `0x607e20` (and its copy `0x607680`) | 8.8% (+0.5%) | DC6 sprite through a remap table: a lit or tinted sprite |
+| `0x4747c0` | 5.9% | one light added to one cell of the 48×48 light grid, 1.7 million calls |
+| `0x475420` | 4.1% | a light with its occlusion map stamped onto the grid |
+| `0x4748d0`, `0x474080`, `0x4740d0` | 1.6%, 1.1%, 1.1% | the plain stamp, and the two copies of its distance |
+| `0x6072f0` | 0.9% | DC6 sprite through two remap tables |
+
+- With the PC's video settings, the interpolated-light floor (`0x4f6bb0`) is 29% on its own. The console never draws it (see issue #80's parked patch).
+
+**Natives** (`d2_native.cpp`, served in line):
+- `Dc6Remap`, `Dc6RemapB` and `Dc6Remap2`, beside the other DC6 natives.
+- `LightStampOccluded` and `LightStamp`, the two stamps whole, with the cell add and the distance inside. `LightAdd` is the cell add on its own, for the shadow-casting stamp (`0x474d70`), which keeps its own code.
+
+**Checked** with `D2_NATIVE_CHECK=1` over `fight.txt`:
+- Each call ran the native, then the game's routine from a trampoline (in a `va_alloc` block) on the same input, and the results were compared. For the sprites that was the pixels and EAX; for the lights, the whole grid.
+- No call differed: more than 32,768 / 4,096 / 8,192 calls of the three sprite natives, 2.1 million of `LightAdd`, 8,192 and 4,096 of the stamps.
+
+**Azahar, alternating builds** (`00b32b833641` without, `ab2159a31744` with), the crowd's windows:
+
+| Build | fps | Frames past 50 ms |
+| --- | --- | --- |
+| Without | 18.3, 17.5 | 41.8%, 47.8% |
+| With | 19.5, 19.3 | 29.4%, 30.8% |
+
+A first run with them reached 24 fps, but it never got into the crowd (8–10 monsters near the player against about 30) and isn't counted.
+
+**Second round**, from the profile with the first round in:
+- **`_ftol2_sse` (`0x682fd0`)**, 2.8%. The C runtime's float-to-int conversion takes `cvttsd2si` when it found SSE2 (`0x994c88`), else a long x87 path through a 64-bit `fistp`/`fild`. The port reports no SIMD, so it always took the long path. Its check is now jumped over. For every value an `int` holds both give the truncated value, and `fstp` + `cvttsd2si` translate to one VFP conversion. Checked on the lane: both paths on each call, 1,048,576 calls, none differ.
+- **`LoadsPending` (`0x5ff2a0`)**, 3.2%. The monsters' preloader asks for each unit of each frame how many sprite loads are pending, and the game walks the sprite cache's whole list to answer: 1.3 million entries in the fight. The native counts loads that are done, and loads whose event isn't signalled (probed with `Waitable::ready`, which consumes nothing). On anything else, a signalled event (whose poll finishes the load) or an assert's case, it runs the game's code. Checked: 8,192+ counts, none differ.
+- **Loop steps over empty slots.** Four of the game's per-frame walks are mostly over empty entries:
+  - the 1024-slot table at `0x882d38` (`0x52fc20`, `0x52fd90`), 3.5%;
+  - the room's cell grid (`0x4df1c0`, `0x4df510`), 3.7%;
+  - the floor's tile records (`0x4de730`), where nine in ten of `0x4de410`'s 922k calls returned at once: flagged, outside the view's rectangle, or with its block already drawn.
+  
+  Each loop's step is now a call to a native that skips the entries with nothing to do and resumes the game's code at the loop's body (or exit) with the registers it would have (`SlotStepA/B`, `CellStepA/B`, `FloorRecordStep`).
+- **The lane's fight, all in:** 4.52 billion bytes of x86 executed for the same 2,507 frames, against 7.63 billion before the first round (41% less).
+- **Azahar** (each game makes a new map, so the first windows' load waits, 0.2–2 s a window, differ from run to run): over the last three windows, once the loads have settled, 19.4 and 20.4 fps without either round, 22.0–22.7 with the first, 23.6 and 23.9 with both. The game's own cap is 25.
+- **`0x608540`** turned out to be the dispatcher in front of the DC6 blitters. Its own clipped loops only run with `[0x8f03c8]` set, a toggle (`0x608520`) that is off in play. Its share is the block counter weighing its whole 1,093-byte block, of which only the dispatch runs.
+
+**Third round:**
+- **`Dc6Blend1` (`0x608110`)**, d = B[d·256 + s], the last unclipped DC6 leaf the dispatcher calls in play. Checked: 65,536+ calls.
+- **`Dc6Shadow` (`0x608d60`)**, every unit's shadow, 2.2%. A sheared silhouette: every other source row, each row a pixel left of the one before, runs clipped, `T[d·256 + c]` or a fill. Only the shape is read. Its EAX (x less the rows drawn) is its caller's return. Checked: 16,384+.
+- **`WeatherStep` (`0x4732c0`'s loop)**, the rain's particles, 2.4% plus their sine lookups and truncations. The floats are done in doubles in the game's order, as box86's x87 does. A particle at its end resumes the game's code, which respawns it. Checked in a different way: each particle's step is predicted on a copy, the game's code does the real one, and the two are compared, 327,680+.
+- **`StormHash` (`0x415330`)**, Storm's file-name hash, 1.8% plus a `toupper` call per character. Checked: 32,768+.
+- **`WallCellStep` (`0x4dea70`)**, the walls' and objects' pass over the cell grid, once per layer: 25% of a lane run that stayed in town, mostly empty cells.
+- **The unit under the cursor.** Each frame the game tests every unit of the rooms near the cursor (about 600 in town): 920k calls of `0x466870` in a minute of the town walk.
+  - `UnitPickFilter` answers 0 at once for a unit with bit 21 of `+0xc4`, or without bit 7 of `+0xc8`: nine in ten. The game's code gives 0 for those whatever else it checks. The paths before those tests either return 0 or reach them, and nothing they call writes memory: by disassembly of the whole call tree, the table of 7 functions `0x4642b0` calls through included. Checked: 851,968 units.
+  - `PickUnitStep`, at the loop's step, passes over the units both tests reject, keeping the loop's notes. A unit seen twice, the count past 30,000, or the cursor's own unit go to the game's code.
+- **`D2_NATIVE_MASK`** is 64 bits now. Past 32 hooks the 32-bit mask had silently skipped the newest ones.
+- **The lane:**
+  - The fight (`fight.txt`): with fewer guest instructions the virtual clock shifts the scripted input. One run never left town (a push landed on Kashya), so fight totals from here on aren't comparable.
+  - The town walk: 1.80 billion bytes of x86 for the same 1,507 frames, against 2.21 billion with the second round.
+  - All natives checked over the fight: none differ.
+- **Azahar**, round two against round three, can't separate them: the same build gave 19.4 and 22.6 fps over the settled windows in two runs. Near the 25 fps cap, the frame thread's run time floors at about 40 ms a frame, because the game polls the clock while it waits. Gains of a few percent need the console's frame trace, or the lane.
+- **What's left (2026-11-12, after the third round):**
+  - **The guest profile is flat.** In town nothing is above 2.8%. Of the top entries, `0x608540` and `0x4f8120` are dispatchers whose shares come from their big blocks, and the rest are small functions called a few hundred thousand times. A native costs a fixed price per call (registers saved, the bridge, the C++ call), probably more than a 5–10-instruction getter's whole translated body. So natives pay off for loops and long bodies, not for leaves.
+  - **The natives' own time** (Azahar, Cold Plains crowd, the `profile frames,guest` script, ms per 10 s):
+
+    | Native | ms per 10 s |
+    | --- | --- |
+    | FloorQueueEnd | 310–570 |
+    | Dc6Copy | 160–260 |
+    | StretchBlt (the present) | 135–210 |
+    | FloorTile | 130–200 |
+    | LightBlock | 100–150 |
+    | SpriteCacheTouch | 90–170 |
+    | Dc6Shadow | 95–150 |
+    | LightGrid | 75–110 |
+    | LightStamp | 75–110 |
+  - **The floor queue's worker draws only 51–58% of the queued tiles.** The frame thread draws the rest itself at the flush, right after the floor pass (`0x476ce1`); it waits for the worker only 0.4 ms a frame. Deferring the flush to the first renderer call wouldn't buy much: the rain (`0x473c00` → `0x473a70`) and then the units' and walls' passes draw straight after the floor.
+  - **The sprite fetch's cache hit (`0x6001f0`)** costs two natives (SpritePath, SpriteCacheTouch: 1–2% each, mostly the per-call price) plus its own code. One native for the whole hit path would need the cache lookup (`0x60ace0`), `0x5fe990`, `0x600cb0`, `0x5fec90` and `0x5fec50` as well: about 2–3%, the largest single item left.
+- **Act II (Lut Gholein, `tests/m4/scripts/act2-town.txt`, the DuringCh2Mid save with an aura on).** The natives above all apply: they're the engine's. But the town's top was different. Per frame, against the Act I fight and town:
+  - room lookups (`0x463740`): 698 against 70 and 66;
+  - collision tests (`0x64d4e0`): 458 against 32 and 20;
+  - stat queries: 285 against 76 and 53;
+  - skill-level calculations (`0x644180`, six stat queries each): 34 against 8 and 5. This is the aura, re-evaluated each frame, so it depends on the character rather than the act.
+
+  Three more natives:
+  - **`RoomFind` (`0x463740`)**, the room holding a subtile, from a room and its neighbours (158 callers). Checked: 1,441,792 calls.
+  - **`CollisionCross` (`0x64d4e0`)**, whether a subtile or one of its four neighbours is blocked for a mask, inside a room's collision grid: 99.97% of calls. On a room's edge it hands back to the game's code, which looks into the next room. Checked: 917,504.
+  - **`StatGet` (`0x625480`)**, a unit's stat: the stat table's row, then a binary search of the holder's base or full list, with the row's minimum for player-type owners. Three nested calls become one; only reads. Checked: 524,288.
+
+  Lut Gholein went from 3.20 to 2.56 billion bytes of x86 for the same 2,007 frames (−20%). What's left on top there is the unit walk `0x648120` (4.3%). It steps a unit toward its target a subtile at a time, using the direction from `0x678df0`, a collision test through `0x64d910` for the unit's size class (`0x64d450`, `0x64d4e0`, `0x64d7c0`), and two alternate directions to slide along. With its helpers that's about 10%.
+- **`UnitWalk` (`0x648120`)**, a unit's step toward its target:
+  - the main direction from a 5×5 table of clamped offsets (`0x678c10`/`0x678df0`), else two alternate directions, each from its own running place;
+  - then, for the units whose `+0x30` record's first dword is 0 (all the walkers in Lut Gholein), `0x648050`'s settle: within 5 subtiles of the target, on by the 9×9 table at `0x6eb490` while the way is free.
+
+  It's planned without side effects, and handed to the game's code for size classes other than 1, 3 and 5 (the cross test) or a room's edge. Checked: 16,384+ calls, none differ. Lut Gholein: 2.56 → 2.31 billion bytes, 28% less than before the Act II natives.
+- **Act II outdoors: the Far Oasis** (`tests/m4/scripts/act2-oasis.txt`).
+  - New autoplay commands get the script there:
+    - `seek Waypoint` finds the waypoint by its objects.txt name. Lut Gholein's rooms list their objects only once loaded, so it walks toward unloaded rooms, tapping at the screen's edge so that the game finds the path.
+    - `tapobject last` taps what `seek` found.
+    - `goto <class>` walks to a preset object, and `units all` lists every loaded unit and the level's presets.
+  - Lut Gholein's waypoint is class 156. This save's enabled waypoints are Lut Gholein, Sewers 2, Dry Hills, Halls of the Dead 2 and Far Oasis (the last, on the fifth line).
+  - `M4_HOTPROF_LEVEL=43` starts the block count 5 s after reaching the oasis.
+  - **Profile there:** monster pathfinding leads. `0x67b200` adds or updates a neighbour node of the search (9%, 3.9M calls); `0x67b440` is 3.5%; the open and closed sets' hash lookups `0x67ae00` and `0x67ae50` are 2.0% and 1.4%. About 17% together, plus the collision tests they call (now native).
+  - All natives checked over it, none differ. CollisionCross ran 3.3 million times and RoomFind 3.9 million.
+  - **`PathSearch` (`0x67b850`)**, the whole search as one native. The search's state is a 0x32f4-byte local, so the native keeps it in host memory and writes only the path: the points where the step direction changes, at most 77, to the unit's `+0x9c`. It reproduces the game's details, including:
+    - the eight-point pre-check around the goal;
+    - the neighbour order;
+    - g + 2 for a straight step, + 3 for a diagonal;
+    - an improved open node kept where it is in the f-sorted list;
+    - a closed node passing its improvement down its children (stopping at the first empty child slot);
+    - the best-so-far rule (least h, or equal h with g more than 5 higher);
+    - the pool of 200 nodes and the path's 1–77 rule.
+
+    A size class other than 1, 3 and 5, or a test on a room's edge, hands the whole call back to the game's code before anything is written. Checked: 2,048+ searches, the same count and points as the game's. The Far Oasis: 14.42 → 11.45 billion bytes of x86 for the same frames (−21%), and the search's routines left the profile.
+- **`SkillLevel` (`0x644180`)**, a skill's level with the unit's bonuses (an aura's, each frame): the base, +2 for state 0x86, and the +all skills, class, tab, single-skill (capped at 3 for a player of the skill's class), `+0x1dc` and 0x6b stats, through `StatGet`. Only reads. Checked: 65,536+ calls in Lut Gholein and in the Far Oasis.
+- **`UnitRelation` (`0x465c60`)**, whether the player may act on a unit, from the cursor's hit test: 530k calls in the Far Oasis. Outside a town (`0x6426a0`'s table of levels) it uses:
+  - the roster (`0x7bb5bc`) and the "owned" bit;
+  - the monstats flags 4 and 5;
+  - "player against object or item";
+  - the alignment test (`0x650d70`, `0x6259b0`: stat 0xac of the state 0x69 stat list).
+
+  Towns and player against player go to the game's code. Checked: 1,638,400 calls, none differ.
+- **Act II on the lane, all in:**
+
+  | Area | x86 bytes, before the Act II natives → now | Change |
+  | --- | --- | --- |
+  | Lut Gholein | 3.20 → 2.27 billion | −29% |
+  | Far Oasis | 14.42 → 10.89 billion | −24.5% |
+- **A bug found on the way:** a native that falls back to the game's code must resume past the bytes its hook's jump covers. `UnitPickFilter` first resumed at `0x466873`, inside the jump. That ran two of the jump's bytes as code, and the lane's town run crashed (a guest thread at `0x40000c`). The checked run hadn't shown it, because the check's trampolines copy the original bytes.
+
 ## Blood Moor: VirtualAlloc ran out (2026-10-18)
 
 After about four and a half minutes, three of them in Blood Moor, the console logged `va full: want 512 KiB, live 44416 KiB, largest free 384 KiB`. The 44 MiB VirtualAlloc range was full, while the heap range held 8.2 MiB of its 17 (peak 9.7). The game kept going after the failed allocation, the sound looped, and translated code then faulted on a wild guest pointer (data abort, far = membase + 0x357db9e8, outside the 75 MiB arena).

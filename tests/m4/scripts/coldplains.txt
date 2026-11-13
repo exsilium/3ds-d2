@@ -1,0 +1,31 @@
+# Cold Plains by the Rogue Encampment's waypoint, then walking loops among
+# its monsters (the circle pad holds the left button: a push at a monster
+# attacks it). For a character with Act I's waypoints (BeforeCh1End).
+0 skipvideos
+35000 tap 400 307
+40000 tapuntil ingame 690 555
+40500 wait ingame
+42500 tapobject 119
+44000 tap 110 112
+50000 profile frames
+50000 units
+51000 closepanels
+52000 circle 120 0
+58000 circle 0 120
+64000 circle -120 0
+70000 circle 0 -120
+76000 circle 100 100
+82000 units
+82000 circle -100 -100
+88000 circle 100 -100
+94000 circle -100 100
+100000 circle 120 0
+106000 circle 0 120
+112000 units
+112000 circle -120 0
+118000 circle 0 -120
+124000 circle 100 100
+130000 circle -100 -100
+136000 circle 0 0
+137000 units
+140000 profile off

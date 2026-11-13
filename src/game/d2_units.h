@@ -16,18 +16,20 @@
 #define D2_GAME_D2_UNITS_H
 
 #include <cstdint>
+#include <vector>
 
 namespace game {
 
 struct UnitSpot {
-    uint32_t cls = 0, id = 0, mode = 0;
+    uint32_t unit = 0, cls = 0, id = 0, mode = 0;   // unit: its guest address
     int x = 0, y = 0;          // the game pixel of its body (may be off the screen)
     float distance = 0;        // from the player, in subtiles
 };
 
-// The monster (NPC) of class `cls` nearest the player. False if none, or
-// not in a game.
-bool find_unit(uint32_t cls, UnitSpot &out);
+// The unit of class `cls` nearest the player: a monster or NPC (type 1), or
+// an object (type 2: a waypoint is 119 in the Rogue Encampment). False if
+// none, or not in a game.
+bool find_unit(uint32_t cls, UnitSpot &out, uint32_t type = 1);
 
 // The act the player is in, 1 to 5; 0 when not in a game.
 int player_act();
@@ -42,9 +44,25 @@ void npc_menu_line(const UnitSpot &npc, int line, int &x, int &y);
 // number as it is; 0 if neither.
 uint32_t unit_class(const char *name);
 
-// Every monster near the player, to the runtime log: class, id, mode, place
-// and its spot on the screen ("units:" lines; autoplay's "units").
-void log_units();
+// The level the player is in (levels.txt's number: 1 the Rogue Encampment,
+// 40 Lut Gholein, 43 the Far Oasis), 0 if not in a game.
+int player_level();
+
+// The nearest loaded object whose objects.txt name is `name` (any case).
+bool find_object_named(const char *name, UnitSpot &out);
+// The nearest of the level's rooms not loaded yet (and not in `skip`): its
+// offset from the player in subtiles, to its centre.
+bool frontier_room(const std::vector<uint32_t> &skip, uint32_t &room, double &dx, double &dy, double &distance);
+
+// The nearest of the level's preset units of `type` (2 objects) and class
+// `cls`, loaded or not: its offset from the player in subtiles. False if
+// none, or not in a game.
+bool find_preset(uint32_t cls, uint32_t type, double &dx, double &dy, double &distance);
+
+// Every monster and object near the player (all: every one in the game's
+// tables), to the runtime log: class, id, mode, an object's name, place and
+// its spot on the screen ("units:" lines; autoplay's "units [all]").
+void log_units(bool all = false);
 
 }  // namespace game
 

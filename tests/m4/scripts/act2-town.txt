@@ -1,0 +1,20 @@
+# Lut Gholein: the DuringCh2Mid save's character (in Act II, an aura on),
+# then a minute of walking loops round the town. Linux lane: the save's
+# save/ folder's contents as build/m4/write; Azahar: scripts/run-game-azahar.sh
+# --save dist/save/DuringCh2Mid/save.
+#   M4_SCRIPT="$(cat tests/m4/scripts/act2-town.txt)"
+0 skipvideos
+35000 tap 400 307
+40000 tapuntil ingame 690 555
+40500 wait ingame
+44000 units
+45000 shot
+46000 circle 120 0
+52000 circle 0 120
+58000 circle -120 0
+64000 circle 0 -120
+70000 circle 100 100
+76000 units
+76000 circle -100 -100
+82000 circle 0 0
+83000 shot

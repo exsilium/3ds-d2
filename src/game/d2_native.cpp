@@ -25,6 +25,7 @@
 #include "runtime/host_clock.h"
 #include "runtime/rt_host.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -322,6 +323,356 @@ uint32_t dc6_blend(Cpu &c)
     }
 }
 
+// The remapped DC6 copies (a lit or tinted sprite: monsters, the player, in
+// a fight 8% of the game's code on the lane), unclipped:
+//   607e20 and 607680 (byte for byte the same) (.., [10]=T), ret 0xc:
+//     d = T[s];
+//   6072f0 (.., [10]=T2, [14]=T1), ret 0x10: d = T2[T1[s]].
+// Each literal is drawn in two parts, its b & 7 pixels then b >> 3 groups of
+// 8, and EAX is left below 256 by both, so EAX is what dc6_blend leaves:
+// dst + pitch; the next-row pointer on each row; a skip (its count) or a
+// literal leaves a value below 256 (cleared by lo0); lo0 at the end.
+// (6072f0 also keeps b & 7 in its [14] argument slot, dead after its ret.)
+struct OpRemap {
+    const uint8_t *t;
+    void operator()(uint8_t *d, const uint8_t *s, int32_t n) const
+    {
+        for (int32_t i = 0; i < n; i++)
+            d[i] = t[s[i]];
+    }
+};
+struct OpRemap2 {
+    const uint8_t *t1, *t2;   // d = t2[t1[s]]
+    void operator()(uint8_t *d, const uint8_t *s, int32_t n) const
+    {
+        for (int32_t i = 0; i < n; i++)
+            d[i] = t2[t1[s[i]]];
+    }
+};
+
+template <class Op> uint32_t dc6_remapped(Cpu &c, const Op &op)
+{
+    const uint8_t *src = H(c.reg(R_ECX));
+    uint32_t dst = c.reg(R_EDX), rows = c.arg(0);
+    const uint32_t pitch = c.arg(1);
+    uint32_t next = dst + pitch, eax = next;
+    for (;;) {
+        const uint8_t b = *src++;
+        if (b == 0x80) {
+            if (--rows == 0)
+                return eax & ~0xffu;
+            dst = next;
+            next += pitch;
+            eax = next;
+        } else if (b & 0x80) {
+            dst += b & 0x7f;
+            eax = 0;
+        } else {
+            op(H(dst), src, b);
+            eax = 0;
+            src += b;
+            dst += b;
+        }
+    }
+}
+
+// 608110 (.., [10]=B), ret 0xc: d = B[d * 256 + s], the same EAX (and it
+// too keeps b & 7 in its [10] slot).
+struct OpBlendOnly {
+    const uint8_t *t;
+    void operator()(uint8_t *d, const uint8_t *s, int32_t n) const
+    {
+        for (int32_t i = 0; i < n; i++)
+            d[i] = t[d[i] * 256 + s[i]];
+    }
+};
+
+uint32_t dc6_remap(Cpu &c) { return dc6_remapped(c, OpRemap{H(c.arg(2))}); }
+uint32_t dc6_blend1(Cpu &c) { return dc6_remapped(c, OpBlendOnly{H(c.arg(2))}); }
+
+// 608d60(ecx=frame, edx=dst, [8]=x, [c]=clipL, [10]=clipR, [14]=width,
+// [18]=rows to skip / 2, [1c]=rows, [20]=T, [24]=c), ret 0x20: a sprite's
+// shadow, from 6017f9 for each unit. The frame's stream (+0x20) after its
+// first 2 * [18] rows, every other row, each row a pixel left of the one
+// before and a row up (the pitch is -width); a run's pixels clipped to
+// [clipL, clipR) unless both are 0, each d = T[d * 256 + c], or c without
+// T. Only the shape is read, not the pixels. EAX, its caller's return: x
+// less the rows drawn. `Put` draws a run, or notes its extent (the check).
+template <class Put> uint32_t dc6_shadow_run(Cpu &c, Put put)
+{
+    const uint32_t frame = c.reg(R_ECX);
+    const int32_t cl = (int32_t)c.arg(1), cr = (int32_t)c.arg(2);
+    const uint32_t pitch = 0u - c.arg(3);
+    uint32_t rows = c.arg(5);
+    const uint8_t *src = H(frame + 0x20);
+    for (uint32_t skip = 2 * c.arg(4); skip;) {
+        const int8_t b = (int8_t)*src++;
+        if (b >= 0)
+            src += b;
+        else if (!(b & 0x7f))
+            skip--;
+    }
+    int32_t x = (int32_t)c.arg(0), row_x = x;
+    uint32_t dst = c.reg(R_EDX), next = dst + pitch;
+    for (;;) {
+        const int8_t b = (int8_t)*src++;
+        if (b < 0) {
+            if (b & 0x7f) {
+                x += b & 0x7f;
+                dst += b & 0x7f;
+                continue;
+            }
+            dst = next - 1;
+            next = next + pitch - 1;
+            x = --row_x;
+            if (--rows == 0)
+                return (uint32_t)row_x;
+            for (;;) {   // the next row isn't drawn (a run of 0 ends it too)
+                const int8_t k = (int8_t)*src++;
+                if (k > 0)
+                    src += k;
+                else if (!(k & 0x7f))
+                    break;
+            }
+            continue;
+        }
+        int32_t n = b;
+        uint32_t at = dst;
+        if (cl || cr) {
+            const int32_t l = imax(cl - x, 0), r = imin(imax(cr - x, 0), (int32_t)b);
+            n = r - l;
+            at = dst + (uint32_t)l;
+        }
+        if (n > 0)
+            put(at, (uint32_t)n);
+        x += b;
+        dst += b;
+        src += b;
+    }
+}
+
+uint32_t dc6_shadow(Cpu &c)
+{
+    const uint8_t *t = c.arg(6) ? H(c.arg(6)) : nullptr;
+    const uint8_t v = (uint8_t)c.arg(7);
+    return dc6_shadow_run(c, [&](uint32_t at, uint32_t n) {
+        uint8_t *d = H(at);
+        if (t)
+            for (uint32_t i = 0; i < n; i++)
+                d[i] = t[d[i] * 256 + v];
+        else
+            std::memset(d, v, n);
+    });
+}
+
+uint32_t dc6_remap2(Cpu &c) { return dc6_remapped(c, OpRemap2{H(c.arg(3)), H(c.arg(2))}); }
+
+// D2_NATIVE_CHECK=1 (the lane): each call runs the native, keeps its pixels
+// and EAX, puts the destination back, runs the game's routine from a
+// trampoline (its first 7 bytes, then a jump back), and compares. The
+// game's result is the one kept. Not in line (guest_call).
+// Also the light stamps' (below): the whole light grid compared.
+struct RemapCheck {
+    const char *name;
+    uint32_t orig, keep;   // the original, and its first whole instructions' bytes (5 or more) the trampoline copies
+    uint32_t tramp = 0, calls = 0, bad = 0;
+};
+RemapCheck g_remap_check[18] = {{"Dc6Remap", 0x00607e20, 7},    {"Dc6RemapB", 0x00607680, 7},
+                               {"Dc6Remap2", 0x006072f0, 7},   {"LightAdd", 0x004747c0, 6},
+                               {"LightStampOccluded", 0x00475420, 6}, {"LightStamp", 0x004748d0, 6},
+                               {"LoadsPending", 0x005ff2a0, 7},       {"Dc6Blend1", 0x00608110, 7},
+                               {"Dc6Shadow", 0x00608d60, 6},          {"StormHash", 0x00415330, 5},
+                               {"UnitPickFilter", 0x00466870, 6},     {"RoomFind", 0x00463740, 6},
+                               {"CollisionCross", 0x0064d4e0, 6},     {"StatGet", 0x00625480, 6},
+                               {"UnitWalk", 0x00648120, 6},           {"PathSearch", 0x0067b850, 8},
+                               {"SkillLevel", 0x00644180, 7},         {"UnitRelation", 0x00465c60, 6}};
+
+// Before the hooks go in: the trampolines copy the originals' first bytes.
+bool install_remap_check(Cpu &c)
+{
+    const uint32_t at = rt::va_alloc(0x1000, 0x00607e20);
+    if (!at)
+        return false;
+    for (int k = 0; k < 18; k++) {
+        RemapCheck &r = g_remap_check[k];
+        r.tramp = at + 16 * k;
+        uint8_t t[16];
+        c.read(r.orig, t, r.keep);
+        t[r.keep] = 0xe9;
+        const uint32_t rel = (r.orig + r.keep) - (r.tramp + r.keep + 5);
+        std::memcpy(t + r.keep + 1, &rel, 4);
+        c.write(r.tramp, t, r.keep + 5);
+    }
+    c.invalidate_code(at, 16 * 18);
+    return true;
+}
+
+void check_note(RemapCheck &k, bool bad)
+{
+    k.calls++;
+    k.bad += bad;
+    if ((k.calls & (k.calls - 1)) == 0 || (k.calls & 0xffff) == 0)
+        rt::logf("native check: %s %u calls, %u differ", k.name, k.calls, k.bad);
+}
+
+template <int K> uint32_t dc6_remap_checked(Cpu &c)
+{
+    RemapCheck &k = g_remap_check[K];
+    const uint32_t ecx = c.reg(R_ECX), edx = c.reg(R_EDX), rows = c.arg(0), pitch = c.arg(1);
+    // The bytes the stream reaches.
+    uint32_t lo = ~0u, hi = 0, dst = edx, next = edx + pitch, left = rows;
+    for (const uint8_t *s = H(ecx);;) {
+        const uint8_t b = *s++;
+        if (b == 0x80) {
+            if (--left == 0)
+                break;
+            dst = next;
+            next += pitch;
+        } else if (b & 0x80) {
+            dst += b & 0x7f;
+        } else {
+            if (b) {
+                lo = std::min(lo, dst);
+                hi = std::max(hi, dst + b);
+            }
+            s += b;
+            dst += b;
+        }
+    }
+    const uint32_t len = hi > lo ? hi - lo : 0;
+    std::vector<uint8_t> before(H(lo), H(lo) + len);
+    const uint32_t r = K == 2 ? dc6_remap2(c) : K == 7 ? dc6_blend1(c) : dc6_remap(c);
+    std::vector<uint8_t> native(H(lo), H(lo) + len);
+    std::memcpy(H(lo), before.data(), len);
+    const uint32_t r0 = K == 2 ? rt::guest_call(c, k.tramp, {rows, pitch, c.arg(2), c.arg(3)})
+                               : rt::guest_call(c, k.tramp, {rows, pitch, c.arg(2)});
+    c.set_reg(R_ECX, ecx);
+    c.set_reg(R_EDX, edx);
+    const bool bad = r != r0 || std::memcmp(native.data(), H(lo), len);
+    if (bad && k.bad < 20)
+        rt::logf("native check: %s(%08x, %08x, rows %u, pitch %d) gave %08x, the game's %08x; pixels %s", k.name, ecx,
+                 edx, rows, (int32_t)pitch, r, r0, std::memcmp(native.data(), H(lo), len) ? "differ" : "match");
+    check_note(k, bad);
+    return r0;
+}
+
+uint32_t storm_hash(Cpu &c);   // below, with Storm's other natives' neighbours
+
+// D2_NATIVE_CHECK=1: each unit the filter answers, through the game's code
+// too (trampoline 10), which must give 0. The game's answer is kept.
+uint32_t unit_pick_filter_checked(Cpu &c)
+{
+    RemapCheck &k = g_remap_check[10];
+    const uint32_t unit = c.reg(R_ECX), edx = c.reg(R_EDX);
+    const bool mine = unit && ((U32(unit + 0xc4) >> 21 & 1) || !(U32(unit + 0xc8) & 0x80));
+    const uint32_t r0 = rt::guest_call(c, k.tramp, {c.arg(0), c.arg(1)});
+    c.set_reg(R_ECX, unit);
+    c.set_reg(R_EDX, edx);
+    if (mine) {
+        const bool bad = r0 != 0;
+        if (bad && k.bad < 20)
+            rt::logf("native check: UnitPickFilter(%08x, type %u) gave 0, the game's %u", unit, U32(unit), r0);
+        check_note(k, bad);
+    }
+    return r0;
+}
+
+// D2_NATIVE_CHECK=1: the room lookup and the collision cross against the
+// game's (trampolines 11 and 12); the game's answers are kept.
+uint32_t room_find(uint32_t room, int32_t x, int32_t y);
+bool collision_cross(uint32_t room, int32_t x, int32_t y, uint16_t mask, uint32_t &r);
+
+uint32_t room_find_checked(Cpu &c)
+{
+    RemapCheck &k = g_remap_check[11];
+    const uint32_t ecx = c.reg(R_ECX), edx = c.reg(R_EDX);
+    const uint32_t r = room_find(ecx, (int32_t)edx, (int32_t)c.arg(0));
+    const uint32_t r0 = rt::guest_call(c, k.tramp, {c.arg(0)});
+    c.set_reg(R_ECX, ecx);
+    c.set_reg(R_EDX, edx);
+    const bool bad = r != r0;
+    if (bad && k.bad < 20)
+        rt::logf("native check: RoomFind(%08x, %d, %d) gave %08x, the game's %08x", ecx, (int32_t)edx,
+                 (int32_t)c.arg(0), r, r0);
+    check_note(k, bad);
+    return r0;
+}
+
+uint32_t collision_cross_checked(Cpu &c)
+{
+    RemapCheck &k = g_remap_check[12];
+    uint32_t r;
+    const bool mine = collision_cross(c.arg(0), (int32_t)c.arg(1), (int32_t)c.arg(2), (uint16_t)c.reg(R_ESI), r);
+    const uint32_t r0 = rt::guest_call(c, k.tramp, {c.arg(0), c.arg(1), c.arg(2)});
+    if (mine) {
+        const bool bad = r != r0;
+        if (bad && k.bad < 20)
+            rt::logf("native check: CollisionCross(%08x, %d, %d, mask %04x) gave %u, the game's %u", c.arg(0),
+                     (int32_t)c.arg(1), (int32_t)c.arg(2), c.reg(R_ESI) & 0xffff, r, r0);
+        check_note(k, bad);
+    }
+    return r0;
+}
+
+// D2_NATIVE_CHECK=1: a unit's stat against the game's (trampoline 13).
+uint32_t stat_get(uint32_t unit, uint32_t stat, uint32_t layer);
+
+uint32_t stat_get_checked(Cpu &c)
+{
+    RemapCheck &k = g_remap_check[13];
+    const uint32_t r = stat_get(c.arg(0), c.arg(1), c.arg(2));
+    const uint32_t r0 = rt::guest_call(c, k.tramp, {c.arg(0), c.arg(1), c.arg(2)});
+    const bool bad = r != r0;
+    if (bad && k.bad < 20)
+        rt::logf("native check: StatGet(%08x, stat %u, layer %u) gave %d, the game's %d", c.arg(0), c.arg(1), c.arg(2),
+                 (int32_t)r, (int32_t)r0);
+    check_note(k, bad);
+    return r0;
+}
+
+// D2_NATIVE_CHECK=1: Storm's hash against the game's (trampoline 9).
+uint32_t storm_hash_checked(Cpu &c)
+{
+    RemapCheck &k = g_remap_check[9];
+    const uint32_t r = storm_hash(c);
+    const uint32_t r0 = rt::guest_call(c, k.tramp, {c.arg(0)});
+    const bool bad = r != r0;
+    if (bad && k.bad < 20)
+        rt::logf("native check: StormHash(\"%s\", %u) gave %08x, the game's %08x",
+                 reinterpret_cast<const char *>(H(c.reg(R_EAX))), c.arg(0), r, r0);
+    check_note(k, bad);
+    return r0;
+}
+
+// D2_NATIVE_CHECK=1: the shadow's runs' extent, the native's bytes and EAX
+// against the game's (trampoline 8).
+uint32_t dc6_shadow_checked(Cpu &c)
+{
+    RemapCheck &k = g_remap_check[8];
+    uint32_t lo = ~0u, hi = 0;
+    dc6_shadow_run(c, [&](uint32_t at, uint32_t n) {
+        lo = std::min(lo, at);
+        hi = std::max(hi, at + n);
+    });
+    const uint32_t len = hi > lo ? hi - lo : 0;
+    std::vector<uint8_t> before(H(lo), H(lo) + len);
+    const uint32_t r = dc6_shadow(c);
+    std::vector<uint8_t> native(H(lo), H(lo) + len);
+    std::memcpy(H(lo), before.data(), len);
+    const uint32_t ecx = c.reg(R_ECX), edx = c.reg(R_EDX);
+    const uint32_t r0 = rt::guest_call(c, k.tramp, {c.arg(0), c.arg(1), c.arg(2), c.arg(3), c.arg(4), c.arg(5),
+                                                    c.arg(6), c.arg(7)});
+    c.set_reg(R_ECX, ecx);
+    c.set_reg(R_EDX, edx);
+    const bool bad = r != r0 || std::memcmp(native.data(), H(lo), len);
+    if (bad && k.bad < 20)
+        rt::logf("native check: Dc6Shadow(x %d, clip %d-%d, rows %u) gave %08x, the game's %08x; pixels %s",
+                 (int32_t)c.arg(0), (int32_t)c.arg(1), (int32_t)c.arg(2), c.arg(5), r, r0,
+                 std::memcmp(native.data(), H(lo), len) ? "differ" : "match");
+    check_note(k, bad);
+    return r0;
+}
+
 // Clipped variants: x is the screen column; a literal of b pixels draws
 // [l, r) with l = max(0, clipL - x) and r = min(clipR - x, b) (r is not
 // clamped at 0). A skip advances x too; a new row resets it to x0.
@@ -445,6 +796,46 @@ uint32_t room_find(uint32_t room, int32_t x, int32_t y)
     return 0;
 }
 
+// The room lookup itself as a native (158 callers; 1.4 million calls in a
+// minute of walking round Lut Gholein on the lane).
+uint32_t room_find_native(Cpu &c)
+{
+    return room_find(c.reg(R_ECX), (int32_t)c.reg(R_EDX), (int32_t)c.arg(0));
+}
+
+// 64d4e0([8]=room, [c]=x, [10]=y; esi=mask), ret 0xc: whether the subtile
+// (x, y) or one next to it is blocked for the mask: 1 blocked (also when no
+// room holds it, or the room has no collision grid), 0 free. The room's
+// collision ([room+0x20]: +0 x, +4 y, +8 width, +0xc height, +0x20 a word
+// per subtile). Inside the room, not on its edge, it tests the subtile and
+// its four neighbours (99.97% of 920 thousand calls in Lut Gholein); on an
+// edge, the neighbours outside go through 64ca50, the next room's: those
+// calls go on to the game's code (push ebp; mov ebp, esp; mov ecx, [ebp+8]
+// done here, on at 64d4e6). The pathfinding's (648120 and its callers).
+// Returns false where the game's code must run; else the answer in r.
+bool collision_cross(uint32_t room, int32_t x, int32_t y, uint16_t mask, uint32_t &r)
+{
+    r = 1;
+    const uint32_t rm = room_find(room, x, y);
+    if (!rm)
+        return true;
+    const uint32_t col = U32(rm + 0x20);
+    if (!col || !U32(col + 0x20))
+        return true;
+    const int32_t cx = I32(col), cy = I32(col + 4), w = I32(col + 8), h = I32(col + 0xc);
+    if (cx >= x || cy >= y || cx + w <= x + 1 || cy + h <= y + 1)
+        return false;   // on an edge
+    const uint8_t *p = H(U32(col + 0x20) + 2 * (uint32_t)((y - cy) * w - cx + x));
+    auto blocked = [&](int32_t at) {
+        uint16_t v;
+        std::memcpy(&v, p + at, 2);
+        return (v & mask) != 0;
+    };
+    r = blocked(0) || blocked(-2) || blocked(2) || blocked(-2 * w) || blocked(2 * w);
+    return true;
+}
+
+
 // 620bb0([8]=unit): the unit's room. Types 2, 4 and 5 (objects, items,
 // tiles) hold it at [[+0x2c]]; the others at [[+0x2c]+0x1c] when they have
 // a path. (A null unit is a fatal error in the game; the caller checks.)
@@ -542,6 +933,185 @@ uint32_t light_block(Cpu &c)
             }
         }
     }
+    return 0;
+}
+
+// ---- the lights' stamps on the light grid ----------------------------------------------
+//
+// Each frame the game stamps every light near the view onto the light grid
+// (dispatcher 4755a0): a square of cells around it, each given the light's
+// falloff at its distance through 4747c0. In a fight on the lane the
+// stamps were 14% of the game's instructions (4747c0 1.7 million calls in
+// 60 s), mostly calls and returns. The two stamp loops are native whole;
+// the third (474d70, shadow casting) keeps its own code and calls the
+// native cell add. Their EAX is dead: 4755a0's one caller overwrites it.
+constexpr uint32_t kGridMaxX = 0x007b0a5c, kGridMaxY = 0x007b0a60;   // the grid's last cell, in cells
+constexpr uint32_t kLightRecip = 0x007b0a68;                         // 256 dwords: 65536 / n, for the colour mix
+
+// 4747c0(eax=x, ecx=y, [8]=intensity, [c] r, [10] g, [14] b), ret 0x10:
+// the cell at subtile (x, y), if on the grid, gains the intensity (to 255)
+// and, with coloured light, the colour weighted by the two intensities.
+inline void light_add(int32_t x, int32_t y, uint32_t v, uint8_t r, uint8_t g, uint8_t b)
+{
+    const uint32_t gx = (uint32_t)(x >> 3) - U32(kGridX), gy = (uint32_t)(y >> 3) - U32(kGridY);
+    if (gx > 0x2f || gy > 0x2f)
+        return;
+    uint8_t *cell = H(kLightGrid + (gy * 48 + gx) * 8);
+    const uint32_t old = cell[4];
+    uint32_t sum = old + v;
+    if (sum >= 0xff)
+        sum = 0xff;
+    if (!U32(kColoredLight)) {
+        cell[5] = cell[6] = cell[7] = 0;
+        cell[4] = (uint8_t)sum;
+        return;
+    }
+    const uint32_t w = U32(kLightRecip + sum * 4);
+    auto mix = [&](uint32_t have, uint32_t add) {
+        const uint32_t m = ((have * old + add * v) * w) >> 16;
+        return (uint8_t)((int32_t)m > 0xff ? 0xff : m);
+    };
+    const uint8_t nr = mix(cell[5], r), ng = mix(cell[6], g), nb = mix(cell[7], b);
+    cell[4] = (uint8_t)sum;
+    cell[5] = nr;
+    cell[6] = ng;
+    cell[7] = nb;
+}
+
+uint32_t light_add_native(Cpu &c)
+{
+    light_add((int32_t)c.reg(R_EAX), (int32_t)c.reg(R_ECX), c.arg(0), (uint8_t)c.arg(1), (uint8_t)c.arg(2),
+              (uint8_t)c.arg(3));
+    return 0;
+}
+
+// 474080 and 4740d0: the distance, as an octagon: 0.96 of the larger
+// difference and 0.4 of the smaller.
+inline int32_t light_distance(int32_t dx, int32_t dy)
+{
+    const uint32_t a = (uint32_t)(dx < 0 ? -dx : dx), b = (uint32_t)(dy < 0 ? -dy : dy);
+    return (int32_t)(a >= b ? (a * 0x3d7 + b * 0x197) >> 10 : (b * 0x3d7 + a * 0x197) >> 10);
+}
+
+// The square both stamps cover: (n + 1) x (n + 1) cells from (x0, y0) in
+// subtiles; false when it is off the grid.
+inline bool light_square(uint32_t light, int32_t radius, int32_t &x0, int32_t &y0, int32_t &n)
+{
+    const int32_t lx = I32(light + 0x10), ly = I32(light + 0x14);
+    x0 = (lx - (lx & 7)) - radius;
+    y0 = (ly - (ly & 7)) - radius;
+    n = (2 * radius) >> 3;
+    return !((x0 >> 3) > I32(kGridMaxX) || (x0 >> 3) + n + 1 < I32(kGridX) || (y0 >> 3) > I32(kGridMaxY) ||
+             (y0 >> 3) + n + 1 < I32(kGridY));
+}
+
+// 475420(edi=light), ret: a light with its occlusion map (light +0x30, a
+// dword per cell of the square; 16 or more: dark), the falloff scaled by
+// (8 - occlusion / 2) / 8.
+uint32_t light_stamp_occluded(Cpu &c)
+{
+    const uint32_t L = c.reg(R_EDI);
+    const int32_t R = I32(L + 0x18);
+    int32_t x0, y0, n;
+    if (R <= 0 || R >= 0x100 || !light_square(L, R, x0, y0, n))
+        return 0;
+    uint32_t map = U32(L + 0x30);
+    if (!map || !U32(L + 0x2c)) {   // the game's assertion (0x47e, 0x47f): never seen
+        static bool said;
+        if (!said)
+            rt::logf("light stamp: light %08x without its occlusion map", L);
+        said = true;
+        return 0;
+    }
+    const int32_t k = (int32_t)((uint32_t)*H(L + 0x24) << 16) / R;
+    const int32_t lx = I32(L + 0x10), ly = I32(L + 0x14);
+    const uint8_t r = *H(L + 0x25), g = *H(L + 0x26), b = *H(L + 0x27);
+    for (int32_t row = 0, y = y0; row <= n; row++, y += 8) {
+        const int32_t dy = ly - y;
+        for (int32_t col = 0, x = x0; col <= n; col++, x += 8, map += 4) {
+            const int32_t occ = I32(map);
+            if (occ >= 0x10)
+                continue;
+            const int32_t d = light_distance(lx - x, dy);
+            int32_t v = (int32_t)((uint32_t)(R - d) * (uint32_t)k) >> 16;
+            v = (int32_t)((uint32_t)v * (uint32_t)(8 - (occ >> 1))) >> 3;
+            if (v > 0)
+                light_add(x, y, (uint32_t)v, r, g, b);
+        }
+    }
+    return 0;
+}
+
+// 4748d0(esi=light, [8]=as is), ret 4: a light without occlusion. Unless
+// `as is`: a light of type 1 has radius 8, one of type 3 none, and one of
+// type 0 not the player's (light +4 against the player unit's +0xc) at
+// most 16.
+uint32_t light_stamp(Cpu &c)
+{
+    const uint32_t L = c.reg(R_ESI);
+    int32_t R = I32(L + 0x18);
+    if ((uint32_t)(R - 1) > 0xfe)
+        return 0;
+    if (!c.arg(0)) {
+        const uint32_t type = U32(L);
+        if (type == 0) {
+            const uint32_t player = U32(kPlayerUnit);
+            const uint32_t id = player ? U32(player + 0xc) : 0xffffffffu;
+            if (U32(L + 4) != id && R >= 0x10)
+                R = 0x10;
+        } else if (type == 1) {
+            R = 8;
+        } else if (type == 3) {
+            return 0;
+        }
+    }
+    int32_t x0, y0, n;
+    if (!light_square(L, R, x0, y0, n))
+        return 0;
+    const int32_t k = (int32_t)((uint32_t)*H(L + 0x24) << 16) / R;
+    const int32_t lx = I32(L + 0x10), ly = I32(L + 0x14);
+    const uint8_t r = *H(L + 0x25), g = *H(L + 0x26), b = *H(L + 0x27);
+    for (int32_t row = 0, y = y0; row <= n; row++, y += 8) {
+        const int32_t dy = ly - y;
+        for (int32_t col = 0, x = x0; col <= n; col++, x += 8) {
+            const int32_t v = (int32_t)((uint32_t)(R - light_distance(lx - x, dy)) * (uint32_t)k) >> 16;
+            if (v > 0)
+                light_add(x, y, (uint32_t)v, r, g, b);
+        }
+    }
+    return 0;
+}
+
+// D2_NATIVE_CHECK=1: the light grid after the native, against the game's
+// routine on the grid as it was (install_remap_check's trampolines, K 3-5).
+template <int K> uint32_t light_checked(Cpu &c)
+{
+    constexpr uint32_t kGridBytes = 48 * 48 * 8;
+    RemapCheck &k = g_remap_check[K];
+    std::vector<uint8_t> before(H(kLightGrid), H(kLightGrid) + kGridBytes);
+    if (K == 3)
+        light_add_native(c);
+    else if (K == 4)
+        light_stamp_occluded(c);
+    else
+        light_stamp(c);
+    std::vector<uint8_t> native(H(kLightGrid), H(kLightGrid) + kGridBytes);
+    std::memcpy(H(kLightGrid), before.data(), kGridBytes);
+    if (K == 3)
+        rt::guest_call(c, k.tramp, {c.arg(0), c.arg(1), c.arg(2), c.arg(3)});
+    else if (K == 4)
+        rt::guest_call(c, k.tramp, {});
+    else
+        rt::guest_call(c, k.tramp, {c.arg(0)});
+    const bool bad = std::memcmp(native.data(), H(kLightGrid), kGridBytes) != 0;
+    if (bad && k.bad < 20) {
+        uint32_t i = 0;
+        while (native[i] == *H(kLightGrid + i))
+            i++;
+        rt::logf("native check: %s differs at cell %u byte %u: %u, the game's %u", k.name, i / 8, i % 8, native[i],
+                 *H(kLightGrid + i));
+    }
+    check_note(k, bad);
     return 0;
 }
 
@@ -1841,9 +2411,10 @@ void cache_unlink(uint32_t cache, uint32_t e)
 // 5ff5b0(ecx=cache, edx=entry), a cache hit: if the cache is on (+0xc),
 // counts the hit (+0x4c), and under its lock (+0x30) moves the entry to the
 // recently used end of the main list, flag bit 0 cleared, stamped with
-// GetTickCount (+0x10). The stamp is now_ms, the value the GetTickCount
-// intrinsic gives: evictions go by it. Its only caller reads no register
-// after it.
+// GetTickCount (+0x10). The stamp is tick_ms, the value the GetTickCount
+// intrinsic gives (the slice's clock), without a host clock read per hit:
+// in a crowd this runs thousands of times a frame. Evictions go by it. Its
+// only caller reads no register after it.
 uint32_t cache_touch(Cpu &c)
 {
     const uint32_t cache = c.reg(R_ECX), e = c.reg(R_EDX);
@@ -1871,7 +2442,7 @@ uint32_t cache_touch(Cpu &c)
         put32(e + 0x18, U32(cache + 0x18));
     }
     put32(cache + 0x18, e);
-    put32(e + 0x10, (uint32_t)rt::now_ms());
+    put32(e + 0x10, rt::tick_ms());
     return 0;   // LeaveCriticalSection's
 }
 
@@ -2280,6 +2851,1475 @@ bool install_check(Cpu &c)
     return true;
 }
 
+// ---- the unit under the cursor: 466870 ---------------------------------------------
+inline bool unit_pick_rejected(uint32_t unit)
+{
+    return unit && ((U32(unit + 0xc4) >> 21 & 1) || !(U32(unit + 0xc8) & 0x80));
+}
+
+//
+// Each frame the game looks for the unit under the cursor (467b40): every
+// unit in the rooms near it, through 467000 and then 466870(ecx=unit,
+// edx, [8], [c]), ret 8 — 920 thousand calls in a minute of the lane's
+// town walk. 466870 returns 0 for a unit with bit 21 of +0xc4 (the test
+// at 4668d6; before it only the game type's branch, which returns 0 or
+// goes on, and two loads: 0x7a6ab0, 0x7a5210), nine in ten of them. And
+// for one without bit 7 of +0xc8 (the test at 466974) whatever came before
+// it: every path before that test
+// either returns 0 or reaches it, and nothing on them writes memory (the
+// functions they call, 465c60, 464ec0, 464f70, 464310 and theirs, and the
+// table 4642b0 calls through, 0x711f34: no store outside their own stack
+// frames, by disassembly). So such a unit is answered at once; any other
+// goes on to the game's code: push ebp; mov ebp, esp; sub esp, 0x34 done
+// here (the hook's jmp covers 466870-466874, into the sub), on at 466876.
+uint32_t unit_pick_filter(Cpu &c)
+{
+    const uint32_t unit = c.reg(R_ECX);
+    if (unit_pick_rejected(unit))
+        return 0;
+    const uint32_t esp = c.reg(R_ESP);
+    put32(esp - 4, c.reg(R_EBP));
+    c.set_reg(R_EBP, esp - 4);
+    resume_original(c, 0x00466876, esp - 4 - 0x34, 2);
+    return c.reg(R_EAX);
+}
+
+// The collision cross (collision_cross, above) as the hook at 64d4e0.
+uint32_t collision_cross_native(Cpu &c)
+{
+    uint32_t r;
+    if (collision_cross(c.arg(0), (int32_t)c.arg(1), (int32_t)c.arg(2), (uint16_t)c.reg(R_ESI), r))
+        return r;
+    const uint32_t esp = c.reg(R_ESP);
+    put32(esp - 4, c.reg(R_EBP));
+    c.set_reg(R_EBP, esp - 4);
+    c.set_reg(R_ECX, c.arg(0));
+    resume_original(c, 0x0064d4e6, esp - 4, 3);
+    return c.reg(R_EAX);
+}
+
+// ---- a unit's stat: 625480 ---------------------------------------------------------
+//
+// 625480([8]=unit, [c]=stat, [10]=layer), ret 0xc: the unit's value of a
+// stat, through 624f60 and its binary search 624b90: three nested calls
+// for each of 546 thousand lookups in a minute of the lane in Lut Gholein
+// (an aura's skill level, 644180, makes six a time). Only reads:
+//   the unit's stat holder (+0x5c), else 0; the stat's row in the stat
+//   table ([0x744304]+0xbcc, 0x144 bytes each, [..]+0xbd4 of them), else 0;
+//   the holder's full list (+0x48) when +0x10's sign bit is set, else its
+//   base list (+0x24): an array ([list]) of (key, value) pairs sorted by
+//   key, (int16)[list+4] of them, the key stat << 16 | layer;
+//   not there: 0; a value below the row's minimum (+0x2c), for a row whose
+//   +5 has a bit of [0x6ce270], on a full list whose owner ([+0x44]) is of
+//   type 0 or 1: the minimum << the row's +0x18.
+// 625420(holder, stat, layer), ret 0xc: the same from a stat holder.
+uint32_t stat_get_holder(uint32_t holder, uint32_t stat, uint32_t layer)
+{
+    const uint32_t table = U32(0x00744304);
+    if (!holder || (int32_t)stat < 0 || (int32_t)stat >= I32(table + 0xbd4))
+        return 0;
+    const uint32_t row = stat * 0x144 + U32(table + 0xbcc);
+    if (!row)
+        return 0;
+    const int32_t key = (int32_t)((stat << 16) + (layer & 0xffff));
+    const uint32_t full = U32(holder + 0x10) & 0x80000000u;
+    const uint32_t list = holder + (full ? 0x48 : 0x24);
+    const uint32_t pairs = U32(list);
+    int32_t lo = 0, hi = *reinterpret_cast<const int16_t *>(H(list + 4)), at = -1;
+    while (lo < hi) {
+        const int32_t mid = lo + (hi - lo) / 2;
+        const int32_t k = I32(pairs + 8 * (uint32_t)mid);
+        if (key > k)
+            lo = mid + 1;
+        else if (key == k) {
+            at = mid;
+            break;
+        } else
+            hi = mid;
+    }
+    if (at < 0 || !(pairs + 8 * (uint32_t)at))
+        return 0;
+    const int32_t v = I32(pairs + 8 * (uint32_t)at + 4);
+    const uint32_t owner = U32(holder + 0x44);
+    if ((*H(row + 5) & *H(0x006ce270)) && full && owner && (U32(owner) == 0 || U32(owner) == 1) &&
+        v < I32(row + 0x2c))
+        return U32(row + 0x2c) << (*H(row + 0x18) & 31);
+    return (uint32_t)v;
+}
+
+uint32_t stat_get(uint32_t unit, uint32_t stat, uint32_t layer)
+{
+    return unit ? stat_get_holder(U32(unit + 0x5c), stat, layer) : 0;
+}
+
+uint32_t stat_get_native(Cpu &c) { return stat_get(c.arg(0), c.arg(1), c.arg(2)); }
+
+// ---- a unit's walk: 648120 -----------------------------------------------------------
+//
+// 648120(eax=path), ret: one step of a unit along its path toward its
+// target, 0 when there (or already there), else 1; the pathfinding's inner
+// step, a loop of collision tests through 64d910 (920 thousand in a minute
+// of Lut Gholein). The path: +0 the target (x, y words), +4 where the unit
+// is (x, y), +8 its room, +0x28 its size class, +0x2c the collision mask,
+// +0x30 the unit. The directions toward the target (678df0, through 678c10
+// and the table at 0x6f1648: a main one, two alternatives, 0xff none),
+// each a step of the table at 0x6eb398. The main step from where the unit
+// is; if blocked, the first alternative's from its own running place, then
+// the second's; all blocked, the main direction again from the blocked
+// main step, and on. The first free step is where the unit goes.
+// The plan below makes no change until it is done: a size class not of
+// the cross test (1, 3, 5), a test on a room's edge, the assertion's case
+// or a walk past 100000 tests all leave the call to the game's code. The
+// unit kind whose +0x30's first dword is 0 settles after a step (648050,
+// done in the plan too).
+inline uint32_t walk_dirs(uint32_t from, uint32_t to)
+{
+    int32_t dx = (int32_t)(to & 0xffff) - (int32_t)(from & 0xffff);
+    int32_t dy = (int32_t)(to >> 16) - (int32_t)(from >> 16);
+    const int32_t ax = dx < 0 ? -dx : dx, ay = dy < 0 ? -dy : dy;
+    int32_t sx = dx, sy = dy;
+    bool clamp_x = true;
+    if (ax >= 2 * ay) {
+        sy = dy < 0 ? -1 : (dy & 1);
+    } else if (ay >= 2 * ax) {
+        sx = dx < 0 ? -1 : (dx & 1);
+        clamp_x = false;
+    }
+    if (clamp_x)
+        sx = sx < -1 ? -2 : sx > 1 ? 2 : sx;
+    sy = sy < -1 ? -2 : sy > 1 ? 2 : sy;
+    const uint32_t i = (uint32_t)(5 * sx + sy + 12);
+    const uint8_t *t = H(0x006f1648 + 3 * i);
+    return t[0] | t[1] << 8 | t[2] << 16;
+}
+
+inline uint16_t step_dx(uint32_t d) { return *reinterpret_cast<const uint16_t *>(H(0x006eb398 + 8 * d)); }
+inline uint16_t step_dy(uint32_t d) { return *reinterpret_cast<const uint16_t *>(H(0x006eb39c + 8 * d)); }
+
+// -1: the game's code; else the result, with the place to write (moved).
+// Why the plan left calls to the game's code (D2_NATIVE_CHECK logs them):
+// 0 the unit or the assertion, 1 (no longer: 648050 is done here), 2 the
+// size class, 3 a room's edge, 4 too long.
+uint32_t g_walk_left[5];
+
+int unit_walk_plan(uint32_t path, bool &moved, uint16_t &nx, uint16_t &ny)
+{
+    moved = false;
+    const uint32_t unit = U32(path + 0x30);
+    if (!unit || (U32(unit + 0x34) & 0x40000))
+        return g_walk_left[0]++, -1;
+    const uint32_t inner = U32(unit + 0x30);
+    const bool settle = inner && !U32(inner);   // 648050 after a step (below)
+    const uint32_t cls = U32(path + 0x28);
+    if (cls != 1 && cls != 3 && cls != 5)
+        return g_walk_left[2]++, -1;
+    const uint16_t tx = *reinterpret_cast<const uint16_t *>(H(path)), ty = *reinterpret_cast<const uint16_t *>(H(path + 2));
+    const uint32_t room = U32(path + 8);
+    const uint16_t mask = (uint16_t)U32(path + 0x2c);
+    uint16_t x = *reinterpret_cast<const uint16_t *>(H(path + 4)), y = *reinterpret_cast<const uint16_t *>(H(path + 6));
+    uint16_t a1x = x, a1y = y, a2x = x, a2y = y;
+    const uint32_t dirs = walk_dirs(U32(path + 4), U32(path));
+    uint32_t main = dirs & 0xff;
+    const uint32_t alt1 = dirs >> 8 & 0xff, alt2 = dirs >> 16 & 0xff;
+    auto free_at = [&](uint16_t px, uint16_t py, int &out) {
+        uint32_t r;
+        if (!collision_cross(room, px, py, mask, r))
+            return false;
+        out = r == 0;
+        return true;
+    };
+    for (int n = 0; n < 100000; n++) {
+        if (x == tx && y == ty)
+            return 0;
+        x = (uint16_t)(x + step_dx(main));
+        y = (uint16_t)(y + step_dy(main));
+        int ok;
+        if (!free_at(x, y, ok))
+            return g_walk_left[3]++, -1;
+        uint16_t px = x, py = y;
+        if (!ok) {
+            a1x = (uint16_t)(a1x + step_dx(alt1));
+            a1y = (uint16_t)(a1y + step_dy(alt1));
+            if (!free_at(a1x, a1y, ok))
+                return g_walk_left[3]++, -1;
+            px = a1x;
+            py = a1y;
+            if (!ok && alt2 != 0xff) {
+                a2x = (uint16_t)(a2x + step_dx(alt2));
+                a2y = (uint16_t)(a2y + step_dy(alt2));
+                if (!free_at(a2x, a2y, ok))
+                    return g_walk_left[3]++, -1;
+                px = a2x;
+                py = a2y;
+            }
+        }
+        if (ok) {
+            moved = true;
+            nx = px;
+            ny = py;
+            if (px == tx && py == ty)
+                return 0;
+            if (settle) {
+                // 648050: within 5 subtiles of the target (not on it), on by
+                // the table's step for the offset (0x6eb490, 9 x 9 dwords
+                // about its centre: x's at dx + 9 dy, y's at dy + 9 dx) while
+                // the way is free, until 5 from the start of the count.
+                const int32_t dx = (int32_t)px - (int32_t)tx, dy = (int32_t)py - (int32_t)ty;
+                const int32_t ax = dx < 0 ? -dx : dx, ay = dy < 0 ? -dy : dy;
+                if (ax < 5 && ay < 5 && (ax || ay)) {
+                    const int32_t sx = I32(0x006eb490 + 4 * (uint32_t)(dx + 9 * dy));
+                    const int32_t sy = I32(0x006eb490 + 4 * (uint32_t)(dy + 9 * dx));
+                    int32_t wx = px, wy = py;
+                    for (int32_t k = ax > ay ? ax : ay; k < 5; k++) {
+                        uint32_t r;
+                        if (!collision_cross(room, wx + sx, wy + sy, mask, r))
+                            return g_walk_left[3]++, -1;
+                        if (r)
+                            break;
+                        wx += sx;
+                        wy += sy;
+                        nx = (uint16_t)wx;
+                        ny = (uint16_t)wy;
+                    }
+                }
+            }
+            return 1;
+        }
+        main = walk_dirs((uint32_t)x | (uint32_t)y << 16, U32(path)) & 0xff;
+    }
+    return g_walk_left[4]++, -1;
+}
+
+uint32_t unit_walk(Cpu &c)
+{
+    const uint32_t path = c.reg(R_EAX);
+    bool moved;
+    uint16_t nx, ny;
+    const int r = unit_walk_plan(path, moved, nx, ny);
+    if (r >= 0) {
+        if (moved) {
+            std::memcpy(H(path + 4), &nx, 2);
+            std::memcpy(H(path + 6), &ny, 2);
+        }
+        return (uint32_t)r;
+    }
+    // push ebp; mov ebp, esp; sub esp, 0x3c (the hook's jmp covers 648120-
+    // 648124), on at 648126.
+    const uint32_t esp = c.reg(R_ESP);
+    put32(esp - 4, c.reg(R_EBP));
+    c.set_reg(R_EBP, esp - 4);
+    resume_original(c, 0x00648126, esp - 4 - 0x3c, 0);
+    return c.reg(R_EAX);
+}
+
+// D2_NATIVE_CHECK=1: the plan (where it has one) against the game's code,
+// the result and the place (trampoline 14). The game's walk is kept.
+uint32_t unit_walk_checked(Cpu &c)
+{
+    RemapCheck &k = g_remap_check[14];
+    const uint32_t path = c.reg(R_EAX);
+    const uint32_t before = U32(path + 4);
+    bool moved;
+    uint16_t nx, ny;
+    const int r = unit_walk_plan(path, moved, nx, ny);
+    const uint32_t r0 = rt::guest_call(c, k.tramp, {});
+    c.set_reg(R_EAX, path);
+    static uint32_t calls = 0;
+    if ((++calls & (calls - 1)) == 0)
+        rt::logf("native check: UnitWalk %u calls, left to the game: unit %u, kind %u, size class %u, edge %u, long %u",
+                 calls, g_walk_left[0], g_walk_left[1], g_walk_left[2], g_walk_left[3], g_walk_left[4]);
+    if (r >= 0) {
+        const uint32_t want = moved ? ((uint32_t)nx | (uint32_t)ny << 16) : before;
+        const bool bad = (uint32_t)r != r0 || U32(path + 4) != want;
+        if (bad && k.bad < 20)
+            rt::logf("native check: UnitWalk(%08x) gave %d at %08x, the game's %u at %08x", path, r, want, r0,
+                     U32(path + 4));
+        check_note(k, bad);
+    }
+    return r0;
+}
+
+// ---- the monsters' path search: 67b850 ---------------------------------------------
+//
+// 67b850(ecx=search), ret: a unit's path toward a goal, an A* over subtiles,
+// 20% of the game's code in the Far Oasis on the lane (566 thousand node
+// expansions in two minutes). The search record: +0 the start (x, y words),
+// +4 the goal, +8 the room, +0x28 the size class, +0x2c the collision mask,
+// +0x30 the unit (+0x58: check the goal first; +0x9c: the path's points).
+// Its working state is a local of 0x32f4 bytes (two hashes of nodes, an
+// open list sorted by f, a pool of 200 nodes of 0x38 bytes, a stack), so
+// the native keeps it in host memory and writes only the path:
+//   67b740: with the unit's +0x58, the search fails (0) unless one of the
+//     eight points two subtiles from the goal is free.
+//   The start node: g 0, h = f = the heuristic (67adc0: 2 max + min of the
+//     two distances). Each pass takes the open list's head (67af40); the
+//     best node so far is the one of least h, or of equal h and a g more
+//     than 5 above the best's; h 0 ends the search, as does a full pool.
+//   67b440: the node's neighbours, (-1,-1) (-1,1) (1,-1) (1,1) (-1,0) (0,-1)
+//     (1,0) (0,1), each free one (64d910) through 67b200: g = the node's +
+//     2 straight or 3 diagonal; a node there already (open first, then
+//     closed) becomes one of the node's 8 children and, if this g is less,
+//     takes the node as parent, the g and f = h + g (an open one stays where
+//     it is in the list; a closed one passes the new g on to its children,
+//     and theirs, 67afe0); else a new node (none left: the search ends) with
+//     h, f, in the open list before the first of f no less (67aed0).
+//   67b690: from the best node back to the start (its parents), the points
+//     where the step's direction changes, at most 78; with 1 to 77, they go
+//     to the unit's +0x9c in walking order, and their count is the result.
+// A size class not of the cross test, or a test on a room's edge, leaves
+// the whole call to the game's code (nothing written yet).
+struct PathNode {
+    uint16_t x, y;
+    int16_t f, h, g;
+    int16_t parent, next;   // next: the open list
+    int16_t child[8];
+    bool closed;
+};
+
+struct PathSearch {
+    PathNode node[200];
+    int count = 0, head = -1;
+    int16_t slot[512];   // node by place: open addressing, at most 200 in 512
+    int16_t stack[200];
+
+    static uint32_t key(uint16_t x, uint16_t y) { return (uint32_t)x | (uint32_t)y << 16; }
+    static uint32_t hash(uint32_t k) { return (k * 0x9e3779b1u) >> 23; }
+    int find(uint16_t x, uint16_t y) const
+    {
+        const uint32_t k = key(x, y);
+        for (uint32_t i = hash(k);; i = (i + 1) & 511) {
+            const int n = slot[i];
+            if (n < 0)
+                return -1;
+            if (node[n].x == x && node[n].y == y)
+                return n;
+            (void)k;
+        }
+    }
+    void remember(int n)
+    {
+        for (uint32_t i = hash(key(node[n].x, node[n].y));; i = (i + 1) & 511)
+            if (slot[i] < 0) {
+                slot[i] = (int16_t)n;
+                return;
+            }
+    }
+    void open_insert(int n)
+    {
+        int prev = -1, cur = head;
+        while (cur >= 0 && node[cur].f < node[n].f) {
+            prev = cur;
+            cur = node[cur].next;
+        }
+        node[n].next = (int16_t)cur;
+        if (prev >= 0)
+            node[prev].next = (int16_t)n;
+        else
+            head = n;
+    }
+    int pop()
+    {
+        const int n = head;
+        if (n >= 0) {
+            head = node[n].next;
+            node[n].closed = true;
+        }
+        return n;
+    }
+    void add_child(int p, int n)
+    {
+        for (int16_t &c : node[p].child)
+            if (c < 0) {
+                c = (int16_t)n;
+                return;
+            }
+    }
+    static int16_t step_cost(const PathNode &a, uint16_t x, uint16_t y) { return a.x == x || a.y == y ? 2 : 3; }
+};
+
+inline int16_t path_heuristic(uint16_t x, uint16_t y, uint32_t goal)
+{
+    int32_t a = (int32_t)x - (int32_t)(goal & 0xffff), b = (int32_t)y - (int32_t)(goal >> 16);
+    a = a < 0 ? -a : a;
+    b = b < 0 ? -b : b;
+    return (int16_t)(a >= b ? 2 * a + b : a + 2 * b);
+}
+
+// -1: the game's code; else the result, with the path's points to write.
+int path_search_plan(uint32_t search, PathSearch &ps, uint32_t *points)
+{
+    const uint32_t cls = U32(search + 0x28);
+    if (cls != 1 && cls != 3 && cls != 5)
+        return -1;
+    const uint32_t room = U32(search + 8), unit = U32(search + 0x30), goal = U32(search + 4);
+    const uint16_t mask = (uint16_t)U32(search + 0x2c);
+    bool edge = false;
+    auto free_at = [&](uint16_t x, uint16_t y) {
+        uint32_t r;
+        if (!collision_cross(room, x, y, mask, r)) {
+            edge = true;
+            return false;
+        }
+        return r == 0;
+    };
+    if (U32(unit + 0x58)) {   // 67b740
+        const uint16_t gx = (uint16_t)goal, gy = (uint16_t)(goal >> 16);
+        static const int8_t kAround[8][2] = {{-2, -2}, {-2, 2}, {2, -2}, {2, 2}, {-2, 0}, {0, -2}, {2, 0}, {0, 2}};
+        bool any = false;
+        for (const auto &d : kAround) {
+            if (free_at((uint16_t)(gx + d[0]), (uint16_t)(gy + d[1]))) {
+                any = true;
+                break;
+            }
+            if (edge)
+                return -1;
+        }
+        if (!any)
+            return 0;
+    }
+    ps.count = 0;
+    ps.head = -1;
+    std::memset(ps.slot, 0xff, sizeof ps.slot);
+    const uint32_t start = U32(search);
+    PathNode &s0 = ps.node[ps.count++];
+    std::memset(&s0, 0, sizeof s0);
+    std::memset(s0.child, 0xff, sizeof s0.child);
+    s0.parent = -1;
+    s0.x = (uint16_t)start;
+    s0.y = (uint16_t)(start >> 16);
+    s0.h = s0.f = path_heuristic(s0.x, s0.y, goal);
+    ps.remember(0);
+    ps.open_insert(0);
+    // 67afe0: a closed node's lower g, on to its children.
+    auto propagate = [&](int from) {
+        int top = 0;
+        ps.stack[top++] = (int16_t)from;
+        while (top) {
+            if (top > 200)
+                return false;
+            const PathNode &c = ps.node[ps.stack[--top]];
+            const int ci = (int)(&c - ps.node);
+            for (int16_t d : c.child) {
+                if (d < 0)
+                    break;
+                PathNode &n = ps.node[d];
+                const int16_t g = (int16_t)(c.g + PathSearch::step_cost(c, n.x, n.y));
+                if (g < n.g) {
+                    n.parent = (int16_t)ci;
+                    n.g = g;
+                    n.f = (int16_t)(n.h + g);
+                    if (top >= 200)
+                        return false;
+                    ps.stack[top++] = d;
+                }
+            }
+        }
+        return true;
+    };
+    // 67b200: 1 done, 0 the pool full, -1 the game's code.
+    auto add = [&](int p, uint16_t x, uint16_t y) {
+        const int16_t g = (int16_t)(ps.node[p].g + PathSearch::step_cost(ps.node[p], x, y));
+        const int k = ps.find(x, y);
+        if (k >= 0) {
+            ps.add_child(p, k);
+            PathNode &n = ps.node[k];
+            if (g < n.g) {
+                n.f = (int16_t)(n.h + g);
+                n.parent = (int16_t)p;
+                n.g = g;
+                if (n.closed && !propagate(k))
+                    return -1;
+            }
+            return 1;
+        }
+        if (ps.count == 200)
+            return 0;
+        const int n = ps.count++;
+        PathNode &nn = ps.node[n];
+        std::memset(&nn, 0, sizeof nn);
+        std::memset(nn.child, 0xff, sizeof nn.child);
+        nn.parent = (int16_t)p;
+        nn.g = g;
+        nn.h = path_heuristic(x, y, goal);
+        nn.x = x;
+        nn.y = y;
+        nn.f = (int16_t)(nn.h + g);
+        ps.remember(n);
+        ps.open_insert(n);
+        ps.add_child(p, n);
+        return 1;
+    };
+    static const int8_t kNear[8][2] = {{-1, -1}, {-1, 1}, {1, -1}, {1, 1}, {-1, 0}, {0, -1}, {1, 0}, {0, 1}};
+    int best = -1;
+    int k = ps.pop();
+    if (k < 0)
+        return 0;
+    for (;;) {
+        if (best < 0 || ps.node[k].h < ps.node[best].h ||
+            (ps.node[k].h == ps.node[best].h && (int32_t)ps.node[k].g > (int32_t)ps.node[best].g + 5))
+            best = k;
+        if (ps.node[k].h == 0)
+            break;
+        bool full = false;
+        for (const auto &d : kNear) {   // 67b440
+            const uint16_t x = (uint16_t)(ps.node[k].x + d[0]), y = (uint16_t)(ps.node[k].y + d[1]);
+            if (!free_at(x, y)) {
+                if (edge)
+                    return -1;
+                continue;
+            }
+            const int r = add(k, x, y);
+            if (r < 0)
+                return -1;
+            if (!r) {
+                full = true;
+                break;
+            }
+        }
+        if (full)
+            break;
+        k = ps.pop();
+        if (k < 0)
+            break;
+    }
+    // 67b690
+    int n = 0;
+    int32_t pdx = -2, pdy = -2;
+    uint32_t back[78];
+    for (int at = best; at >= 0 && n < 0x4e; at = ps.node[at].parent) {
+        const int par = ps.node[at].parent;
+        if (par < 0)
+            continue;
+        const int32_t dx = (int32_t)ps.node[at].x - (int32_t)ps.node[par].x;
+        const int32_t dy = (int32_t)ps.node[at].y - (int32_t)ps.node[par].y;
+        if (dx == pdx && dy == pdy)
+            continue;
+        back[n++] = PathSearch::key(ps.node[at].x, ps.node[at].y);
+        pdx = dx;
+        pdy = dy;
+    }
+    if ((uint32_t)(n - 1) > 0x4c)
+        return 0;
+    for (int i = 0; i < n; i++)
+        points[i] = back[n - 1 - i];
+    return n;
+}
+
+uint32_t path_search(Cpu &c)
+{
+    static PathSearch ps;   // the game thread's only
+    uint32_t points[78];
+    const uint32_t search = c.reg(R_ECX);
+    const int r = path_search_plan(search, ps, points);
+    if (r >= 0) {
+        if (r > 0)
+            std::memcpy(H(U32(search + 0x30) + 0x9c), points, 4 * (uint32_t)r);
+        return (uint32_t)r;
+    }
+    // push ebp; mov ebp, esp; mov eax, 0x32f4 (the hook's jmp covers
+    // 67b850-67b854), on at 67b858.
+    const uint32_t esp = c.reg(R_ESP);
+    put32(esp - 4, c.reg(R_EBP));
+    c.set_reg(R_EBP, esp - 4);
+    c.set_reg(R_EAX, 0x32f4);
+    resume_original(c, 0x0067b858, esp - 4, 0);
+    return 0x32f4;
+}
+
+// D2_NATIVE_CHECK=1: the plan's result and points against the game's
+// (trampoline 15). The game's are kept.
+uint32_t path_search_checked(Cpu &c)
+{
+    static PathSearch ps;
+    RemapCheck &k = g_remap_check[15];
+    uint32_t points[78];
+    const uint32_t search = c.reg(R_ECX);
+    const int r = path_search_plan(search, ps, points);
+    const uint32_t r0 = rt::guest_call(c, k.tramp, {});
+    c.set_reg(R_ECX, search);
+    if (r >= 0) {
+        bool bad = (uint32_t)r != r0;
+        if (!bad && r > 0)
+            bad = std::memcmp(points, H(U32(search + 0x30) + 0x9c), 4 * (uint32_t)r) != 0;
+        if (bad && k.bad < 20)
+            rt::logf("native check: PathSearch(%08x) gave %d points, the game's %u", search, r, r0);
+        check_note(k, bad);
+    }
+    return r0;
+}
+
+// ---- a skill's level: 644180 ---------------------------------------------------------
+//
+// 644180(esi=unit, [8]=skill), ret 4: the skill's level with the unit's
+// bonuses, eight stat queries and two table lookups; an aura's is worked
+// out each frame (34 a frame in Lut Gholein on the lane with an aura on).
+// Only reads:
+//   the skill's record ([skill]; its id, (int16)[+0], below the skills
+//   table's count, [0x744304]+0xba0), else 0; its base level (+0x2c);
+//   + 2 with the unit's state 0x86 (644150: 639df0 and 625b70, a bit of the
+//   full stat holder's +0x58, for a unit of type 0, 1 or 3);
+//   + stat 0x7f (all skills);
+//   a player (type 0) of the skill's class (record +0xc, the unit's +4):
+//     + stat 0x53 for the class, + stat 0xbc for the skill's tab (its
+//     description, 4a89d0, byte 2, if set: tab + class * 8 - 1), + stat
+//     0x61 for the skill, at most 3;
+//   another player: + stat 0x61, as it is;
+//   not a player: + stat 0x61, at most 3 when the skill's +0x28 is above 0;
+//   + stat 0x7e for the record's +0x1dc (if set), + stat 0x6b for the skill.
+// A skill without its description (where the game's code would read
+// address 2) goes on to the game's code.
+uint32_t stat_get(uint32_t unit, uint32_t stat, uint32_t layer);
+
+inline bool unit_state(uint32_t unit, uint32_t state)
+{
+    if (!unit || I32(unit) < 0 || (U32(unit) > 1 && U32(unit) != 3))
+        return false;
+    const uint32_t table = U32(0x00744304);
+    if ((int32_t)state < 0 || (int32_t)state >= I32(table + 0xc4))
+        return false;
+    const uint32_t holder = U32(unit + 0x5c);
+    if (!holder || !(U32(holder + 0x10) & 0x80000000u))
+        return false;
+    return (U32(U32(holder + 0x58) + 4 * (state >> 5)) & U32(0x006ce268 + 4 * (state & 31))) != 0;
+}
+
+// False where the game's code must run.
+bool skill_level(uint32_t unit, uint32_t skill, uint32_t &level)
+{
+    level = 0;
+    const uint32_t rec = skill ? U32(skill) : 0;
+    if (!rec)
+        return true;
+    const uint32_t table = U32(0x00744304);
+    const int32_t id = *reinterpret_cast<const int16_t *>(H(rec));
+    if (id < 0 || id >= I32(table + 0xba0))
+        return true;
+    uint32_t v = U32(skill + 0x2c) + (unit_state(unit, 0x86) ? 2 : 0) + stat_get(unit, 0x7f, 0);
+    if (unit && U32(unit) == 0) {
+        const uint32_t cls = U32(unit + 4);
+        if ((uint32_t)(int32_t)(int8_t)*H(rec + 0xc) == cls) {
+            // 4a89d0: the skill's description
+            uint32_t desc = 0;
+            const uint32_t row = (uint32_t)id * 0x23c + U32(table + 0xb98);
+            if (row) {
+                const int32_t d = *reinterpret_cast<const int16_t *>(H(row + 0x194));
+                if (d >= 0 && d < I32(table + 0xb94))
+                    desc = (uint32_t)d * 0x120 + U32(table + 0xb8c);
+            }
+            if (!desc)
+                return false;
+            v += stat_get(unit, 0x53, cls);
+            const int8_t tab = (int8_t)*H(desc + 2);
+            if (tab)
+                v += stat_get(unit, 0xbc, (uint32_t)((int32_t)tab + (int32_t)cls * 8 - 1));
+            const int32_t one = (int32_t)stat_get(unit, 0x61, (uint32_t)id);
+            v += (uint32_t)(one > 3 ? 3 : one);
+        } else {
+            v += stat_get(unit, 0x61, (uint32_t)id);
+        }
+    } else if (I32(skill + 0x28) > 0) {
+        const int32_t one = (int32_t)stat_get(unit, 0x61, (uint32_t)id);
+        v += (uint32_t)(one > 3 ? 3 : one);
+    } else {
+        v += stat_get(unit, 0x61, (uint32_t)id);
+    }
+    const uint8_t extra = *H(rec + 0x1dc);
+    if (extra)
+        v += stat_get(unit, 0x7e, extra);
+    level = v + stat_get(unit, 0x6b, (uint32_t)id);
+    return true;
+}
+
+uint32_t skill_level_native(Cpu &c)
+{
+    uint32_t level;
+    if (skill_level(c.reg(R_ESI), c.arg(0), level))
+        return level;
+    // push ebp; mov ebp, esp; push ecx; mov ecx, [ebp+8] (the hook's jmp
+    // covers 644180-644184), on at 644187.
+    const uint32_t esp = c.reg(R_ESP);
+    put32(esp - 4, c.reg(R_EBP));
+    put32(esp - 8, c.reg(R_ECX));
+    c.set_reg(R_EBP, esp - 4);
+    c.set_reg(R_ECX, c.arg(0));
+    resume_original(c, 0x00644187, esp - 8, 1);
+    return c.reg(R_EAX);
+}
+
+// D2_NATIVE_CHECK=1: against the game's (trampoline 16), whose is kept.
+uint32_t skill_level_checked(Cpu &c)
+{
+    RemapCheck &k = g_remap_check[16];
+    uint32_t level;
+    const bool mine = skill_level(c.reg(R_ESI), c.arg(0), level);
+    const uint32_t r0 = rt::guest_call(c, k.tramp, {c.arg(0)});
+    if (mine) {
+        const bool bad = level != r0;
+        if (bad && k.bad < 20)
+            rt::logf("native check: SkillLevel(unit %08x, skill %08x) gave %d, the game's %d", c.reg(R_ESI), c.arg(0),
+                     (int32_t)level, (int32_t)r0);
+        check_note(k, bad);
+    }
+    return r0;
+}
+
+// ---- two units' relation: 465c60 ---------------------------------------------------
+//
+// 465c60(ecx=a, edx=b), ret: whether a (the player, from the cursor's hit
+// test 466870, 530 thousand calls in the Far Oasis on the lane) may act on
+// b: 0 or 1. Outside a town (the level of a's room: 6426a0's table), only
+// reads:
+//   a unit of type 1 the roster knows (0x7bb5bc: +8 id, +0xc its player,
+//   next +0x30) counts as that player (type 0); so does a unit with +0xc8's
+//   bit 10 while b's +0x94 is 0 (its +0x98's); b likewise;
+//   the same type and id: 0;
+//   b a monster: 1 for its monstats flag 4, 0 for flag 5 (4638a0);
+//   a player and b of type 2 or 4: 1;
+//   else 650d70's alignment test (6259b0: 2 above type 1, else stat 0xac of
+//   the state 0x69 stat list) gives 0 where it holds, else 1.
+// A town, two players, or a missing unit go on to the game's code (push
+// ebp; mov ebp, esp; sub esp, 0x10 done here, on at 465c66).
+inline bool level_is_town(uint32_t level)
+{
+    if (level - 1 > 0x6c)
+        return false;
+    const uint8_t k = *H(0x006426c8 + level - 1);
+    return U32(0x006426c0 + 4u * k) == 0x006426b6;
+}
+
+inline uint32_t roster_player(uint32_t id)
+{
+    for (uint32_t e = U32(0x007bb5bc), n = 0; e && n < 4096; e = U32(e + 0x30), n++)
+        if (U32(e + 8) == id)
+            return U32(e + 0xc);
+    return 0xffffffffu;
+}
+
+inline bool monster_flag(uint32_t cls, uint32_t flag)
+{
+    const uint32_t t = U32(0x00744304);
+    if ((int32_t)cls < 0 || (int32_t)cls >= I32(t + 0xa80))
+        return false;
+    const int32_t i = *reinterpret_cast<const int16_t *>(H(U32(t + 0xa78) + cls * 0x1a8 + 0x18));
+    if (i < 0 || i >= I32(t + 0xa98))
+        return false;
+    const uint32_t rec = (uint32_t)i * 0x134 + U32(t + 0xa90);
+    if (!rec)
+        return false;
+    return (*H(rec + 4 + (flag >> 3)) & U32(0x006ce268 + 4 * (flag & 7))) != 0;
+}
+
+inline uint32_t unit_alignment(uint32_t u)
+{
+    if (!u)
+        return 0;
+    const uint32_t holder = U32(u + 0x5c);
+    if (!holder)
+        return 0;
+    if (U32(u) > 1)
+        return 2;
+    if (!(U32(holder + 0x10) & 0x80000000u))
+        return 0;
+    uint32_t list = 0;
+    for (uint32_t at : {0x3cu, 0x40u}) {
+        for (uint32_t e = U32(holder + at), n = 0; e && n < 4096; e = U32(e + 0x2c), n++)
+            if (U32(e + 0x14) == 0x69) {
+                list = e;
+                break;
+            }
+        if (list)
+            break;
+    }
+    return list ? stat_get_holder(list, 0xac, 0) : 0;
+}
+
+bool unit_relation(uint32_t a, uint32_t b, uint32_t &r)
+{
+    if (!a || !b)
+        return false;
+    const uint32_t room = unit_room(a);
+    if (room) {
+        const uint32_t room2 = U32(room + 0x10);
+        if (level_is_town(U32(U32(room2 + 0x58) + 0x1d0)))
+            return false;
+    }
+    uint32_t at = U32(a), aid = U32(a + 0xc), bt = U32(b), bid = U32(b + 0xc);
+    if (at == 1) {
+        const uint32_t m = roster_player(aid);
+        if (m != 0xffffffffu) {
+            at = 0;
+            aid = m;
+        }
+    }
+    if ((U32(a + 0xc8) >> 10 & 1) && !U32(b + 0x94)) {
+        at = 0;
+        aid = U32(a + 0x98);
+    }
+    if (bt == 1) {
+        const uint32_t m = roster_player(bid);
+        if (m != 0xffffffffu) {
+            bt = 0;
+            bid = m;
+        }
+        if ((U32(b + 0xc8) >> 10 & 1) && !U32(b + 0x94)) {
+            bid = U32(b + 0x98);
+            bt = 0;
+        }
+    }
+    if (at == bt && aid == bid) {
+        r = 0;
+        return true;
+    }
+    if (at == 0 && bt == 0)
+        return false;   // two players: 464820, 47a4f0, 4dc440
+    if (bt == 1) {
+        const uint32_t cls = U32(b + 4);
+        if (monster_flag(cls, 4)) {
+            r = 1;
+            return true;
+        }
+        if (monster_flag(cls, 5)) {
+            r = 0;
+            return true;
+        }
+    }
+    if (at == 0 && (bt == 4 || bt == 2)) {
+        r = 1;
+        return true;
+    }
+    // 650d70
+    bool same = false;
+    if (a == b) {
+        same = true;
+    } else {
+        const uint32_t x = unit_alignment(a), y = unit_alignment(b);
+        same = (x == 0 && y == 0) || (x == 2 && y == 2);
+    }
+    r = same ? 0 : 1;
+    return true;
+}
+
+uint32_t unit_relation_native(Cpu &c)
+{
+    uint32_t r;
+    if (unit_relation(c.reg(R_ECX), c.reg(R_EDX), r))
+        return r;
+    const uint32_t esp = c.reg(R_ESP);
+    put32(esp - 4, c.reg(R_EBP));
+    c.set_reg(R_EBP, esp - 4);
+    resume_original(c, 0x00465c66, esp - 4 - 0x10, 0);
+    return c.reg(R_EAX);
+}
+
+// D2_NATIVE_CHECK=1: against the game's (trampoline 17), whose is kept.
+uint32_t unit_relation_checked(Cpu &c)
+{
+    RemapCheck &k = g_remap_check[17];
+    const uint32_t a = c.reg(R_ECX), b = c.reg(R_EDX);
+    uint32_t r;
+    const bool mine = unit_relation(a, b, r);
+    const uint32_t r0 = rt::guest_call(c, k.tramp, {});
+    c.set_reg(R_ECX, a);
+    c.set_reg(R_EDX, b);
+    if (mine) {
+        const bool bad = r != r0;
+        if (bad && k.bad < 20)
+            rt::logf("native check: UnitRelation(%08x type %u, %08x type %u class %u) gave %u, the game's %u", a,
+                     U32(a), b, U32(b), U32(b + 4), r, r0);
+        check_note(k, bad);
+    }
+    return r0;
+}
+
+// ---- Storm's name hash: 415330 ------------------------------------------------------
+//
+// 415330(eax=name, [8]=hash type), ret 4: the MPQ hash of a file name, each
+// character through the C runtime's toupper (685385: in the "C" locale,
+// a-z only) and the crypt table at [0x779048]. 659 thousand characters in
+// the lane's fight: each file open hashes its name three times.
+uint32_t storm_hash(Cpu &c)
+{
+    const uint8_t *str = H(c.reg(R_EAX));
+    const uint32_t *crypt = reinterpret_cast<const uint32_t *>(H(U32(0x00779048))) + (c.arg(0) << 8);
+    uint32_t seed1 = 0x7fed7fed, seed2 = 0xeeeeeeee;
+    if (!c.reg(R_EAX))
+        return seed1;
+    for (; *str; str++) {
+        uint32_t ch = *str;
+        if (ch >= 'a' && ch <= 'z')
+            ch -= 0x20;
+        uint32_t t;
+        std::memcpy(&t, crypt + ch, 4);
+        seed1 = (seed1 + seed2) ^ t;
+        seed2 = ch + seed2 + (seed2 << 5) + seed1 + 3;
+    }
+    return seed1;
+}
+
+// ---- loads pending: 5ff2a0 -----------------------------------------------------------
+//
+// The monsters' preloader (4700b0) asks, for each unit of each frame, how
+// many sprite loads are still pending (fewer than 30: it starts the next).
+// 5ff2a0 walks the sprite cache's whole list (0x89db7c, next at +0x14) for
+// it, calling 40a7f0 on each entry's load: 1.3 million entries in the
+// lane's fight. 40a7f0, for a load not marked done (+0x48 bit 0), polls its
+// event (WaitForSingleObject(h, 0)), and when it is signalled finishes the
+// load (40a4c0). The native counts what it can decide without the poll's
+// side effect: loads done, and loads whose event is not signalled (a
+// zero-timeout wait on those returns at once, changing nothing, on the
+// console's scheduler). A signalled event, or anything unexpected (the
+// asserts' cases), runs the original from its third instruction.
+constexpr uint32_t kSpriteList = 0x0089db7c;
+constexpr uint32_t kLoadMagic = 0x41737960;   // a load's +0x48, its low four bits aside
+
+// The count, or false if the original must run.
+bool loads_pending_count(uint32_t &n)
+{
+    ThreadScheduler *sch = wx86_sched();
+    GuestThread *t = sch ? sch->current() : nullptr;
+    n = 0;
+    for (uint32_t e = U32(kSpriteList); e; e = U32(e + 0x14)) {
+        const uint32_t sp = U32(e);
+        if (!sp || (*H(sp + 0x20) & 1))
+            continue;
+        const uint32_t ld = U32(sp + 0xb0);
+        const uint32_t st = ld ? U32(ld + 0x48) : 0;
+        if (!ld || (st & ~0xfu) != kLoadMagic)
+            return false;
+        if (st & 1)
+            continue;
+        {
+            d2rt::Waitable *w = wx86_handle_find(U32(U32(ld + 0x38)));
+            if (!w || !t || w->ready(t))   // unknown handles count as signalled, as the shim does
+                return false;
+        }
+        n++;
+    }
+    return true;
+}
+
+uint32_t loads_pending(Cpu &c)
+{
+    uint32_t n;
+    if (loads_pending_count(n))
+        return n;
+    // push esi; mov esi, [0x89db7c]; on at 5ff2a7
+    const uint32_t esp = c.reg(R_ESP);
+    put32(esp - 4, c.reg(R_ESI));
+    c.set_reg(R_ESI, U32(kSpriteList));
+    resume_original(c, 0x005ff2a7, esp - 4, 0);
+    return c.reg(R_EAX);
+}
+
+// D2_NATIVE_CHECK=1: the native's count, when it gives one, against the
+// original's (install_remap_check's trampoline 6). The original's is kept.
+uint32_t loads_pending_checked(Cpu &c)
+{
+    RemapCheck &k = g_remap_check[6];
+    uint32_t n;
+    const bool mine = loads_pending_count(n);
+    const uint32_t r0 = rt::guest_call(c, k.tramp, {});
+    if (mine) {
+        const bool bad = n != r0;
+        if (bad && k.bad < 20)
+            rt::logf("native check: LoadsPending gave %u, the game's %u", n, r0);
+        check_note(k, bad);
+    }
+    return r0;
+}
+
+// ---- the 1024-slot table's empty slots: 52fc20, 52fd90 ---------------------------------
+//
+// Two routines walk a table of 1024 slots (0x882d38 to 0x883d38) once a
+// frame each; nearly all slots are empty (0 or -1), and the empty slots'
+// test and step were 3.5% of the game's code in the lane's fight. Each
+// loop's step becomes a call to a native that goes on to the next slot
+// that is not empty and resumes the loop's top with it, or its exit:
+//   52fd2c  add ebx, 4; cmp ebx, 0x883d38; jl 0x52fc90         (the slot in ebx)
+//   52fe94  mov eax, [ebp+8]; add eax, 4; cmp eax, 0x883d38;
+//           mov [ebp+8], eax; jl 0x52fde5                      (the slot in [ebp+8] and eax)
+// become call <native> and nops, which run on to the exits, 52fd3b and
+// 52fea8 (each starts xor eax, eax; the flags are not read).
+constexpr uint32_t kSlots = 0x00882d38, kSlotsEnd = 0x00883d38;
+
+inline uint32_t next_slot(uint32_t p)
+{
+    for (p += 4; p < kSlotsEnd; p += 4) {
+        const uint32_t v = U32(p);
+        if (v && v != 0xffffffffu)
+            break;
+    }
+    return p;
+}
+
+uint32_t slot_step_ebx(Cpu &c)
+{
+    const uint32_t p = next_slot(c.reg(R_EBX));
+    c.set_reg(R_EBX, p);
+    if (p < kSlotsEnd)
+        rt::bridge().redirect_next(0x0052fc90);
+    return c.reg(R_EAX);
+}
+
+uint32_t slot_step_frame(Cpu &c)
+{
+    const uint32_t at = c.reg(R_EBP) + 8, p = next_slot(U32(at));
+    put32(at, p);
+    if (p < kSlotsEnd)
+        rt::bridge().redirect_next(0x0052fde5);
+    return p;
+}
+
+// The same for two walks of the room's cell grid (n x n cells of 0x24
+// bytes from +0xeaa8, n at +0xeab0; about 1000 cells a frame, nearly all
+// with empty lists), each a frame:
+//   4df1c0 (the cells' +0x14 and +0x18 lists): at 4df1f0, the cell's +0x14
+//     in edi, the cells left in ebx (also [ebp-0x34]), edi kept in [ebp-0x1c]:
+//       sub ebx, 1; cmp dword [edi], 0; mov [ebp-0x34], ebx; je 0x4df3f8
+//     4df3f8 goes on to the +0x18 list, and with neither, to the next cell
+//     at 4df446 (edi += 0x24), or the end, 4df454.
+//   4df510 (the +0x10 list, then a call if +0x14): at 4df543, the cells
+//     left in esi (also [ebp-0xc]), the cell in [ebp-8]:
+//       mov ecx, [ebp-8]; sub esi, 1; mov [ebp-0xc], esi;
+//       mov esi, [ecx+0x10]; test esi, esi; je 0x4df5ff
+//     4df5ff calls 4def80 if +0x14, then the next cell (esi = [ebp-8] +
+//     0x24, kept in [ebp-8]), or the end, 4df621.
+// The natives skip the cells with nothing to do, and resume where the
+// game's code would, with the registers it would have.
+uint32_t cells_step_a(Cpu &c)
+{
+    const uint32_t ebp = c.reg(R_EBP);
+    uint32_t left = c.reg(R_EBX), at = c.reg(R_EDI), next;
+    for (;;) {
+        put32(ebp - 0x34, --left);
+        if (U32(at)) {
+            next = 0x004df1ff;
+            break;
+        }
+        if (U32(at + 4)) {
+            next = 0x004df3f8;
+            break;
+        }
+        at += 0x24;
+        put32(ebp - 0x1c, at);
+        c.set_reg(R_ESI, 0);   // the empty +0x18 list
+        if (!left) {
+            next = 0x004df454;
+            break;
+        }
+    }
+    c.set_reg(R_EBX, left);
+    c.set_reg(R_EDI, at);
+    rt::bridge().redirect_next(next);
+    return c.reg(R_EAX);
+}
+
+uint32_t cells_step_b(Cpu &c)
+{
+    const uint32_t ebp = c.reg(R_EBP);
+    uint32_t left = c.reg(R_ESI), cell = U32(ebp - 8), next;
+    for (;;) {
+        put32(ebp - 0xc, --left);
+        c.set_reg(R_ECX, cell);
+        if (const uint32_t list = U32(cell + 0x10)) {
+            c.set_reg(R_ESI, list);
+            next = 0x004df557;
+            break;
+        }
+        if (U32(cell + 0x14)) {
+            c.set_reg(R_ESI, 0);
+            next = 0x004df5ff;
+            break;
+        }
+        cell += 0x24;
+        put32(ebp - 8, cell);
+        c.set_reg(R_ESI, cell);
+        if (!left) {
+            next = 0x004df621;
+            break;
+        }
+    }
+    rt::bridge().redirect_next(next);
+    return c.reg(R_EAX);
+}
+
+// And the floor's tiles: 4de730 goes through each room's tile records
+// (0x30 bytes) for each of 3 layers, calling 4de410 on each record of the
+// layer: 0.92 million calls in the lane's fight, nine in ten of which
+// return at once (the record's +0x14 & 0x408; its place outside the view's
+// rectangle, [this+0x24]+0x14; or its block's +0x14 set). At 4de91c, the
+// record in esi, the records left in [ebp-8], the layer in [ebp+8], this
+// in edi:
+//   mov eax, [ebp-8]; sub eax, 1; add esi, 0x30; test eax, eax;
+//   mov [ebp-8], eax; jne 0x4de8e0
+// The native passes over the records of other layers and those 4de410
+// would return on, and resumes the call's setup (4de8ee) with the next
+// other one, or the loop's end (4de92c).
+inline bool floor_record_idle(uint32_t self, uint32_t rec)
+{
+    if (U32(rec + 0x14) & 0x408)
+        return true;
+    const uint32_t rect = U32(self + 0x24) + 0x14;
+    if (!rect)
+        return false;   // the game's assertion
+    const int32_t x = (int32_t)(U32(self + 0x3c) + U32(rec)), y = (int32_t)(U32(rec + 4) + U32(self + 0x40));
+    if (x < I32(rect) || x >= I32(rect + 8) || y < I32(rect + 4) || y >= I32(rect + 0xc))
+        return true;
+    return U32(U32(rec + 0x18) + 0x14) != 0;
+}
+
+uint32_t floor_records_step(Cpu &c)
+{
+    const uint32_t ebp = c.reg(R_EBP), self = c.reg(R_EDI), layer = U32(ebp + 8);
+    uint32_t rec = c.reg(R_ESI), left = U32(ebp - 8);
+    for (;;) {
+        left--;
+        rec += 0x30;
+        if (!left) {
+            rt::bridge().redirect_next(0x004de92c);
+            break;
+        }
+        if (((U32(rec + 0x14) >> 14) & 7) == layer && !floor_record_idle(self, rec)) {
+            rt::bridge().redirect_next(0x004de8ee);
+            break;
+        }
+    }
+    put32(ebp - 8, left);
+    c.set_reg(R_ESI, rec);
+    return left;
+}
+
+// And the walls' and objects' pass (4dea70: the cell grid once for each
+// of layers 1-4, the cell's +0x1c list; 6.1 million empty cells in a lane
+// run that stayed in the Rogue Encampment): at 4deb00, the cell's +0x1c
+// in eax (also [ebp-0x18]), the cells left in ecx (also [ebp-0x34]):
+//   mov ebx, [eax]; sub ecx, 1; test ebx, ebx; mov [ebp-0x34], ecx;
+//   mov [ebp-8], ebx; je 0x4decc5
+// 4decc5 steps eax by 0x24 to the next cell, or ends the layer (4decd6).
+uint32_t wall_cells_step(Cpu &c)
+{
+    const uint32_t ebp = c.reg(R_EBP);
+    uint32_t at = c.reg(R_EAX), left = c.reg(R_ECX), list;
+    for (;;) {
+        list = U32(at);
+        put32(ebp - 0x34, --left);
+        put32(ebp - 8, list);
+        if (list) {
+            rt::bridge().redirect_next(0x004deb18);
+            break;
+        }
+        at += 0x24;
+        put32(ebp - 0x18, at);
+        if (!left) {
+            rt::bridge().redirect_next(0x004decd6);
+            break;
+        }
+    }
+    c.set_reg(R_EBX, list);
+    c.set_reg(R_ECX, left);
+    return at;
+}
+
+// And the hit test's loop over the units of each room near the cursor
+// (467ac0, through 467000 and 466870 each; unit_pick_rejected): at its
+// step, 467d4d, the unit in esi:
+//   mov esi, [esi+0xe8]; test esi, esi; mov ebx, [ebp-0x1c];
+//   mov [ebp-8], esi; jne 0x467bd0         (else jmp 0x467da3, the room's end)
+// For each next unit the game's code would only note and pass over (not
+// type 3, which it passes at once; not type 5, the one 467000 can take;
+// rejected by 466870), the native does the same notes: [ebp-0x18] its
+// type, [ebp-0x20] the unit, [ebp-0x24] + 1, edi 0x7a6aa0. A unit seen
+// twice, the count past 30000, the cursor's own unit (ebx) or any other
+// goes to the game's code at the loop's top.
+uint32_t pick_units_step(Cpu &c)
+{
+    const uint32_t ebp = c.reg(R_EBP), own = U32(ebp - 0x1c);
+    uint32_t u = U32(c.reg(R_ESI) + 0xe8);
+    c.set_reg(R_EBX, own);
+    for (;; u = U32(u + 0xe8)) {
+        put32(ebp - 8, u);
+        if (!u) {
+            rt::bridge().redirect_next(0x00467da3);
+            break;
+        }
+        const uint32_t type = U32(u);
+        if (type == 3) {
+            put32(ebp - 0x18, 3);
+            continue;
+        }
+        if (U32(ebp - 0x20) == u || I32(ebp - 0x24) > 0x7530 || u == own || type == 5 || !unit_pick_rejected(u)) {
+            rt::bridge().redirect_next(0x00467bd0);
+            break;
+        }
+        put32(ebp - 0x18, type);
+        put32(ebp - 0x20, u);
+        put32(ebp - 0x24, U32(ebp - 0x24) + 1);
+        c.set_reg(R_EDI, 0x007a6aa0);
+    }
+    c.set_reg(R_ESI, u);
+    return c.reg(R_EAX);
+}
+
+// The weather's particles (4732c0, 390 thousand particle steps in the
+// lane's fight): its loop's head, 473330, the particle in esi (0x28 bytes),
+// its index in ebx, edi a scratch the loop leaves set:
+//   cmp word [esi], 0; je 0x473446          (no particle: the next)
+// becomes a call to a native that does the particles' steps itself until
+// one comes to its end (+0x1c set with +0x20 at 0: the game's 6bccd0 and
+// 473090 respawn it), which resumes the game's code at that point
+// (473396), or the loop's end (47345d). The float maths is the game's in
+// doubles, as the dynarec's x87 does it: [ebp-4] the frame's fall speed,
+// 0x707800 a table of 512 sines, 0x7a89c4 the wind's angle; each
+// truncation as _ftol2_sse (cvttsd2si) gives it.
+inline int32_t ftol_sse(double v)
+{
+    return v > -2147483649.0 && v < 2147483648.0 ? (int32_t)v : INT32_MIN;
+}
+
+inline double sine_at(uint32_t i)
+{
+    float f;
+    std::memcpy(&f, H(0x00707800 + (i & 0x1ff) * 4), 4);
+    return f;
+}
+
+// One particle's step on q (its 0x28 bytes, the guest's or a copy), as the
+// game's code from 47333a; false, with q as it is to 473396, at its end
+// (the game's code goes on with it). fa: the float the game leaves at
+// [ebp-8]; dx: what it leaves in edi.
+bool weather_particle(uint8_t *q, float speed, float &fa, int32_t &dx)
+{
+    auto rd = [&](uint32_t o) { int32_t v; std::memcpy(&v, q + o, 4); return v; };
+    auto wr = [&](uint32_t o, int32_t v) { std::memcpy(q + o, &v, 4); };
+    const int32_t a = ftol_sse((double)rd(0x14) * (double)speed);
+    fa = (float)a;
+    const uint32_t wind = U32(0x007a89c4);
+    dx = ftol_sse(sine_at(wind + 0x80) * (double)fa);
+    const int32_t dy = ftol_sse(sine_at(wind) * (double)fa);
+    wr(8, (int32_t)((uint32_t)rd(8) + (uint32_t)dy - U32(0x007a067c)));
+    if (rd(8) > rd(0xc))
+        wr(0x1c, 1);
+    if (rd(0x1c)) {
+        const int32_t left = rd(0x20);
+        if (!left)
+            return false;
+        dx = 0;
+        wr(0x14, 0);
+        wr(0x20, left - 1);
+    }
+    if (U32(0x007a8a14) && !rd(0x1c)) {
+        const uint32_t k = (uint32_t)(((uint64_t)(U32(0x007a8a34) << 9) * 0x51eb851fu) >> 35);
+        const double s2 = sine_at(k + (uint32_t)rd(0x18));
+        dx += ftol_sse(s2 + s2);
+    }
+    dx -= I32(0x007a0678);
+    const int32_t w = I32(0x0071146c);
+    int32_t x = (int32_t)((uint32_t)rd(4) + (uint32_t)dx);
+    if (x >= w)
+        x -= w;
+    if (x < 0)
+        x += w;
+    wr(4, x);
+    return true;
+}
+
+uint32_t weather_step(Cpu &c)
+{
+    const uint32_t ebp = c.reg(R_EBP), parts = U32(0x007a8a04);
+    float speed;
+    std::memcpy(&speed, H(ebp - 4), 4);
+    uint32_t i = c.reg(R_EBX), p = c.reg(R_ESI), scratch = c.reg(R_EDI);
+    for (;;) {
+        if (*reinterpret_cast<const uint16_t *>(H(p))) {
+            float fa;
+            int32_t dx;
+            const bool done = weather_particle(H(p), speed, fa, dx);
+            std::memcpy(H(ebp - 8), &fa, 4);
+            if (!done) {   // its end: the game's code, from 473396
+                c.set_reg(R_EBX, i);
+                c.set_reg(R_ESI, p);
+                c.set_reg(R_EDI, (uint32_t)dx);
+                rt::bridge().redirect_next(0x00473396);
+                return 0;
+            }
+            scratch = (uint32_t)dx;
+        }
+        i++;
+        p += 0x28;
+        if ((int32_t)i > I32(parts + 0x110))
+            break;
+    }
+    c.set_reg(R_EBX, i);
+    c.set_reg(R_ESI, p);
+    c.set_reg(R_EDI, scratch);
+    rt::bridge().redirect_next(0x0047345d);
+    return parts;
+}
+
+// D2_NATIVE_CHECK=1: at each head the game's code does the step; the
+// native's prediction for the particle before (on a copy) is checked
+// against what the game's code made of it, within the same loop.
+struct WeatherCheck {
+    bool pending = false;
+    uint32_t at = 0, ebp = 0;
+    uint8_t want[0x28];
+    float fa = 0;
+    int32_t dx = 0;
+    uint32_t calls = 0, bad = 0;
+} g_weather_check;
+
+uint32_t weather_step_checked(Cpu &c)
+{
+    WeatherCheck &k = g_weather_check;
+    const uint32_t ebp = c.reg(R_EBP), p = c.reg(R_ESI);
+    if (k.pending && c.reg(R_EBX) && k.ebp == ebp && p == k.at + 0x28) {
+        float fa;
+        std::memcpy(&fa, H(ebp - 8), 4);
+        const bool bad = std::memcmp(k.want, H(k.at), 0x28) || std::memcmp(&fa, &k.fa, 4) ||
+                         (int32_t)c.reg(R_EDI) != k.dx;
+        k.calls++;
+        k.bad += bad;
+        if (bad && k.bad <= 20)
+            rt::logf("native check: WeatherStep differs at particle %08x (x %d, the game's %d; y %d, the game's %d)",
+                     k.at, *(const int32_t *)(k.want + 4), I32(k.at + 4), *(const int32_t *)(k.want + 8),
+                     I32(k.at + 8));
+        if ((k.calls & (k.calls - 1)) == 0 || (k.calls & 0xffff) == 0)
+            rt::logf("native check: WeatherStep %u calls, %u differ", k.calls, k.bad);
+    }
+    k.pending = false;
+    if (*reinterpret_cast<const uint16_t *>(H(p))) {
+        float speed;
+        std::memcpy(&speed, H(ebp - 4), 4);
+        std::memcpy(k.want, H(p), 0x28);
+        k.pending = weather_particle(k.want, speed, k.fa, k.dx);
+        k.at = p;
+        k.ebp = ebp;
+        rt::bridge().redirect_next(0x0047333a);
+    } else {
+        rt::bridge().redirect_next(0x00473446);
+    }
+    return c.reg(R_EAX);
+}
+
+bool install_slot_steps(Cpu &c)
+{
+    static const uint8_t kA[] = {0x83, 0xc3, 0x04, 0x81, 0xfb, 0x38, 0x3d, 0x88, 0x00, 0x0f, 0x8c, 0x55, 0xff, 0xff, 0xff};
+    static const uint8_t kB[] = {0x8b, 0x45, 0x08, 0x83, 0xc0, 0x04, 0x3d, 0x38, 0x3d, 0x88,
+                                 0x00, 0x89, 0x45, 0x08, 0x0f, 0x8c, 0x3d, 0xff, 0xff, 0xff};
+    struct Site {
+        uint32_t va;
+        const uint8_t *orig;
+        uint32_t n;
+        uint32_t (*fn)(Cpu &);
+        const char *name;
+    };
+    static const uint8_t kC[] = {0x83, 0xeb, 0x01, 0x83, 0x3f, 0x00, 0x89, 0x5d, 0xcc, 0x0f, 0x84, 0xf9, 0x01, 0x00, 0x00};
+    static const uint8_t kD[] = {0x8b, 0x4d, 0xf8, 0x83, 0xee, 0x01, 0x89, 0x75, 0xf4, 0x8b,
+                                 0x71, 0x10, 0x85, 0xf6, 0x0f, 0x84, 0xa8, 0x00, 0x00, 0x00};
+    static const uint8_t kE[] = {0x8b, 0x45, 0xf8, 0x83, 0xe8, 0x01, 0x83, 0xc6,
+                                 0x30, 0x85, 0xc0, 0x89, 0x45, 0xf8, 0x75, 0xb4};
+    static const uint8_t kG[] = {0x8b, 0x18, 0x83, 0xe9, 0x01, 0x85, 0xdb, 0x89, 0x4d, 0xcc,
+                                 0x89, 0x5d, 0xf8, 0x0f, 0x84, 0xb2, 0x01, 0x00, 0x00};
+    static const uint8_t kH[] = {0x8b, 0xb6, 0xe8, 0x00, 0x00, 0x00, 0x85, 0xf6, 0x8b, 0x5d,
+                                 0xe4, 0x89, 0x75, 0xf8, 0x0f, 0x85, 0x6f, 0xfe, 0xff, 0xff};
+    static const uint8_t kF[] = {0x66, 0x83, 0x3e, 0x00, 0x0f, 0x84, 0x0c, 0x01, 0x00, 0x00};
+    const Site sites[] = {{0x0052fd2c, kA, sizeof kA, slot_step_ebx, "SlotStepA"},
+                          {0x0052fe94, kB, sizeof kB, slot_step_frame, "SlotStepB"},
+                          {0x004df1f0, kC, sizeof kC, cells_step_a, "CellStepA"},
+                          {0x004df543, kD, sizeof kD, cells_step_b, "CellStepB"},
+                          {0x004de91c, kE, sizeof kE, floor_records_step, "FloorRecordStep"},
+                          {0x004deb00, kG, sizeof kG, wall_cells_step, "WallCellStep"},
+                          {0x00467d4d, kH, sizeof kH, pick_units_step, "PickUnitStep"},
+                          {0x00473330, kF, sizeof kF, std::getenv("D2_NATIVE_CHECK") ? weather_step_checked : weather_step,
+                           "WeatherStep"}};
+    for (const Site &st : sites) {
+        uint8_t have[20];
+        if (!c.read(st.va, have, st.n) || std::memcmp(have, st.orig, st.n))
+            return false;
+    }
+    for (const Site &st : sites) {
+        const uint32_t trap = rt::native_entry(st.name, 0, st.fn);
+        if (!trap)
+            return false;
+        c.set_inline_shim(trap);
+        uint8_t p[20];
+        std::memset(p, 0x90, sizeof p);
+        p[0] = 0xe8;
+        const uint32_t rel = trap - (st.va + 5);
+        std::memcpy(p + 1, &rel, 4);
+        c.write(st.va, p, st.n);
+        c.invalidate_code(st.va, st.n);
+        rt::logf("native %s at %08x (in line)", st.name, st.va);
+    }
+    return true;
+}
+
+// ---- float to int: _ftol2_sse ------------------------------------------------------
+//
+// The C runtime's 32-bit float-to-int conversion (0x682fd0), 1.26 million
+// calls in the lane's fight. It takes cvttsd2si when the runtime found
+// SSE2 (0x994c88), else a long x87 path with a 64-bit fistp and fild. The
+// port reports no SIMD (RunOptions::cpuid_edx), so it was always the long
+// path. For every value an int holds, both give the truncated value (the
+// compiler calls _ftol2_sse only for 32-bit results), and the dynarec turns
+// fstp + cvttsd2si into one VFP conversion. So the check is jumped over:
+//   682fd0  83 3d 88 4c 99 00 00   cmp dword [0x994c88], 0
+//   682fd7  74 2d                  je 0x683006 (the x87 path)
+//   682fd9  push ebp; ...; fstp qword [esp]; cvttsd2si eax, [esp]; leave; ret
+// becomes jmp 0x682fd9. With D2_NATIVE_CHECK, a stub runs both on each
+// call instead, and FtolCheck compares them.
+constexpr uint32_t kFtol = 0x00682fd0, kFtolSse = 0x00682fd9, kFtolX87 = 0x00683006;
+uint32_t g_ftol_calls = 0, g_ftol_bad = 0;
+
+uint32_t ftol_check(Cpu &c)
+{
+    const uint32_t fast = c.reg(R_EAX), x87 = c.read_u32(c.reg(R_ESP) + 4);
+    g_ftol_calls++;
+    if (fast != x87) {
+        g_ftol_bad++;
+        if (g_ftol_bad <= 20)
+            rt::logf("native check: _ftol2_sse gave %08x, the x87 path %08x", fast, x87);
+    }
+    if ((g_ftol_calls & (g_ftol_calls - 1)) == 0 || (g_ftol_calls & 0xfffff) == 0)
+        rt::logf("native check: _ftol2_sse %u calls, %u differ", g_ftol_calls, g_ftol_bad);
+    return fast;
+}
+
+bool install_ftol(Cpu &c, bool check)
+{
+    static const uint8_t kOrig[] = {0x83, 0x3d, 0x88, 0x4c, 0x99, 0x00, 0x00, 0x74, 0x2d};
+    uint8_t have[sizeof kOrig];
+    if (!c.read(kFtol, have, sizeof have) || std::memcmp(have, kOrig, sizeof have))
+        return false;
+    auto rel = [](uint32_t from_end, uint32_t to) { return to - from_end; };
+    if (check) {
+        const uint32_t native = rt::native_entry("FtolCheck", 0, ftol_check), at = rt::va_alloc(0x1000, kFtol);
+        if (!native || !at)
+            return false;
+        // fld st0; call x87 (pops the copy); push eax; call sse (pops x);
+        // call FtolCheck (eax: sse's, [esp+4]: x87's); add esp, 4; ret
+        uint8_t t[24] = {0xd9, 0xc0, 0xe8, 0, 0, 0, 0, 0x50, 0xe8, 0, 0, 0, 0, 0xe8, 0, 0, 0, 0, 0x83, 0xc4, 0x04, 0xc3};
+        uint32_t r = rel(at + 7, kFtolX87);
+        std::memcpy(t + 3, &r, 4);
+        r = rel(at + 13, kFtolSse);
+        std::memcpy(t + 9, &r, 4);
+        r = rel(at + 18, native);
+        std::memcpy(t + 14, &r, 4);
+        c.write(at, t, 22);
+        c.invalidate_code(at, 22);
+        uint8_t j[5] = {0xe9};
+        r = rel(kFtol + 5, at);
+        std::memcpy(j + 1, &r, 4);
+        c.write(kFtol, j, 5);
+    } else {
+        static const uint8_t j[] = {0xeb, 0x07};   // jmp 0x682fd9
+        c.write(kFtol, j, sizeof j);
+    }
+    c.invalidate_code(kFtol, sizeof kOrig);
+    rt::logf("native: _ftol2_sse at %08x takes its cvttsd2si path%s", kFtol, check ? " (checked)" : "");
+    return true;
+}
+
 }  // namespace
 
 int install_d2_native(Cpu &c)
@@ -2301,8 +4341,8 @@ int install_d2_native(Cpu &c)
     static const uint8_t k4f7580[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x10, 0x83, 0x7d, 0x14, 0x00};
     // D2_NATIVE_MASK (tests): bit k enables the k-th hook below; default all.
     const char *m = std::getenv("D2_NATIVE_MASK");
-    const unsigned mask = m ? (unsigned)std::strtoul(m, nullptr, 0) : ~0u;
-    unsigned bit = 1;
+    const uint64_t mask = m ? (uint64_t)std::strtoull(m, nullptr, 0) : ~0ull;   // more than 32 hooks: 64 bits
+    uint64_t bit = 1;
     int n = 0;
     // The last argument, true: served in line (rt::hook_function). Not for
     // LightBlock and FloorTile, which call back into the game's own code.
@@ -2426,6 +4466,70 @@ int install_d2_native(Cpu &c)
          "CurrentLookup", !check);
     static const uint8_t k52df40[] = {0xa1, 0x34, 0x2d, 0x88, 0x00, 0x85, 0xc0, 0x75, 0x1f};
     HOOK(c, 0x0052df40, k52df40, sizeof k52df40, 0, current_unlock, "CurrentUnlock", true);
+    // The remapped DC6 copies (dc6_remapped): last, so that the bits above
+    // keep their places in D2_NATIVE_MASK.
+    static const uint8_t k607e20[] = {0x55, 0x8b, 0xec, 0x51, 0x8b, 0x45, 0x0c, 0x53, 0x56, 0x8b, 0x75, 0x10, 0x57};
+    static const uint8_t k6072f0[] = {0x55, 0x8b, 0xec, 0x51, 0x8b, 0x45, 0x0c, 0x53, 0x56, 0x8b, 0x75, 0x14, 0x57};
+    const bool remap_check = check && install_remap_check(c);
+    HOOK(c, 0x00607e20, k607e20, sizeof k607e20, 3, DRAW(remap_check ? dc6_remap_checked<0> : dc6_remap, "Dc6Remap"),
+         !remap_check);
+    HOOK(c, 0x00607680, k607e20, sizeof k607e20, 3, DRAW(remap_check ? dc6_remap_checked<1> : dc6_remap, "Dc6RemapB"),
+         !remap_check);
+    HOOK(c, 0x006072f0, k6072f0, sizeof k6072f0, 4,
+         DRAW(remap_check ? dc6_remap_checked<2> : dc6_remap2, "Dc6Remap2"), !remap_check);
+    // The lights' stamps (light_stamp, light_stamp_occluded, light_add).
+    static const uint8_t k4747c0[] = {0x55, 0x8b, 0xec, 0x8b, 0x55, 0x08, 0xc1, 0xf8, 0x03};
+    static const uint8_t k475420[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x20, 0x53, 0x8b, 0x5f, 0x18};
+    static const uint8_t k4748d0[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x18, 0x53, 0x8b, 0x5e, 0x18};
+    HOOK(c, 0x004747c0, k4747c0, sizeof k4747c0, 4, remap_check ? light_checked<3> : light_add_native, "LightAdd",
+         !remap_check);
+    HOOK(c, 0x00475420, k475420, sizeof k475420, 0, remap_check ? light_checked<4> : light_stamp_occluded,
+         "LightStampOccluded", !remap_check);
+    HOOK(c, 0x004748d0, k4748d0, sizeof k4748d0, 1, remap_check ? light_checked<5> : light_stamp, "LightStamp",
+         !remap_check);
+    if (mask & bit)   // the next bits of D2_NATIVE_MASK
+        n += install_ftol(c, check);
+    bit <<= 1;
+    static const uint8_t k5ff2a0[] = {0x56, 0x8b, 0x35, 0x7c, 0xdb, 0x89, 0x00, 0x57, 0x33, 0xff};
+    HOOK(c, 0x005ff2a0, k5ff2a0, sizeof k5ff2a0, 0, remap_check ? loads_pending_checked : loads_pending,
+         "LoadsPending", !remap_check);
+    if (mask & bit)
+        n += install_slot_steps(c) ? 8 : 0;
+    bit <<= 1;
+    // The blend-only DC6 copy and the sprites' shadows (dc6_blend1, dc6_shadow).
+    HOOK(c, 0x00608110, k607e20, sizeof k607e20, 3,
+         DRAW(remap_check ? dc6_remap_checked<7> : dc6_blend1, "Dc6Blend1"), !remap_check);
+    static const uint8_t k608d60[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x0c, 0x8b, 0x45, 0x08, 0x53, 0x56, 0x57};
+    HOOK(c, 0x00608d60, k608d60, sizeof k608d60, 8, DRAW(remap_check ? dc6_shadow_checked : dc6_shadow, "Dc6Shadow"),
+         !remap_check);
+    static const uint8_t k415330[] = {0x55, 0x8b, 0xec, 0x53, 0x56, 0x8b, 0xd8, 0x85, 0xdb, 0x57};
+    HOOK(c, 0x00415330, k415330, sizeof k415330, 1, remap_check ? storm_hash_checked : storm_hash, "StormHash",
+         !remap_check);
+    static const uint8_t k466870[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x34, 0x53, 0x8b, 0xd9, 0x56};
+    HOOK(c, 0x00466870, k466870, sizeof k466870, 2, remap_check ? unit_pick_filter_checked : unit_pick_filter,
+         "UnitPickFilter", !remap_check);
+    static const uint8_t k625480[] = {0x55, 0x8b, 0xec, 0x8b, 0x45, 0x08, 0x85, 0xc0, 0x75, 0x04};
+    HOOK(c, 0x00625480, k625480, sizeof k625480, 3, remap_check ? stat_get_checked : stat_get_native, "StatGet",
+         !remap_check);
+    static const uint8_t k648120[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x3c, 0x53, 0x56, 0x8b, 0xf0};
+    HOOK(c, 0x00648120, k648120, sizeof k648120, 0, remap_check ? unit_walk_checked : unit_walk, "UnitWalk",
+         !remap_check);
+    static const uint8_t k67b850[] = {0x55, 0x8b, 0xec, 0xb8, 0xf4, 0x32, 0x00, 0x00, 0xe8};
+    HOOK(c, 0x0067b850, k67b850, sizeof k67b850, 0, remap_check ? path_search_checked : path_search, "PathSearch",
+         !remap_check);
+    static const uint8_t k644180[] = {0x55, 0x8b, 0xec, 0x51, 0x8b, 0x4d, 0x08, 0x85, 0xc9};
+    HOOK(c, 0x00644180, k644180, sizeof k644180, 1, remap_check ? skill_level_checked : skill_level_native,
+         "SkillLevel", !remap_check);
+    static const uint8_t k465c60[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x10, 0x85, 0xc9, 0x53};
+    HOOK(c, 0x00465c60, k465c60, sizeof k465c60, 0, remap_check ? unit_relation_checked : unit_relation_native,
+         "UnitRelation", !remap_check);
+    // Rooms and collision (room_find, collision_cross): Act II's pathfinding.
+    static const uint8_t k463740[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x08, 0x56, 0x8b, 0xc1, 0x33, 0xf6};
+    HOOK(c, 0x00463740, k463740, sizeof k463740, 1, remap_check ? room_find_checked : room_find_native, "RoomFind",
+         !remap_check);
+    static const uint8_t k64d4e0[] = {0x55, 0x8b, 0xec, 0x8b, 0x4d, 0x08, 0x83, 0xec, 0x10, 0x53};
+    HOOK(c, 0x0064d4e0, k64d4e0, sizeof k64d4e0, 3, remap_check ? collision_cross_checked : collision_cross_native,
+         "CollisionCross", !remap_check);
 #undef DRAW
 #undef HOOK
     return n;

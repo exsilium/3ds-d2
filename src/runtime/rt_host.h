@@ -212,6 +212,13 @@ uint32_t guest_clock_ahead_us();   // the total so far
 // call's return), up to 8 samples a frame. take_stall, at the next present,
 // takes them (the count).
 void note_present();
+// The game's main loop (0x451bb0): PeekMessageA, then the game's frame
+// callback, with no Sleep in game. note_loop_pass at each PeekMessageA of
+// the frame thread: a pass with a present since the last is a frame's, one
+// without is the callback finding it is not yet time (spare time). loop_line
+// gives the window's figures for the heartbeat ("" when none).
+void note_loop_pass();
+std::string loop_line();
 // The dynarec's translation knobs (dyn86.c): return-address prediction,
 // flag archiving at blocks ending in a CALL (1: dropped), the budget check
 // at a block's tail, the forward-bridge size. Each -1 keeps the backend's

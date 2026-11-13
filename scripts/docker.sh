@@ -64,7 +64,7 @@ ensure_image() { # <target> <tag>
 run_in() { # <image> <cmd...>
     local image="$1"; shift
     local tty=(); [ -t 0 ] && [ -t 1 ] && tty=(-it)
-    docker run --rm "${tty[@]}" --network "${RUN_NETWORK:-none}" \
+    docker run --rm ${tty[@]+"${tty[@]}"} --network "${RUN_NETWORK:-none}" \
         -u "$(id -u):$(id -g)" -e HOME=/tmp \
         -v "$(host_path "$ROOT"):/work" ${RUN_EXTRA[@]+"${RUN_EXTRA[@]}"} -w /work "$image" "$@"
 }

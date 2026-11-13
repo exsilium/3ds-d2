@@ -104,10 +104,12 @@ The natives in `g_remap_check`, and the sprite cache's and the locked lookups' o
 ## Measuring
 
 - **The lane's exact block counter shows where the game's own code spends its time:** `WX86_HOTPROF=1 D2_NOLINK=1`, with the console's video settings (`M4_FAST=1`) and decoder (`D2_DCC=1`).
-  - It counts executed blocks times their sizes, rolled up into functions.
+  - It counts executed blocks times their sizes, rolled up into functions: `python3 -I tools/hot_report.py build/m4/err.txt dist/game/Game.exe`.
   - `M4_HOTPROF_LEVEL=<level id>` starts the count once that level is reached.
   - The total ("4.52 billion bytes of x86 for the same 2,507 frames") is the before/after measure for a native.
 - **The timer profiles can't find hot translated code.** Both the console's guest code profile and the lane's `prof eip` sample where a thread is at its next block boundary. Chained translated blocks never stop at one, but every return from a native does, so translated time is charged to the native that comes next. `SpriteCacheTouch` once looked like 12% of a crowd frame; its own timing is 3–5%.
+- **Names.** The profile tools name functions where a name is known (`tools/game_names.py`, #107): a native's from the `HOOK` list in `d2_native.cpp`, then d2decomped's (`third_party/d2d`'s `names.tsv`, then Ghidra's in its `game-functions.tsv`), as `0x67b850` (PathSearch). Without the submodule they print bare addresses.
+  - `tools/function_starts.py dist/game/Game.exe` compares our function starts with d2d's list, and says how the binary reaches the starts only d2d has.
 - **On the console,** a profiler run with **guest code profile** ticked gives each native's time per frame:
   - `tools/profile_report.py --windows fights|quiet --routines <Name>,0x<addr>`;
   - add the new native's name to `NATIVES` in `tools/profile_report.py`.

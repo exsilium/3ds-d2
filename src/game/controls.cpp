@@ -11,6 +11,7 @@ namespace {
 constexpr uint8_t VK_TAB = 0x09, VK_RETURN = 0x0D, VK_SHIFT = 0x10, VK_MENU = 0x12, VK_ESCAPE = 0x1B,
                   VK_F1 = 0x70;
 constexpr uint8_t kMouseLeft = 0xFE, kMouseRight = 0xFF;   // bindings that are mouse buttons, not keys
+constexpr uint8_t kAsNormal = 0xFD;                         // with_zr: the button's normal binding
 
 constexpr float kStickMax = 156.0f;
 constexpr float kWalkEngage = 0.20f, kWalkRelease = 0.15f;   // hysteresis, fraction of full tilt
@@ -22,22 +23,24 @@ constexpr float kCircleCursorSpeed = 12.0f;                   // circle pad as a
 
 struct Binding {
     Button button;
-    uint8_t normal, with_r;   // virtual key (or kMouse*); 0 = nothing
+    uint8_t normal, with_r, with_zr;   // virtual key (or kMouse*, kAsNormal); 0 = nothing
 };
 
 // Buttons that act on press and release. Select and Start are handled apart.
+// R and ZR are modifiers (issue #95): ZR alone does nothing; ZR + A/B/Y/X are
+// the skill hotkeys F1-F4 (R + D-pad still are too); ZR + D-pad is left
+// free for later shortcuts; L and ZL do as they always do.
 const Binding kBindings[] = {
-    {kA, kMouseLeft, 'C'},
-    {kB, kMouseRight, 'T'},
-    {kX, 'I', VK_TAB},
-    {kY, VK_MENU, 'Q'},
-    {kL, VK_SHIFT, VK_SHIFT},
-    {kUp, '1', VK_F1},
-    {kRight, '2', VK_F1 + 1},
-    {kDown, '3', VK_F1 + 2},
-    {kLeft, '4', VK_F1 + 3},
-    {kZL, 'W', 'W'},
-    {kZR, VK_TAB, VK_TAB},
+    {kA, kMouseLeft, 'C', VK_F1},
+    {kB, kMouseRight, 'T', VK_F1 + 1},
+    {kX, 'I', VK_TAB, VK_F1 + 3},
+    {kY, VK_MENU, 'Q', VK_F1 + 2},
+    {kL, VK_SHIFT, VK_SHIFT, kAsNormal},
+    {kUp, '1', VK_F1, 0},
+    {kRight, '2', VK_F1 + 1, 0},
+    {kDown, '3', VK_F1 + 2, 0},
+    {kLeft, '4', VK_F1 + 3, 0},
+    {kZL, 'W', 'W', kAsNormal},
 };
 
 }  // namespace
@@ -98,6 +101,7 @@ void Controls::update(const Pad &pad, uint64_t now_ms)
 {
     const uint32_t held = pad.held, pressed = held & ~prev_, released = prev_ & ~held;
     const bool r_layer = (held & kR) != 0;
+    const bool zr_layer = (held & kZR) != 0;
 
     // ---- Select / Start: zoom, keyboard, Escape, Enter ----
     if (pressed & kSelect) {
@@ -137,7 +141,7 @@ void Controls::update(const Pad &pad, uint64_t now_ms)
         if ((pressed & b.button) && select_layer && (b.button & (kUp | kDown | kLeft | kRight))) {
             bound_[i] = 0;   // taken by the Select layer above
         } else if (pressed & b.button) {
-            bound_[i] = r_layer ? b.with_r : b.normal;
+            bound_[i] = zr_layer ? (b.with_zr == kAsNormal ? b.normal : b.with_zr) : r_layer ? b.with_r : b.normal;
             if (bound_[i] != kMouseLeft && bound_[i] != kMouseRight)
                 key(bound_[i], true);
         }

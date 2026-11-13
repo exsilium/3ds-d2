@@ -87,12 +87,13 @@ Start 3ds-d2 from the HOME menu. The game appears on the top screen. The bottom 
 | Y | Show items on the ground (held) |
 | L | Stand still (held) |
 | D-pad | Belt potions 1–4 |
-| ZL / ZR | Weapon swap / automap |
+| ZL | Weapon swap |
 | Start | Game menu, close panels |
 | Select | Top screen: whole frame ↔ 1:1 zoom for reading text |
 | A, B, Start or a tap | During a cinematic: skip it |
 | R + A / B / X / Y | Character screen / skill tree / automap / quests |
-| R + D-pad | Skill hotkeys F1–F4 |
+| ZR + A / B / Y / X | Skill hotkeys F1–F4 |
+| R + D-pad | Skill hotkeys F1–F4 too |
 | R + Start | Enter (confirm) |
 | R + Select | On-screen keyboard |
 | L + R + Select | Screenshot into the Camera album |

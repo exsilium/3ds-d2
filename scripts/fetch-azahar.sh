@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # A portable Azahar for this project only, under build/azahar/<version>/: the
 # release recorded in docs/compatibility.md, for this host (macOS, Linux, or
-# Windows under Git Bash). A user/ folder next to the binary makes Azahar
-# portable: its settings and emulated SD card stay in
-# build/azahar/<version>/<dir>/user/, apart from any Azahar installed on the
-# machine. scripts/run-game-azahar.sh uses this copy when it is there.
+# Windows under Git Bash). A user/ folder makes Azahar portable: its settings
+# and emulated SD card stay in it, apart from any Azahar installed on the
+# machine. Azahar looks for it next to its binary (an AppImage: next to the
+# file), and on macOS next to Azahar.app: build/azahar/<version>/<dir>/user/
+# there, build/azahar/<version>/azahar.AppImage's user/ on Linux.
+# scripts/run-game-azahar.sh uses this copy when it is there.
 #
 #   scripts/fetch-azahar.sh            fetch (once) and print the binary's path
 #
@@ -63,11 +65,20 @@ if [ -z "$bin" ]; then
     bin="$(find_bin)"
     [ -n "$bin" ] || die "no azahar binary in $DEST after unpacking $asset"
 fi
-# Portable mode: user/ next to the binary (an AppImage: next to the file).
-mkdir -p "$(dirname "$bin")/user"
+# Portable mode: user/ next to the binary (an AppImage: next to the file), on
+# macOS next to Azahar.app. One left next to the macOS binary by an earlier
+# version of this script, which Azahar never read, moves to its place.
+case "$bin" in
+*/Azahar.app/Contents/MacOS/*)
+    user="${bin%/Azahar.app/Contents/MacOS/*}/user"
+    old="$(dirname "$bin")/user"
+    if [ -d "$old" ] && [ ! -e "$user" ]; then mv "$old" "$user"; fi ;;
+*)  user="$(dirname "$bin")/user" ;;
+esac
+mkdir -p "$user"
 # Its first settings: the Vulkan renderer. On OpenGL (Windows, AMD driver)
 # Azahar locks up at the game's first video frame; Azahar fills in the rest.
-cfg="$(dirname "$bin")/user/config/qt-config.ini"
+cfg="$user/config/qt-config.ini"
 if [ ! -f "$cfg" ]; then
     mkdir -p "$(dirname "$cfg")"
     printf '[Renderer]\ngraphics_api\\default=false\ngraphics_api=2\n' > "$cfg"

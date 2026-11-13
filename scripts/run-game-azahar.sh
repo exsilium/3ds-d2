@@ -26,8 +26,10 @@
 #
 # Azahar is the project's own portable copy (scripts/fetch-azahar.sh, fetched on
 # first use into build/azahar/<version>/, its SD card in user/sdmc next to the
-# binary), unless --system-azahar picks an installed one instead. AZAHAR=<azahar
-# binary> and AZAHAR_SDMC=<emulated SD folder> override both.
+# binary, on macOS next to Azahar.app), unless --system-azahar picks an
+# installed one instead. AZAHAR=<azahar binary> and AZAHAR_SDMC=<emulated SD
+# folder> override both. On macOS the game is started through `open` on the
+# app bundle: run directly, the binary first shows a dialog saying so.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 die() { echo "run-game-azahar.sh: $*" >&2; exit 1; }
@@ -53,7 +55,11 @@ case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) windows=1 ;; esac
 unix_path() { if [ "$windows" = 1 ]; then cygpath -u "$1"; else printf '%s\n' "$1"; fi; }
 
 find_azahar() {
-    [ -n "${AZAHAR:-}" ] && { unix_path "$AZAHAR"; return; }
+    if [ -n "${AZAHAR:-}" ]; then   # made absolute: the portable copy is told by its path
+        local a; a="$(unix_path "$AZAHAR")"
+        case "$a" in /*) ;; *) a="$PWD/$a" ;; esac
+        echo "$a"; return
+    fi
     [ "$system" = 1 ] || { "$ROOT/scripts/fetch-azahar.sh"; return; }
     local c
     for c in /Applications/Azahar.app/Contents/MacOS/azahar "$HOME/Applications/Azahar.app/Contents/MacOS/azahar"; do
@@ -69,12 +75,30 @@ find_azahar() {
     command -v azahar 2>/dev/null || command -v azahar.exe 2>/dev/null || command -v azahar-qt 2>/dev/null || true
 }
 
-# The emulated SD card: a portable install's user/ folder next to the binary
-# first, then the platform's data folder.
+# A portable install's user/ folder: next to the binary, on macOS next to
+# Azahar.app (where Azahar looks for it).
+portable_user() {
+    case "$1" in
+    */Azahar.app/Contents/MacOS/*) echo "${1%/Azahar.app/Contents/MacOS/*}/user" ;;
+    *) echo "$(dirname "$1")/user" ;;
+    esac
+}
+
+# Starts Azahar on <file>, and returns when it closes. On macOS through `open`
+# on the app bundle (-W waits for it, -n a new instance).
+run_azahar() {
+    case "$AZ" in
+    */Azahar.app/Contents/MacOS/*) exec open -W -n "${AZ%/Contents/MacOS/*}" --args "$1" ;;
+    *) exec "$AZ" "$1" ;;
+    esac
+}
+
+# The emulated SD card: a portable install's user/ folder first, then the
+# platform's data folder.
 find_sdmc() {
     [ -n "${AZAHAR_SDMC:-}" ] && { unix_path "$AZAHAR_SDMC"; return; }
     local c
-    for c in "$(dirname "$1")/user/sdmc" "$HOME/Library/Application Support/Azahar/sdmc" \
+    for c in "$(portable_user "$1")/sdmc" "$HOME/Library/Application Support/Azahar/sdmc" \
              "${XDG_DATA_HOME:-$HOME/.local/share}/azahar-emu/sdmc" "${XDG_DATA_HOME:-$HOME/.local/share}/azahar/sdmc"; do
         [ -d "$c" ] && { echo "$c"; return; }
     done
@@ -86,7 +110,7 @@ find_sdmc() {
 
 AZ="$(find_azahar)"
 [ -n "$AZ" ] || die "Azahar not found: install it, or set AZAHAR to its binary"
-case "$AZ" in "$ROOT"/build/azahar/*) mkdir -p "$(dirname "$AZ")/user/sdmc" ;; esac   # the portable copy's SD card
+case "$AZ" in "$ROOT"/build/azahar/*) mkdir -p "$(portable_user "$AZ")/sdmc" ;; esac   # the portable copy's SD card
 SDMC="$(find_sdmc "$AZ")"
 [ -n "$SDMC" ] || die "no emulated SD card found: start Azahar once, or set AZAHAR_SDMC"
 SD="$SDMC/3ds/3ds-d2"
@@ -138,7 +162,7 @@ if [ "$use_3dsx" = 1 ]; then
     app="$ROOT/build/cpu/ctr/3ds-d2-game.3dsx"
     [ -f "$app" ] || die "no $app (scripts/docker.sh game-3dsx)"
     [ "$windows" = 1 ] && app="$(cygpath -w "$app")"
-    exec "$AZ" "$app"
+    run_azahar "$app"
 fi
 
 # The CIA: built with the game's art (its icon, banner and tune) from the
@@ -178,4 +202,4 @@ rm -f "$stamp"
 [ -n "$app" ] || die "the CIA did not install (no $content/*.app)"
 echo "installed: $app"
 [ "$windows" = 1 ] && app="$(cygpath -w "$app")"
-exec "$AZ" "$app"
+run_azahar "$app"

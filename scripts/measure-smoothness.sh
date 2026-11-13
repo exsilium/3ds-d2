@@ -42,7 +42,13 @@ done
 [ -n "$out" ] || out="build/smooth/$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$out"
 
-sdmc="${AZAHAR_SDMC:-build/azahar/2126.2/azahar-windows-msvc-2126.2/user/sdmc}/3ds/3ds-d2"
+# The portable copy's SD card (scripts/fetch-azahar.sh), unless AZAHAR_SDMC.
+case "$(uname -s)" in
+Darwin) user=build/azahar/2126.2/azahar-macos-universal-2126.2/user ;;   # next to Azahar.app
+Linux)  user=build/azahar/2126.2/user ;;                                 # next to the AppImage
+*)      user=build/azahar/2126.2/azahar-windows-msvc-2126.2/user ;;
+esac
+sdmc="${AZAHAR_SDMC:-$user/sdmc}/3ds/3ds-d2"
 mkdir -p "$sdmc"
 # settings.txt: the measurement's lines only (the checklist's own come from
 # the script's "profile").

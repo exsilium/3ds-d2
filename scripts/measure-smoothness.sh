@@ -65,12 +65,19 @@ stop_azahar() {
 
 # The emulated CPU clock, for this run only (Azahar's own setting, put back after).
 config="$(dirname "$(dirname "$(dirname "$sdmc")")")/config/qt-config.ini"
+# GNU sed (-b, and -i without a suffix). macOS's own is BSD sed; Homebrew's
+# GNU sed (brew install gnu-sed) is gsed there.
+SED=sed
+if [ "$(uname -s)" = Darwin ]; then
+  command -v gsed >/dev/null || { echo "measure-smoothness.sh: needs GNU sed on macOS: brew install gnu-sed" >&2; exit 1; }
+  SED=gsed
+fi
 set_cpu() {
   [ -f "$config" ] || return 0
   local is_default=false
   [ "$1" = 100 ] && is_default=true
   # -b and no ".*": the file's CRLF line ends stay as they are.
-  sed -b -i -e "s/^cpu_clock_percentage\\\\default=[a-z]*/cpu_clock_percentage\\\\default=$is_default/" \
+  "$SED" -b -i -e "s/^cpu_clock_percentage\\\\default=[a-z]*/cpu_clock_percentage\\\\default=$is_default/" \
          -e "s/^cpu_clock_percentage=[0-9]*/cpu_clock_percentage=$1/" "$config"
 }
 set_cpu "$cpu"

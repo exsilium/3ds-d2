@@ -185,7 +185,9 @@ SpriteGovernor g_governor;
 uint32_t g_inserted = 0;   // since the start, wrapping
 uint32_t g_decodes = 0;    // sprites decoded since the start, and the time it took
 uint64_t g_decode_us = 0;
-uint64_t g_decode_from = 0;   // the decode under way began (0: none)
+uint64_t g_decode_from[16] = {};   // by guest thread: its decode under way began (0: none)
+uint32_t g_frame_decodes = 0;      // ...of them the frame thread's, for the frame trace
+uint64_t g_frame_decode_us = 0;
 struct {
     uint32_t inserted, sprites, decodes;
     uint64_t decode_us;
@@ -395,17 +397,28 @@ bool install_sprite_decode_timer(d2rt::Cpu &c)
     if (!c.read(kDecode, have, sizeof have) || std::memcmp(have, kDecodeOrig, sizeof have) != 0 ||
         !c.read(kDecodeStub, slack, sizeof slack) || std::memcmp(slack, kZero, sizeof slack) != 0)
         return false;
-    // The game's thread alone decodes, and the guest's threads take turns:
-    // no lock. A decode does not nest in another.
+    // The game's thread decodes, and Storm's read thread in its loads'
+    // callbacks (issue #76): a start by thread, the guest's threads taking
+    // turns (no lock). A decode does not nest in another on one thread. The
+    // frame trace counts the frame thread's alone: the read thread's cost
+    // the frames only the turns it takes, counted as their ready time.
     const uint32_t begin = rt::native_entry("SpriteDecodeBegin", 0, [](d2rt::Cpu &) -> uint32_t {
-        g_decode_from = rt::now_us();
+        const int t = rt::current_thread_id();
+        if (t >= 0 && t < 16)
+            g_decode_from[t] = rt::now_us();
         return 0;
     });
     const uint32_t end = rt::native_entry("SpriteDecodeEnd", 0, [](d2rt::Cpu &) -> uint32_t {
-        if (g_decode_from) {
-            g_decode_us += rt::now_us() - g_decode_from;
+        const int t = rt::current_thread_id();
+        if (t >= 0 && t < 16 && g_decode_from[t]) {
+            const uint64_t us = rt::now_us() - g_decode_from[t];
+            g_decode_us += us;
             g_decodes++;
-            g_decode_from = 0;
+            if (rt::on_frame_thread()) {
+                g_frame_decode_us += us;
+                g_frame_decodes++;
+            }
+            g_decode_from[t] = 0;
         }
         return 0;
     });
@@ -463,7 +476,13 @@ SpriteCacheWindow sprite_cache_window(d2rt::Cpu &c)
 
 uint32_t sprite_cache_taken() { return __atomic_load_n(&g_inserted, __ATOMIC_RELAXED); }
 
-uint32_t govern_sprite_cache(d2rt::Cpu &c, uint32_t pool_free, bool spare_used, uint32_t evicted, uint32_t reserve,
+void sprite_decode_totals(uint32_t &decodes, uint64_t &us)
+{
+    decodes = g_frame_decodes;
+    us = g_frame_decode_us;
+}
+
+uint32_t govern_sprite_cache(d2rt::Cpu &c, uint32_t pool_free, bool spare_taken, uint32_t evicted, uint32_t reserve,
                              uint32_t min_limit)
 {
     const uint32_t cur = c.read_u32(kSpriteCache + 4);
@@ -474,13 +493,13 @@ uint32_t govern_sprite_cache(d2rt::Cpu &c, uint32_t pool_free, bool spare_used, 
     // space, as the pool systems' would if they could be told apart.
     if (g_frames)
         pool_free += g_frames->stats().held - g_frames->stats().in_use;
-    const SpriteGovernor::Beat beat{cur, c.read_u32(kSpriteCache + 8), evicted, pool_free, spare_used};
+    const SpriteGovernor::Beat beat{cur, c.read_u32(kSpriteCache + 8), evicted, pool_free, spare_taken};
     const uint32_t want = g_governor.step(beat, reserve, min_limit);
     if (want == cur)
         return cur;
     c.write_u32(kSpriteCache + 4, want);
     rt::logf("sprite cache limit %u KiB (pool free %u KiB%s, working set %u KiB)", want >> 10, pool_free >> 10,
-             spare_used ? ", spare used" : "", g_governor.working_set() >> 10);
+             spare_taken ? ", spare taken" : "", g_governor.working_set() >> 10);
     return want;
 }
 
@@ -639,8 +658,12 @@ uint32_t frames_alloc(d2rt::Cpu &c)
     const uint32_t pool = c.read_u32(kPoolsOn) && ecx ? ecx : kPool;
     if (const uint32_t va = n ? g_frames->alloc(n, pool) : 0)
         return va;
-    if (g_frames_to_pool++ < 8)
+    if (g_frames_to_pool++ < 8) {
         rt::logf("sprite frames: %u bytes to the pool system", n);
+        // No block of that size in the pool: what its free space is in
+        // (issue #70; in 3DS-D2-10 these came with the spare's takes).
+        rt::log_pool_pieces("sprite frames to the pool system");
+    }
     // The bridge pops the return address and the three arguments from the
     // ESP set here, then goes to 0x40b430 with the call's own frame.
     c.set_reg(d2rt::R_ESP, c.reg(d2rt::R_ESP) - 16);

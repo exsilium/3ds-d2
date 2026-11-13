@@ -27,6 +27,7 @@ enum ProfileOption : uint32_t {
     kProfGuest = 1u << 1,     // the guest code profile (rt::set_profiling): game.log's "prof" lines
     kProfFiles = 1u << 2,     // every read of a game file (rt::set_file_trace): logs/files.trc
     kProfSdBench = 1u << 3,   // the SD card's read costs, measured once as the run starts
+    kProfFrames = 1u << 4,    // every frame's timing (frame_trace.h): logs/frames.trc
 };
 
 struct ProfileOptionInfo {
@@ -41,18 +42,20 @@ inline constexpr ProfileOptionInfo kProfileOptions[] = {
     {kProfGuest, "guest", "guest code profile", "shims, threads, EIPs; ~12% slower"},
     {kProfFiles, "files", "file-read trace", "every game read to logs/files.trc"},
     {kProfSdBench, "sdbench", "SD card benchmark", "read costs; a 1 s pause at start"},
+    {kProfFrames, "frames", "frame timing", "every frame to logs/frames.trc"},
 };
 inline constexpr int kProfileOptionCount = sizeof kProfileOptions / sizeof kProfileOptions[0];
-inline constexpr uint32_t kProfileAll = kProfSprites | kProfGuest | kProfFiles | kProfSdBench;
+inline constexpr uint32_t kProfileAll = kProfSprites | kProfGuest | kProfFiles | kProfSdBench | kProfFrames;
 
-// How the traces reach the SD card (issue #66): the checklist's last row,
-// which steps through these on a tap, a run on or not. Buffered is how the
-// traces were always written, in large writes as their buffers fill (the
-// sprite trace's also at each heartbeat), cheapest, and it loses what is
-// still in the buffers when the console goes down. Every second, the
-// platform writes out what the traces hold once a second; each record at
-// once, every record is written as it is made, so a crash loses nothing
-// before it, at an SD card write per file read and per sprite use.
+// How game.log and the traces reach the SD card (issues #66, #71): the
+// checklist's last row, "log writes", which steps through these on a tap, a
+// run on or not. Buffered (the default): a file is written at 16 KiB queued
+// or 5 s after its last write, cheapest; a freeze or a power-off loses what
+// is still queued (a crash the app catches writes it out). Every second:
+// what is queued, once a second. At once: every line and record is written
+// as it is made, from the thread that makes it, so nothing is lost before a
+// freeze, at an SD card write per log line, file read and sprite use. The
+// names stay "trace writes" in settings.txt, game.log and reports.
 enum class TraceWrites : uint8_t { Buffered, EverySecond, AtOnce };
 
 struct TraceWritesInfo {
@@ -63,9 +66,9 @@ struct TraceWritesInfo {
 };
 
 inline constexpr TraceWritesInfo kTraceWrites[] = {
-    {TraceWrites::Buffered, "buffered", "trace writes: buffered", "as before; a crash loses the buffers"},
-    {TraceWrites::EverySecond, "second", "trace writes: every second", "a crash loses up to a second"},
-    {TraceWrites::AtOnce, "now", "trace writes: at once", "for crashes: each record; slower"},
+    {TraceWrites::Buffered, "buffered", "log writes: batched", "all logs, a run or not: 16 KiB/5 s"},
+    {TraceWrites::EverySecond, "second", "log writes: every second", "all logs; a freeze loses 1 s"},
+    {TraceWrites::AtOnce, "now", "log writes: at once", "all logs, for crashes; slower"},
 };
 inline constexpr int kTraceWritesCount = sizeof kTraceWrites / sizeof kTraceWrites[0];
 

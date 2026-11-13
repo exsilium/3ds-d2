@@ -11,6 +11,7 @@ namespace {
 constexpr uint8_t VK_TAB = 0x09, VK_RETURN = 0x0D, VK_SHIFT = 0x10, VK_MENU = 0x12, VK_ESCAPE = 0x1B,
                   VK_F1 = 0x70;
 constexpr uint8_t kMouseLeft = 0xFE, kMouseRight = 0xFF;   // bindings that are mouse buttons, not keys
+constexpr uint8_t kAsNormal = 0xFD;                         // with_zr: the button's normal binding
 
 constexpr float kStickMax = 156.0f;
 constexpr float kWalkEngage = 0.20f, kWalkRelease = 0.15f;   // hysteresis, fraction of full tilt
@@ -22,22 +23,24 @@ constexpr float kCircleCursorSpeed = 12.0f;                   // circle pad as a
 
 struct Binding {
     Button button;
-    uint8_t normal, with_r;   // virtual key (or kMouse*); 0 = nothing
+    uint8_t normal, with_r, with_zr;   // virtual key (or kMouse*, kAsNormal); 0 = nothing
 };
 
 // Buttons that act on press and release. Select and Start are handled apart.
+// R and ZR are modifiers (issue #95): ZR alone does nothing; ZR + A/B/Y/X are
+// the skill hotkeys F1-F4 (R + D-pad still are too); ZR + D-pad is left
+// free for later shortcuts; L and ZL do as they always do.
 const Binding kBindings[] = {
-    {kA, kMouseLeft, 'C'},
-    {kB, kMouseRight, 'T'},
-    {kX, 'I', VK_TAB},
-    {kY, VK_MENU, 'Q'},
-    {kL, VK_SHIFT, VK_SHIFT},
-    {kUp, '1', VK_F1},
-    {kRight, '2', VK_F1 + 1},
-    {kDown, '3', VK_F1 + 2},
-    {kLeft, '4', VK_F1 + 3},
-    {kZL, 'W', 'W'},
-    {kZR, VK_TAB, VK_TAB},
+    {kA, kMouseLeft, 'C', VK_F1},
+    {kB, kMouseRight, 'T', VK_F1 + 1},
+    {kX, 'I', VK_TAB, VK_F1 + 3},
+    {kY, VK_MENU, 'Q', VK_F1 + 2},
+    {kL, VK_SHIFT, VK_SHIFT, kAsNormal},
+    {kUp, '1', VK_F1, 0},
+    {kRight, '2', VK_F1 + 1, 0},
+    {kDown, '3', VK_F1 + 2, 0},
+    {kLeft, '4', VK_F1 + 3, 0},
+    {kZL, 'W', 'W', kAsNormal},
 };
 
 }  // namespace
@@ -52,10 +55,84 @@ void Controls::set_frame(int width, int height)
 
 void Controls::warp_cursor(int x, int y) { move_cursor(x, y); }
 
-void Controls::set_context(bool in_game, bool panel_open)
+void Controls::set_context(bool in_game, bool panel_open, uint64_t ui, bool holding)
 {
     in_game_ = in_game;
     panel_open_ = panel_open;
+    ui_ = ui;
+    holding_ = holding;
+}
+
+// ---- Y with the inventory open: sell or drop the item under the cursor ----
+//
+// The UI table's entries (d2_state.h): the inventory 0x01 (the frame's right
+// half), a shop 0x0C (the left half, the inventory beside it without 0x01's
+// entry, as the lane showed); the other left-half panels, over which a drop
+// would land on the panel: character sheet, socketing, quest log, waypoints,
+// party, trade, stash, cube, mercenary.
+constexpr uint64_t kUiInventory = 1ull << 0x01, kUiShop = 1ull << 0x0C;
+constexpr uint64_t kUiLeftPanels = 1ull << 0x02 | 1ull << 0x0C | 1ull << 0x0E | 1ull << 0x0F | 1ull << 0x14 |
+                                   1ull << 0x16 | 1ull << 0x17 | 1ull << 0x19 | 1ull << 0x1A | 1ull << 0x24;
+constexpr uint64_t kItemStepMs = 80;   // two game frames
+
+void Controls::item_move_start(bool sell, uint64_t now_ms)
+{
+    item_sell_ = sell;
+    item_x_ = cx_;
+    item_y_ = cy_;
+    item_step_ = 1;
+    item_at_ms_ = now_ms;
+    rt::logf("controls: %s the item at %d,%d", sell ? "selling" : "dropping", cx_, cy_);
+}
+
+// Steps: 1 press (picks the item up) - 2 release - 3 the item on the cursor?
+// else stop (nothing was under the cursor: a click on a shop's goods would
+// buy, one on the ground walk) - 4 the cursor to the left half's middle (the
+// shop's panel, or the ground left of the character) - 5 press - 6 release
+// - 7 the cursor back; still holding (the shop refused it)? 8 press, 9
+// release: the item back where it was.
+bool Controls::item_move_step(uint64_t now_ms)
+{
+    if (!item_step_)
+        return false;
+    if (now_ms < item_at_ms_)
+        return item_left_;   // the button as the last step left it
+    item_at_ms_ = now_ms + kItemStepMs;
+    item_left_ = false;
+    switch (item_step_++) {
+    case 1:
+        item_left_ = true;
+        break;
+    case 3:
+        if (!holding_) {
+            rt::logf("controls: no item under the cursor");
+            item_step_ = 0;
+        }
+        break;
+    case 4:
+        move_cursor(w_ / 4, h_ / 2);
+        break;
+    case 5:
+        item_left_ = true;
+        break;
+    case 7:
+        move_cursor(item_x_, item_y_);
+        if (!holding_) {
+            item_step_ = 0;
+            rt::logf("controls: item %s", item_sell_ ? "sold" : "dropped");
+        }
+        break;
+    case 8:
+        rt::logf("controls: the item came back; put where it was");
+        item_left_ = true;
+        break;
+    case 9:
+        item_step_ = 0;
+        break;
+    default:   // 2, 6: let go
+        break;
+    }
+    return item_left_;
 }
 
 // Relative cursor from a stick: quadratic response, so small tilts aim finely.
@@ -98,6 +175,7 @@ void Controls::update(const Pad &pad, uint64_t now_ms)
 {
     const uint32_t held = pad.held, pressed = held & ~prev_, released = prev_ & ~held;
     const bool r_layer = (held & kR) != 0;
+    const bool zr_layer = (held & kZR) != 0;
 
     // ---- Select / Start: zoom, keyboard, Escape, Enter ----
     if (pressed & kSelect) {
@@ -136,8 +214,12 @@ void Controls::update(const Pad &pad, uint64_t now_ms)
         const Binding &b = kBindings[i];
         if ((pressed & b.button) && select_layer && (b.button & (kUp | kDown | kLeft | kRight))) {
             bound_[i] = 0;   // taken by the Select layer above
+        } else if ((pressed & b.button) && b.button == kY && !r_layer && !zr_layer && in_game_ && !item_step_ &&
+                   ((ui_ & kUiShop) || ((ui_ & kUiInventory) && !(ui_ & kUiLeftPanels)))) {
+            bound_[i] = 0;   // Y with the inventory open: sell or drop, not Alt (issue #99)
+            item_move_start((ui_ & kUiShop) != 0, now_ms);
         } else if (pressed & b.button) {
-            bound_[i] = r_layer ? b.with_r : b.normal;
+            bound_[i] = zr_layer ? (b.with_zr == kAsNormal ? b.normal : b.with_zr) : r_layer ? b.with_r : b.normal;
             if (bound_[i] != kMouseLeft && bound_[i] != kMouseRight)
                 key(bound_[i], true);
         }
@@ -244,7 +326,8 @@ void Controls::update(const Pad &pad, uint64_t now_ms)
     }
 
     // ---- the mouse buttons, from all their sources ----
-    rt::input_button(false, a_left || walk_left_ || tap_left || pad.point_left);
+    const bool item_left = item_move_step(now_ms);
+    rt::input_button(false, a_left || walk_left_ || tap_left || pad.point_left || item_left);
     rt::input_button(true, b_right || pad.point_right);
     prev_ = held;
 }

@@ -1,0 +1,174 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Fri, 6 Nov 2026 22:23:04 +0000
+Subject: [PATCH] custommem: the host may refuse a new block for a dynablock_t
+
+The 3DS host heap is the JIT's and the app's alike. customMalloc took it
+64 KiB at a time as new code was translated, and nothing gave it back:
+after 1 h 47 min of new areas the app's own next C++ new found nothing
+and the game ended in std::terminate (3ds-d2 issue #24, Sentry
+3DS-D2-12).
+
+- customCallocMeta, for AddNewDynablock's dynablock_t only: before a new
+  64 KiB block it asks the host, d2rt_meta_may_grow(bytes), weak, 1 by
+  default. Refused, it returns NULL and counts it in
+  d2rt_meta_reserve_refusals.
+- internalDBGetBlock already takes that NULL as a refusal of this heap
+  and evicts old blocks (the D2Vita eviction, D2_JITEVICT): their records
+  are freed here and the next record reuses them.
+
+- DynaRun leaves and retries on a refused record as on a refused
+  translation (dyn86_meta_allocfail next to dyn86_jit_allocfail): it
+  fell through to the death path before, a guest thread killed on the
+  first refusal (the Linux lane, M4_META_CAP_KB). The exit is the
+  budget's preemption (dyn86_bbreak), as CpuBox86::run() takes a plain
+  quit for the thread's end: it is resumed at the same EIP.
+
+customMalloc's other callers (rbtree, khash) are never refused: they do
+not handle NULL.
+---
+ third_party/box86-dynarec/custommem.c         | 30 +++++++++++++++++--
+ third_party/box86-dynarec/dynarec/dynablock.c |  2 +-
+ third_party/box86-dynarec/dynarec/dynarec.c   | 10 +++++--
+ third_party/box86-dynarec/include/custommem.h |  7 +++++
+ 4 files changed, 44 insertions(+), 5 deletions(-)
+ mode change 100644 => 100755 third_party/box86-dynarec/custommem.c
+ mode change 100644 => 100755 third_party/box86-dynarec/include/custommem.h
+
+diff --git a/third_party/box86-dynarec/custommem.c b/third_party/box86-dynarec/custommem.c
+old mode 100644
+new mode 100755
+index eeccfbe..26d593a
+--- a/third_party/box86-dynarec/custommem.c
++++ b/third_party/box86-dynarec/custommem.c
+@@ -385,7 +385,20 @@ size_t d2rt_box86_jmptbl_kb(void){
+     return 0;
+ #endif
+ }
+-void* customMalloc(size_t size)
++/* D2 3DS (issue #24, Sentry 3DS-D2-12): the host heap is the JIT's and the
++ * app's alike. This allocator took it 64 KiB at a time as new code was
++ * translated, until the app's own next allocation (a C++ new) found nothing
++ * and the game ended in std::terminate after 1 h 47 min. The host may now
++ * refuse a new block for a dynablock_t while its heap is under a reserve:
++ * AddNewDynablock's caller takes the NULL as a refusal of this heap and
++ * evicts old blocks, whose records are freed here and reused. Other callers
++ * (rbtree, khash) are never refused: they do not handle NULL. */
++unsigned d2rt_meta_reserve_refusals = 0;
++__attribute__((weak)) int d2rt_meta_may_grow(size_t bytes) { (void)bytes; return 1; }
++
++static void* customMallocEx(size_t size, int may_refuse);
++void* customMalloc(size_t size) { return customMallocEx(size, 0); }
++static void* customMallocEx(size_t size, int may_refuse)
+ {
+     size = roundSize(size);
+     // look for free space
+@@ -408,12 +421,17 @@ void* customMalloc(size_t size)
+         }
+     }
+     // add a new block
++    size_t allocsize = (fullsize>MMAPSIZE)?fullsize:MMAPSIZE;
++    if(may_refuse && !d2rt_meta_may_grow(allocsize)) {
++        ++d2rt_meta_reserve_refusals;
++        mutex_unlock(&mutex_blocks);
++        return NULL;
++    }
+     int i = n_blocks++;
+     if(n_blocks>c_blocks) {
+         c_blocks += 4;
+         p_blocks = (blocklist_t*)box_realloc(p_blocks, c_blocks*sizeof(blocklist_t));
+     }
+-    size_t allocsize = (fullsize>MMAPSIZE)?fullsize:MMAPSIZE;
+     /* D2Vita — INJECTION DE PENURIE (D2_CUSTOMFAILAFTER=N). Le refus du noyau
+      * sur ce tas est arrive en production mais ne se produit JAMAIS sous qemu,
+      * ou mmap ne refuse rien : sans de quoi le fabriquer, le traitement du
+@@ -495,6 +513,14 @@ void* customCalloc(size_t n, size_t size)
+     memset(ret, 0, newsize);
+     return ret;
+ }
++void* customCallocMeta(size_t n, size_t size)
++{
++    size_t newsize = roundSize(n*size);
++    void* ret = customMallocEx(newsize, 1);
++    if(!ret) return NULL;
++    memset(ret, 0, newsize);
++    return ret;
++}
+ void* customRealloc(void* p, size_t size)
+ {
+     if(!p)
+diff --git a/third_party/box86-dynarec/dynarec/dynablock.c b/third_party/box86-dynarec/dynarec/dynablock.c
+index 5687210..142e2a7 100755
+--- a/third_party/box86-dynarec/dynarec/dynablock.c
++++ b/third_party/box86-dynarec/dynarec/dynablock.c
+@@ -208,7 +208,7 @@ dynablock_t *AddNewDynablock(uintptr_t addr)
+     #endif
+     // create and add new block
+     dynarec_log(LOG_VERBOSE, "Ask for DynaRec Block creation @%p\n", (void*)addr);
+-    block = (dynablock_t*)customCalloc(1, sizeof(dynablock_t));
++    block = (dynablock_t*)customCallocMeta(1, sizeof(dynablock_t));   // may be refused: the host's reserve (issue #24)
+     return block;
+ }
+ 
+diff --git a/third_party/box86-dynarec/dynarec/dynarec.c b/third_party/box86-dynarec/dynarec/dynarec.c
+index 48c8322..a1b3089 100755
+--- a/third_party/box86-dynarec/dynarec/dynarec.c
++++ b/third_party/box86-dynarec/dynarec/dynarec.c
+@@ -29,6 +29,7 @@ extern int dyn86_should_break(void);
+ // D2Vita (lot eviction JIT) : compteurs partages, definis dans custommem.c et
+ // dynablock.c — voir le commentaire au site d'incrementation plus bas.
+ extern uint32_t dyn86_jit_allocfail;
++extern uint32_t dyn86_meta_allocfail;   /* dynablock.c: a block's record refused (the host's reserve, issue #24) */
+ extern uint32_t dyn86_ev_fatal;
+ extern uint32_t dyn86_ev_oomexit;
+ extern uint32_t dyn86_ev_reclaimed;
+@@ -432,7 +433,7 @@ int DynaRun(x86emu_t* emu)
+                  * blocage, et le fil retombe alors sur la mort nommee. Le
+                  * compteur est aussi remis a zero des qu'une traduction de ce
+                  * fil aboutit (branche else, plus bas). */
+-                if((dyn86_jit_allocfail || dyn86_pool_near_full()) && dyn86_evict_armed()
++                if((dyn86_jit_allocfail || dyn86_meta_allocfail || dyn86_pool_near_full()) && dyn86_evict_armed()
+                    && emu->dyn86_oomexit < DYN86_OOM_EXITS) {
+                     if(dyn86_ev_reclaimed != emu->dyn86_oomwatch) {
+                         emu->dyn86_oomwatch = dyn86_ev_reclaimed;
+@@ -450,6 +451,11 @@ int DynaRun(x86emu_t* emu)
+                      * evinceur. La grace ne peut pas converger si le fil qui
+                      * l'attend empeche les autres d'avancer. */
+                     sched_yield();
++                    /* 3DS (cooperative scheduler, issue #24): a quit with no
++                     * error is a thread's clean END to CpuBox86::run(); the
++                     * resumable stop is the budget's, dyn86_bbreak, which the
++                     * scheduler takes as a preemption and resumes at EIP. */
++                    emu->dyn86_bbreak = 2;
+                     emu->quit = 1;          /* EIP inchange : strictement reprenable */
+                     continue;               /* while(!emu->quit) -> on sort */
+                 }
+@@ -462,7 +468,7 @@ int DynaRun(x86emu_t* emu)
+                  * "il n'a jamais refuse" EST la question, et elle ne se lit
+                  * qu'ici, jamais sur le battement 10s qui arrive trop tard
+                  * (voir vita_present.cpp, commentaire jitp=). */
+-                if(dyn86_jit_allocfail) {
++                if(dyn86_jit_allocfail || dyn86_meta_allocfail) {
+                     ++dyn86_ev_fatal;
+                     if(dyn86_ev_fatal==1) dyn86_ev_dump("MORT d'un fil invite — allocateur avait refuse");
+                 } else {
+diff --git a/third_party/box86-dynarec/include/custommem.h b/third_party/box86-dynarec/include/custommem.h
+old mode 100644
+new mode 100755
+index 1c6c89f..1d3092e
+--- a/third_party/box86-dynarec/include/custommem.h
++++ b/third_party/box86-dynarec/include/custommem.h
+@@ -8,6 +8,13 @@ typedef struct box86context_s box86context_t;
+ 
+ void* customMalloc(size_t size);
+ void* customCalloc(size_t n, size_t size);
++/* A dynablock_t (AddNewDynablock): its caller treats NULL as a refusal and
++ * evicts old blocks, so it alone may be refused for the host's reserve. */
++void* customCallocMeta(size_t n, size_t size);
++/* The host's say over a new metadata block of `bytes` (customCallocMeta
++ * only): 0 refuses it, to keep the host heap's reserve. Weak, 1 by default. */
++int d2rt_meta_may_grow(size_t bytes);
++extern unsigned d2rt_meta_reserve_refusals;   /* new blocks refused so */
+ void* customRealloc(void* p, size_t size);
+ void customFree(void* p);
+ 

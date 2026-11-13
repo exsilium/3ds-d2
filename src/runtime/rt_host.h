@@ -82,6 +82,28 @@ struct RunOptions {
     // one) kept back in one contiguous block, for a request that fits
     // nowhere else once the pool's free space has gone to pieces (0: none).
     uint32_t pool_spare = 0;
+    // Bytes of the pool (a multiple of 64 KiB) set aside for va_alloc's
+    // blocks over pool_large_min, before the faces allocate (0: none): blocks
+    // that large found no piece of a long session's pool, whose free space
+    // had gone to 64-256 KiB pieces, and took the spare (issue #70). Only
+    // they go there, so nothing smaller can cut it up; and the game's heap
+    // blocks over pool_large_min that no free piece of the pool holds.
+    uint32_t pool_large = 0;
+    uint32_t pool_large_min = 256u << 10;
+    // The scheduler's slice for every guest thread but the frame thread, in
+    // instructions (0: the scheduler's quantum, 300000, for all). The
+    // threads take turns on one core: a file loader decompressing for a
+    // whole quantum kept the game's thread from its frame (~16 ms in Azahar,
+    // most of the frames over 50 ms while walking). Shorter slices give it
+    // the same share in smaller pieces.
+    uint32_t background_quantum = 0;
+    // ...and by time (us, 0: none): the quantum counts guest instructions
+    // only, and a native (a decompressor, called sector by sector) runs for
+    // free, so a loader's slice of Storm's decoders held the game's thread
+    // 15 ms at a time, every 250-550 ms, in Azahar. After a native returns on
+    // another thread, past this much of its slice and with the frame thread
+    // ready, the thread yields.
+    uint32_t background_slice_us = 0;
     // CPUID leaf-1 EDX reported to the guest; 0 keeps the backend's default
     // (FPU CMOV MMX FXSR SSE SSE2). The 3DS reports kCpuidNoSimd: the game
     // then takes its x87/integer paths instead of SSE code the ARM11 emulates.
@@ -161,10 +183,75 @@ struct FrameThreadTimes {
     uint64_t run_ms = 0, ready_ms = 0, host_ms = 0, blocked_ms = 0;
 };
 FrameThreadTimes frame_thread_times();
+// The same in us by what it was doing, charged up to now: run, ready, host,
+// sleep, then its waits (critsec, event, fileio, multi, thread, other). For
+// the frame trace (game/frame_trace.h), at each frame; the scheduler's
+// thread (a shim's).
+constexpr size_t kFrameThreadKinds = 10;
+void frame_thread_us(uint64_t out[kFrameThreadKinds]);
+// Of its ready time, us by the guest thread that ran meanwhile (ids 0-15),
+// and a guest thread's entry point (0: none), to name it.
+void frame_thread_ready_by(uint64_t out[16]);
+// Its longest wait on a guest object (a Sleep left out) since the last call:
+// the us, the site it waited from (wait_site: the game's code), and for a
+// critical section the guest thread that owned it (else 0), and the return
+// addresses into the game on its EBP chain (0: fewer). Clears them.
+constexpr size_t kWaitFrom = 4;
+uint64_t frame_thread_wait_top(uint32_t &site, uint32_t &owner, uint32_t from[kWaitFrom]);
+// Moves the real clock's guest time (GetTickCount, QPC, Sleep, timed waits)
+// ahead of the host's by `us`, for good: the frame lock (issue #86) runs the
+// game's clock slightly fast to keep its frames in step with the screen.
+// Never back. Any thread.
+void advance_guest_clock(uint32_t us);
+uint32_t guest_clock_ahead_us();   // the total so far
+// Long frames, sampled (the frame trace's stall column). note_present at
+// each present (the scheduler's thread). stall_probe from another host
+// thread every few ms: once the frame thread has gone `min_us` without a
+// present, it is told to stop at its next block and where it stops is
+// kept (its EIP, and the dword on top of its stack: after a host call, the
+// call's return), up to 8 samples a frame. take_stall, at the next present,
+// takes them (the count).
+void note_present();
+// The game's main loop (0x451bb0): PeekMessageA, then the game's frame
+// callback, with no Sleep in game. note_loop_pass at each PeekMessageA of
+// the frame thread: a pass with a present since the last is a frame's, one
+// without is the callback finding it is not yet time (spare time). loop_line
+// gives the window's figures for the heartbeat ("" when none).
+void note_loop_pass();
+std::string loop_line();
+// The dynarec's translation knobs (dyn86.c): return-address prediction,
+// flag archiving at blocks ending in a CALL (1: dropped), the budget check
+// at a block's tail, the forward-bridge size. Each -1 keeps the backend's
+// default. Before the game runs (blocks translated already keep their
+// shape); the run logs them.
+void set_dynarec_knobs(int callret, int nopend, int budgettail, int forward);
+void stall_probe(uint64_t min_us);
+int take_stall(uint32_t out[][2], int max);
+uint32_t guest_thread_entry(uint32_t tid);
+// The running guest thread is the one presenting frames (stats().frame_thread);
+// the running guest thread's id (-1: none).
+bool on_frame_thread();
+int current_thread_id();
+// A native's work on the I/O worker (the second core) while the guest
+// thread that called it waits, as a file read does: the other guest threads
+// run meanwhile. `job` gets `args` (at most 8, captured from the guest's
+// registers and stack before the call), touches guest memory only through
+// host pointers, and must not depend on anything the game's core changes
+// meanwhile. True: the native returns `ret`, and the thread's EAX becomes
+// what the job returned when it wakes. False (asynchronous reads off, the
+// frame thread calling, the worker full): the caller runs it itself.
+bool offload_job(uint32_t (*job)(const uint32_t *), const uint32_t *args, size_t n, uint32_t &ret);
 // How long the last heartbeat took (us): the runtime's lines and
 // RunOptions::heartbeat, on the guest's core, so the frame after it waited
 // as long. The scheduler's thread.
 uint64_t last_heartbeat_us();
+// Of that, the guest code profile's and the other profile lines (us;
+// issue #71). 0 while the profiler is off.
+uint64_t last_prof_report_us();
+// Logs the guest pool's free pieces, the blocks in its spare and the
+// VirtualAlloc owners (issue #70). The heartbeat calls it when a request
+// has been served from the spare; `why` names the caller in the line.
+void log_pool_pieces(const char *why);
 
 // The read cache of game files (rt_shims_files.cpp): cumulative counters,
 // reported per interval with the heartbeat.
@@ -185,8 +272,29 @@ struct FileStats {
     // (an OVERLAPPED read, a full request pool, or synchronous reads).
     uint64_t waits = 0, wait_us = 0, wait_frame_us = 0;
     uint64_t stall_us = 0;
+    // Jobs on the I/O worker (offload_job): how many, their time running
+    // there, those past 5 ms, and their time queued behind other requests.
+    uint64_t jobs = 0, job_us = 0, job_long = 0, job_queued_us = 0;
+    // The prefetch store (issue #89): the worker's reads into it, and the
+    // blocks the read caches took from it instead of the card.
+    uint64_t prefetch_reads = 0, prefetch_bytes = 0, prefetch_us = 0, prefetch_hits = 0, prefetch_held = 0;
 };
 const FileStats &file_stats();
+// Reading ahead (issue #89). prefetch_file: the id of the read-only game
+// file named so ("d2data.mpq"), once the game has opened it; -1 otherwise.
+// io_background: `task` runs on the I/O worker when it has no read or job
+// waiting (false: no worker, or 512 queued). In such a task, prefetch_raw
+// reads bytes of the file for the task itself, and prefetch_range reads
+// [pos, pos+n) into the store a read inside it is served from, before the
+// read cache and the card: the arena set_prefetch_arena gave (before the
+// game runs), written as a ring, a range at most a quarter of it. False if
+// it read nothing: already stored, no arena, or the read failed.
+void set_prefetch_arena(void *arena, uint32_t size);
+int prefetch_file(const char *name);
+bool io_background(std::function<void()> task);
+bool prefetch_raw(int id, uint64_t pos, void *dst, uint32_t n);
+bool prefetch_range(int id, uint64_t pos, uint32_t n);
+
 // The asynchronous reads' worker (RunOptions::io_start): started and stopped
 // by run_exe.
 void start_async_io();
@@ -228,6 +336,9 @@ struct MemoryReport {
     uint32_t free, largest_free;
     // RunOptions::pool_spare: bytes in use in it, and requests it has served.
     uint32_t spare_used, spare_takes;
+    // RunOptions::pool_large: bytes in use in it, and its size. The zone is
+    // used space to `free` and `largest_free`.
+    uint32_t large_used, large_size;
     // Host memory of the CPU backend (0 when the build does not count it):
     uint32_t jit_code_kb;    // translated ARM code: the 2 MiB chunks opened for it
     uint32_t jit_used_kb;    // of those, what the translated blocks hold now
@@ -279,6 +390,11 @@ void sleep_guest(uint32_t ms);
 // The guest's clock: the scheduler's (virtual or real), so GetTickCount, QPC,
 // Sleep and timed waits always agree.
 uint64_t now_ms();
+// now_ms as the game's GetTickCount sees it, without a clock read: the
+// slice's clock on the real clock (it moves at each slice), now_ms itself
+// on the virtual one. For code run per call in play (issue #72: a host
+// clock read costs ~1 us on the console).
+uint32_t tick_ms();
 // Closes the host side of every file the game has open (after the I/O
 // worker's queued reads), and opens them again where they were: for the
 // platform to let go of its storage while the app is suspended (the HOME
@@ -300,7 +416,9 @@ wx86::GuestRegion &va_region();
 // A block of it for native code, as VirtualAlloc would give the guest one
 // (not zeroed), owned by `owner` in the "VirtualAlloc by caller" lines; 0
 // when the pool has no free piece that large (tried only when it has one,
-// so no "va full" is logged or counted for it). And its return.
+// so no "va full" is logged or counted for it). A block over
+// RunOptions::pool_large_min comes from the pool's large-block zone when
+// that has room. And its return.
 uint32_t va_alloc(uint32_t bytes, uint32_t owner);
 void va_free(uint32_t va);
 
@@ -333,6 +451,10 @@ bool hook_function(d2rt::Cpu &c, uint32_t va, const uint8_t *expect, uint32_t n,
 // and returns its guest address (0 on failure). hook_function is this plus
 // a jmp over a guest function.
 uint32_t native_entry(const char *name, uint32_t stack_args, std::function<uint32_t(d2rt::Cpu &)> fn);
+// Called at each of the game's frames (its StretchBlt or BitBlt of an 8-bit
+// DIB), before the frame is presented: the DIB's guest address and size in
+// bytes. For the draw census (game/draw_census.h, issue #80); null: none.
+void set_blit_hook(void (*hook)(uint32_t bits, uint32_t bytes));
 
 void install_kernel32(d2rt::Bridge &br);
 // The lock calls (EnterCriticalSection, LeaveCriticalSection) since the

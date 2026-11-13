@@ -1,13 +1,18 @@
 // See d2_state.h.
 #include "game/d2_state.h"
 #include "game/cinematics.h"
+#include "game/frame_trace.h"
 
 #include "runtime/rt_host.h"
 
 #include <cstdint>
+#include <cstdio>
+#include <utility>
 
 namespace game {
 namespace {
+
+bool g_renote = false;   // note_game_state_again
 
 constexpr uint32_t kCheckVa = 0x0045B440;     // push ebp
 constexpr uint32_t kPlayerUnitVa = 0x007A6A70;
@@ -22,6 +27,8 @@ constexpr uint8_t kPanels[] = {0x01, 0x02, 0x04, 0x08, 0x09, 0x0C, 0x0E, 0x0F, 0
                                0x16, 0x17, 0x19, 0x1A, 0x21, 0x24};
 
 }  // namespace
+
+void note_game_state_again() { g_renote = true; }
 
 GameState read_game_state()
 {
@@ -50,9 +57,12 @@ GameState read_game_state()
     // Transitions go to the runtime log (rare, and useful to follow a session).
     static bool was_in_game = false, was_panel = false, was_edit = false;
     static uint64_t was_ui = 0;
-    if (s.in_game != was_in_game || s.panel_open != was_panel || (s.edit_focus != 0) != was_edit || s.ui != was_ui) {
-        rt::logf("game state: %s%s%s (ui %llx)", s.in_game ? "in game" : "menus", s.panel_open ? ", panel open" : "",
-                 s.edit_focus ? ", text field" : "", (unsigned long long)s.ui);
+    if (std::exchange(g_renote, false) || s.in_game != was_in_game || s.panel_open != was_panel || (s.edit_focus != 0) != was_edit || s.ui != was_ui) {
+        char line[96];
+        std::snprintf(line, sizeof line, "game state: %s%s%s (ui %llx)", s.in_game ? "in game" : "menus",
+                      s.panel_open ? ", panel open" : "", s.edit_focus ? ", text field" : "", (unsigned long long)s.ui);
+        rt::logf("%s", line);
+        frame_trace_note(line);   // the frames' windows: in game or not, a panel open
         was_in_game = s.in_game;
         was_panel = s.panel_open;
         was_edit = s.edit_focus != 0;

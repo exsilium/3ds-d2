@@ -564,6 +564,8 @@ std::string event_json(const Event &e)
         o += ",\"release\":" + json_string(e.release);
     if (!e.dist.empty())
         o += ",\"dist\":" + json_string(e.dist);
+    if (!e.environment.empty())
+        o += ",\"environment\":" + json_string(e.environment);
     // The title is what happened (the reason, or the exception below), or for
     // a player's report its version and topic; the player's words go along
     // as context (issue #61). They were the message, and every wording
@@ -607,6 +609,10 @@ std::string event_json(const Event &e)
         tags.push_back({"dump_pc", hex32(e.dump.pc)});
     o += ",\"tags\":" + json_object(tags);
     o += ",\"contexts\":{\"device\":" + json_object(e.device);
+    // The build the session went wrong on, as the runtime: Sentry's events
+    // table shows it in its Runtime column ("3ds-d2 <build>").
+    if (!e.dist.empty())
+        o += ",\"runtime\":{\"type\":\"runtime\",\"name\":\"3ds-d2\",\"version\":" + json_string(e.dist) + "}";
     if (!e.note.empty() || !topic.empty() || !e.screenshots.empty()) {
         o += ",\"report\":{\"type\":\"report\"";
         if (!topic.empty())

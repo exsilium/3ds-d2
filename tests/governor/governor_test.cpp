@@ -57,7 +57,7 @@ int main()
         CHECK(g.step(beat(kGame, 12 * MiB, 5, kReserve + 100 * KiB), kReserve, kMin) == kGame);
         CHECK(g.step(beat(kGame, 12 * MiB, 5, 4 * MiB), kReserve, kMin) == kGame);
     }
-    {   // Up in 256 KiB steps, with the pool two steps above the reserve and the cache at its limit.
+    {   // Up with the pool two steps above the reserve and the cache at its limit: a step near the reserve.
         SpriteGovernor g = started();
         g.step(beat(kGame, 12 * MiB, 5, 4 * MiB), kReserve, kMin);
         CHECK(g.step(beat(kGame, 12 * MiB, 5, 4 * MiB), kReserve, kMin) == 10 * MiB);
@@ -115,10 +115,48 @@ int main()
         h.step(beat(kGame, 12 * MiB, 3, kReserve - 300 * KiB), kReserve, kMin);
         CHECK(h.step(beat(kGame, 12 * MiB, 3, kReserve - 300 * KiB), kReserve, kMin) == 11 * MiB + 512 * KiB);
     }
-    {   // A request served from the spare: the minimum at once, working set or not.
+    {   // A request served from the spare: at once, down by the pool's shortfall
+        // and a step, from what the cache holds; the minimum at the least.
         SpriteGovernor g = started();
         g.step(beat(kGame, 12 * MiB, 0, 11 * MiB), kReserve, kMin);
-        CHECK(g.step(beat(kGame, 12 * MiB, 3, 4 * MiB, true), kReserve, kMin) == kMin);
+        CHECK(g.step(beat(kGame, 12 * MiB, 3, 4 * MiB, true), kReserve, kMin) == 9 * MiB + 768 * KiB);
+        // 3DS-D2-18's mob: 13.5 MiB held, 1 MiB free. Not the minimum (it let
+        // go of the sprites on screen and decoded them again for 30 s).
+        SpriteGovernor h = started();
+        CHECK(h.step(beat(kGame, 13 * MiB + 512 * KiB, 3, 1 * MiB, true), kReserve, kMin) == 8 * MiB + 256 * KiB);
+        // Little held: the minimum.
+        SpriteGovernor m = started();
+        CHECK(m.step(beat(kGame, 5 * MiB, 3, 1 * MiB, true), kReserve, kMin) == kMin);
+    }
+    {   // Up by half of what the pool has over the reserve, in steps: back to the
+        // working set in a few heartbeats, not 32. (One step per beat held the
+        // cache at 4 MiB against a 12 MiB working set in the Halls of the Dead,
+        // 2026-11-07.)
+        SpriteGovernor g = started();
+        g.step(beat(kGame, 5 * MiB, 3, 4 * MiB, true), kReserve, kMin);   // to the minimum
+        // 12 MiB free, 6 over the reserve: 3 MiB up.
+        CHECK(g.step(beat(kMin, 12 * MiB, 3, 12 * MiB), kReserve, kMin) == 7 * MiB);
+        // 7.3 MiB free: half of 1.3 MiB is 640 KiB, 512 in steps.
+        CHECK(g.step(beat(7 * MiB, 7 * MiB, 3, 7 * MiB + 300 * KiB), kReserve, kMin) == 7 * MiB + 512 * KiB);
+        // Never above the game's size.
+        CHECK(g.step(beat(7 * MiB + 512 * KiB, 7 * MiB + 512 * KiB, 3, 30 * MiB), kReserve, kMin) == kGame);
+        // A cache filling each raise leaves the pool above the reserve.
+        SpriteGovernor h = started();
+        h.step(beat(kGame, 5 * MiB, 3, 4 * MiB, true), kReserve, kMin);   // to the minimum
+        uint32_t limit = kMin, free = 14 * MiB;
+        for (int i = 0; i < 10; i++) {
+            const uint32_t want = h.step(beat(limit, limit, 3, free), kReserve, kMin);
+            free -= want - limit;   // the cache takes all of it from the pool
+            CHECK(free >= kReserve);
+            limit = want;
+        }
+        CHECK(limit > 11 * MiB);
+    }
+    {   // The spare still holding a request after the beat that saw it taken
+        // holds nothing: with the pool free, the cache goes back up.
+        SpriteGovernor g = started();
+        CHECK(g.step(beat(kGame, 5 * MiB, 3, 5 * MiB, true), kReserve, kMin) == kMin);
+        CHECK(g.step(beat(kMin, 12 * MiB, 3, 12 * MiB), kReserve, kMin) > kMin);
     }
     {   // The game re-creating its cache (a limit step() did not set): a new start.
         SpriteGovernor g = started();
@@ -132,7 +170,8 @@ int main()
         CHECK(g.step(beat(8 * MiB, 8 * MiB, 3, 4 * MiB), kReserve, kMin) == 8 * MiB);
     }
     {   // A run of a session's shape: the pool swinging around the reserve. The
-        // limit goes down at most once per two short beats, and up a step at a time.
+        // limit goes down at most once per two short beats, and up by at most
+        // half of what the pool has over the reserve.
         SpriteGovernor g = started();
         uint32_t limit = kGame, downs = 0, shorts = 0;
         const uint32_t frees[] = {5, 4, 3, 7, 5, 4, 7, 4, 5, 7, 3, 4, 7, 5, 3, 4};
@@ -140,7 +179,7 @@ int main()
             const uint32_t want = g.step(beat(limit, limit, 3, f * MiB), kReserve, kMin);
             shorts += f < 6;
             downs += want < limit;
-            CHECK(want <= limit + SpriteGovernor::kStep);
+            CHECK(want <= limit + SpriteGovernor::kStep || want - limit <= (f * MiB - kReserve) / 2);
             CHECK(want <= limit || f >= 6);
             limit = want;
         }

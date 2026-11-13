@@ -1,0 +1,31 @@
+# The Far Oasis by Lut Gholein's waypoint (class 156, found by name: the
+# town's rooms only list their objects once loaded), then walking loops
+# among its monsters. For the DuringCh2Mid save (its waypoints: Lut
+# Gholein, Sewers 2, Dry Hills, Halls of the Dead 2, Far Oasis, the last
+# one enabled, the fifth line). Linux lane: the save's save/ folder's
+# contents as build/m4/write; M4_HOTPROF_LEVEL=43 counts from the oasis.
+#   M4_SCRIPT="$(cat tests/m4/scripts/act2-oasis.txt)"
+0 skipvideos
+35000 tap 400 307
+40000 tapuntil ingame 690 555
+40500 wait ingame
+41000 seek Waypoint
+41100 tapobject last
+42600 tap 110 218
+48000 units
+49000 profile frames
+49000 circle 120 0
+55000 circle 0 120
+61000 circle -120 0
+67000 circle 0 -120
+73000 circle 100 100
+79000 units
+79000 circle -100 -100
+85000 circle 100 -100
+91000 circle -100 100
+97000 circle 120 0
+103000 circle 0 120
+109000 units
+109000 circle 0 0
+110000 shot
+111000 profile off

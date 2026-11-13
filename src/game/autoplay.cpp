@@ -5,10 +5,14 @@
 
 #include "runtime/rt_host.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace game {
+
 namespace {
 
 constexpr int kNpcMenuUi = 0x08;        // GameState::ui: an NPC's menu (talk, trade, travel...)
@@ -18,6 +22,64 @@ constexpr uint64_t kHoverMs = 300;      // ...the cursor on the spot that long b
 constexpr int kEdgeX0 = 24, kEdgeX1 = 615, kEdgeY0 = 40, kEdgeY1 = 380;
 
 }  // namespace
+
+bool Autoplay::seek_near() const
+{
+    UnitSpot u;
+    return find_object_named(seek_name_.c_str(), u) && u.distance <= 8;
+}
+
+// seek: the object if it is loaded; else the nearest room not loaded yet,
+// given up on after 15 s without coming 2 subtiles closer. A tap at the
+// screen's edge its way: the game finds the path there.
+void Autoplay::seek_step(uint64_t now_ms, Controls &controls)
+{
+    next_retry_ms_ = now_ms + 1500;
+    double sx = 0, sy = 0;
+    UnitSpot u;
+    if (find_object_named(seek_name_.c_str(), u)) {
+        sx = u.x - 320;
+        sy = u.y - 197;
+        rt::logf("autoplay: seek %s: class %u, %.1f subtiles away", seek_name_.c_str(), u.cls, u.distance);
+    } else {
+        uint32_t room = 0;
+        double dx, dy, d;
+        if (!frontier_room(seek_skip_, room, dx, dy, d)) {
+            rt::logf("autoplay: seek %s: no room left to look in", seek_name_.c_str());
+            pad_.circle_x = pad_.circle_y = 0;
+            return;
+        }
+        if (room != seek_room_ || d < seek_best_ - 2) {
+            seek_room_ = room;
+            seek_best_ = d;
+            seek_since_ = now_ms;
+        } else if (now_ms - seek_since_ > 15000) {
+            seek_skip_.push_back(room);
+            seek_room_ = 0;
+            seek_best_ = 1e9;
+            rt::logf("autoplay: seek %s: room %08x given up on", seek_name_.c_str(), room);
+        }
+        sx = (dx - dy) * 16;
+        sy = (dx + dy) * 8;
+        rt::logf("autoplay: seek %s: room %08x %.1f subtiles away", seek_name_.c_str(), room, d);
+    }
+    const double len = std::sqrt(sx * sx + sy * sy);
+    if (len <= 0)
+        return;
+    // Out from the centre to the edge of the tappable area, at most 240 px.
+    const double k = std::min(240.0, len) / len;
+    int x = 320 + (int)std::lround(sx * k), y = 197 + (int)std::lround(sy * k);
+    x = x < kEdgeX0 ? kEdgeX0 : x > kEdgeX1 ? kEdgeX1 : x;
+    y = y < kEdgeY0 ? kEdgeY0 : y > kEdgeY1 ? kEdgeY1 : y;
+    controls.warp_cursor(x, y);
+    click_at_ = now_ms + kHoverMs;
+}
+
+bool Autoplay::goto_near() const
+{
+    UnitSpot u;
+    return find_unit(goto_cls_, u, 2) && u.distance <= 8;
+}
 
 void Autoplay::load(const std::string &script)
 {
@@ -34,6 +96,8 @@ void Autoplay::load(const std::string &script)
     click_until_ = 0;
     skip_videos_ = false;
     skip_release_ms_ = skip_next_ms_ = 0;
+    close_panels_ = false;
+    close_release_ms_ = close_next_ms_ = 0;
     pad_ = Pad();
     std::string item;
     for (size_t i = 0; i <= script.size(); i++) {
@@ -71,6 +135,22 @@ const Pad &Autoplay::step(uint64_t now_ms, Controls &controls, bool &shot, const
             skip_release_ms_ = now_ms + 100;
         }
     }
+    // closepanels: START (Escape) while a panel is open in the game (an
+    // NPC's menu a walk clicked into, say); one press, the next no sooner
+    // than a second after the release, so the panel has closed.
+    if (close_panels_) {
+        if (close_release_ms_) {
+            if (now_ms >= close_release_ms_) {
+                pad_.held &= ~kStart;
+                close_release_ms_ = 0;
+                close_next_ms_ = now_ms + 1000;
+            }
+        } else if (state.in_game && state.panel_open && now_ms >= close_next_ms_) {
+            rt::logf("autoplay: START to close a panel (ui %llx)", (unsigned long long)state.ui);
+            pad_.held |= kStart;
+            close_release_ms_ = now_ms + 100;
+        }
+    }
     // The click of a tap (tap, tapuntil, tapunit, tapmenu): A, the left
     // mouse button, once the cursor has been over the spot for a few frames
     // (the game resolves a click against what the cursor hovered in the
@@ -89,15 +169,36 @@ const Pad &Autoplay::step(uint64_t now_ms, Controls &controls, bool &shot, const
                          (waiting_for_ == "ingame" && state.in_game) || (waiting_for_ == "menus" && !state.in_game) ||
                          (waiting_for_ == "npcmenu" && state.in_game && (state.ui >> kNpcMenuUi & 1)) ||
                          (waiting_for_ == "menuclosed" && !(state.in_game && (state.ui >> kNpcMenuUi & 1))) ||
+                         (waiting_for_.size() > 2 && waiting_for_.compare(0, 2, "ui") == 0 && state.in_game &&
+                          (state.ui >> std::atoi(waiting_for_.c_str() + 2) & 1)) ||
                          (waiting_for_.size() == 4 && waiting_for_.compare(0, 3, "act") == 0 && state.in_game &&
-                          player_act() == waiting_for_[3] - '0');
+                          player_act() == waiting_for_[3] - '0') ||
+                         (waiting_for_ == "goto" && state.in_game && goto_near()) ||
+                         (waiting_for_ == "seek" && state.in_game && seek_near());
+        if (waiting_for_ == "seek" && !met && now_ms >= next_retry_ms_ && !click_until_ && !click_at_)
+            seek_step(now_ms, controls);
+        if (waiting_for_ == "goto" && !met && now_ms >= next_retry_ms_) {
+            // Steer towards the preset: the circle pad held its way, the
+            // game walking (and finding its path) towards the cursor.
+            double dx, dy, d;
+            if (find_preset(goto_cls_, 2, dx, dy, d)) {
+                const double sx = (dx - dy) * 16, sy = (dx + dy) * 8, len = std::sqrt(sx * sx + sy * sy);
+                pad_.circle_x = len > 0 ? (int)std::lround(sx / len * 140) : 0;
+                pad_.circle_y = len > 0 ? (int)std::lround(-sy / len * 140) : 0;   // the pad: y up
+                rt::logf("autoplay: goto %u, %.1f subtiles away, circle %d %d", goto_cls_, d, pad_.circle_x,
+                         pad_.circle_y);
+            } else {
+                rt::logf("autoplay: goto %u: no such preset in this level", goto_cls_);
+            }
+            next_retry_ms_ = now_ms + 1000;
+        }
         if (!met) {
             if (retry_tap_ && now_ms >= next_retry_ms_ && !click_until_ && !click_at_ && retry_unit_) {
                 // tapunit: where the unit is now; one off the screen is
                 // walked towards (the spot at the edge in its direction).
                 // tapmenu: the line of its menu, where the unit is now.
                 UnitSpot u;
-                if (find_unit(retry_unit_, u)) {
+                if (find_unit(retry_unit_, u, retry_type_)) {
                     int x = u.x < kEdgeX0 ? kEdgeX0 : u.x > kEdgeX1 ? kEdgeX1 : u.x;
                     int y = u.y < kEdgeY0 ? kEdgeY0 : u.y > kEdgeY1 ? kEdgeY1 : u.y;
                     if (retry_line_)
@@ -130,13 +231,21 @@ const Pad &Autoplay::step(uint64_t now_ms, Controls &controls, bool &shot, const
             click_until_ = 0;
         }
         rt::logf("autoplay: %s reached", waiting_for_.c_str());
+        if (waiting_for_ == "goto" || waiting_for_ == "seek")
+            pad_.circle_x = pad_.circle_y = 0;
+        if (waiting_for_ == "seek") {
+            UnitSpot u;
+            if (find_object_named(seek_name_.c_str(), u))
+                seek_cls_ = u.cls;
+            rt::logf("autoplay: seek %s: class %u", seek_name_.c_str(), seek_cls_);
+        }
         waiting_for_.clear();
         shift_ms_ = (int64_t)now_ms - (int64_t)wait_at_;   // later events count from here
     }
     while (next_ < events_.size()) {
         const char *ev = events_[next_].c_str();
         unsigned long long at = 0;
-        char verb[16] = {}, arg[16] = {};
+        char verb[16] = {}, arg[64] = {};
         int x = 0, y = 0;
         if (std::sscanf(ev, "%llu %15s", &at, verb) < 2) {   // malformed: skip it
             next_++;
@@ -154,6 +263,8 @@ const Pad &Autoplay::step(uint64_t now_ms, Controls &controls, bool &shot, const
             click_at_ = now_ms + kHoverMs;
         } else if (v == "skipvideos") {
             skip_videos_ = true;
+        } else if (v == "closepanels") {
+            close_panels_ = std::strstr(ev, "closepanels off") == nullptr;
         } else if (v == "touch" && std::sscanf(ev, "%*s %*s %d %d", &x, &y) == 2) {
             int ms = 100;
             std::sscanf(ev, "%*s %*s %*d %*d %d", &ms);
@@ -162,6 +273,8 @@ const Pad &Autoplay::step(uint64_t now_ms, Controls &controls, bool &shot, const
             pad_.touch_x = x;
             pad_.touch_y = y;
             touch_until_ = now_ms + (uint64_t)ms;
+        } else if (v == "hover" && std::sscanf(ev, "%*s %*s %d %d", &x, &y) == 2) {
+            controls.warp_cursor(x, y);
         } else if (v == "circle" && std::sscanf(ev, "%*s %*s %d %d", &x, &y) == 2) {
             pad_.circle_x = x;
             pad_.circle_y = y;
@@ -175,12 +288,15 @@ const Pad &Autoplay::step(uint64_t now_ms, Controls &controls, bool &shot, const
                 rt::input_char((unsigned char)*t);
         } else if (v == "shot") {
             shot = true;
+        } else if (v == "profile" && std::sscanf(ev, "%*s %*s %63s", arg) == 1) {
+            profile_ = arg;
         } else if (v == "tapmenu" && std::sscanf(ev, "%*s %*s %d", &x) == 1 && x > 0) {
             if (!menu_unit_) {
                 rt::logf("autoplay: tapmenu without an NPC (tapunit first)");
                 continue;
             }
             retry_unit_ = menu_unit_;
+            retry_type_ = 1;
             retry_line_ = x;
             waiting_for_ = "menuclosed";
             wait_at_ = script_at;
@@ -188,10 +304,22 @@ const Pad &Autoplay::step(uint64_t now_ms, Controls &controls, bool &shot, const
             next_retry_ms_ = now_ms;
             break;
         } else if (v == "units") {
-            log_units();
+            log_units(std::strstr(ev, " all") != nullptr);
+        } else if (v == "tapobject" && std::sscanf(ev, "%*s %*s %15s", arg) == 1) {
+            char state[16] = "ui20";   // the waypoint's panel
+            std::sscanf(ev, "%*s %*s %*s %15s", state);
+            retry_unit_ = std::strcmp(arg, "last") == 0 ? seek_cls_ : (uint32_t)std::strtoul(arg, nullptr, 10);
+            retry_type_ = 2;
+            retry_line_ = 0;
+            waiting_for_ = state;
+            wait_at_ = script_at;
+            retry_tap_ = true;
+            next_retry_ms_ = now_ms;
+            break;
         } else if (v == "tapunit" && std::sscanf(ev, "%*s %*s %15s", arg) == 1) {
             char state[16] = "npcmenu";
             std::sscanf(ev, "%*s %*s %*s %15s", state);
+            retry_type_ = 1;
             retry_unit_ = menu_unit_ = unit_class(arg);
             if (!retry_unit_) {
                 rt::logf("autoplay: no unit named %s", arg);
@@ -209,6 +337,22 @@ const Pad &Autoplay::step(uint64_t now_ms, Controls &controls, bool &shot, const
             retry_x_ = x;
             retry_y_ = y;
             next_retry_ms_ = now_ms;   // the first tap right away
+            break;
+        } else if (v == "seek" && std::sscanf(ev, "%*s %*s %63s", arg) == 1) {
+            seek_name_ = arg;
+            seek_skip_.clear();
+            seek_room_ = 0;
+            seek_best_ = 1e9;
+            seek_since_ = now_ms;
+            waiting_for_ = "seek";
+            wait_at_ = script_at;
+            next_retry_ms_ = now_ms;
+            break;
+        } else if (v == "goto" && std::sscanf(ev, "%*s %*s %15s", arg) == 1) {
+            goto_cls_ = (uint32_t)std::strtoul(arg, nullptr, 10);
+            waiting_for_ = "goto";
+            wait_at_ = script_at;
+            next_retry_ms_ = now_ms;
             break;
         } else if (v == "wait" && std::sscanf(ev, "%*s %*s %15s", arg) == 1) {
             waiting_for_ = arg;

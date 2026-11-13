@@ -21,11 +21,25 @@
 // M4_SPRITE_TRACE=<file> writes the sprite trace (game/sprite_trace.h) from
 // the first heartbeat on.
 //
+// M4_POOL_PIECES=1 logs the guest pool's free pieces and the spare's blocks
+// at every heartbeat (rt::log_pool_pieces; the console logs them at a take
+// from the spare), to compare a pool policy's fragmentation (issue #70).
+// M4_POOL_BALLAST_MB=<n> takes n MiB of the pool's VirtualAlloc face at the
+// first heartbeat and keeps it: a smaller pool, so that a short script runs
+// the governor into its reserve as hours of play do on the console.
+// M4_POOL_LARGE_KB=<n> sizes the pool's large-block zone (0: none; the 3DS
+// layouts' own otherwise) and M4_POOL_LARGE_MIN_KB=<n> what goes there:
+// the fight has no sprite frames over 256 KiB, so 64 sends it the frames'
+// own blocks of 128-256 KiB.
+//
 // M4_SCRIPT drives game::Controls (the 3DS control scheme) with scripted pad
 // events (game::Autoplay, src/game/autoplay.h), ';'-separated, e.g.
 //   "20000 tap 400 307;26000 tap 400 290;32000 text Tester;34000 press R;..."
 
+#include "game/dcc_native.h"
+#include "game/frame_reads.h"
 #include "game/autoplay.h"
+#include "game/d2_units.h"
 #include "game/automap.h"
 #include "game/cinematics.h"
 #include "game/controls.h"
@@ -57,6 +71,18 @@
 extern "C" {
 void dyn86_hotprof_reset(void);
 void dyn86_hotprof_dump(FILE *f, int top);
+size_t d2rt_box86_custommalloc_kb(void);
+extern unsigned d2rt_meta_reserve_refusals;
+
+// M4_META_CAP_KB=<n>: box86's block records held at n KiB, as the console's
+// host heap reserve holds them (ctr_game.cpp's d2rt_meta_may_grow, issue
+// #24): past it a new 64 KiB block for a record is refused, and the JIT
+// evicts old blocks to translate new ones. Unset: never refused.
+int d2rt_meta_may_grow(size_t bytes)
+{
+    static const long cap = std::getenv("M4_META_CAP_KB") ? std::atol(std::getenv("M4_META_CAP_KB")) : 0;
+    return cap <= 0 || (long)(d2rt_box86_custommalloc_kb() + (bytes >> 10)) <= cap;
+}
 }
 
 static bool shot_now = false;   // M4_SCRIPT "shot": save the next frame
@@ -129,6 +155,13 @@ private:
     bool created_ = false;
 };
 
+// The floor queue's worker (issue #80, D2_FLOOR_QUEUE=1): a thread of its
+// own, woken as the console's is (a one-shot event).
+static std::mutex g_floor_m;
+static std::condition_variable g_floor_cv;
+static bool g_floor_signal = false;
+static std::thread g_floor_thread;
+
 int main(int argc, char **argv)
 {
     if (argc < 4) {
@@ -144,12 +177,44 @@ int main(int argc, char **argv)
     if (ctr) {
         opt.total_phys_mb = 64;
         opt.pool_spare = game::kCtrPoolSpare;
+        opt.pool_large = game::kCtrPoolLarge;
+        opt.background_quantum = 40000;   // as the console's (ctr_game.cpp)
     }
     if (const char *kb = std::getenv("M4_POOL_SPARE_KB"))   // another spare (0: none)
         opt.pool_spare = (uint32_t)std::atoi(kb) << 10;
+    if (const char *kb = std::getenv("M4_POOL_LARGE_KB"))   // another large-block zone (0: none)
+        opt.pool_large = (uint32_t)std::atoi(kb) << 10;
+    if (const char *kb = std::getenv("M4_POOL_LARGE_MIN_KB"))   // blocks over this go there (256: the console's)
+        opt.pool_large_min = (uint32_t)std::atoi(kb) << 10;
+    if (const char *q = std::getenv("M4_BG_QUANTUM"))   // the other threads' slice (0: the frame thread's)
+        opt.background_quantum = (uint32_t)std::atoi(q);
+    {   // The dynarec's knobs, as the console's settings.txt sets them (M4_CALLRET, M4_NOPEND, M4_BUDGETTAIL, M4_FORWARD).
+        auto knob = [](const char *n) { const char *v = std::getenv(n); return v ? std::atoi(v) : -1; };
+        rt::set_dynarec_knobs(knob("M4_CALLRET"), knob("M4_NOPEND"), knob("M4_BUDGETTAIL"), knob("M4_FORWARD"));
+    }
     if (const char *mb = std::getenv("M4_PHYS_MB"))   // override the RAM the game is told about
         opt.total_phys_mb = (uint32_t)std::atoi(mb);
     opt.virtual_tick_us = 250;   // used only under M4_VIRTUAL_CLOCK
+    {
+        game::FloorWorker w;
+        w.start = [](void (*worker)()) {
+            g_floor_thread = std::thread(worker);
+            return true;
+        };
+        w.wait = [] {
+            std::unique_lock<std::mutex> l(g_floor_m);
+            g_floor_cv.wait(l, [] { return g_floor_signal; });
+            g_floor_signal = false;
+        };
+        w.wake = [] {
+            {
+                std::lock_guard<std::mutex> l(g_floor_m);
+                g_floor_signal = true;
+            }
+            g_floor_cv.notify_one();
+        };
+        game::set_floor_worker(w);
+    }
     // Native drawing routines, as in the 3DS app; M4_NATIVE=0 runs the
     // translated originals (the A/B for byte-exactness and speed).
     // M4_NATIVE=late installs them on arrival in the game world instead: the
@@ -175,9 +240,16 @@ int main(int argc, char **argv)
         game::install_sprite_cache_counter(c);
         game::install_sprite_decode_timer(c);
         game::install_sprite_trace(c);
+        // The native DCC decoder (issue #83): D2_DCC=1 in place, 2 on the I/O
+        // worker, 3 checked against the game's code; off otherwise.
+        game::install_dcc_native(c, game::DccMode::Off);
         // Storm serving a waiting caller first, as on the console (M4_STORM_PRIO=0: as the game does).
         if (!std::getenv("M4_STORM_PRIO") || std::string(std::getenv("M4_STORM_PRIO")) != "0")
             game::install_storm_read_priority(c);
+        // ...and reading it itself while the read thread is not reading (M4_STORM_DIRECT=0: queued).
+        if (!std::getenv("M4_STORM_DIRECT") || std::string(std::getenv("M4_STORM_DIRECT")) != "0")
+            game::install_storm_direct_reads(c);
+        game::install_frame_reads(c);
         game::install_fatal_exit(c);
         if (ctr_layout) {
             game::install_pool_release(c);
@@ -213,11 +285,22 @@ int main(int argc, char **argv)
                                             ? (uint32_t)std::atoi(std::getenv("M4_POOL_RESERVE_MB")) << 20
                                             : game::kCtrPoolReserve;
         const game::SpriteCacheWindow w = game::sprite_cache_window(*guest_cpu);
+        for (const std::string &l : game::frame_reads_lines())   // "[rt] ..." lines: logf adds the prefix
+            rt::logf("%s", l.c_str() + (l.compare(0, 5, "[rt] ") == 0 ? 5 : 0));
+        if (game::dcc_mode() != game::DccMode::Off) {
+            const game::DccStats d = game::dcc_stats();
+            rt::logf("dcc: native %u, offloaded %u, the game's %u (refused %u), native %llu ms; checked %u, differed %u",
+                     d.native, d.offloaded, d.game, d.refused, (unsigned long long)(d.native_us / 1000), d.checked,
+                     d.differed);
+        }
         if (ctr_layout) {
             const rt::MemoryReport m = rt::memory_report();
+            static uint32_t spare_takes_seen = 0;
+            const bool spare_taken = m.spare_takes != spare_takes_seen;
+            spare_takes_seen = m.spare_takes;
             if (m.spare_used || m.free < game::kCtrPoolRelease)
                 game::request_pool_release();
-            game::govern_sprite_cache(*guest_cpu, m.free, m.spare_used, w.evicted, reserve, game::kCtrSpriteCacheMin);
+            game::govern_sprite_cache(*guest_cpu, m.free, spare_taken, w.evicted, reserve, game::kCtrSpriteCacheMin);
         }
         const game::SpriteCacheStats sc = game::sprite_cache_stats(*guest_cpu);
         char frames[192];
@@ -225,6 +308,18 @@ int main(int argc, char **argv)
             std::fprintf(stderr, "[rt] %s\n", frames);
         std::fprintf(stderr, "[rt] sprite cache %u/%u KiB, %u sprites, in %u, out %u, decoded %u in %u ms\n",
                      sc.used >> 10, sc.limit >> 10, sc.sprites, w.inserted, w.evicted, w.decodes, w.decode_ms);
+        static const bool pool_pieces = std::getenv("M4_POOL_PIECES") != nullptr;
+        if (const char *mb = std::getenv("M4_POOL_BALLAST_MB")) {
+            static bool taken = false;
+            if (!taken) {
+                taken = true;
+                const uint32_t bytes = (uint32_t)std::atoi(mb) << 20;
+                const uint32_t va = bytes ? rt::va_alloc(bytes, 0xba11a57) : 0;
+                std::fprintf(stderr, "[rt] pool ballast: %u KiB at %08x\n", bytes >> 10, va);
+            }
+        }
+        if (pool_pieces)
+            rt::log_pool_pieces("heartbeat");
         // M4_SPRITE_TRACE=<file>: the sprite trace (sprite_trace.h), from the first heartbeat on.
         if (const char *trace = std::getenv("M4_SPRITE_TRACE")) {
             static bool tried = false;
@@ -464,7 +559,13 @@ int main(int argc, char **argv)
             if (g_cpu && sprite_frames)
                 game::install_sprite_frames(*g_cpu);
         }
-        if (in_game_since && !reset_done && now - in_game_since > 10000 && std::getenv("WX86_HOTPROF")) {
+        // M4_HOTPROF_LEVEL=<n>: from 5 s after first reaching level n instead.
+        static const int hot_level = std::getenv("M4_HOTPROF_LEVEL") ? std::atoi(std::getenv("M4_HOTPROF_LEVEL")) : 0;
+        static uint64_t level_since = 0;
+        if (hot_level && !level_since && gs.in_game && game::player_level() == hot_level)
+            level_since = now;
+        if (in_game_since && !reset_done && std::getenv("WX86_HOTPROF") &&
+            (hot_level ? level_since && now - level_since > 5000 : now - in_game_since > 10000)) {
             dyn86_hotprof_reset();
             reset_done = true;
             std::fprintf(stderr, "[rt] hotprof: counting from here (in game)\n");
@@ -473,7 +574,7 @@ int main(int argc, char **argv)
         if (shot)
             shot_now = true;
         second_screen.update(pad, gs, controls.cursor_x(), controls.cursor_y(), now);
-        controls.set_context(gs.in_game, gs.panel_open);
+        controls.set_context(gs.in_game, gs.panel_open, gs.ui, gs.in_game && game::holding_item());
         controls.update(pad, now);
         second_screen.request(controls.take_bottom_request());
     };
@@ -529,6 +630,9 @@ int main(int argc, char **argv)
     });
 #endif
     rt::RunResult r = rt::run_exe(std::move(exe), opt);
+    game::stop_floor_worker();
+    if (g_floor_thread.joinable())
+        g_floor_thread.join();
     game::sprite_trace_stop();
     if (io_thread.joinable())
         io_thread.join();
@@ -536,7 +640,7 @@ int main(int argc, char **argv)
     sampler_stop = true;
     sampler.join();
 #endif
-    dyn86_hotprof_dump(stderr, 60);
+    dyn86_hotprof_dump(stderr, 600);
     save("last.png");
     if (!r.loaded) {
         std::fprintf(stderr, "[rt] FATAL %s\n", r.error.c_str());

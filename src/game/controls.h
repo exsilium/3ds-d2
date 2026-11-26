@@ -61,6 +61,16 @@ public:
     void set_frame(int width, int height);
     // One poll. now_ms: the guest clock (tap timing).
     void update(const Pad &pad, uint64_t now_ms);
+    // A message pump starts (issue #118: the app replays the pad's readings
+    // between two pumps). A mouse button that went down during this pump's
+    // updates and comes up in the same pump stays down until the next one:
+    // the game reads down and up in one pump as no click. Never called (the
+    // Linux lane): buttons follow the pad, as before.
+    void begin_pump()
+    {
+        pump_++;
+        pumps_ = true;
+    }
 
     // What the game is showing (from game::GameState): the circle pad walks
     // only in the game world with no panel open. ui: GameState::ui (the
@@ -102,6 +112,10 @@ private:
     int touch_x0_ = 0, touch_y0_ = 0, touch_moved_ = 0, touch_lx_ = 0, touch_ly_ = 0;
     float touch_acc_x_ = 0, touch_acc_y_ = 0;
     uint64_t tap_hold_until_ms_ = 0;
+    // The mouse buttons as last sent, and the pump each went down in (begin_pump).
+    uint32_t pump_ = 0, down_pump_[2] = {};
+    bool pumps_ = false, button_on_[2] = {};
+    void button(bool right, bool want);
     float cstick_acc_x_ = 0, cstick_acc_y_ = 0, circle_acc_x_ = 0, circle_acc_y_ = 0;
     bool in_game_ = false, panel_open_ = false, holding_ = false;
     uint64_t ui_ = 0;

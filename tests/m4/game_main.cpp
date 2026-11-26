@@ -38,12 +38,18 @@
 
 #include "game/dcc_native.h"
 #include "game/frame_reads.h"
+#include "game/monster_pace.h"
+#include "game/sound_defer.h"
+#include "game/player_modes.h"
+#include "game/sprite_headers.h"
 #include "game/autoplay.h"
 #include "game/d2_units.h"
 #include "game/automap.h"
 #include "game/cinematics.h"
 #include "game/controls.h"
 #include "game/d2_memory.h"
+#include "runtime/rt_cpu_aot.h"
+#include "game/aot_spike.h"
 #include "game/d2_native.h"
 #include "game/d2_state.h"
 #include "game/second_screen.h"
@@ -235,8 +241,7 @@ int main(int argc, char **argv)
     static const bool sprite_frames = ctr && (!std::getenv("M4_SPRITE_FRAMES") || std::string(std::getenv("M4_SPRITE_FRAMES")) != "0");
     opt.install_native = [](d2rt::Cpu &c) {
         guest_cpu = &c;
-        if (sprite_floor)
-            game::set_sprite_cache_floor(c, sprite_floor);
+        game::set_sprite_cache_floor(c, sprite_floor);   // 0: the game's own floor, its code as the AOT code is compiled
         game::install_sprite_cache_counter(c);
         game::install_sprite_decode_timer(c);
         game::install_sprite_trace(c);
@@ -246,10 +251,21 @@ int main(int argc, char **argv)
         // Storm serving a waiting caller first, as on the console (M4_STORM_PRIO=0: as the game does).
         if (!std::getenv("M4_STORM_PRIO") || std::string(std::getenv("M4_STORM_PRIO")) != "0")
             game::install_storm_read_priority(c);
+        // The read thread's rate limit (M4_STORM_RATE_KB: KiB/s; the default otherwise).
+        game::set_storm_read_rate(c, std::getenv("M4_STORM_RATE_KB") ? (uint32_t)std::atoi(std::getenv("M4_STORM_RATE_KB")) << 10 : 0);
         // ...and reading it itself while the read thread is not reading (M4_STORM_DIRECT=0: queued).
         if (!std::getenv("M4_STORM_DIRECT") || std::string(std::getenv("M4_STORM_DIRECT")) != "0")
             game::install_storm_direct_reads(c);
         game::install_frame_reads(c);
+        // Sounds read off the game thread at their first play (D2_SOUND_DEFER=0: as the game does).
+        game::set_big_room_test(std::getenv("D2_BIG_ROOM_TEST") != nullptr);
+        game::install_sound_defer(c, !std::getenv("D2_SOUND_DEFER") || std::string(std::getenv("D2_SOUND_DEFER")) != "0");
+        game::install_monster_pace(c, !std::getenv("D2_MONSTER_PACE") || std::string(std::getenv("D2_MONSTER_PACE")) != "0");
+        // The player's eight modes asked for again (D2_PLAYER_MODES=0: as the game does; 2: the other six too).
+        game::install_player_modes(c, std::getenv("D2_PLAYER_MODES") ? std::atoi(std::getenv("D2_PLAYER_MODES")) : 1);
+        // DCC headers kept (D2_SPRITE_HEADERS=0: each read; D2_SPRITE_HEADERS_FILE: kept there between runs).
+        game::install_sprite_headers(c, std::getenv("D2_SPRITE_HEADERS_FILE"), 1,
+                                     !std::getenv("D2_SPRITE_HEADERS") || std::string(std::getenv("D2_SPRITE_HEADERS")) != "0");
         game::install_fatal_exit(c);
         if (ctr_layout) {
             game::install_pool_release(c);
@@ -265,7 +281,10 @@ int main(int argc, char **argv)
             game::install_d2_native(c);
         if (video)
             game::install_cinematics(c);
+        else
+            game::install_cinematics(c, false);   // its code as the AOT code is compiled, nothing played
         game::install_automap_capture(c);
+        game::aot_after_natives(c);   // D2_AOT's Sig or Check, once the natives are in (issue #115)
     };
     static LaneVideoAudio video_audio;
     opt.video_audio = &video_audio;
@@ -281,12 +300,28 @@ int main(int argc, char **argv)
     opt.trap_report = 250;
     opt.heartbeat_ms = 10000;
     opt.heartbeat = [] {   // as the console does it (M4_POOL_RESERVE_MB: another reserve)
+        // M4_STOP_TEST=<n>: a CpuAot stop at the n-th heartbeat (with CPU_AOT_STOP_IN_PLACE, the console's end; issue #139)
+        static int stop_at = std::getenv("M4_STOP_TEST") ? std::atoi(std::getenv("M4_STOP_TEST")) : 0;
+        if (stop_at && --stop_at == 0)
+            d2rt::cpu_aot_stop_test();
         static const uint32_t reserve = std::getenv("M4_POOL_RESERVE_MB")
                                             ? (uint32_t)std::atoi(std::getenv("M4_POOL_RESERVE_MB")) << 20
                                             : game::kCtrPoolReserve;
         const game::SpriteCacheWindow w = game::sprite_cache_window(*guest_cpu);
         for (const std::string &l : game::frame_reads_lines())   // "[rt] ..." lines: logf adds the prefix
             rt::logf("%s", l.c_str() + (l.compare(0, 5, "[rt] ") == 0 ? 5 : 0));
+        for (const std::string &l : game::dcc_frame_lines())
+            rt::logf("%s", l.c_str() + 5);
+        for (const std::string &l : game::monster_pace_lines())
+            rt::logf("%s", l.c_str() + 5);
+        for (const std::string &l : game::player_modes_lines())
+            rt::logf("%s", l.c_str() + 5);
+        for (const std::string &l : game::sprite_headers_lines())
+            rt::logf("%s", l.c_str() + 5);
+        for (const std::string &l : game::sound_defer_lines())
+            rt::logf("%s", l.c_str() + 5);
+        for (const std::string &l : game::aot_lines())   // the AOT spike (issue #113): "aot: ..."
+            rt::logf("%s", l.c_str());
         if (game::dcc_mode() != game::DccMode::Off) {
             const game::DccStats d = game::dcc_stats();
             rt::logf("dcc: native %u, offloaded %u, the game's %u (refused %u), native %llu ms; checked %u, differed %u",
@@ -640,12 +675,18 @@ int main(int argc, char **argv)
     sampler_stop = true;
     sampler.join();
 #endif
-    dyn86_hotprof_dump(stderr, 600);
+    // M4_HOTPROF_TOP=<n>: that many blocks (600 by default); a large number lists
+    // every block that ran, for the AOT coverage list (issue #115).
+    dyn86_hotprof_dump(stderr, std::getenv("M4_HOTPROF_TOP") ? std::atoi(std::getenv("M4_HOTPROF_TOP")) : 600);
     save("last.png");
     if (!r.loaded) {
         std::fprintf(stderr, "[rt] FATAL %s\n", r.error.c_str());
         return 3;
     }
+    for (const std::string &l : game::aot_strict_lines())   // D2_AOT_STRICT=1 (issue #138)
+        std::fprintf(stderr, "[rt] %s\n", l.c_str());
+    for (const std::string &l : d2rt::cpu_aot_lines())      // a CPU=aot build: the threads' host stacks
+        std::fprintf(stderr, "[rt] %s\n", l.c_str());
     std::fprintf(stderr, "[rt] RESULT exited=%d timed_out=%d code=%u %s\n", r.exited, r.timed_out, r.exit_code,
                  r.error.c_str());
     std::fflush(stdout);

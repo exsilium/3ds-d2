@@ -905,7 +905,19 @@ void install_kernel32(Bridge &br)
         const uint32_t code = c.arg(0);
         if (code == 0x406D1388u)   // MSVC "set thread name": a debugger notification
             return 0u;
-        logf("RaiseException %08x flags %x: stopping", code, c.arg(1));
+        // Who raised it: the return address, then the words up the stack that
+        // look like code addresses (the image's .text), for the guest's trace.
+        char trace[160] = "";
+        size_t n = 0;
+        const uint32_t esp = c.reg(R_ESP);
+        for (uint32_t k = 0, found = 0; k < 256 && found < 10 && n + 10 < sizeof trace; k++) {
+            const uint32_t w = c.read_u32(esp + 4 * k);
+            if (w >= 0x00401000u && w < 0x00800000u) {
+                n += (size_t)std::snprintf(trace + n, sizeof trace - n, " %08x", w);
+                found++;
+            }
+        }
+        logf("RaiseException %08x flags %x: stopping (stack:%s)", code, c.arg(1), trace);
         request_exit(code);
         return 0u;
     });

@@ -8,7 +8,9 @@ namespace d2rt { struct Cpu; }
 
 namespace game {
 
-int install_cinematics(d2rt::Cpu &c);
+// play false: the code is installed (the AOT code is compiled with it, issue
+// #138) but answers as the game's own stubs do: no video is played.
+int install_cinematics(d2rt::Cpu &c, bool play = true);
 
 // A cinematic is playing (from its open to its last frame or skip).
 bool cinematic_playing();

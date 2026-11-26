@@ -38,6 +38,8 @@
 // never sees it at all: one press skips one video.
 #include "game/cinematics.h"
 
+#include "game/native_sites.h"
+
 #include "game/bink/bink_audio.h"
 #include "game/bink/bink_file.h"
 #include "game/bink/bink_video.h"
@@ -65,31 +67,7 @@ constexpr uint32_t kVideoSlots = kGdiRenderer + 0x34;
 // What 1.14d keeps there: "return 0", "ret 4", "return 0", each padded with
 // int3 to 16 bytes, one after the other from kLoopAt. The play loop goes
 // over them.
-constexpr uint32_t kLoopAt = 0x006c7cc0, kLoopRoom = 48;
-const uint8_t kStubBytes[3][3] = {{0x33, 0xc0, 0xc3}, {0xc2, 0x04, 0x00}, {0x33, 0xc0, 0xc3}};
-
-// The play loop (fastcall: ecx = name, edx = mode; one stack argument, the
-// callback, popped on return). Operands at kOpen, kStep, kSleep: addresses.
-const uint8_t kLoop[] = {
-    0x52,                          //  0 push edx
-    0x51,                          //  1 push ecx
-    0xB8, 0, 0, 0, 0,              //  2 mov eax, VideoOpen
-    0xFF, 0xD0,                    //  7 call eax
-    0x85, 0xC0,                    //  9 test eax, eax
-    0x74, 0x16,                    // 11 jz done
-    0xB8, 0, 0, 0, 0,              // 13 loop: mov eax, VideoStep
-    0xFF, 0xD0,                    // 18 call eax
-    0x83, 0xF8, 0xFF,              // 20 cmp eax, -1
-    0x74, 0x0A,                    // 23 je done
-    0x50,                          // 25 push eax
-    0xB8, 0, 0, 0, 0,              // 26 mov eax, Sleep
-    0xFF, 0xD0,                    // 31 call eax
-    0xEB, 0xEA,                    // 33 jmp loop
-    0x31, 0xC0,                    // 35 done: xor eax, eax
-    0xC2, 0x04, 0x00,              // 37 ret 4
-};
-constexpr int kOpen = 3, kStep = 14, kSleep = 27;
-static_assert(sizeof kLoop <= kLoopRoom, "the play loop must fit over the stubs");
+constexpr uint32_t kLoopAt = 0x006c7cc0;
 
 constexpr uint32_t WM_KEYDOWN = 0x0100, WM_KEYUP = 0x0101, WM_CHAR = 0x0102, WM_SYSKEYDOWN = 0x0104,
                    WM_LBUTTONDOWN = 0x0201, WM_LBUTTONUP = 0x0202, WM_RBUTTONDOWN = 0x0204, WM_RBUTTONUP = 0x0205,
@@ -370,8 +348,12 @@ int Session::step()
 std::unique_ptr<Session> g_session;
 
 // VideoOpen(name, mode): 1 if the video plays (VideoStep follows), 0 to skip it.
+bool g_play = true;   // install_cinematics's: false, the stubs' answers (no video)
+
 uint32_t video_open(Cpu &c)
 {
+    if (!g_play)
+        return 0;   // as nothing to play: the loop returns 0, the stub's "ret 4"
     const std::string name = rt::read_cstr(c, c.arg(0), 260);
     rt::logf("cinematic: %s (mode %u)", name.c_str(), c.arg(1));
     std::string host;
@@ -427,34 +409,23 @@ bool cinematic_playing()
     return __atomic_load_n(&g_playing, __ATOMIC_RELAXED);
 }
 
-int install_cinematics(Cpu &c)
+int install_cinematics(Cpu &c, bool play)
 {
-    uint8_t expect[kLoopRoom], have[kLoopRoom];
-    std::memset(expect, 0xCC, sizeof expect);
-    bool same = c.read(kLoopAt, have, sizeof have);
-    for (uint32_t i = 0; i < 3; i++) {
-        std::memcpy(expect + 16 * i, kStubBytes[i], 3);
-        same = same && c.read_u32(kVideoSlots + 4 * i) == kLoopAt + 16 * i;
-    }
-    if (!same || std::memcmp(have, expect, sizeof have) != 0) {
-        rt::logf("cinematics: the GDI renderer's video entries differ, not installed");
-        return 0;
-    }
-    const uint32_t begin = rt::native_entry("VideoBegin", 0, [](Cpu &) { return 1u; });
+    g_play = play;
+    for (uint32_t i = 0; i < 3; i++)
+        if (c.read_u32(kVideoSlots + 4 * i) != kLoopAt + 16 * i) {
+            rt::logf("cinematics: the GDI renderer's video entries differ, not installed");
+            return 0;
+        }
+    const uint32_t begin = rt::native_entry("VideoBegin", 0, [](Cpu &) { return g_play ? 1u : 0u; });
     const uint32_t playing = rt::native_entry("VideoPlaying", 0, [](Cpu &) { return g_playing ? 1u : 0u; });
     const uint32_t open = rt::native_entry("VideoOpen", 2, video_open);
     const uint32_t step = rt::native_entry("VideoStep", 0, video_step);
-    const uint32_t sleep = rt::bridge().shim_trap("KERNEL32.dll", "Sleep");
-    if (!begin || !playing || !open || !step || !sleep)
+    // The play loop over the three stubs: native_sites_table.h's cinematics
+    // row, which the AOT recompiler reads too (issue #138).
+    if (!begin || !playing || !open || !step ||
+        !apply_sites(c, "cinematics", {{"VideoOpen", open}, {"VideoStep", step}}))
         return 0;
-    uint8_t loop[kLoopRoom];
-    std::memset(loop, 0xCC, sizeof loop);
-    std::memcpy(loop, kLoop, sizeof kLoop);
-    std::memcpy(loop + kOpen, &open, 4);
-    std::memcpy(loop + kStep, &step, 4);
-    std::memcpy(loop + kSleep, &sleep, 4);
-    c.write(kLoopAt, loop, sizeof loop);
-    c.invalidate_code(kLoopAt, sizeof loop);
     c.write_u32(kVideoSlots, begin);
     c.write_u32(kVideoSlots + 4, kLoopAt);
     c.write_u32(kVideoSlots + 8, playing);

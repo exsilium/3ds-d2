@@ -13,8 +13,12 @@ tools/profile_windows.py the same way tools/profile_report.py picks them
 A window is the heartbeat's four lines: `prof:` (frames, idle, thread
 switches, cache syncs), `prof intrin:` (DCC cells decoded so far), `prof
 files:` (reads, disk time) and `t=` (memory). The state comes from the last
-`game state:` line before it. Windows with no frames and no switches are
-suspends (HOME menu, lid) and are left out of the play figures. The cells
+`game state:` line before it. Windows with no frames and no switches, and
+windows a suspend (HOME menu, lid) fell in, are left out of the play
+figures: a `home:` line, logged on the return just before the `prof:` line
+of the window it fell in, gives the suspend's length, and that window's time
+includes it (a 757 s HOME trip made a 0.2 fps window in 3DS-D2-Z). A
+window's fps is over its time less its suspends. The cells
 decoded in a window are a count of sprite loads: sprites new to the game,
 and sprites the cache evicted and the game drew again (issue #31).
 
@@ -40,6 +44,11 @@ ms, and the windows with the longest frames are listed with what else
 happened in them. The first sessions' logs (3DS-D2-E) had the frame
 thread's read wait in place of wait, ready, host and heartbeat, and a ready
 time that included much of its own running.
+
+The sites the frame thread waited longest from are guest return addresses.
+They are named by the function they are in, where d2decomped's function list
+(the third_party/d2d submodule) knows it and a native or d2d names it (issue
+#107, tools/game_names.py): `0x5ff5f3` (in SpriteCacheTouch +0x43).
 """
 import argparse
 import collections
@@ -50,6 +59,7 @@ import statistics
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import game_names  # noqa: E402
 import profile_windows  # noqa: E402
 
 PROF = re.compile(r"prof: (\d+) ms, frames (\d+), idle (\d+) ms, switches (\d+), cache syncs (\d+) \((\d+) us\)")
@@ -72,7 +82,7 @@ HITCH = re.compile(r"prof hitch: frames \d+, <=50ms \d+, <=100ms \d+, <=250ms (\
                    r"sprites in \d+ out \d+, (?:read wait (\d+) ms|wait (\d+) ms, ready (\d+) ms, host (\d+) ms, "
                    r"heartbeat (\d+) ms), skipped (\d+), famine (\d+)")
 
-FIELDS = ["t", "state", "ms", "frames", "fps", "idle_ms", "switches", "cache_syncs", "cache_sync_us", "cells",
+FIELDS = ["t", "state", "ms", "suspends", "suspend_ms", "frames", "fps", "idle_ms", "switches", "cache_syncs", "cache_sync_us", "cells",
           "reads", "opened", "load", "disk_reads", "disk_kib", "disk_ms", "heap_kib", "heap_peak_kib", "va_kib", "va_peak_kib",
           "free_kib", "jit_kib", "jit_used_kib", "meta_kib", "host_kib", "sprite_kib", "sprite_limit_kib", "sprites", "sprites_in",
           "sprites_out", "wait_ms", "wait_frame_ms", "stall_ms", "decodes", "decode_ms", "hitches", "hitches_250",
@@ -83,7 +93,13 @@ FIELDS = ["t", "state", "ms", "frames", "fps", "idle_ms", "switches", "cache_syn
 
 def parse(path):
     rows, cur, state, cells_before, opened_before = [], None, "start", None, None
+    suspends, suspend_ms = 0, 0   # the home: lines since the last prof: line
     for line in open(path, encoding="utf-8", errors="replace"):
+        m = profile_windows.HOME.search(line)
+        if m:
+            suspends += 1
+            suspend_ms += round(float(m.group(1)) * 1000)
+            continue
         m = STATE.search(line)
         if m:
             state = m.group(1)
@@ -91,8 +107,11 @@ def parse(path):
         m = PROF.search(line)
         if m:
             ms, frames, idle, switches, syncs, sync_us = map(int, m.groups())
-            cur = dict(state=state, ms=ms, frames=frames, fps=frames * 1000 / ms, idle_ms=idle, switches=switches,
+            live_ms = max(ms - suspend_ms, 1)
+            cur = dict(state=state, ms=ms, suspends=suspends, suspend_ms=suspend_ms, frames=frames,
+                       fps=frames * 1000 / live_ms, idle_ms=idle, switches=switches,
                        cache_syncs=syncs, cache_sync_us=sync_us, cells=0)
+            suspends, suspend_ms = 0, 0
             continue
         if cur is None:
             continue
@@ -170,6 +189,23 @@ def parse(path):
     return rows
 
 
+NAMES = None   # game_names.Names, loaded by main()
+
+
+def sites(text):
+    """The wait sites ("0052f7a2:350 ...") with the functions they are in."""
+    if NAMES is None:
+        return text
+    out = []
+    for pair in text.split():
+        addr, _, ms = pair.partition(":")
+        try:
+            out.append(f"{NAMES.label(int(addr, 16), code=False)}:{ms}")
+        except ValueError:
+            out.append(pair)
+    return " ".join(out)
+
+
 def pct(values, p):
     s = sorted(values)
     return s[min(len(s) - 1, int(len(s) * p))] if s else 0.0
@@ -188,11 +224,14 @@ def report(rows):
     if not rows:
         print("no heartbeat windows found")
         return
-    suspended = [r for r in rows if r["frames"] == 0 and r["switches"] == 0]
+    suspended = [r for r in rows if (r["frames"] == 0 and r["switches"] == 0) or r["suspends"]]
     live = [r for r in rows if r not in suspended]
     play = [r for r in live if r["state"].startswith("in game")]
     last = rows[-1]
-    print(f"session: {last['t']} s, {len(rows)} windows ({len(suspended)} suspended), "
+    trips = sum(r["suspends"] for r in rows)
+    print(f"session: {last['t']} s, {len(rows)} windows ({len(suspended)} suspended"
+          + (f"; {trips} HOME/lid suspends, {sum(r['suspend_ms'] for r in rows) / 1000:.0f} s" if trips else "")
+          + "), "
           f"{sum(r['frames'] for r in rows)} frames, {sum(r['cells'] for r in rows)} DCC cells decoded")
 
     print("\nby game state (suspends left out):")
@@ -254,7 +293,7 @@ def report(rows):
                       (f"   | {r['ft_run']:18d} {r['ft_ready']:5d} {r['ft_host']:5d} {r['ft_sleep']:5d} "
                        f"{r['ft_critsec']:7d} {r['ft_event']:5d} {r['ft_fileio']:6d} "
                        f"{r['ft_multi'] + r['ft_thread'] + r['ft_other']:5d}"
-                       if sampled else "") + (f"  {r['ft_sites']}" if r["ft_sites"] else ""))
+                       if sampled else "") + (f"  {sites(r['ft_sites'])}" if r["ft_sites"] else ""))
             n = sum(r["ms"] for r in timed) or 1
             print(f"  all play: waited {sum(r['wait_ms'] for r in timed) / n:.1%} of the time "
                   f"(frame thread {sum(r['wait_frame_ms'] for r in timed) / n:.1%}), stalled "
@@ -313,6 +352,8 @@ def main():
     ap.add_argument("--windows", choices=profile_windows.KINDS,
                     help="only these windows (tools/profile_windows.py): fights, quiet play, play, area loads")
     args = ap.parse_args()
+    global NAMES
+    NAMES = game_names.Names()
     rows = parse(args.log)
     if args.windows:
         rows, how = profile_windows.select(rows, args.windows)

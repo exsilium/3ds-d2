@@ -8,7 +8,9 @@ A window is one 10 s heartbeat. Both tools give a window these fields:
 files:`), `timer_reads` (the in-line clock reads from 0x470c30's return
 address 0x470c6c, `prof clock:`; None when the log has no clock line) and
 `state` (the last `game state:` line before it) and `opened` (the files
-opened in it, from the `t=` line's `files=`).
+opened in it, from the `t=` line's `files=`), and `suspends` (the HOME
+menu or lid trips logged by the `home:` lines just before its `prof:`
+line: the window's `ms` includes them).
 
 - fights: the slowest 15% of the steady windows, by frames in the window.
 - quiet: the fastest 25% of them.
@@ -19,12 +21,14 @@ opened in it, from the `t=` line's `files=`).
 
 A steady window draws more than 50 frames, decodes fewer than 10 sprites
 (no re-loading), makes fewer than 50 cache syncs (no translation burst),
-and has the unit timers running: 0x470c30 reads the clock 50 times a frame
+has no suspend in it, and has the unit timers running: 0x470c30 reads the clock 50 times a frame
 or more, which it does only in game. These are the windows #37, #38, #39,
 #40 and #48 were judged on (3DS-D2-10, 97 fights and 162 quiet ones of 651
 steady windows); fights in a slower act are the same rule, not a different
 cut.
 """
+import re
+
 STEADY_FRAMES = 50       # more than this many frames in the window
 STEADY_DECODES = 10      # fewer sprites decoded than this
 STEADY_SYNCS = 50        # fewer cache syncs than this
@@ -37,9 +41,14 @@ LOAD_OPENS = 10          # or this many files opened
 
 KINDS = ("fights", "quiet", "play", "loads")
 
+# A suspend (HOME menu, lid), logged on the return, before the prof: line of
+# the window it fell in: "home: seen +0 ms, ..., restore after 756.7 s, ...".
+HOME = re.compile(r"^home: .*restore after ([\d.]+) s")
+
 
 def steady(w):
-    return (w["frames"] > STEADY_FRAMES and w["decodes"] < STEADY_DECODES and w["syncs"] < STEADY_SYNCS
+    return (not w.get("suspends") and w["frames"] > STEADY_FRAMES and w["decodes"] < STEADY_DECODES
+            and w["syncs"] < STEADY_SYNCS
             and w["timer_reads"] is not None and w["timer_reads"] >= TIMER_READS * w["frames"])
 
 

@@ -981,6 +981,11 @@ bool build_envelope(const Host &host, const Offer &o, const game::report::Dsn &d
     if (!o.log.trace_writes().empty())
         e.tags.push_back({"trace_writes", o.log.trace_writes()});   // how complete the traces are (issue #66)
     e.device = {{"model", model_name(model)}, {"family", "Nintendo 3DS"}, {"arch", "armv6k"}};
+#ifdef D2RT_CPU_AOT
+    e.os_name = "aot";   // the build's CPU backend: the AOT code alone
+#else
+    e.os_name = "x86";   // Box86
+#endif
     e.screenshots = o.shots;
 
     Gzip gz;

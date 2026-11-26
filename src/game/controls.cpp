@@ -327,9 +327,20 @@ void Controls::update(const Pad &pad, uint64_t now_ms)
 
     // ---- the mouse buttons, from all their sources ----
     const bool item_left = item_move_step(now_ms);
-    rt::input_button(false, a_left || walk_left_ || tap_left || pad.point_left || item_left);
-    rt::input_button(true, b_right || pad.point_right);
+    button(false, a_left || walk_left_ || tap_left || pad.point_left || item_left);
+    button(true, b_right || pad.point_right);
     prev_ = held;
+}
+
+void Controls::button(bool right, bool want)
+{
+    const int k = right ? 1 : 0;
+    if (!want && button_on_[k] && pumps_ && down_pump_[k] == pump_)
+        want = true;   // down and up in one pump: up at the next one (begin_pump)
+    if (want && !button_on_[k])
+        down_pump_[k] = pump_;
+    button_on_[k] = want;
+    rt::input_button(right, want);
 }
 
 }  // namespace game

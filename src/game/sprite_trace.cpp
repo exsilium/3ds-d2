@@ -37,7 +37,9 @@
 // The natives run on the guest's thread (the scheduler is cooperative), as
 // does the heartbeat, so the file needs no lock of its own.
 #include "game/sprite_trace.h"
+#include "game/aot_spike.h"
 #include "game/d2_memory.h"
+#include "game/native_sites.h"
 
 #include "runtime/cpu.h"
 #include "runtime/rt_host.h"
@@ -50,13 +52,11 @@
 namespace game {
 namespace {
 
-constexpr uint32_t kUseAt = 0x00600350, kUseNext = 0x00600355;
+constexpr uint32_t kUseAt = 0x00600350;
 constexpr uint8_t kUseOrig[] = {0x8b, 0x58, 0x20, 0x85, 0xdb};
-constexpr uint32_t kRemoveAt = 0x005ff53c, kRemoveNext = 0x005ff542;
+constexpr uint32_t kRemoveAt = 0x005ff53c;
 constexpr uint8_t kRemoveOrig[] = {0x8b, 0x4f, 0x04, 0x29, 0x4e, 0x08};
 constexpr uint32_t kFlag = 0x006cb6e0;
-constexpr uint32_t kUseStub = 0x006cb6f0, kUseStubSize = 45;
-constexpr uint32_t kRemoveStub = 0x006cb720, kRemoveStubSize = 31;
 constexpr uint32_t kSlackEnd = 0x006cb740;
 
 constexpr uint32_t kTouched = 1u << 31;   // a use's bytes: the game moved it up its list
@@ -89,12 +89,6 @@ bool g_started = false;   // the file has its header: later starts append
 uint32_t g_lost = 0;
 SpriteTraceWrap g_wrap = nullptr;   // sprite_trace_set_wrap
 bool g_each = false;      // sprite_trace_each: every record written out at once
-
-void put_rel32(uint8_t *at, uint32_t insn_end, uint32_t target)
-{
-    const uint32_t rel = target - insn_end;
-    std::memcpy(at, &rel, 4);
-}
 
 // The game's own clock (GetTickCount's, rt::tick_ms): taken for every use,
 // and a host clock read costs ~1 us on the console (issue #72).
@@ -218,54 +212,10 @@ bool install_sprite_trace(d2rt::Cpu &c)
         return true;
     });
 
-    // S+0  cmp byte [flag], 0; je S+35
-    // S+9  push eax; push ecx; push edx
-    // S+12 mov ecx, eax; cmp dword [ebp+0xc], 0; sete dl; movzx edx, dl; or ecx, edx
-    // S+26 push ecx; S+27 call use (pops it)
-    // S+32 pop edx; pop ecx; pop eax
-    // S+35 mov ebx, [eax+0x20]; test ebx, ebx; jmp 0x600355 (its je)
-    static const uint8_t kArg[] = {0x89, 0xc1, 0x83, 0x7d, 0x0c, 0x00, 0x0f, 0x94,
-                                   0xc2, 0x0f, 0xb6, 0xd2, 0x09, 0xd1, 0x51};
-    uint8_t u[kUseStubSize] = {0x80, 0x3d};
-    std::memcpy(u + 2, &kFlag, 4);
-    u[6] = 0x00, u[7] = 0x74, u[8] = 35 - 9;
-    u[9] = 0x50, u[10] = 0x51, u[11] = 0x52;
-    std::memcpy(u + 12, kArg, sizeof kArg);
-    u[27] = 0xe8;
-    put_rel32(u + 28, kUseStub + 32, use_native);
-    u[32] = 0x5a, u[33] = 0x59, u[34] = 0x58;
-    std::memcpy(u + 35, kUseOrig, sizeof kUseOrig);
-    u[40] = 0xe9;
-    put_rel32(u + 41, kUseStub + 45, kUseNext);
-    static_assert(kUseStub + kUseStubSize <= kRemoveStub, "the use stub runs into the remove stub");
-
-    // S+0  cmp byte [flag], 0; je S+20
-    // S+9  push eax; push ecx; push edx; call remove; pop edx; pop ecx; pop eax
-    // S+20 mov ecx, [edi+4]; sub [esi+8], ecx; jmp 0x5ff542
-    uint8_t r[kRemoveStubSize] = {0x80, 0x3d};
-    std::memcpy(r + 2, &kFlag, 4);
-    r[6] = 0x00, r[7] = 0x74, r[8] = 20 - 9;
-    r[9] = 0x50, r[10] = 0x51, r[11] = 0x52;
-    r[12] = 0xe8;
-    put_rel32(r + 13, kRemoveStub + 17, remove_native);
-    r[17] = 0x5a, r[18] = 0x59, r[19] = 0x58;
-    std::memcpy(r + 20, kRemoveOrig, sizeof kRemoveOrig);
-    r[26] = 0xe9;
-    put_rel32(r + 27, kRemoveStub + 31, kRemoveNext);
-
-    uint8_t use_jump[sizeof kUseOrig] = {0xe9};
-    put_rel32(use_jump + 1, kUseAt + 5, kUseStub);
-    uint8_t remove_jump[sizeof kRemoveOrig] = {0xe9, 0, 0, 0, 0, 0x90};
-    put_rel32(remove_jump + 1, kRemoveAt + 5, kRemoveStub);
-
-    c.write(kUseStub, u, sizeof u);
-    c.write(kRemoveStub, r, sizeof r);
-    c.write(kUseAt, use_jump, sizeof use_jump);
-    c.write(kRemoveAt, remove_jump, sizeof remove_jump);
-    c.invalidate_code(kUseStub, sizeof u);
-    c.invalidate_code(kRemoveStub, sizeof r);
-    c.invalidate_code(kUseAt, sizeof use_jump);
-    c.invalidate_code(kRemoveAt, sizeof remove_jump);
+    // The stubs and the jumps to them: native_sites_table.h's sprite_trace
+    // rows, which the AOT build's code is compiled with, so it traces too.
+    if (!apply_sites(c, "sprite_trace", {{"SpriteTraceUse", use_native}, {"SpriteTraceRemove", remove_native}}))
+        return false;
     rt::logf("sprite trace: stubs at %08x and %08x (in line%s), off", kUseAt, kRemoveAt,
              fast ? ", the use without the GIL" : "");
     return true;

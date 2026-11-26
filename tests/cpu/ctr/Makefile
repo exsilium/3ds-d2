@@ -18,6 +18,34 @@ DYN86  := $(W)/src/dynarec86
 RT     := $(W)/src/runtime
 X86    := $(ROOT)/build/x86
 OUT    := $(ROOT)/build/cpu/ctr
+# CPU: the game app's CPU backend, chosen when it is built (issue #138,
+# docs/aot.md). box86: the dynarec, as ever. aot: CpuAot (src/runtime/
+# rt_cpu_aot.h), the AOT code alone, needing AOT=<dir>: the dynarec's objects
+# and its code pool aren't in the app, whose memory is then the game's. Its
+# objects are in a folder of their own.
+CPU ?= box86
+AOT_OPT ?= -O2 -g
+ifeq ($(CPU),aot)
+OUT    := $(ROOT)/build/cpu/ctr-aot
+CPUDEF := -DD2RT_CPU_AOT
+# The functions off the recompiler's hot list (AOT_FNC, src/game/aot_rt.h) for
+# size: 81% of the code's bytes ran in none of the profiles (issue #153).
+AOTDEF := -DAOT_COLD_SIZE
+# AOT_SAMPLE=1: a profile of where compiled code is (src/game/aot_rt.h's
+# AOT_SAMPLE_ON), in a build directory of its own.
+ifneq ($(AOT_SAMPLE),)
+OUT    := $(ROOT)/build/cpu/ctr-aot-sample
+CPUDEF += -DAOT_SAMPLE_ON
+AOTDEF += -DAOT_SAMPLE_ON
+endif
+# AOT_OPT: the generated C's optimisation (its 24 MiB of code are the heap's
+# loss: docs/aot.md), with AOT_TAG naming a build directory of its own.
+ifneq ($(AOT_TAG),)
+OUT    := $(OUT)-$(AOT_TAG)
+endif
+else
+CPUDEF := -DD2RT_CPU_BOX86
+endif
 CTRULIB := $(DEVKITPRO)/libctru
 
 PREFIX := $(DEVKITARM)/bin/arm-none-eabi-
@@ -31,7 +59,7 @@ INC    := -I$(CTR) -I$(SHIM) -I$(DYN86) -I$(B86)/include -I$(B86) -I$(B86)/dynar
 # GCC 16 rejects Box86's uint32_t*/uintptr_t* mixing; both are 32-bit on ARM.
 CFLAGS := -O2 -g $(ARCH) -std=gnu17 $(DEFS) $(INC) -ffile-prefix-map=$(abspath $(ROOT))=. \
           -Wno-error=incompatible-pointer-types -w
-CXXFLAGS := -O2 -g $(ARCH) -std=gnu++17 -D__3DS__ -DD2RT_CPU_BOX86 -I$(CTR) -I$(W)/src -I$(DYN86) \
+CXXFLAGS := -O2 -g $(ARCH) -std=gnu++17 -D__3DS__ $(CPUDEF) -I$(CTR) -I$(W)/src -I$(DYN86) \
           -I$(SHIM) -I$(B86)/include -I$(B86) -I$(CTRULIB)/include -ffile-prefix-map=$(abspath $(ROOT))=. -w
 # Header dependencies (-MMD): without them a changed header (guest_region.h
 # gained members) left older objects compiled against the old class layout,
@@ -75,10 +103,41 @@ M3OBJ := $(CPUOBJ) $(addprefix $(OUT)/rt/,$(RTFULL:.cpp=.o)) $(addprefix $(OUT)/
 GAMELDFLAGS := -Wl,--wrap=_sbrk_r -Wl,--wrap=abort
 GAMESRC := $(notdir $(wildcard $(ROOT)/src/game/*.cpp))
 BINKSRC := $(notdir $(wildcard $(ROOT)/src/game/bink/*.cpp))
-GAMEOBJ := $(CPUOBJ) $(addprefix $(OUT)/rt/,$(RTFULL:.cpp=.o)) $(addprefix $(OUT)/m3/,$(M3SRC:.cpp=.o)) \
+# With CPU=aot, of the backend's own objects only its memory services (the
+# guest's arena is mmap'd through them) and the 80-bit conversions aot_rt.h
+# uses; and no cpu_box86.cpp.
+ifeq ($(CPU),aot)
+GAMECPUOBJ := $(OUT)/shim/mman_ctr.o $(OUT)/core/x87emu_private.o
+GAMERT := $(filter-out cpu_box86.cpp,$(RTFULL))
+else
+GAMECPUOBJ := $(CPUOBJ)
+GAMERT := $(RTFULL)
+endif
+GAMEOBJ := $(GAMECPUOBJ) $(addprefix $(OUT)/rt/,$(GAMERT:.cpp=.o)) $(addprefix $(OUT)/m3/,$(M3SRC:.cpp=.o)) \
            $(addprefix $(OUT)/game/,$(GAMESRC:.cpp=.o)) $(addprefix $(OUT)/game/bink/,$(BINKSRC:.cpp=.o)) $(OUT)/game/ctr_game.o $(OUT)/game/ctr_audio.o $(OUT)/game/ctr_screenshot.o $(OUT)/game/ctr_writer.o $(OUT)/game/ctr_report.o $(OUT)/game/ctr_tls.o $(OUT)/runner/ctr_stubs.o
 
-.PHONY: all clean FORCE
+# AOT=<dir> (scripts/docker.sh package-cia with D2_AOT_BUILD=1): the AOT
+# spike's C, generated there from the user's Game.exe (issue #113,
+# tools/aot/), in the game app twice (src/game/aot_rt.h: inlined and not).
+# aot.cfg relinks the app when it comes or goes.
+AOT ?=
+ifneq ($(AOT),)
+AOTSRC := $(sort $(wildcard $(AOT)/aot_spike*.c))   # the tables and the functions' parts (issue #135)
+# (CPU=aot: once. The build with no function inlined into another is the spike's SigCalls modes'.)
+AOTOBJ := $(foreach v,$(if $(filter aot,$(CPU)),d,d n),$(patsubst $(AOT)/%.c,$(OUT)/aot/$(v)/%.o,$(AOTSRC)))
+GAMEOBJ += $(AOTOBJ)
+endif
+$(OUT)/aot/d/%.o: $(AOT)/%.c $(ROOT)/src/game/aot_rt.h
+	@mkdir -p $(@D); $(CC) $(AOT_OPT) $(ARCH) -std=gnu17 -I$(ROOT)/src -w $(AOTDEF) -c $< -o $@
+$(OUT)/aot/n/%.o: $(AOT)/%.c $(ROOT)/src/game/aot_rt.h
+	@mkdir -p $(@D); $(CC) -O2 -g $(ARCH) -std=gnu17 -I$(ROOT)/src -w -DAOT_NOINLINE -c $< -o $@
+$(OUT)/aot.cfg: FORCE
+	@mkdir -p $(@D); echo '$(AOT)' | cmp -s - $@ || echo '$(AOT)' > $@
+# The AOT objects alone (scripts/docker.sh builds them first at AOT_JOBS:
+# each part takes gcc about 1 GB, too many for the app's -j8).
+aot-objs: $(AOTOBJ)
+
+.PHONY: all clean FORCE aot-objs
 
 # The compile flags: when they change (PROF_COUNTERS joining every build),
 # every object is built again instead of old and new ones linked together.
@@ -192,11 +251,11 @@ $(OUT)/romfs-3dsx/tls.bin: $(OUT)/tls.bin
 	@mkdir -p $(@D); cp $< $@
 $(OUT)/game/ctr_game_cia.o: $(ROOT)/src/app/ctr_game.cpp $(wildcard $(ROOT)/src/game/*.h) $(wildcard $(ROOT)/src/runtime/rt_*.h)
 	@mkdir -p $(@D); $(CXX) $(CXXFLAGS) -O2 -DD2_CIA -I$(ROOT)/src -c $< -o $@
-$(OUT)/3ds-d2-game-cia.elf: $(filter-out $(OUT)/game/ctr_game.o,$(GAMEOBJ)) $(OUT)/game/ctr_game_cia.o
-	$(CXX) $(LDFLAGS) $(GAMELDFLAGS) $^ -L$(PORTLIBS)/lib -ljpeg -lz -lctru -lm -o $@
+$(OUT)/3ds-d2-game-cia.elf: $(filter-out $(OUT)/game/ctr_game.o,$(GAMEOBJ)) $(OUT)/game/ctr_game_cia.o $(OUT)/aot.cfg
+	$(CXX) $(LDFLAGS) $(GAMELDFLAGS) $(filter %.o,$^) -L$(PORTLIBS)/lib -ljpeg -lz -lctru -lm -o $@
 
-$(OUT)/3ds-d2-game.elf: $(GAMEOBJ)
-	$(CXX) $(LDFLAGS) $(GAMELDFLAGS) $^ -L$(PORTLIBS)/lib -ljpeg -lz -lctru -lm -o $@
+$(OUT)/3ds-d2-game.elf: $(GAMEOBJ) $(OUT)/aot.cfg
+	$(CXX) $(LDFLAGS) $(GAMELDFLAGS) $(filter %.o,$^) -L$(PORTLIBS)/lib -ljpeg -lz -lctru -lm -o $@
 $(OUT)/3ds-d2-game.smdh:
 	@mkdir -p $(@D); smdhtool --create "3ds-d2" "Diablo II LoD 1.14d on the n3DS" "3ds-d2" $(CTRULIB)/default_icon.png $@
 $(OUT)/3ds-d2-game.3dsx: $(OUT)/3ds-d2-game.elf $(OUT)/3ds-d2-game.smdh $(OUT)/romfs-3dsx/tls.bin

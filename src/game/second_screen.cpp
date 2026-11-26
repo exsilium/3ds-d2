@@ -417,7 +417,9 @@ void SecondScreen::update(Pad &pad, const GameState &gs, int cursor_x, int curso
             } else if (kind == BottomView::kInfo && pad.touch_y >= kMapBtnY && !checklist_ && !options_) {
                 // INFO's own buttons: the profiler run, the OPTIONS page, the report.
                 grip_ = Grip::MapButton;
-                key_ = pad.touch_x < kInfoBtnX1 ? 4 : pad.touch_x < kInfoBtnX2 ? 7 : 3;
+                // OPTIONS is 99: 5 and up are the checklist's rows, and its third
+                // (5 + 2) used to open OPTIONS instead of ticking the file-read trace.
+                key_ = pad.touch_x < kInfoBtnX1 ? 4 : pad.touch_x < kInfoBtnX2 ? kKeyOptions : 3;
             } else if (kind == BottomView::kInfo && pad.touch_y >= kMapBtnY && pad.touch_x >= kReportBtnX) {
                 grip_ = Grip::MapButton;
                 key_ = 3;   // the checklist's and the OPTIONS page's way back
@@ -484,11 +486,11 @@ void SecondScreen::update(Pad &pad, const GameState &gs, int cursor_x, int curso
             if (key_ == 3 && (checklist_ || options_)) {
                 checklist_ = options_ = false;
                 dirty_ = true;
-            } else if (key_ == 7) {
+            } else if (key_ == kKeyOptions) {
                 options_ = true;
                 dirty_ = true;
             } else if (key_ >= 100) {
-                set_port_options(port_ ^ kPortOptions[key_ - 100].bit);   // a run on or not, at once
+                set_port_options(port_option_tap(port_, kPortOptions[key_ - 100]));   // at once
             } else if (key_ == 4 && options_) {
                 // the OPTIONS page has no left-hand button
             } else if (key_ == 3) {
@@ -929,9 +931,10 @@ void draw_bottom(uint16_t *fb, const BottomView &v, const uint8_t *frame, int fw
                 const int y = SecondScreen::kOptRowY + i * SecondScreen::kOptRowH + 3;
                 const uint16_t ink = rgb(230, 220, 200);
                 cv.fill(8, y, 14, 14, ink);
-                cv.fill(10, y + 2, 10, 10, (v.port & o.bit) ? kGold : kBg);
+                const bool alt = (v.port & o.alt) != 0;   // the row's second state: a box of another colour
+                cv.fill(10, y + 2, 10, 10, (v.port & o.bit) ? kGold : alt ? rgb(120, 170, 230) : kBg);
                 cv.text(32, y + 3, o.label, ink);
-                cv.text(32, y + 15, o.note, kHint);
+                cv.text(32, y + 15, alt ? o.alt_note : o.note, kHint);
             }
         } else {
             for (size_t i = 0; i < v.lines.size() && (int)i < (kAreaH - SecondScreen::kMapBtnH) / 8; i++)

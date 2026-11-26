@@ -32,6 +32,8 @@ void storm_direct_counts(uint32_t &direct, uint32_t &queued);
 // loads of a new area's sprites arrive late, the game then waiting for them
 // (0x40a9bc). Before the game starts (install_native). False, changing
 // nothing, on a different Game.exe.
+// 0: kStormReadRate.
+constexpr uint32_t kStormReadRate = 256u << 10;
 bool set_storm_read_rate(d2rt::Cpu &c, uint32_t bytes_per_s);
 
 }  // namespace game

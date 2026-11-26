@@ -264,6 +264,7 @@ struct FileStats {
     uint64_t disk_reads = 0, disk_bytes = 0, disk_us = 0;   // file system reads by the cache
     uint64_t cache_bytes = 0; // block memory held now (freed with its handle)
     uint64_t async = 0;       // reads handed to the I/O worker, the guest thread waiting
+    uint64_t plain = 0, plain_us = 0;   // ReadFile calls on stdio files (created, or written), and their time
     // Time the game waited on the file system (issue #31): a guest thread
     // waiting on the I/O worker as a guest wait, the other threads running
     // (from the read's submission to the waiter waking; wait_frame_us those
@@ -290,6 +291,29 @@ const FileStats &file_stats();
 // game runs), written as a ring, a range at most a quarter of it. False if
 // it read nothing: already stored, no arena, or the read failed.
 void set_prefetch_arena(void *arena, uint32_t size);
+// The read cache's size, set before a file is opened: 16 KiB blocks a file
+// (8; 32 at most), and a slab for blocks beside the heap's 1 MiB of them
+// (null: none), used first. The slab is the caller's and stays.
+void set_read_cache(uint32_t blocks, void *slab, uint32_t slab_size);
+// The card's read time, modelled (issue #166), for a run in an emulator:
+// each read of a game file from the file system,
+// the read cache's and the prefetch worker's, takes at least fixed_us and
+// kib_us a KiB, within spread_pct per cent either way, evenly. The time is
+// in the counters above as the card's. fixed_us 0: off (the default).
+void set_sd_model(uint32_t fixed_us, uint32_t kib_us, uint32_t spread_pct);
+// The sprites' store (issue #153). set_sprite_keep: its memory, before the
+// game runs (null: none). keep_region: bytes read from the card inside
+// [pos, pos+len) of the file `id` (prefetch_file's) are kept from now on,
+// and a later read of the same bytes is served from the store, before the
+// read cache and the card; the last 128 regions named count. A ring: a new
+// range replaces the oldest ones where it lands; a range is a quarter of
+// the store at the most. keep_stats: the counts since the last call.
+struct KeepStats {
+    uint32_t hits = 0, hit_bytes = 0, puts = 0, put_bytes = 0, held = 0, size = 0;
+};
+void set_sprite_keep(void *arena, uint32_t size);
+void keep_region(int id, uint64_t pos, uint32_t len);
+KeepStats keep_stats();
 int prefetch_file(const char *name);
 bool io_background(std::function<void()> task);
 bool prefetch_raw(int id, uint64_t pos, void *dst, uint32_t n);
@@ -368,6 +392,9 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt);
 const RunOptions &options();
 const Layout &layout();
 d2rt::Bridge &bridge();
+// Tests only (tests/d2d, issue #109): the bridge a native's hand-back to the
+// game's code goes through, where no runtime was started.
+void set_bridge_for_tests(d2rt::Bridge *b);
 uint32_t exe_base();
 // TEB of the guest thread currently running (the main TEB before the scheduler starts).
 uint32_t current_teb();
@@ -375,6 +402,13 @@ void set_last_error(d2rt::Cpu &c, uint32_t err);
 // Calls guest code from inside a shim (window procedures, callbacks): builds the
 // frame below the caller's ESP, runs to the bridge sentinel, restores registers.
 uint32_t guest_call(d2rt::Cpu &c, uint32_t va, std::initializer_list<uint32_t> args);
+// cpuid leaf 1's edx, as the CPU backend reports it to the game.
+uint32_t cpuid1_edx();
+// AOT (issue #115): guest_call's callee as compiled code, in C, instead of a
+// nested run (8-10 us each on the lane): true when it ran, regs (eax..edi,
+// esp at the return address) in and out. Off: nullptr.
+using GuestDirectFn = bool (*)(d2rt::Cpu &c, uint32_t va, uint32_t *regs);
+void set_guest_direct(GuestDirectFn fn);
 // Ends the current stdcall shim (registered with `shim_argc` arguments) by
 // jumping to guest function `va` with `args`, as if the guest had called it
 // in the shim's place: its return value and stack cleanup become the shim's.
@@ -446,11 +480,26 @@ std::string module_name_of(uint32_t base);
 // guest code (guest_call) and never blocks.
 bool hook_function(d2rt::Cpu &c, uint32_t va, const uint8_t *expect, uint32_t n, uint32_t stack_args,
                    std::function<uint32_t(d2rt::Cpu &)> fn, const char *name, bool in_line = false);
+// On CpuAot (issue #138) hook_function writes nothing into the image: nothing
+// runs the x86, so the native is bound to the function's address here, and
+// the compiled code's dispatcher and callers go to its trap (game/
+// aot_spike.cpp). The image stays the Game.exe that was compiled.
+// entry_natives: each (function, trap); entry_native: a function's, else 0.
+const std::vector<std::pair<uint32_t, uint32_t>> &entry_natives();
+uint32_t entry_native(uint32_t va);
 // Native code the guest can call (or a guest function pointer can hold):
 // registers `fn` as a shim taking `stack_args` dwords, popped on return,
 // and returns its guest address (0 on failure). hook_function is this plus
 // a jmp over a guest function.
 uint32_t native_entry(const char *name, uint32_t stack_args, std::function<uint32_t(d2rt::Cpu &)> fn);
+// A shim blocked the running thread inside a nested run (the AOT code's call
+// to Box86, issue #115): the scheduler can't switch away there, so the wait
+// is done in place, the host polling its object (the I/O worker's read), and
+// EAX set as a wake sets it. A wait only another guest thread could end never
+// ends here: the recompiler compiles nothing that calls, under Box86, code that
+// can reach a shim. Returns the microseconds waited (at least 1), or 0 when
+// the thread wasn't blocked (an advisory yield).
+uint32_t finish_nested_block(d2rt::Cpu &c);
 // Called at each of the game's frames (its StretchBlt or BitBlt of an 8-bit
 // DIB), before the frame is presented: the DIB's guest address and size in
 // bytes. For the draw census (game/draw_census.h, issue #80); null: none.

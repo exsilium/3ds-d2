@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Mon, 16 Nov 2026 21:58:51 +0200
+Subject: [PATCH] bridge: slot_shim() and yield_requested(), for a host calling
+ a shim from its own code
+
+---
+ src/runtime/bridge.cpp |  1 +
+ src/runtime/bridge.h   | 12 ++++++++++++
+ 2 files changed, 13 insertions(+)
+
+diff --git a/src/runtime/bridge.cpp b/src/runtime/bridge.cpp
+index 4e3d872..dddbe97 100644
+--- a/src/runtime/bridge.cpp
++++ b/src/runtime/bridge.cpp
+@@ -82,6 +82,7 @@ struct BridgeTls { bool yield_pending; bool yielded; uint32_t redirect_eip; };
+ static __thread BridgeTls t_b = { false, false, 0 };
+ 
+ void Bridge::request_yield() { t_b.yield_pending = true; }
++bool Bridge::yield_requested() const { return t_b.yield_pending; }
+ bool Bridge::take_yield()    { bool y = t_b.yielded; t_b.yielded = false; return y; }
+ void Bridge::redirect_next(uint32_t va) { t_b.redirect_eip = va; }
+ uint32_t Bridge::take_redirect() { uint32_t v = t_b.redirect_eip; t_b.redirect_eip = 0; return v; }
+diff --git a/src/runtime/bridge.h b/src/runtime/bridge.h
+index bdc4853..e798500 100644
+--- a/src/runtime/bridge.h
++++ b/src/runtime/bridge.h
+@@ -182,6 +182,18 @@ public:
+     void redirect_next(uint32_t va);
+     uint32_t take_redirect();          // 0 = none (consumes)
+     uint32_t sentinel() const { return sentinel_; }
++    // The shim behind trap VA `va` (a slot of the trap window), or null.
++    // For a host that calls a shim from its own code (an ahead-of-time
++    // compiled caller): it sets the CPU's registers as at the trap, calls
++    // shim->fn, and does the trap's tail itself. Valid until the next slot
++    // is allocated.
++    const Shim* slot_shim(uint32_t va) const {
++        if (va < trap_base_) return nullptr;
++        const uint32_t idx = (va - trap_base_) / 16;
++        return idx < slots_.size() && slots_[idx].va == va ? &slots_[idx].shim : nullptr;
++    }
++    // A yield requested by a shim and not yet taken by a trap's tail.
++    bool yield_requested() const;
+ 
+ private:
+     struct Mod {

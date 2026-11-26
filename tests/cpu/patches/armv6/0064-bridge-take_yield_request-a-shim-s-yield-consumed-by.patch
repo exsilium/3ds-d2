@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Exile <exile@chamber.ee>
+Date: Tue, 17 Nov 2026 05:24:47 +0200
+Subject: [PATCH] bridge: take_yield_request(), a shim's yield consumed by a
+ host that called it itself
+
+---
+ src/runtime/bridge.cpp | 1 +
+ src/runtime/bridge.h   | 3 +++
+ 2 files changed, 4 insertions(+)
+
+diff --git a/src/runtime/bridge.cpp b/src/runtime/bridge.cpp
+index dddbe97..92cecda 100644
+--- a/src/runtime/bridge.cpp
++++ b/src/runtime/bridge.cpp
+@@ -83,6 +83,7 @@ static __thread BridgeTls t_b = { false, false, 0 };
+ 
+ void Bridge::request_yield() { t_b.yield_pending = true; }
+ bool Bridge::yield_requested() const { return t_b.yield_pending; }
++bool Bridge::take_yield_request() { bool y = t_b.yield_pending; t_b.yield_pending = false; return y; }
+ bool Bridge::take_yield()    { bool y = t_b.yielded; t_b.yielded = false; return y; }
+ void Bridge::redirect_next(uint32_t va) { t_b.redirect_eip = va; }
+ uint32_t Bridge::take_redirect() { uint32_t v = t_b.redirect_eip; t_b.redirect_eip = 0; return v; }
+diff --git a/src/runtime/bridge.h b/src/runtime/bridge.h
+index e798500..7099e38 100644
+--- a/src/runtime/bridge.h
++++ b/src/runtime/bridge.h
+@@ -194,6 +194,9 @@ public:
+     }
+     // A yield requested by a shim and not yet taken by a trap's tail.
+     bool yield_requested() const;
++    // ... and consumed: a host that called the shim itself (not through its
++    // trap) does the wait its own way; the next trap mustn't yield for it.
++    bool take_yield_request();
+ 
+ private:
+     struct Mod {

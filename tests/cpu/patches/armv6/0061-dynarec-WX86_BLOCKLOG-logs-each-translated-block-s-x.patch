@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Sat, 14 Nov 2026 21:42:54 +0200
+Subject: [PATCH] dynarec: WX86_BLOCKLOG logs each translated block's x86
+ address, size and ARM bytes
+
+---
+ third_party/box86-dynarec/dynarec/dynarec_arm.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/third_party/box86-dynarec/dynarec/dynarec_arm.c b/third_party/box86-dynarec/dynarec/dynarec_arm.c
+index c5e05f7..baa04e5 100755
+--- a/third_party/box86-dynarec/dynarec/dynarec_arm.c
++++ b/third_party/box86-dynarec/dynarec/dynarec_arm.c
+@@ -720,6 +720,17 @@ dynarec_log(LOG_DEBUG, "Asked to Fill block %p with %p\n", block, (void*)addr);
+         dyn86_jp_x86_insns += (uint64_t)helper.size;
+         dyn86_jp_arm_bytes += (uint64_t)oldarmsize;
+     }
++    // 3ds-d2's AOT spike (issue #113): WX86_BLOCKLOG=1 logs each block that
++    // made it, by its x86 address and size and its ARM bytes (the body, as
++    // D2_JITPROFILE counts them), so tools/aot can add Box86's code up per
++    // function. Re-translations log again; the tool keeps each address's last.
++    {
++        static int blocklog = -1;
++        if (blocklog < 0) blocklog = getenv("WX86_BLOCKLOG") ? 1 : 0;
++        if (blocklog)
++            fprintf(stderr, "[block] %08x +%u arm %u\n", (uint32_t)addr, (unsigned)block->x86_size,
++                    (unsigned)oldarmsize);
++    }
+     current_helper = NULL;
+     //block->done = 1;
+     return (void*)block;

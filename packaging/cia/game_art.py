@@ -38,7 +38,9 @@ LOD_WARM = (20, 70)           # or warmth (red minus blue): the gold text agains
 LOD_COLUMNS = (240, 556)      # the lines (241-554); the scene has bright bits beside them
 LOD_HALO = (1, 170)           # a dark halo of this radius and alpha behind the letters
 MENU_FONT = "data\\local\\font\\latin\\font24.DC6"   # the main menu's gold face
-VERSION_TEXT = "v1.14d"   # a line under the subtitle, as far below it as the lines are apart
+# A line under the subtitle, as far below it as the lines are apart. D2_BANNER_VERSION: the
+# CIA's own (docker.sh: "v1.14D-AOT", "v1.14D-X86", a banner a CPU backend; issue #116).
+VERSION_TEXT = os.environ.get("D2_BANNER_VERSION", "v1.14d")
 VERSION_LIGHTEN = 0.15  # the version's colour: the lines' gold, this much toward white
 VERSION_HALO = (1, 110)   # a thinner, lighter halo than the lines'
 
@@ -473,6 +475,9 @@ def main(argv):
     else:
         frames = frames[:1]
     subtitle = lod_subtitle(Mpq(mpq_path), Mpq(exp_path)) if exp_path else None
+    if subtitle:   # the lines under the logo, the version's among them, on black: to look at
+        png(os.path.join(out, "subtitle-preview.png"), len(subtitle[0]), len(subtitle),
+            [p + (255,) for row in over(subtitle, (0, 0, 0)) for p in row])
     # D2_BANNER_TURN=1: billboard only the planes' parent, the layout first
     # tested on hardware; the HOME menu turns the banner. Default: every
     # plane faces the viewer.

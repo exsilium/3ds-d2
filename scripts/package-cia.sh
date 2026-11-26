@@ -3,7 +3,7 @@
 # inside the ctrtools image, started by `scripts/docker.sh package-cia
 # [--slim|--full <game-dir>]`. D2_CIA_MODE:
 #   sdcard  (default) the app alone, ~2 MB: it reads the game files from
-#           sdmc:/3ds/3ds-d2/game/ (copied there once). dist/cia/3ds-d2-<version>-<id>.cia
+#           sdmc:/3ds/3ds-d2/game/ (copied there once). dist/cia/3ds-d2-<cpu>-<version>-<id>.cia
 #   slim    with the user's Game.exe, d2data, d2exp, d2char, d2sfx and patch_d2
 #           in its RomFS; the cinematic, music and speech archives become empty
 #           MPQs (the game only checks that they exist). ~0.8 GB. ...-slim.cia
@@ -14,14 +14,27 @@
 # game files: it is for their own console, not for distribution.
 # The HOME-menu icon, banner model and tune are made from the user's Game.exe,
 # d2data.mpq and d2xmusic.mpq by packaging/cia/game_art.py, which docker.sh
-# runs first (in the banner image) into build/cia/game-art/. Without them,
+# runs first (in the banner image) into build/cia/game-art-<cpu>/. Without them,
 # make_art.py's drawn art and silence. D2_BANNER (read by game_art.py too):
 # animated (default), still (the model with one frame), static (the first
 # frame as bannertool's own still banner, no model of ours). A banner model
 # needs the SMDH's extendedbanner flag.
 set -eu
 cd /work
-elf=build/cpu/ctr/3ds-d2-game-cia.elf
+# D2_CIA_CPU (docker.sh): the CPU backend this CIA is built with, x86 (Box86)
+# or aot (CpuAot, no Box86), in its name; its code is in D2_CIA_ELF_DIR.
+cpu="${D2_CIA_CPU:-x86}"
+# A title of its own each (issue #116), so both install side by side: the
+# build without Box86 keeps the ID the app has always had (an install of it
+# updates in place), the Box86 build has the next. The HOME menu tells them
+# apart by the name and by the banner's version line (docker.sh). Both read
+# and write sdmc:/3ds/3ds-d2: one set of game files, saves and settings.
+case "$cpu" in
+aot) unique_id=0xD2D3D; product=CTR-H-D2DS; title_id=000400000D2D3D00; short="3ds-d2"; long="Diablo II LoD 1.14d on the n3DS (AOT)" ;;
+x86) unique_id=0xD2D3E; product=CTR-H-D2DX; title_id=000400000D2D3E00; short="3ds-d2 x86"; long="Diablo II LoD 1.14d on the n3DS (x86)" ;;
+*) echo "package-cia.sh: D2_CIA_CPU is x86 or aot" >&2; exit 1 ;;
+esac
+elf="${D2_CIA_ELF_DIR:-build/cpu/ctr}/3ds-d2-game-cia.elf"
 [ -f "$elf" ] || { echo "package-cia.sh: $elf missing" >&2; exit 1; }
 mode="${D2_CIA_MODE:-sdcard}"
 romfs=build/cia/romfs
@@ -56,11 +69,11 @@ cp "$tls" "$romfs/tls.bin"
 
 work=build/cia
 out=dist/cia
-version=0.4.0   # the title version FBI and the HOME menu show (major.minor.micro)
+version=0.5.0   # the title version FBI and the HOME menu show (major.minor.micro)
 mkdir -p "$out"
 python3 -I packaging/cia/make_art.py "$work"   # the drawn art, and a silent banner.wav
 smdh_flags=visible,allow3d,recordusage   # bannertool's default
-art_dir=build/cia/game-art
+art_dir=build/cia/game-art-$cpu
 if [ -f "$art_dir/banner.cgfx" ]; then
     cp "$art_dir/icon.png" "$work/icon.png"
     [ -f "$art_dir/banner.wav" ] && cp "$art_dir/banner.wav" "$work/banner.wav"
@@ -76,13 +89,15 @@ else
     bannertool makebanner -i "$work/banner.png" -a "$work/banner.wav" -o "$work/banner.bnr" >/dev/null
     art=drawn
 fi
-bannertool makesmdh -s "3ds-d2" -l "Diablo II LoD 1.14d on the n3DS" -p "https://github.com/exsilium/3ds-d2" -f "$smdh_flags" \
+bannertool makesmdh -s "$short" -l "$long" -p "https://github.com/exsilium/3ds-d2" -f "$smdh_flags" \
     -i "$work/icon.png" -o "$work/icon.icn" >/dev/null
 
-id="$(sh scripts/build-id.sh 2>/dev/null || echo unversioned)"
+# D2_BUILD_ID: docker.sh's, when it isn't build-id.sh's alone (an AOT build's
+# "-aot..." suffix, issue #113).
+id="${D2_BUILD_ID:-$(sh scripts/build-id.sh 2>/dev/null || echo unversioned)}"
 # The name says the version reports carry: "0.4.0-dev" unless built from the
 # release tag (docker.sh passes scripts/version.sh's; issue #61).
-name="3ds-d2-${D2_VERSION:-$version-dev}-$id"
+name="3ds-d2-$cpu-${D2_VERSION:-$version-dev}-$id"
 case "$mode" in sdcard) cia="$out/$name.cia" ;; *) cia="$out/$name-$mode.cia" ;; esac
 size="$(du -shL "$romfs" | cut -f1)"
 echo "packing $cia ($mode, RomFS $size)..."
@@ -92,7 +107,7 @@ EOF_VERSION
 makerom -f cia -o "$cia" -target t -elf "$elf" -rsf packaging/cia/3ds-d2.rsf \
     -ver $(( (v_major << 10) | (v_minor << 4) | v_micro )) \
     -icon "$work/icon.icn" -banner "$work/banner.bnr" \
-    -DAPP_TITLE=3ds-d2 -DAPP_PRODUCT_CODE=CTR-H-D2DS -DAPP_UNIQUE_ID=0xD2D3D -DAPP_ROMFS="$romfs"
+    -DAPP_TITLE=3ds-d2 -DAPP_PRODUCT_CODE="$product" -DAPP_UNIQUE_ID="$unique_id" -DAPP_ROMFS="$romfs"
 # The console's AM hashes the whole content at the end of an install: check
 # the same hashes here, so a bad file is caught before it is copied.
 verify="$(ctrtool -p --verify "$cia" 2>&1)"
@@ -113,7 +128,7 @@ cp "$elf" "${cia%.cia}.elf"   # the exact code of this CIA: decodes its crash du
         echo "files:"
         ls -lL "$game" | awk 'NR>1 {printf "  %-14s %12s\n", $9, $5}'
     fi
-    echo "title_id: 000400000D2D3D00"
+    echo "title_id: $title_id"
     echo "memory: New 3DS extended mode (124 MiB), 804 MHz, L2 cache"
 } > "$cia.txt"
 cat "$cia.txt"

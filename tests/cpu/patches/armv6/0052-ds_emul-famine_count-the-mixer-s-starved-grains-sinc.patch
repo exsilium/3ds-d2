@@ -13,10 +13,10 @@ the running count to difference. Lock-free.
  2 files changed, 7 insertions(+)
 
 diff --git a/src/runtime/ds_emul.cpp b/src/runtime/ds_emul.cpp
-index f0cfd5c..2144b6a 100644
+index 7b50407..219abc9 100644
 --- a/src/runtime/ds_emul.cpp
 +++ b/src/runtime/ds_emul.cpp
-@@ -1131,6 +1131,8 @@ void shutdown() {
+@@ -1293,6 +1293,8 @@ void shutdown() {
                  " (le port reste au noyau, le processus sort juste apres) — VOLONTAIRE");
  }
  
@@ -26,12 +26,12 @@ index f0cfd5c..2144b6a 100644
      if (!g_on || !out || !n) return 0;
      static unsigned long long p_gr = 0, p_fa = 0, p_mix = 0, p_out = 0, p_fr = 0;
 diff --git a/src/runtime/ds_emul.h b/src/runtime/ds_emul.h
-index d733ec6..d86fd8a 100644
+index d8fd6fb..c73f52d 100644
 --- a/src/runtime/ds_emul.h
 +++ b/src/runtime/ds_emul.h
-@@ -87,6 +87,11 @@ void shutdown();
- //   resamp=<grains mixed at a rate != the configured mix rate>  puits=  codec=h/a/fallback
- int stat_line(char* out, unsigned n);
+@@ -107,6 +107,11 @@ int stat_line(char* out, unsigned n);
+ // behavior). On by default.
+ int diag_line(char* out, unsigned n);
  
 +// Grains the mixer found with nothing left to play (famine= above), since
 +// start: a counter a host can difference itself without taking the window

@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Wed, 18 Nov 2026 21:29:07 +0200
+Subject: [PATCH] cpu: x87_state(), the running emu's x87 fields for a host's
+ own compiled code
+
+---
+ src/runtime/cpu.h         |  7 +++++++
+ src/runtime/cpu_box86.cpp | 14 ++++++++++++++
+ 2 files changed, 21 insertions(+)
+
+diff --git a/src/runtime/cpu.h b/src/runtime/cpu.h
+index a77b4cd..bc19f95 100644
+--- a/src/runtime/cpu.h
++++ b/src/runtime/cpu.h
+@@ -278,6 +278,13 @@ struct Cpu {
+     // never end the thread: a thread parked inside the dynarec loop would
+     // hold back the JIT eviction grace period. No-op on backends without it.
+     virtual void set_inline_shim(uint32_t slot_va) { (void)slot_va; }
++    // The running emu's x87 state, for a host whose own compiled code works
++    // on the guest's x87 stack: Box86's x86emu_t fields from cw to fpu_ll
++    // (416 bytes, the offsets checked in cpu_box86.cpp), as the interpreter
++    // keeps them. Valid while this thread's emu runs nothing else; the
++    // dynarec's cached registers are written back at each exit from
++    // translated code (a trap, an in-line call). nullptr: none.
++    virtual void* x87_state() { return nullptr; }
+     // D2_FASTSYNC: a LOCK-FREE intrinsic, tried from the in-line call (see
+     // set_inline_shim) BEFORE the GIL is taken. It sees only the stdcall frame
+     // — return address and first stack argument, read once by the backend —
+diff --git a/src/runtime/cpu_box86.cpp b/src/runtime/cpu_box86.cpp
+index c96dead..afa8741 100644
+--- a/src/runtime/cpu_box86.cpp
++++ b/src/runtime/cpu_box86.cpp
+@@ -1176,6 +1176,20 @@ public:
+     }
+     void set_inline_shim(uint32_t va) override { inline_stub(va, 1u); }
+     void set_cur_guest_thread(void* t) override { E().dyn86_guest_thread = t; }
++    // cpu.h: the x87 fields, cw .. fpu_ll, at these offsets from cw (regs.h's
++    // types are packed): what a host's mirror of them assumes.
++    void* x87_state() override {
++        static_assert(offsetof(x86emu_t, cw) % 4 == 0, "x87 state: cw not word-aligned");
++        static_assert(offsetof(x86emu_t, sw) - offsetof(x86emu_t, cw) == 2, "x87 state: sw");
++        static_assert(offsetof(x86emu_t, x87) - offsetof(x86emu_t, cw) == 4, "x87 state: x87");
++        static_assert(offsetof(x86emu_t, top) - offsetof(x86emu_t, cw) == 132, "x87 state: top");
++        static_assert(offsetof(x86emu_t, fpu_stack) - offsetof(x86emu_t, cw) == 136, "x87 state: fpu_stack");
++        static_assert(offsetof(x86emu_t, fpu_tags) - offsetof(x86emu_t, cw) == 140, "x87 state: fpu_tags");
++        static_assert(offsetof(x86emu_t, fpu_ld) - offsetof(x86emu_t, cw) == 144, "x87 state: fpu_ld");
++        static_assert(offsetof(x86emu_t, fpu_ll) - offsetof(x86emu_t, cw) == 288, "x87 state: fpu_ll");
++        static_assert(offsetof(x86emu_t, xmm) - offsetof(x86emu_t, cw) == 416, "x87 state: the end");
++        return &E().cw;
++    }
+     // D2_FASTSYNC (cpu.h): tag bit 1 on the in-line stub = "try the lock-free
+     // intrinsic before the GIL". A decline falls through to the slot's
+     // regular intrinsic (set_intrinsic), under the GIL, or, on a slot already

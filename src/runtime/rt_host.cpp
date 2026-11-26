@@ -1,4 +1,5 @@
 // See rt_host.h.
+#include "runtime/rt_cpu_aot.h"
 #include "runtime/rt_host.h"
 #include "runtime/rt_layout.h"
 #include "runtime/pool_fit.h"
@@ -619,6 +620,18 @@ uint32_t native_entry(const char *name, uint32_t stack_args, std::function<uint3
     return g_br->shim_trap("3DSD2NATIVE", name);
 }
 
+namespace {
+std::vector<std::pair<uint32_t, uint32_t>> g_entry_natives;   // CpuAot: (function, its native's trap)
+}
+const std::vector<std::pair<uint32_t, uint32_t>> &entry_natives() { return g_entry_natives; }
+uint32_t entry_native(uint32_t va)
+{
+    for (const auto &e : g_entry_natives)
+        if (e.first == va)
+            return e.second;
+    return 0;
+}
+
 bool hook_function(Cpu &c, uint32_t va, const uint8_t *expect, uint32_t n, uint32_t stack_args,
                    std::function<uint32_t(Cpu &)> fn, const char *name, bool in_line)
 {
@@ -632,6 +645,17 @@ bool hook_function(Cpu &c, uint32_t va, const uint8_t *expect, uint32_t n, uint3
     const uint32_t trap = native_entry(name, stack_args, std::move(fn));
     if (!trap)
         return false;
+    if (d2rt::cpu_is_aot(c)) {   // bound by address, the image as it was (rt_host.h)
+        bool known = false;
+        for (auto &e : g_entry_natives)
+            if (e.first == va)
+                e.second = trap, known = true;
+        if (!known)
+            g_entry_natives.emplace_back(va, trap);
+        c.invalidate_code(va, 5);   // the dispatcher takes the new binding at its next call
+        logf("native %s at %08x (bound, the image unchanged)", name, va);
+        return true;
+    }
     uint8_t jmp[5] = {0xE9};
     const uint32_t rel = trap - (va + 5);
     std::memcpy(jmp + 1, &rel, 4);
@@ -659,7 +683,14 @@ MemoryReport memory_report()
             (uint32_t)d2rt_box86_custommalloc_kb(), (uint32_t)d2rt_box86_jmptbl_kb()};
 }
 Bridge &bridge() { return *g_br; }
+void set_bridge_for_tests(Bridge *b) { g_br = b; }
 uint32_t exe_base() { return g_exe_base; }
+
+// cpuid leaf 1's edx as the backend reports it (its default: FPU CMOV MMX FXSR
+// SSE SSE2; RunOptions::cpuid_edx sets both).
+constexpr uint32_t kCpuid1EdxDefault = (1u << 0) | (1u << 15) | (1u << 23) | (1u << 24) | (1u << 25) | (1u << 26);
+static uint32_t g_cpuid1_edx = kCpuid1EdxDefault;
+uint32_t cpuid1_edx() { return g_cpuid1_edx; }
 
 uint32_t current_teb()
 {
@@ -671,6 +702,12 @@ uint32_t current_teb()
 }
 
 void set_last_error(Cpu &c, uint32_t err) { c.write_u32(current_teb() + kTebLastError, err); }
+
+namespace {
+GuestDirectFn g_guest_direct = nullptr;
+}
+
+void set_guest_direct(GuestDirectFn fn) { g_guest_direct = fn; }
 
 uint32_t guest_call(Cpu &c, uint32_t va, std::initializer_list<uint32_t> args)
 {
@@ -685,6 +722,14 @@ uint32_t guest_call(Cpu &c, uint32_t va, std::initializer_list<uint32_t> args)
     esp -= 4;
     c.write_u32(esp, g_br->sentinel());
     c.set_reg(R_ESP, esp);
+    if (g_guest_direct) {
+        uint32_t r[8];
+        c.regs_gp(r);
+        if (g_guest_direct(c, va, r)) {
+            c.load_context(saved);
+            return r[0];
+        }
+    }
     const char *fault = nullptr;
     const bool ok = c.run(va, &fault);
     const uint32_t ret = c.reg(R_EAX);
@@ -993,7 +1038,8 @@ void prof_report(uint64_t ms)
     }
     const FileStats &f = now.files, &f0 = g_mark.files;
     logf("prof files: %llu reads (%llu async), %llu hits, %llu fills, %llu direct, %llu seeks; disk %llu reads %llu KiB in "
-         "%llu ms; cache %llu KiB; waited %llu ms in %llu reads (frame thread %llu ms), stalled %llu ms",
+         "%llu ms; cache %llu KiB; waited %llu ms in %llu reads (frame thread %llu ms), stalled %llu ms; stdio %llu reads "
+         "%llu ms",
          (unsigned long long)(f.calls - f0.calls), (unsigned long long)(f.async - f0.async),
          (unsigned long long)(f.hits - f0.hits),
          (unsigned long long)(f.fills - f0.fills), (unsigned long long)(f.direct - f0.direct),
@@ -1001,7 +1047,8 @@ void prof_report(uint64_t ms)
          (unsigned long long)((f.disk_bytes - f0.disk_bytes) >> 10), (unsigned long long)((f.disk_us - f0.disk_us) / 1000),
          (unsigned long long)(f.cache_bytes >> 10), (unsigned long long)((f.wait_us - f0.wait_us) / 1000),
          (unsigned long long)(f.waits - f0.waits), (unsigned long long)((f.wait_frame_us - f0.wait_frame_us) / 1000),
-         (unsigned long long)((f.stall_us - f0.stall_us) / 1000));
+         (unsigned long long)((f.stall_us - f0.stall_us) / 1000), (unsigned long long)(f.plain - f0.plain),
+         (unsigned long long)((f.plain_us - f0.plain_us) / 1000));
     if (f.jobs != f0.jobs)
         logf("prof jobs: %llu on the I/O worker, %llu ms (%llu past 5 ms), %llu ms queued",
              (unsigned long long)(f.jobs - f0.jobs), (unsigned long long)((f.job_us - f0.job_us) / 1000),
@@ -1412,6 +1459,47 @@ uint64_t now_us()
     return last;
 }
 
+// See rt_host.h.
+uint32_t finish_nested_block(Cpu &c)
+{
+    GuestThread *t = g_sched ? g_sched->current() : nullptr;
+    if (!t || t->state != GuestThread::State::Blocked || !t->wait_obj)
+        return 0;
+    Waitable *w = static_cast<Waitable *>(t->wait_obj);
+    const uint64_t start = wx86_now_us();
+    // A timed wait: on the real clock, its time left by the scheduler's clock;
+    // on the virtual clock at once, since that clock can't run while this
+    // thread holds the core.
+    uint64_t until = start;
+    if (t->wake_deadline && g_opt.real_clock && t->wake_deadline > g_sched->virt_ms())
+        until = start + (t->wake_deadline - g_sched->virt_ms()) * 1000;
+    bool got = false, warned = false;
+    for (;;) {
+        if (w->try_acquire(t)) {
+            got = true;
+            break;
+        }
+        const uint64_t now = wx86_now_us();
+        if (t->wake_deadline && now >= until)
+            break;
+        if (!warned && now - start > 10000000) {   // only another guest thread could end it: it never will
+            logf("aot: a nested run has waited 10 s on a %s no host thread will signal", w->kind());
+            warned = true;
+        }
+        if (g_opt.sleep_ms)
+            g_opt.sleep_ms(1);
+    }
+    if (t->wake_writes_eax)
+        c.set_reg(R_EAX, got ? w->result() : t->wake_timeout_eax);
+    t->wait_obj = nullptr;
+    t->wake_writes_eax = true;
+    t->wake_timeout_eax = 0x102;
+    t->wake_deadline = 0;
+    t->state = GuestThread::State::Running;
+    const uint32_t us = (uint32_t)std::min<uint64_t>(wx86_now_us() - start, 0xffffffffu);
+    return us ? us : 1;
+}
+
 void request_exit(uint32_t code)
 {
     g_exited = true;
@@ -1529,7 +1617,21 @@ RunResult run_exe(std::vector<uint8_t> exe, const RunOptions &opt)
 
     if (g_opt.cpuid_edx)
         wx86_set_cpuid1_edx(g_opt.cpuid_edx);
+    g_cpuid1_edx = g_opt.cpuid_edx ? g_opt.cpuid_edx : kCpuid1EdxDefault;
+    // The CPU backend is the build's (issue #138): with D2RT_CPU_AOT, CpuAot,
+    // the AOT recompiler's C on a host stack a guest thread (rt_cpu_aot.h),
+    // and no Box86 linked: its memory is the game's. What CpuAot can't run
+    // stops the run with a report.
+#ifdef D2RT_CPU_AOT
+    Cpu *cpu = make_cpu_aot();
+    if (!cpu) {
+        logf("cpu: CpuAot isn't available on this host");
+        std::abort();
+    }
+    logf("cpu: CpuAot, a build with no Box86");
+#else
     Cpu *cpu = make_cpu_box86();
+#endif
     static std::unique_ptr<Bridge> br;
     br.reset(new Bridge(cpu));
     g_br = br.get();

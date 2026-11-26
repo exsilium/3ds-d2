@@ -6,7 +6,7 @@ Results come from the probe logs in [evidence/](evidence/). Every row names the 
 
 | Target | Details |
 | --- | --- |
-| Azahar | 2126.2, git `219d743`, macOS arm64 bundle. New 3DS mode on, CPU JIT on, clock 100%, graphics API 2 (Vulkan via MoltenVK), hardware shaders on. Host: Apple M1 Max, macOS 27.0.1. |
+| Azahar | 2127.0.1, git `fd4c9ab`, macOS arm64 bundle. New 3DS mode on, CPU JIT on, clock 100%, graphics API 2 (Vulkan via MoltenVK), hardware shaders on. Host: Apple M1 Max, macOS 27.0.1. |
 | New 3DS | — (model, system version, Luma3DS version and launch method to be recorded) |
 
 ## Launch and platform basics (M0)

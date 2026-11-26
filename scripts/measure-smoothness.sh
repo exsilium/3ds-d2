@@ -42,7 +42,13 @@ done
 [ -n "$out" ] || out="build/smooth/$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$out"
 
-sdmc="${AZAHAR_SDMC:-build/azahar/2126.2/azahar-windows-msvc-2126.2/user/sdmc}/3ds/3ds-d2"
+# The portable copy's SD card (scripts/fetch-azahar.sh), unless AZAHAR_SDMC.
+case "$(uname -s)" in
+Darwin) user=build/azahar/2127.0.1/azahar-macos-universal-2127.0.1/user ;;   # next to Azahar.app
+Linux)  user=build/azahar/2127.0.1/user ;;                                 # next to the AppImage
+*)      user=build/azahar/2127.0.1/azahar-windows-msvc-2127.0.1/user ;;
+esac
+sdmc="${AZAHAR_SDMC:-$user/sdmc}/3ds/3ds-d2"
 mkdir -p "$sdmc"
 # settings.txt: the measurement's lines only (the checklist's own come from
 # the script's "profile").
@@ -59,12 +65,19 @@ stop_azahar() {
 
 # The emulated CPU clock, for this run only (Azahar's own setting, put back after).
 config="$(dirname "$(dirname "$(dirname "$sdmc")")")/config/qt-config.ini"
+# GNU sed (-b, and -i without a suffix). macOS's own is BSD sed; Homebrew's
+# GNU sed (brew install gnu-sed) is gsed there.
+SED=sed
+if [ "$(uname -s)" = Darwin ]; then
+  command -v gsed >/dev/null || { echo "measure-smoothness.sh: needs GNU sed on macOS: brew install gnu-sed" >&2; exit 1; }
+  SED=gsed
+fi
 set_cpu() {
   [ -f "$config" ] || return 0
   local is_default=false
   [ "$1" = 100 ] && is_default=true
   # -b and no ".*": the file's CRLF line ends stay as they are.
-  sed -b -i -e "s/^cpu_clock_percentage\\\\default=[a-z]*/cpu_clock_percentage\\\\default=$is_default/" \
+  "$SED" -b -i -e "s/^cpu_clock_percentage\\\\default=[a-z]*/cpu_clock_percentage\\\\default=$is_default/" \
          -e "s/^cpu_clock_percentage=[0-9]*/cpu_clock_percentage=$1/" "$config"
 }
 set_cpu "$cpu"

@@ -13,6 +13,7 @@
 // Calling convention of all of them: MSVC fastcall (ecx, edx, then stack
 // arguments popped by the callee), which rt::hook_function maps directly.
 // No caller reads EAX afterwards; callee-saved registers are untouched here.
+#include "game/aot_spike.h"
 #include "game/d2_native.h"
 #include "game/draw_census.h"
 #include "game/pklib_explode.h"
@@ -43,6 +44,7 @@ void dyn86_mi_set_span(uint32_t span);
 // And its translation-time intrinsics: a direct native call where a block
 // starts at a registered address, no trap, no bridge.
 #include "dyn86_intrin.h"
+#include "game/native_sites.h"
 
 namespace game {
 namespace {
@@ -2266,9 +2268,14 @@ bool section_free(uint32_t cs)
 }
 
 // Resumes the original at `va` once the shim returns: the bridge then pops
-// the return address and `stack_args` dwords from the ESP set here.
+// the return address and `stack_args` dwords from the ESP set here. Every
+// register as the code at va wants it, eax included, and the native returns
+// c.reg(R_EAX) after: where the recompiler compiled an entry at va (issue
+// #138), the function has run to its return here, and eax is its result.
 void resume_original(Cpu &c, uint32_t va, uint32_t esp, uint32_t stack_args)
 {
+    if (game::aot_resume(c, va, esp, stack_args))   // its compiled code (issue #138)
+        return;
     c.set_reg(R_ESP, esp - 4 - 4 * stack_args);
     rt::bridge().redirect_next(va);
 }
@@ -2281,7 +2288,7 @@ constexpr uint32_t kAfterFloorCall = 0x00476ce1, kAfterFloorFn = 0x00473c00;
 
 uint32_t floor_queue_arm(Cpu &c)
 {
-    g_floor_armed = g_floor_on;
+    g_floor_armed = g_floor_on && g_floor_mode;   // off: the rows' calls alone, no queue
     g_floor_t0 = wx86_now_us();
     resume_original(c, kFloorFn, c.reg(R_ESP), 0);
     return c.reg(R_EAX);
@@ -2290,6 +2297,10 @@ uint32_t floor_queue_arm(Cpu &c)
 uint32_t floor_queue_end(Cpu &c)
 {
     g_floor_armed = false;
+    if (!g_floor_mode) {   // the queue is off: the call's own target alone
+        resume_original(c, kAfterFloorFn, c.reg(R_ESP), 0);
+        return c.reg(R_EAX);
+    }
     const uint64_t t1 = wx86_now_us();
     floor_queue_flush();
     const uint64_t t2 = wx86_now_us();
@@ -2334,31 +2345,19 @@ uint32_t guard_entry(Cpu &c, uint32_t k)
 }
 
 // A call at `at` (e8 rel32) to `to`, sent to `native` instead.
-bool redirect_call(Cpu &c, uint32_t at, uint32_t to, uint32_t native)
-{
-    uint8_t ins[5];
-    if (!native || !c.read(at, ins, 5) || ins[0] != 0xe8)
-        return false;
-    int32_t rel;
-    std::memcpy(&rel, ins + 1, 4);
-    if (at + 5 + (uint32_t)rel != to)
-        return false;
-    rel = (int32_t)(native - (at + 5));
-    std::memcpy(ins + 1, &rel, 4);
-    c.write(at, ins, 5);
-    c.invalidate_code(at, 5);
-    return true;
-}
-
 bool install_floor_queue(Cpu &c, int mode)
 {
-    if (!mode)
-        return false;
-    if (!redirect_call(c, kFloorCall, kFloorFn, rt::native_entry("FloorQueueArm", 0, floor_queue_arm)) ||
-        !redirect_call(c, kAfterFloorCall, kAfterFloorFn, rt::native_entry("FloorQueueEnd", 0, floor_queue_end))) {
+    // The two calls are native_sites_table.h's floor_queue rows, applied
+    // whatever the mode (issue #138: the AOT code is compiled with them); off,
+    // the natives go on to the calls' own targets and do nothing else.
+    const uint32_t arm = rt::native_entry("FloorQueueArm", 0, floor_queue_arm);
+    const uint32_t end = rt::native_entry("FloorQueueEnd", 0, floor_queue_end);
+    if (!arm || !end || !apply_sites(c, "floor_queue", {{"FloorQueueArm", arm}, {"FloorQueueEnd", end}})) {
         rt::logf("floor queue: the world's draw differs, not installed");
         return false;
     }
+    if (!mode)
+        return false;
     g_floor_mode = mode;
     g_floor_ring = new FloorJob[kFloorJobs];
     g_floor_worker = (mode == 1 || mode == 3) && g_floor_host.start && g_floor_host.start(floor_worker_main);
@@ -2455,6 +2454,7 @@ constexpr uint32_t kDirChars = 0x006dcc34, kDirMonsters = 0x006d6cac, kDirObject
 // to the .dcc choice; read from its jump tables at install.
 enum : uint8_t { kKeepDcc, kDc6, kDc6IfNoMode };
 uint8_t g_mon_lo[0x7e], g_mon_hi[0xa6];
+bool g_mon_tables = false;   // both read as expected (load_native_tables)
 
 bool read_class_table(uint32_t index, uint32_t targets, uint8_t *out, uint32_t n)
 {
@@ -2672,8 +2672,9 @@ uint32_t current_unlock(Cpu &c)
     if (!cs) {
         // The original's fatal error, from 52df45 (the jmp covers its first
         // instruction, eax = the current entry).
+        c.set_reg(R_EAX, e);
         resume_original(c, 0x0052df45, c.reg(R_ESP), 0);
-        return e;
+        return c.reg(R_EAX);
     }
     wx86_crit_leave(cs, wx86_sched());
     return 0;   // LeaveCriticalSection's
@@ -2878,6 +2879,24 @@ uint32_t unit_pick_filter(Cpu &c)
     if (unit_pick_rejected(unit))
         return 0;
     const uint32_t esp = c.reg(R_ESP);
+    // The function's compiled code, when it's on (issue #115: else Box86 runs
+    // the rest, and enters compiled 470860 about 340k times a fight window):
+    // in C, as at the hook, when it can be (no trap to enter: about 200k a
+    // window in Act II), else its trap, from the entry, with everything as
+    // at the hook (the check's).
+    {
+        uint32_t r[8];
+        c.regs_gp(r);
+        if (game::aot_direct(c, 0x00466870, r))
+            return r[0];
+    }
+    // Its compiled entry at 466876 where there's one (issue #138): in C, and
+    // a compiled caller's call doesn't exit, as it does at the trap.
+    if (!game::aot_resumable(0x00466876))
+        if (const uint32_t trap = game::aot_trap_for(0x00466870)) {
+            resume_original(c, trap, esp, 2);
+            return c.reg(R_EAX);
+        }
     put32(esp - 4, c.reg(R_EBP));
     c.set_reg(R_EBP, esp - 4);
     resume_original(c, 0x00466876, esp - 4 - 0x34, 2);
@@ -2967,6 +2986,10 @@ uint32_t stat_get_native(Cpu &c) { return stat_get(c.arg(0), c.arg(1), c.arg(2))
 // is; if blocked, the first alternative's from its own running place, then
 // the second's; all blocked, the main direction again from the blocked
 // main step, and on. The first free step is where the unit goes.
+// d2decomped names the same fields the other way round: +0 the path's start
+// and +4 its end, which 648120 walks back toward the start when it is blocked
+// (rules::end_walk_back); its "under 5 off the start" is our offset from the
+// target below. Its 800 walk-back cases pass (tests/d2d, issue #108).
 // The plan below makes no change until it is done: a size class not of
 // the cross test (1, 3, 5), a test on a room's edge, the assertion's case
 // or a walk past 100000 tests all leave the call to the game's code. The
@@ -3002,7 +3025,11 @@ inline uint16_t step_dy(uint32_t d) { return *reinterpret_cast<const uint16_t *>
 // size class, 3 a room's edge, 4 too long.
 uint32_t g_walk_left[5];
 
-int unit_walk_plan(uint32_t path, bool &moved, uint16_t &nx, uint16_t &ny)
+// `cross` is the collision test the plan asks (collision_cross's signature),
+// in place of the game's 64d910 for these size classes. The host test
+// answers it from d2decomped's walk-back cases instead (tests/d2d, #108).
+template <class Cross>
+int unit_walk_plan(uint32_t path, bool &moved, uint16_t &nx, uint16_t &ny, Cross cross)
 {
     moved = false;
     const uint32_t unit = U32(path + 0x30);
@@ -3023,7 +3050,7 @@ int unit_walk_plan(uint32_t path, bool &moved, uint16_t &nx, uint16_t &ny)
     const uint32_t alt1 = dirs >> 8 & 0xff, alt2 = dirs >> 16 & 0xff;
     auto free_at = [&](uint16_t px, uint16_t py, int &out) {
         uint32_t r;
-        if (!collision_cross(room, px, py, mask, r))
+        if (!cross(room, px, py, mask, r))
             return false;
         out = r == 0;
         return true;
@@ -3072,7 +3099,7 @@ int unit_walk_plan(uint32_t path, bool &moved, uint16_t &nx, uint16_t &ny)
                     int32_t wx = px, wy = py;
                     for (int32_t k = ax > ay ? ax : ay; k < 5; k++) {
                         uint32_t r;
-                        if (!collision_cross(room, wx + sx, wy + sy, mask, r))
+                        if (!cross(room, wx + sx, wy + sy, mask, r))
                             return g_walk_left[3]++, -1;
                         if (r)
                             break;
@@ -3095,7 +3122,7 @@ uint32_t unit_walk(Cpu &c)
     const uint32_t path = c.reg(R_EAX);
     bool moved;
     uint16_t nx, ny;
-    const int r = unit_walk_plan(path, moved, nx, ny);
+    const int r = unit_walk_plan(path, moved, nx, ny, collision_cross);
     if (r >= 0) {
         if (moved) {
             std::memcpy(H(path + 4), &nx, 2);
@@ -3121,7 +3148,7 @@ uint32_t unit_walk_checked(Cpu &c)
     const uint32_t before = U32(path + 4);
     bool moved;
     uint16_t nx, ny;
-    const int r = unit_walk_plan(path, moved, nx, ny);
+    const int r = unit_walk_plan(path, moved, nx, ny, collision_cross);
     const uint32_t r0 = rt::guest_call(c, k.tramp, {});
     c.set_reg(R_EAX, path);
     static uint32_t calls = 0;
@@ -3423,7 +3450,7 @@ uint32_t path_search(Cpu &c)
     c.set_reg(R_EBP, esp - 4);
     c.set_reg(R_EAX, 0x32f4);
     resume_original(c, 0x0067b858, esp - 4, 0);
-    return 0x32f4;
+    return c.reg(R_EAX);
 }
 
 // D2_NATIVE_CHECK=1: the plan's result and points against the game's
@@ -3570,8 +3597,8 @@ uint32_t skill_level_checked(Cpu &c)
 // b: 0 or 1. Outside a town (the level of a's room: 6426a0's table), only
 // reads:
 //   a unit of type 1 the roster knows (0x7bb5bc: +8 id, +0xc its player,
-//   next +0x30) counts as that player (type 0); so does a unit with +0xc8's
-//   bit 10 while b's +0x94 is 0 (its +0x98's); b likewise;
+//   next +0x30) counts as that player (type 0); so does a monster with
+//   +0xc8's bit 10 while b's +0x94 is 0 (its +0x98's); b likewise;
 //   the same type and id: 0;
 //   b a monster: 1 for its monstats flag 4, 0 for flag 5 (4638a0);
 //   a player and b of type 2 or 4: 1;
@@ -3644,16 +3671,16 @@ bool unit_relation(uint32_t a, uint32_t b, uint32_t &r)
             return false;
     }
     uint32_t at = U32(a), aid = U32(a + 0xc), bt = U32(b), bid = U32(b + 0xc);
-    if (at == 1) {
+    if (at == 1) {   // as for b: only a monster (465d37), found in the roster or not
         const uint32_t m = roster_player(aid);
         if (m != 0xffffffffu) {
             at = 0;
             aid = m;
         }
-    }
-    if ((U32(a + 0xc8) >> 10 & 1) && !U32(b + 0x94)) {
-        at = 0;
-        aid = U32(a + 0x98);
+        if ((U32(a + 0xc8) >> 10 & 1) && !U32(b + 0x94)) {
+            at = 0;
+            aid = U32(a + 0x98);
+        }
     }
     if (bt == 1) {
         const uint32_t m = roster_player(bid);
@@ -3704,6 +3731,14 @@ uint32_t unit_relation_native(Cpu &c)
     uint32_t r;
     if (unit_relation(c.reg(R_ECX), c.reg(R_EDX), r))
         return r;
+    {   // the function's compiled code, when it's on (issue #115): in C, as at
+        // the hook (a town's every call: 200k a window in Act II's, each a
+        // nested run of the game's code when compiled code calls this native)
+        uint32_t regs[8];
+        c.regs_gp(regs);
+        if (game::aot_direct(c, 0x00465c60, regs))
+            return regs[0];
+    }
     const uint32_t esp = c.reg(R_ESP);
     put32(esp - 4, c.reg(R_EBP));
     c.set_reg(R_EBP, esp - 4);
@@ -4249,6 +4284,9 @@ bool install_slot_steps(Cpu &c)
         std::memcpy(p + 1, &rel, 4);
         c.write(st.va, p, st.n);
         c.invalidate_code(st.va, st.n);
+        // Each step does the loop it replaced (issue #138): the compiled
+        // function runs the original loop.
+        game::set_aot_inline_equivalent(st.va, st.orig, st.n);
         rt::logf("native %s at %08x (in line)", st.name, st.va);
     }
     return true;
@@ -4268,6 +4306,9 @@ bool install_slot_steps(Cpu &c)
 //   682fd9  push ebp; ...; fstp qword [esp]; cvttsd2si eax, [esp]; leave; ret
 // becomes jmp 0x682fd9. With D2_NATIVE_CHECK, a stub runs both on each
 // call instead, and FtolCheck compares them.
+// Where compiled code runs _ftol2 (issue #138), not patched: the patch is for
+// the dynarec, and the compiled original's x87 path is C's own (patched, the
+// function would be Box86's, each call an exit).
 constexpr uint32_t kFtol = 0x00682fd0, kFtolSse = 0x00682fd9, kFtolX87 = 0x00683006;
 uint32_t g_ftol_calls = 0, g_ftol_bad = 0;
 
@@ -4287,6 +4328,10 @@ uint32_t ftol_check(Cpu &c)
 
 bool install_ftol(Cpu &c, bool check)
 {
+    if (game::aot_compiled(kFtol)) {
+        rt::logf("native: _ftol2_sse at %08x left as it is: compiled", kFtol);
+        return false;
+    }
     static const uint8_t kOrig[] = {0x83, 0x3d, 0x88, 0x4c, 0x99, 0x00, 0x00, 0x74, 0x2d};
     uint8_t have[sizeof kOrig];
     if (!c.read(kFtol, have, sizeof have) || std::memcmp(have, kOrig, sizeof have))
@@ -4320,7 +4365,48 @@ bool install_ftol(Cpu &c, bool check)
     return true;
 }
 
+// The game's tables the natives keep a copy of: the iso floor's rows, the
+// ADPCM steps and index moves, the DCC bit masks and bits, SpritePath's
+// monster class tables. Read once g_base is set (install_d2_native; tests/d2d's case runner
+// too).
+void load_native_tables()
+{
+    for (int r = 0; r < 15; r++) {
+        g_xoff[r] = I32(kIsoXoff + 4 * r);
+        g_width[r] = I32(kIsoWidth + 4 * r);
+        g_soff[r] = I32(kIsoSoff + 4 * r);
+    }
+    for (int i = 0; i < 89; i++)
+        g_adpcm_step[i] = U32(kAdpcmSteps + 4 * i);
+    for (int i = 0; i < 32; i++)
+        g_adpcm_adj[i] = I32(kAdpcmIndexAdj + 4 * i);
+    for (int i = 0; i <= 32; i++)
+        g_dcc_mask[i] = U32(kDccMasks + 4 * i);
+    for (int i = 0; i < 4; i++)
+        g_dcc_bit[i] = U32(0x006ce268 + 4 * i);
+    g_mon_tables = read_class_table(0x005fe85c, 0x005fe850, g_mon_lo, sizeof g_mon_lo) &&
+                   read_class_table(0x005fe8e8, 0x005fe8dc, g_mon_hi, sizeof g_mon_hi);
+}
+
 }  // namespace
+
+// The AOT spike's compiled code (aot_rt.h) calls our natives in C. RoomFind
+// covers every call; CollisionCross hands a room's edge back (0 in the high
+// word), and the compiled 64d4e0 runs instead. With CollisionCross masked off
+// (D2_NATIVE_MASK), the compiled code doesn't use it either.
+bool g_aot_collision_cross = true;
+uint8_t *aot_guest_base() { return g_base; }
+extern "C" uint64_t aot_native_463740(uint32_t ecx, uint32_t edx, uint32_t y)
+{
+    return 1ull << 32 | room_find(ecx, (int32_t)edx, (int32_t)y);
+}
+extern "C" uint64_t aot_native_64d4e0(uint32_t esi, uint32_t room, uint32_t x, uint32_t y)
+{
+    uint32_t r;
+    if (!g_aot_collision_cross || !collision_cross(room, (int32_t)x, (int32_t)y, (uint16_t)esi, r))
+        return 0;
+    return 1ull << 32 | r;
+}
 
 int install_d2_native(Cpu &c)
 {
@@ -4329,11 +4415,12 @@ int install_d2_native(Cpu &c)
     if (!p)
         return 0;
     g_base = p - 0x00400000;
-    for (int r = 0; r < 15; r++) {
-        g_xoff[r] = I32(kIsoXoff + 4 * r);
-        g_width[r] = I32(kIsoWidth + 4 * r);
-        g_soff[r] = I32(kIsoSoff + 4 * r);
-    }
+    load_native_tables();
+    // The AOT spike's compiled roots (issue #113) go in first, so that a
+    // native on the same entry (PathSearch) isn't hooked over them. Bench
+    // times PathSearch through this pointer.
+    aot_set_native(0x0067b850, path_search);
+    install_aot(c);
     // First bytes of each original (push ebp; mov ebp,esp; ...): only this
     // build of Game.exe gets hooked.
     static const uint8_t k4f69b0[] = {0x55, 0x8b, 0xec, 0x51, 0x53, 0x56, 0x8b, 0x75, 0x08};
@@ -4393,10 +4480,6 @@ int install_d2_native(Cpu &c)
     HOOK(c, 0x004ddef0, k4ddef0, sizeof k4ddef0, 3, light_block, "LightBlock");
     static const uint8_t k4f8b80[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x48, 0x53, 0x8b, 0x1d};
     HOOK(c, 0x004f8b80, k4f8b80, sizeof k4f8b80, 2, draw_census_wrap("FloorTile", floor_tile), "FloorTile");
-    for (int i = 0; i < 89; i++)
-        g_adpcm_step[i] = U32(kAdpcmSteps + 4 * i);
-    for (int i = 0; i < 32; i++)
-        g_adpcm_adj[i] = I32(kAdpcmIndexAdj + 4 * i);
     static const uint8_t k41dce0[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x1c, 0x53, 0x56, 0x8b, 0x75, 0x0c};
     HOOK(c, 0x0041dce0, k41dce0, sizeof k41dce0, 3, adpcm_decode, "AdpcmDecode", true);
     static const uint8_t k41f9e0[] = {0x55, 0x8b, 0xec, 0xb8, 0x80, 0x3a, 0x00, 0x00, 0xe8};
@@ -4405,8 +4488,6 @@ int install_d2_native(Cpu &c)
     HOOK(c, 0x0041e000, k41e000, sizeof k41e000, 3, pk_decode, "PkExplode", true);
     static const uint8_t k524c60[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x08, 0x0f, 0xb7, 0x47, 0x02};
     HOOK(c, 0x00524c60, k524c60, sizeof k524c60, 3, lang_lookup, "LangLookup", true);
-    for (int i = 0; i <= 32; i++)
-        g_dcc_mask[i] = U32(kDccMasks + 4 * i);
     // DccCell: a translation-time intrinsic, not a hook. ecx, edx and esi
     // are its register arguments (stored for it), ret 8; it changes no guest
     // register the caller reads. Its only entry is the call at 0x60cbbe, and
@@ -4415,8 +4496,6 @@ int install_d2_native(Cpu &c)
     static const uint8_t k60b7b0[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x30, 0xa1, 0xe0, 0x9d, 0x74, 0x00};
     uint8_t cell_have[sizeof k60b7b0];
     g_cpu = &c;
-    for (int i = 0; i < 4; i++)
-        g_dcc_bit[i] = U32(0x006ce268 + 4 * i);
     if ((mask & bit) && c.read(0x0060b7b0, cell_have, sizeof cell_have) && !std::memcmp(cell_have, k60b7b0, sizeof cell_have) &&
         dyn86_intrin_add(0x0060b7b0, dcc_cell_intrin, 8, DYN86_IR_CX | DYN86_IR_DX | DYN86_IR_SI, 0, "DccCell")) {
         g_dcc_intrin = &dyn86_intrin_tbl[dyn86_intrin_n - 1];
@@ -4450,8 +4529,7 @@ int install_d2_native(Cpu &c)
          !check);
     // SpritePath: only with its class tables as expected.
     static const uint8_t k5fe610[] = {0x55, 0x8b, 0xec, 0x8b, 0x4d, 0x08, 0x83, 0xec, 0x08, 0x80, 0x39, 0x00};
-    if (read_class_table(0x005fe85c, 0x005fe850, g_mon_lo, sizeof g_mon_lo) &&
-        read_class_table(0x005fe8e8, 0x005fe8dc, g_mon_hi, sizeof g_mon_hi))
+    if (g_mon_tables)
         HOOK(c, 0x005fe610, k5fe610, sizeof k5fe610, 1, check ? sprite_path_checked : sprite_path, "SpritePath",
              !check);
     else
@@ -4523,11 +4601,15 @@ int install_d2_native(Cpu &c)
     static const uint8_t k465c60[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x10, 0x85, 0xc9, 0x53};
     HOOK(c, 0x00465c60, k465c60, sizeof k465c60, 0, remap_check ? unit_relation_checked : unit_relation_native,
          "UnitRelation", !remap_check);
+    // Compiled code calls the original's C instead (issue #115: 200k calls a
+    // window in Act II's town, where the native only hands back to it).
+    game::set_aot_equivalent(0x00465c60);
     // Rooms and collision (room_find, collision_cross): Act II's pathfinding.
     static const uint8_t k463740[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x08, 0x56, 0x8b, 0xc1, 0x33, 0xf6};
     HOOK(c, 0x00463740, k463740, sizeof k463740, 1, remap_check ? room_find_checked : room_find_native, "RoomFind",
          !remap_check);
     static const uint8_t k64d4e0[] = {0x55, 0x8b, 0xec, 0x8b, 0x4d, 0x08, 0x83, 0xec, 0x10, 0x53};
+    g_aot_collision_cross = (mask & bit) != 0;
     HOOK(c, 0x0064d4e0, k64d4e0, sizeof k64d4e0, 3, remap_check ? collision_cross_checked : collision_cross_native,
          "CollisionCross", !remap_check);
 #undef DRAW

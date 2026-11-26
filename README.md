@@ -4,7 +4,15 @@ Diablo II: Lord of Destruction 1.14d on the New 3DS.
 
 ![Diablo II on a New 3DS XL: the Rogue Encampment on the top screen, the town automap on the bottom screen](docs/evidence/3ds-d2-banner.jpeg)
 
-3ds-d2 runs the unmodified Windows `Game.exe` of Diablo II 1.14d on a New 3DS. The x86 code runs through an ARMv6 port of the Box86 dynamic recompiler (from the WinVita engine). The Windows APIs the game calls come from 3ds-d2's own runtime. The hottest drawing routines run as native ARM code. The game itself is not included: you need your own copy of Diablo II and Lord of Destruction, patched to 1.14d.
+3ds-d2 runs the unmodified Windows `Game.exe` of Diablo II 1.14d on a New 3DS. The x86 code runs through an ARMv6 port of the Box86 dynamic recompiler (from the WinVita engine) or as an AOT package. The Windows APIs the game calls come from 3ds-d2's own runtime. The hottest drawing routines run as native ARM code. The game itself is not included: you need your own copy of Diablo II and Lord of Destruction, patched to 1.14d.
+
+## Status & the Journey
+
+This port evolves as I play the game. It is quite something that a full computer game from 2001 runs as well as it does on the n3DS's tiny screen. I started a journey with a fresh Paladin so the port is not only about "it compiles, thus it works", but there's a remarkable amount of personal playhours invested as I've moved through the game and encountered issues that I try to solve before continuing. Is it perfect? Definitely not! But I try to enjoy the journey. Version 1.0.0 is my goal for when I've finished the campaign, but the journey is a long one:
+
+- `v0.3.2`: a rough road, used up to the end of Act I
+- `v0.4.0`: brought us to the middle of Act II
+- `v0.5.0`: marks the fall of Duriel and the end of Act II
 
 ## Requirements
 
@@ -69,7 +77,7 @@ If you set up your console with the 3ds.hacks.guide, you may have done this alre
 
 ### 3. Install the app
 
-Build the CIA as described under [Building the CIA](#building-the-cia), then install `3ds-d2-<version>-<build-id>.cia` with FBI. Either copy it to the SD card and pick it in FBI under *SD*, or use FBI's *Remote Install*. The HOME menu then shows a **3ds-d2** icon (title ID `000400000D2D3D00`).
+Build the CIA as described under [Building the CIA](#building-the-cia), then install `3ds-d2-x86-<version>-<build-id>.cia` with FBI. Either copy it to the SD card and pick it in FBI under *SD*, or use FBI's *Remote Install*. The HOME menu then shows a **3ds-d2 x86** icon (title ID `000400000D2D3E00`), its banner marked `v1.14D-X86`. The `3ds-d2-aot-...` CIA is a title of its own, **3ds-d2** (`000400000D2D3D00`, the ID of every release up to v0.5.0, so it installs over one), marked `v1.14D-AOT`. Both can be installed at once; they use the same game files, saves and settings in `/3ds/3ds-d2`.
 
 The CIA holds only the app, about 2 MB. A new version is a quick reinstall over the old one, and the game files on the SD card stay where they are.
 
@@ -130,7 +138,7 @@ The rest of the Camera album is never offered. A pair is sent as `screenshot-<n>
 
 In Sentry, reports are grouped by what happened, not by your description, so the same crash lands in one issue however it's described. The groups: a crash the app caught (the fault, and where in Game.exe); a Luma3DS dump (the crashed process and exception, and outside 3ds-d2 its address); a fatal error by its kind; a session that didn't end; a report you asked for, by its title. Your description goes with each report as its `note`.
 
-A report you ask for (or a profiler run's) is titled by the version, which you can't change, and an optional topic you add with **R**: `v0.4.0` alone, or `v0.4.0 #24`. Reports with the same title are one Sentry issue; the topic ignores case and extra spaces. The topic is remembered (`/3ds/3ds-d2/report-topic.txt`) for every later report until you change it, and goes with crash reports too, as the `topic` tag, without changing how they group. Builds not made from a release's tag carry `-dev` in their version (`v0.4.0-dev`), in the CIA's name and in Sentry, so testing never mixes with a release's reports.
+A report you ask for (or a profiler run's) is titled by the version, which you can't change, and an optional topic you add with **R**: `v0.5.0` alone, or `v0.5.0 #24`. Reports with the same title are one Sentry issue; the topic ignores case and extra spaces. The topic is remembered (`/3ds/3ds-d2/report-topic.txt`) for every later report until you change it, and goes with crash reports too, as the `topic` tag, without changing how they group. Builds not made from a release's tag carry `-dev` in their version (`v0.5.0-dev`), in the CIA's name and in Sentry, so testing never mixes with a release's reports.
 
 On a report's screen:
 
@@ -150,7 +158,7 @@ Nothing is sent unless you press A or X. Up to 32 reports wait to be sent; of th
 
 Everything builds inside Docker containers with a pinned toolchain (devkitARM, libctru, makerom). The host needs only **Docker** and **git**: Docker Desktop on macOS (Apple Silicon or Intel) or Windows, or Docker Engine on Linux. You don't need the game files to build the app.
 
-1. **Get the source with its submodule.** The CPU backend (WinVita, with Box86) is a git submodule, so clone recursively:
+1. **Get the source with its submodules.** The CPU backend (WinVita, with Box86) is a git submodule, so clone recursively. This also fetches d2decomped (`third_party/d2d`, about 60 MB with its history), which only the tests use, and the diablo-2-recompilation spec (`third_party/d2spec`, about 30 MB), a reference that nothing builds from:
 
    ```sh
    git clone --recursive https://github.com/exsilium/3ds-d2.git
@@ -164,6 +172,8 @@ Everything builds inside Docker containers with a pinned toolchain (devkitARM, l
    ```sh
    git -c core.autocrlf=false clone --recursive https://github.com/exsilium/3ds-d2.git
    git -C 3ds-d2/third_party/winx86 config core.autocrlf false
+   git -C 3ds-d2/third_party/d2d config core.autocrlf false
+   git -C 3ds-d2/third_party/d2spec config core.autocrlf false
    ```
 
 2. **Build the toolchain images, once.** This downloads and builds the pinned tools, and takes a few minutes the first time:
@@ -181,15 +191,15 @@ Everything builds inside Docker containers with a pinned toolchain (devkitARM, l
    On the first run this also builds the CIA tools image. It then compiles the CPU backend with this project's patches and the 3DS app, and packs the CIA. The last lines show the result:
 
    ```
-   cia: 3ds-d2-<version>-<build-id>.cia
-   version: 0.4.0
+   cia: 3ds-d2-x86-<version>-<build-id>.cia
+   version: 0.5.0
    sha256: ...
    ```
 
 The output goes to `dist/cia/`:
-- `3ds-d2-<version>-<build-id>.cia`: the app to install (step 3 above).
-- `3ds-d2-<version>-<build-id>.elf`: the same code with debug symbols, for reading crash dumps (`tools/luma_dump.py`).
-- `3ds-d2-<version>-<build-id>.cia.txt`: version, size and SHA-256. To check that a copy on the SD card is intact, compare its SHA-256 with this file.
+- `3ds-d2-x86-<version>-<build-id>.cia`: the app to install (step 3 above). With a game directory a second one, `3ds-d2-aot-...`, is built too: the game's code compiled ahead of time and no Box86 in it ([docs/aot.md](docs/aot.md), experimental); `D2_CIA_CPU=x86` or `aot` builds one alone. The two are separate titles and can both be installed.
+- `3ds-d2-x86-<version>-<build-id>.elf`: the same code with debug symbols, for reading crash dumps (`tools/luma_dump.py`).
+- `3ds-d2-x86-<version>-<build-id>.cia.txt`: version, size and SHA-256. To check that a copy on the SD card is intact, compare its SHA-256 with this file.
 
 The build ID is a hash of everything that goes into the CIA, so the same sources always produce the same name, and any change gives a new one. Builds run without network access, and the game files never enter an image.
 
@@ -214,6 +224,8 @@ Projects this one builds on, learned from or uses.
 
 **Inspiration and reference**
 - [D2Vita](https://github.com/Franckrst/D2Vita) (GPL-3.0): Diablo II 1.14d on the PlayStation Vita, built on WinVita. It proved the approach on this exact executable. It was used only as a behavioural reference, for game facts such as memory addresses and the sprite-cache sizing, and for its control ideas. None of its code is in this project.
+- [d2decomped](https://github.com/psi29a/d2decomped) (GPL-3.0-or-later): a behaviour-matching reimplementation of Diablo II 1.14d, checked against Game.exe in an emulator. It is the submodule `third_party/d2d`, used only by tests and tools: its test cases check our natives, and its maps name the game's functions in our profile tools. None of its code is in the 3DS builds.
+- [diablo-2-recompilation](https://github.com/IgorKonovalov/diablo-2-recompilation) (documentation CC BY 4.0, tools MIT) by Igor Konovalov: a reimplementation-grade specification of Diablo II: LoD 1.14d, reverse-engineered from Game.exe with evidence-tagged claims: item generation, monster spawning, level generation, and the server's frame, its tick and its client messages. It is the submodule `third_party/d2spec`. Its function and data names and its account of the game's behaviour guide our own implementation of the game's code paths. It is documentation only: it holds no game data, and nothing of it is built into the 3DS builds.
 - [DOSBox-3DS](https://github.com/MrHuu/dosbox-3ds) (GPL-2.0): read to confirm how a 3DS homebrew app makes JIT memory executable (`svcControlProcessMemory`). None of its code is used.
 - [DOSBox-X](https://dosbox-x.com/) and [M-HT/SR](https://github.com/M-HT/SR) (static recompilation of DOS and Windows games): evaluated as alternative CPU approaches while planning.
 

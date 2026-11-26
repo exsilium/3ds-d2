@@ -148,6 +148,11 @@ int main()
         CHECK(j.find("\"runtime\":{\"type\":\"runtime\",\"name\":\"3ds-d2\",\"version\":\"0123456789ab\"}") !=
               std::string::npos);
         CHECK(j.find("\"environment\"") == std::string::npos);
+        // No OS unless named; then the backend as its name, and nothing else.
+        CHECK(j.find("\"os\"") == std::string::npos);
+        e.os_name = "aot";
+        CHECK(event_json(e).find("\"os\":{\"type\":\"os\",\"name\":\"aot\"}") != std::string::npos);
+        e.os_name.clear();
         e.environment = "azahar";
         CHECK(event_json(e).find("\"environment\":\"azahar\"") != std::string::npos);
         e.environment.clear();

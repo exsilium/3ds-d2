@@ -28,6 +28,7 @@
 // renderer's frame base, 0x7d5448: pointing that elsewhere left the map in
 // the frame, hence the copy aside.)
 #include "game/automap.h"
+#include "game/native_sites.h"
 
 #include "runtime/cpu.h"
 #include "runtime/rt_host.h"
@@ -47,18 +48,12 @@ namespace game {
 namespace {
 
 constexpr uint32_t kCallSite = 0x00456f93;
-// cmp [0x7a27e8], ebx; je +0f; call 0x45ae90; cmp eax, 3; je +05; call 0x45ad60
-constexpr uint8_t kCallSiteBytes[] = {0x39, 0x1d, 0xe8, 0x27, 0x7a, 0x00, 0x74, 0x0f, 0xe8, 0xf0, 0x3e, 0x00,
-                                      0x00, 0x83, 0xf8, 0x03, 0x74, 0x05, 0xe8, 0xb6, 0x3d, 0x00, 0x00};
+// (cmp [0x7a27e8], ebx; je +0f; call 0x45ae90; cmp eax, 3; je +05; call 0x45ad60:
+// native_sites_table.h's automap rows have the bytes.)
 constexpr uint32_t kAutomapOn = 0x007a27e8;     // ui[0x0A], the map toggle (Tab)
-constexpr uint32_t kAutomapMode = 0x0045ae90;   // 3: no map to draw
-constexpr uint32_t kDrawAutomap = 0x0045ad60;   // the whole map, as Tab shows it
-constexpr uint32_t kMapSetup = 0x00457520;      // the map's bounds and offsets for this frame
-constexpr uint32_t kDrawUnits = 0x0045ac90;     // the units' crosses and names
 // 0x45a860(eax = unit): one unit's cross and name. Its first instructions
 // (push ebp; mov ebp, esp; sub esp, 0x14), moved into the unit filter.
 constexpr uint32_t kDrawUnit = 0x0045a860;
-constexpr uint8_t kDrawUnitBytes[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x14, 0x56};
 constexpr uint32_t kMapAvailable = 0x007a0634;  // 0: no map (the game's own check)
 constexpr uint32_t kPlayerUnit = 0x007a6a70;    // the player's unit, or 0
 
@@ -72,10 +67,9 @@ constexpr uint32_t kPlayerColour = 0x007a51b0;  // the player's cross
 
 // The stub and the unit filter, in the zero slack after .text's last byte
 // (0x6cb5a1), in its last mapped page; the flag the filter reads after them.
-constexpr uint32_t kStub = 0x006cb5b0, kStubSize = 59;
-constexpr uint32_t kFilter = 0x006cb600, kFilterSize = 29;
+constexpr uint32_t kStub = 0x006cb5b0;
+constexpr uint32_t kFilter = 0x006cb600;
 constexpr uint32_t kCapturing = 0x006cb640;
-constexpr uint32_t kSlackEnd = 0x006cb650;
 
 uint8_t *g_base = nullptr;   // host = guest + base (WinVita's single arena)
 uint32_t g_span = 0;         // guest addresses below this are readable
@@ -248,13 +242,6 @@ uint32_t capture_end(Cpu &)
     }
     g_seq++;
     return 0;
-}
-
-void put_call(uint8_t *code, uint32_t base, uint32_t at, uint32_t target, uint8_t op = 0xE8)
-{
-    code[at - base] = op;
-    const uint32_t rel = target - (at + 5);
-    std::memcpy(code + (at - base) + 1, &rel, 4);
 }
 
 // ---- the tiles, drawn here --------------------------------------------------------------
@@ -470,12 +457,6 @@ void draw_cross(const View &v, uint8_t colour)
     }
 }
 
-void put_stub(Cpu &c, uint32_t at, const uint8_t *code, uint32_t n)
-{
-    c.write(at, code, n);
-    c.invalidate_code(at, n);
-}
-
 }  // namespace
 
 bool install_automap_capture(Cpu &c)
@@ -485,27 +466,14 @@ bool install_automap_capture(Cpu &c)
         return false;
     g_base = p - 0x00400000;
     g_span = rt::layout().span;
-    uint8_t have[sizeof kCallSiteBytes];
-    if (!c.read(kCallSite, have, sizeof have) || std::memcmp(have, kCallSiteBytes, sizeof have) != 0) {
-        rt::logf("automap: bytes at %08x differ, not installed", kCallSite);
-        return false;
-    }
-    uint8_t unit[sizeof kDrawUnitBytes];
-    if (!c.read(kDrawUnit, unit, sizeof unit) || std::memcmp(unit, kDrawUnitBytes, sizeof unit) != 0) {
-        rt::logf("automap: bytes at %08x differ, not installed", kDrawUnit);
-        return false;
-    }
-    uint8_t slack[kSlackEnd - kStub];
-    static const uint8_t kZero[kSlackEnd - kStub] = {};
-    if (!c.read(kStub, slack, sizeof slack) || std::memcmp(slack, kZero, sizeof slack) != 0) {
-        rt::logf("automap: no room for the stub at %08x, not installed", kStub);
-        return false;
-    }
     const uint32_t decide = rt::native_entry("AutomapDecide", 0, pass_decide);
     const uint32_t begin = rt::native_entry("AutomapBegin", 0, capture_begin);
     const uint32_t end = rt::native_entry("AutomapEnd", 0, capture_end);
-    if (!decide || !begin || !end)
-        return false;
+    // The stub, the unit filter, 0x45a860's jump to it and the call site:
+    // native_sites_table.h's automap rows, which the AOT recompiler reads too
+    // (issue #138).
+    //
+    // The stub:
     // S+0  call decide          eax: bit 0 the game's map, bit 1 the units
     // S+5  test eax, eax; jz S+58
     // S+9  push eax
@@ -516,48 +484,18 @@ bool install_automap_capture(Cpu &c)
     // S+52 call 0x45ad60
     // S+57 pop eax
     // S+58 ret
-    uint8_t stub[kStubSize] = {};
-    put_call(stub, kStub, kStub + 0, decide);
-    stub[5] = 0x85, stub[6] = 0xC0, stub[7] = 0x74, stub[8] = 58 - 9;
-    stub[9] = 0x50;
-    put_call(stub, kStub, kStub + 10, kAutomapMode);
-    stub[15] = 0x83, stub[16] = 0xF8, stub[17] = 0x03, stub[18] = 0x74, stub[19] = 57 - 20;
-    stub[20] = 0xF6, stub[21] = 0x04, stub[22] = 0x24, stub[23] = 0x02, stub[24] = 0x74, stub[25] = 46 - 26;
-    put_call(stub, kStub, kStub + 26, kMapSetup);
-    put_call(stub, kStub, kStub + 31, begin);
-    put_call(stub, kStub, kStub + 36, kDrawUnits);
-    put_call(stub, kStub, kStub + 41, end);
-    stub[46] = 0xF6, stub[47] = 0x04, stub[48] = 0x24, stub[49] = 0x01, stub[50] = 0x74, stub[51] = 57 - 52;
-    put_call(stub, kStub, kStub + 52, kDrawAutomap);
-    stub[57] = 0x58;
-    stub[58] = 0xC3;
-    put_stub(c, kStub, stub, sizeof stub);
-
+    //
     // The unit filter, in front of 0x45a860: while capturing, the player's
     // own unit is skipped (its cross is drawn by automap_draw).
     // F+0  cmp byte [kCapturing], 0; je F+18
     // F+9  cmp eax, [0x7a6a70]; jne F+18
     // F+17 ret
     // F+18 push ebp; mov ebp, esp; sub esp, 0x14; jmp 0x45a866
-    uint8_t filter[kFilterSize] = {0x80, 0x3D};
-    std::memcpy(filter + 2, &kCapturing, 4);
-    filter[6] = 0x00, filter[7] = 0x74, filter[8] = 18 - 9;
-    filter[9] = 0x3B, filter[10] = 0x05;
-    std::memcpy(filter + 11, &kPlayerUnit, 4);
-    filter[15] = 0x75, filter[16] = 18 - 17;
-    filter[17] = 0xC3;
-    std::memcpy(filter + 18, kDrawUnitBytes, 6);
-    put_call(filter, kFilter, kFilter + 24, kDrawUnit + 6, 0xE9);
-    put_stub(c, kFilter, filter, sizeof filter);
-    uint8_t jump[6];
-    put_call(jump, kDrawUnit, kDrawUnit, kFilter, 0xE9);
-    jump[5] = 0x90;
-    put_stub(c, kDrawUnit, jump, sizeof jump);
-
-    uint8_t site[sizeof kCallSiteBytes];
-    std::memset(site, 0x90, sizeof site);   // nops up to the next instruction (0x456faa)
-    put_call(site, kCallSite, kCallSite, kStub);
-    put_stub(c, kCallSite, site, sizeof site);
+    if (!decide || !begin || !end ||
+        !apply_sites(c, "automap", {{"AutomapDecide", decide}, {"AutomapBegin", begin}, {"AutomapEnd", end}})) {
+        rt::logf("automap: not installed");
+        return false;
+    }
     rt::logf("automap: UI pass call site at %08x, stub at %08x, unit filter at %08x", kCallSite, kStub, kFilter);
     return true;
 }

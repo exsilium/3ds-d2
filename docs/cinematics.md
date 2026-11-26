@@ -9,6 +9,7 @@ Diablo II's videos (the Blizzard logos, the intro, the act transitions, the Lord
 | Finding a stored file inside an MPQ | `src/game/mpq.cpp` |
 | 3DS drawing (YUV to RGB565, scaled) and sound (ndsp channel 1) | `src/app/ctr_game.cpp`, `src/app/ctr_audio.cpp` |
 | Test against FFmpeg | `tests/bink/compare.sh` |
+| Soundtracks of both variants (RDFT, DCT) against FFmpeg | `tests/bink/audio_compare.sh` |
 
 ## How the game plays a video (1.14d)
 
@@ -51,6 +52,14 @@ Decode-ahead on the second core, as the issue planned, is not used. During a vid
 **Why fixed point (issue #24).** On the console, going East in game (the Act II cinematic) brought the system down within seconds, nearly every time: the HOME Menu, the kernel, or one of the app's threads finding a 1 MiB section of its heap unmapped. The app had not unmapped anything (`[diag] address space` never changed). Builds that played the cinematic silent, or read its soundtrack without decoding it, or spent the decoder's time on integer work instead, never crashed. The one that decoded it (in float, on the game's thread) always did, with or without the DSP. The same video with sound from the main menu was fine. How floating point on that thread leads to the damage is not known; the decoder now does without it. Its tables (sine, quantiser steps) are in `bink_audio_tables.h`, generated once, and GCC is kept from moving 64-bit values through VFP registers.
 
 FFmpeg's decoder was read as a format reference and is used as the test oracle. No FFmpeg code is used. The format's constant tables (`bink_tables.cpp`) carry the same values as FFmpeg's `binkdata.h`, as any compatible decoder must (see `THIRD_PARTY_NOTICES.md`).
+
+## The DCT soundtrack variant
+
+Blizzard's own cinematics code their soundtracks with Bink's RDFT audio variant. Some re-encoded cinematics, such as those of some localised releases, use the DCT variant instead (FFmpeg names them `binkaudio_rdft` and `binkaudio_dct`). Before, the decoder refused DCT soundtracks and those videos played silent (`cinematic: ... sound off` in `logs/game.log`).
+
+The decoder now handles both (`src/game/bink/bink_audio.h` explains the differences). The DCT variant codes each channel on its own and turns each spectrum into samples with an inverse DCT (DCT-III), computed with the same fixed-point FFT as the RDFT variant after a pre-rotation (Makhoul's method). Like the rest of the decoder it uses no floating point. RDFT output is unchanged, byte for byte.
+
+`tests/bink/audio_compare.sh <dir with .bik files> [<baseline dir>]` decodes each file's soundtrack (audio only) and compares it with FFmpeg's `s16le`. On 14 DCT and 8 RDFT cinematics of a localised install: every sample within 1 of FFmpeg, SNR 88 to 96 dB, and the RDFT soundtracks byte-identical to the decoder's output before the change. The same build for ARMv6 (armel, qemu-arm `arm11mpcore`) gives byte-identical output to the x86 build. On qemu-arm a 640x292 DCT soundtrack takes 0.21 ms per video frame, against 0.18 for RDFT.
 
 ## Speed
 

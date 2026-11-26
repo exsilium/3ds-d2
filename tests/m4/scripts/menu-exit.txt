@@ -1,0 +1,4 @@
+# The main menu's Exit Diablo II: the game's own way out (the C runtime's
+# exit, then ExitProcess), which the lane's other scripts never take.
+#   M4_SCRIPT="$(cat tests/m4/scripts/menu-exit.txt)"
+20000 tap 400 550

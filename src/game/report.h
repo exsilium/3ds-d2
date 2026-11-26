@@ -191,6 +191,10 @@ struct Event {
     std::string reason;      // why there is a report, in a few words
     std::vector<std::pair<std::string, std::string>> tags;
     std::vector<std::pair<std::string, std::string>> device;   // contexts.device
+    // contexts.os, when named: the build's CPU backend alone ("aot", "x86":
+    // Sentry's OS column tells the two builds apart). The system's version
+    // and the kernel's are tags, not repeated here.
+    std::string os_name;
     std::vector<std::string> crash_lines;
     LumaDump dump;           // the session's first Luma3DS dump, if have_dump
     bool have_dump = false;

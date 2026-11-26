@@ -1,0 +1,4 @@
+# d2d's whole function list (issue #138): every function on game-functions.tsv, as the census compiles
+# them, with register signatures only (the roots' context entries aren't needed: there are no roots).
+--all
+--modes sig

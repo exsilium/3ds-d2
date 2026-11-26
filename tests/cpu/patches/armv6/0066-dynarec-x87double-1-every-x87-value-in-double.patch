@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Wed, 18 Nov 2026 21:29:08 +0200
+Subject: [PATCH] dynarec: x87double=1, every x87 value in double
+
+---
+ src/dynarec86/shim/debug.h | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/dynarec86/shim/debug.h b/src/dynarec86/shim/debug.h
+index 693934d..e3283f0 100644
+--- a/src/dynarec86/shim/debug.h
++++ b/src/dynarec86/shim/debug.h
+@@ -99,7 +99,12 @@ extern int box86_dynarec_budgettail;
+ // settles it.
+ extern int box86_dynarec_forward;
+ static const int box86_dynarec_strongmem = 0;
+-static const int box86_dynarec_x87double = 0;
++// 3ds-d2 (issue #136): every x87 value in double, as a real x87 computes at
++// the 53-bit precision the game sets. At 0 a value loaded from a float (fld
++// m32, fld1, fild m16) could stay single precision through a block, by rules
++// that depend on where the block ends: ahead-of-time compiled code, which
++// computes in double, could not give the same results.
++static const int box86_dynarec_x87double = 1;
+ // safeflags: x86 FLAGS conservatism at RET/RETN, upstream box86 value.
+ // Do not turn this into a runtime switch: the body of READFLAGS(A) is guarded
+ // by `if(((A)!=X_PEND && ...) ...)`, and X_PEND is 0x80 -- with A == X_PEND

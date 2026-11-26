@@ -26,13 +26,20 @@
 #include "game/automap.h"
 #include "game/cinematics.h"
 #include "game/controls.h"
+#include "game/pad_history.h"
 #include "game/d2_memory.h"
+#include "game/aot_spike.h"
 #include "game/d2_native.h"
 #include "game/d2_state.h"
 #include "game/d2_units.h"
 #include "game/draw_census.h"
 #include "game/dcc_native.h"
 #include "game/frame_reads.h"
+#include "game/monster_pace.h"
+#include "game/sound_defer.h"
+#include "game/player_modes.h"
+#include "game/sprite_headers.h"
+#include "game/sprites_ahead.h"
 #include "game/tiles_ahead.h"
 #include "game/frame_trace.h"
 #include "game/port_options.h"
@@ -43,6 +50,7 @@
 #include "game/sprite_trace.h"
 #include "game/storm_reads.h"
 #include "runtime/ds_emul.h"
+#include "runtime/rt_cpu_aot.h"
 #include "runtime/rt_host.h"
 
 #include <3ds.h>
@@ -57,6 +65,8 @@
 #include <ctime>
 #include <malloc.h>
 #include <string>
+#include <dirent.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <utility>
@@ -92,15 +102,25 @@ u32 __ctru_linear_heap_size = 2u << 20;
 // pool refuses new chunks without trying the heap (issue #90), and the JIT
 // evicts old code (#23: exact at 6 MiB of the fight's 7.2 on the lane).
 // Box86 takes it in 2 MiB chunks, so its size is a multiple of 2 MiB.
+#ifdef D2RT_CPU_AOT
+// A build with CpuAot (issue #138) has no translated code to keep: a page
+// stands for the pool, which the memory services (mman_ctr.c) name, and its
+// 14 MiB are the game's.
+alignas(0x1000) uint8_t dyn86_ctr_jitpool[0x1000];
+extern const uint32_t dyn86_ctr_jitpool_size = 0x1000;
+#else
 alignas(0x1000) uint8_t dyn86_ctr_jitpool[14u << 20];
 extern const uint32_t dyn86_ctr_jitpool_size = 14u << 20;
+#endif
 extern uint32_t dyn86_ctr_jitpool_refused;   // mman_ctr.c: chunks refused, the pool full
 // The tile prefetch's store (issue #89, rt::set_prefetch_arena), here for
 // the same reason: out of the heap, whose last MiB the JIT's records and
 // the port's own allocations share. The pool's other MiB goes to the budget
 // __system_allocateHeaps hands the linear heap, for jump tables that would
 // otherwise take the main heap.
+#ifndef D2RT_CPU_AOT
 alignas(64) uint8_t g_prefetch_arena[1u << 20];
+#endif
 
 // libctru's own __system_allocateHeaps panics (svcBreak) when the kernel
 // refuses the heap it asks for, and the console refused "all that is left":
@@ -300,6 +320,7 @@ namespace {
 
 const char kRoot[] = "sdmc:/3ds/3ds-d2";
 const char kGameDir[] = "sdmc:/3ds/3ds-d2/game";
+const char kSpriteHeaders[] = "sdmc:/3ds/3ds-d2/sprite-headers.bin";   // game/sprite_headers.h
 const char kRomfsGameDir[] = "romfs:/game";   // the CIA carries the game files in its RomFS
 const char kSaveDir[] = "sdmc:/3ds/3ds-d2/save";
 const char kLogDir[] = "sdmc:/3ds/3ds-d2/logs";
@@ -405,12 +426,28 @@ void show_stats(float fps, float draw_ms, float worst_ms)
     const game::SpriteCacheStats sc = g_guest_cpu ? game::sprite_cache_stats(*g_guest_cpu) : game::SpriteCacheStats{};
     std::snprintf(line[7], 48, "sprites %5u/%5u in %4u out %4u", sc.used >> 10, sc.limit >> 10,
                   g_sprite_window.inserted, g_sprite_window.evicted);
+#ifdef D2RT_CPU_AOT
+    // No JIT in this build: the compiled functions and the start's check of
+    // them (differ: 0 unless the image isn't the one compiled), the natives
+    // bound, and the most a guest thread has used of its host stack, read at
+    // the heartbeat's pace (it scans the stacks).
+    const bool jit_full = false;
+    {
+        static uint32_t peak = 0, size = 0, asked = 0;
+        if (asked++ % 10 == 0)
+            d2rt::cpu_aot_stack(&peak, &size);
+        const game::AotStatus a = game::aot_status();
+        std::snprintf(line[8], 48, "aot %5u diff %u nat %u stk %u/%uK", a.functions, a.differ, a.natives, peak >> 10,
+                      size >> 10);
+    }
+#else
     const bool jit_full = dyn86_jit_allocfail != 0;   // translated code no longer fits: the game will stall
     if (jit_full)
         std::snprintf(line[8], 48, "JIT MEMORY FULL code %u jmptbl %u", m.jit_code_kb, m.jmptbl_kb);
     else
         std::snprintf(line[8], 48, "jit %5u/%5u meta %5u jmptbl %5u", m.jit_used_kb, m.jit_code_kb, m.jit_meta_kb,
                       m.jmptbl_kb);   // jit: held by blocks / chunks opened (issue #23)
+#endif
     // The hitch counters (issue #19), the last heartbeat's 10 s.
     const HitchWindow &hw = g_hitch_last;
     std::snprintf(line[9], 48, "files %3u read %4u MiB skip %3u fam %3u", st.files_opened,
@@ -994,6 +1031,45 @@ std::atomic<bool> g_lock_on{false};
 // would put them a quarter second apart.
 std::atomic<bool> g_lock_in_game{false};
 bool g_lock_test = false;
+bool g_monster_pace = true;  // monsterpace=0 in settings.txt: a monster's modes asked for at once, as the game does (issue #153)
+uint64_t g_archives_sig = 0;    // the archives' sizes, for the kept headers to be this copy's
+void note_archives(const std::string &game_dir)
+{
+    uint64_t sig = 0;
+    if (DIR *d = opendir(game_dir.c_str())) {
+        while (const dirent *e = readdir(d)) {
+            const size_t n = std::strlen(e->d_name);
+            struct stat st;
+            if (n > 4 && strcasecmp(e->d_name + n - 4, ".mpq") == 0 && stat((game_dir + "/" + e->d_name).c_str(), &st) == 0)
+                sig += ((uint64_t)st.st_size + n) * 1099511628211ull;
+        }
+        closedir(d);
+    }
+    g_archives_sig = sig;
+}
+// playermodes= in settings.txt (issue #153): 0 the player's modes asked for
+// as the game does, 1 its eight modes asked for again, 2 the other six too
+// (game/player_modes.h). For the AOT build: under Box86 the other six
+// stopped the game, and the x86 build is left as the game is.
+#ifdef D2RT_CPU_AOT
+int g_player_modes = 2;
+#else
+int g_player_modes = 0;
+#endif
+// The sprites' store (rt::set_sprite_keep, issue #153), KiB of the heap:
+// the compressed sprite data the draw has fetched, kept for when the game's
+// cache has let the frames go and fetches them again. The AOT build's; the
+// console's heap had 2.5 MiB of room at its lowest in 59 minutes (3DS-D2-1J,
+// event 7f538e2f). "spritekeep=<KiB>", 0 off.
+#ifdef D2RT_CPU_AOT
+uint32_t g_sprite_keep_kib = 768;
+#else
+uint32_t g_sprite_keep_kib = 0;
+#endif
+bool g_sprites_ahead = true;   // spritesahead=0 in settings.txt: a sprite's directions each read at their first draw (issue #153)
+bool g_sprite_headers = true;   // spriteheaders=0 in settings.txt: every DCC header read from its archive (issue #153)
+bool g_sound_defer = true;   // sounddefer=0 in settings.txt: sounds read by the game thread, as the game does (issue #153)
+uint32_t g_stop_test_s = 0;   // stoptest=<s> in settings.txt: a CpuAot stop that long after the first heartbeat (issue #139)
 int32_t g_lock_err_us = 0;    // the render thread's: where the swaps fall from a refresh's middle, averaged
 uint64_t g_lock_last_us = 0;  // the render thread's: the last swap
 std::atomic<uint32_t> g_lock_pushes{0};   // frames the clock was moved for
@@ -1222,6 +1298,25 @@ void sampler_main(void *)
     }
 }
 
+#ifdef AOT_SAMPLE_ON
+// The AOT build's own profile (game/aot_spike.cpp, aot_sample): the compiled
+// function the game is in, every 2 ms, from the render core.
+void aot_sampler_main(void *)
+{
+    for (;;) {
+        svcSleepThread(2000000);
+        game::aot_sample();
+    }
+}
+void start_aot_sampler()
+{
+    s32 prio = 0x30;
+    svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+    const Thread t = threadCreate(aot_sampler_main, nullptr, 4 * 1024, prio - 3, g_render_core >= 0 ? g_render_core : 2, false);
+    status("aot sampler: %s", t ? "every 2 ms" : "not started");
+}
+#endif
+
 void start_sampler()
 {
     if (g_sampler)
@@ -1399,6 +1494,27 @@ void present(const rt::Frame &f)
                 game::frame_trace_note(lock ? "frame lock: on" : "frame lock: off");
         }
     }
+    {   // settings.txt's "port=aot" or "aotbench" (port_options.h; no row on the OPTIONS page): compiled
+        // code (issue #115) or its bench (issue #113), in a build with Box86 and the compiled code both
+        const uint32_t port = g_ss.port_options();
+        const game::AotMode want = !game::aot_linked()          ? game::AotMode::Off
+                                   : (port & game::kPortAot)      ? game::AotMode::Sig
+                                   : (port & game::kPortAotBench) ? game::AotMode::Bench
+                                                                  : game::AotMode::Off;
+        if (game::aot_mode() != want && g_guest_cpu) {
+            game::set_aot_mode(*g_guest_cpu, want);
+            logline(want == game::AotMode::Sig     ? "aot: compiled code on"
+                    : want == game::AotMode::Bench ? "aot bench: on"
+                                                   : "aot: off");
+        }
+    }
+    {   // the OPTIONS page's sound limiter (issue #117)
+        const bool lim = (g_ss.port_options() & game::kPortSoundLimit) != 0;
+        if (lim != d2rt::dsound::limiter_on()) {
+            d2rt::dsound::set_limiter(lim);
+            logline(lim ? "sound limiter: on" : "sound limiter: off (hard clamp)");
+        }
+    }
     {   // the OPTIONS page's native sprite decoder (issue #83)
         const game::DccMode want = native_dcc() ? game::DccMode::Offload : game::DccMode::Off;
         if (game::dcc_mode() != want) {
@@ -1523,8 +1639,22 @@ uint32_t g_background_slice_us = kBackgroundSliceUs;
 // leaves them queued, as the game does.
 bool g_storm_direct = true;
 // The read thread's rate limit (game::set_storm_read_rate): "stormrate=" in
-// KiB/s, 0: the game's 256 KiB/s.
-uint32_t g_storm_rate_kib = 0;
+// KiB/s (256: the game's). The limit is on the loads no caller waits for,
+// which the deferred sounds and the monsters' sprites are: at 256 KiB/s a
+// sound asked for by a play took up to 20 s in a fight, at 4096 a fifth of
+// a second as a rule (issue #153).
+uint32_t g_storm_rate_kib = 4096;
+// The card's read time modelled (rt::set_sd_model, issue #166), in an
+// emulator only: there every run has it, so that a run on the desk shows the
+// frames a console's card would cost; on a console it is never on, whatever
+// the setting. The default is the console's slow end, not its average: 7 ms
+// a read and 170 us a KiB, within 20 per cent either way, the line through
+// the ninth decile of the game thread's file time a read at 1, 8, 26 and 107
+// KiB (6.7, 9.0, 12.7 and 25 ms; 59 minutes on a New 3DS, Sentry 3DS-D2-1J,
+// event 7f538e2f, 2026-11-25). The average there was 5.4 ms and 38 us a KiB:
+// "sdmodel=5400,38,30". "sdmodel=<us a read>,<us a KiB>,<spread per cent>"
+// another card, "sdmodel=0" off (the emulator's own reads).
+uint32_t g_sd_model[3] = {7000, 170, 20};
 // The frame trace's stall column: a frame this long or longer is sampled
 // (rt::stall_probe). "stallms=" (a measurement's).
 uint32_t g_stall_ms = 150;
@@ -1571,9 +1701,20 @@ void load_settings()
             g_dyn_budgettail = std::atoi(line + 11);
         else if (std::strncmp(line, "forward=", 8) == 0)
             g_dyn_forward = std::atoi(line + 8);
+        else if (std::strncmp(line, "aotfns=", 7) == 0) {   // a measurement's (Azahar), issue #115: D2_AOT_FNS
+            unsigned first = 0, last = 0;
+            if (std::sscanf(line + 7, "%u-%u", &first, &last) == 2)
+                game::set_aot_fns(first, last);
+        } else if (std::strncmp(line, "aotmin=", 7) == 0)   // issue #115: the probe's threshold, in us
+            game::set_aot_min_us(std::atof(line + 7));
         else if (std::strncmp(line, "stallms=", 8) == 0)
             g_stall_ms = (uint32_t)std::strtoul(line + 8, nullptr, 10);
-        else if (std::strncmp(line, "stormrate=", 10) == 0)
+        else if (std::strncmp(line, "sdmodel=", 8) == 0) {
+            unsigned f = 0, k = 170, s = 20;
+            if (std::sscanf(line + 8, "%u,%u,%u", &f, &k, &s) == 1 && f == 1)
+                f = 7000;   // "sdmodel=1": the default
+            g_sd_model[0] = f, g_sd_model[1] = k, g_sd_model[2] = s;
+        } else if (std::strncmp(line, "stormrate=", 10) == 0)
             g_storm_rate_kib = (uint32_t)std::strtoul(line + 10, nullptr, 10);
         else if (std::strncmp(line, "stormdirect=", 12) == 0)
             g_storm_direct = std::atoi(line + 12) != 0;
@@ -1584,6 +1725,22 @@ void load_settings()
                                                        : g_ss.port_options() & ~game::kPortCore2Draw);
         else if (std::strncmp(line, "copycheck=", 10) == 0)   // a measurement's (Azahar), issue #80
             g_copy_check = std::atoi(line + 10) != 0;
+        else if (std::strncmp(line, "bigroomtest=", 12) == 0)   // issue #153: the room made for a large sprite, at every one
+            game::set_big_room_test(std::atoi(line + 12) != 0);
+        else if (std::strncmp(line, "monsterpace=", 12) == 0)   // issue #153: 0 for a run to compare
+            g_monster_pace = std::atoi(line + 12) != 0;
+        else if (std::strncmp(line, "playermodes=", 12) == 0)   // issue #153: 0, 1 or 2
+            g_player_modes = std::atoi(line + 12);
+        else if (std::strncmp(line, "spritekeep=", 11) == 0)
+            g_sprite_keep_kib = std::min<uint32_t>((uint32_t)std::strtoul(line + 11, nullptr, 10), 4096);
+        else if (std::strncmp(line, "spritesahead=", 13) == 0)   // issue #153: 0 for a run to compare
+            g_sprites_ahead = std::atoi(line + 13) != 0;
+        else if (std::strncmp(line, "spriteheaders=", 14) == 0)   // issue #153: 0 for a run to compare
+            g_sprite_headers = std::atoi(line + 14) != 0;
+        else if (std::strncmp(line, "sounddefer=", 11) == 0)   // issue #153: 0 for a run to compare
+            g_sound_defer = std::atoi(line + 11) != 0;
+        else if (std::strncmp(line, "stoptest=", 9) == 0)   // a stop as a test (issue #139)
+            g_stop_test_s = (uint32_t)std::atoi(line + 9);
         else if (std::strncmp(line, "locktest=", 9) == 0)   // the frame lock against the host clock (Azahar), issue #86
             g_lock_test = std::atoi(line + 9) != 0;
         else if (std::strncmp(line, "drawphases=", 11) == 0)   // the draw natives timed (issue #80)
@@ -1783,6 +1940,8 @@ void open_storage()
 // the game's thread inside aptMainLoop, where no guest code runs (a sleep
 // may be announced on libctru's own APT thread while the game runs on).
 aptHookCookie g_apt_cookie;
+game::PadHistory g_pad_history;   // issue #118: the pad's readings between two pumps (poll)
+
 void apt_hook(APT_HookType type, void *)
 {
     u32 thread = 0;
@@ -1794,6 +1953,7 @@ void apt_hook(APT_HookType type, void *)
         screen_hz_set(false);  // the console's own rate for the HOME menu, sleep and the end
     if (type == APTHOOK_ONRESTORE || type == APTHOOK_ONWAKEUP) {
         g_ss.invalidate();   // the HOME menu or sleep drew over the bottom screen
+        g_pad_history.reset();   // presses made in the HOME menu aren't the game's
         g_timing.last_present_us = 0;   // the time away is not a frame (worst gap, hitches)
     }
     if (type == APTHOOK_ONRESTORE && game_thread) {
@@ -1819,10 +1979,10 @@ void apt_hook(APT_HookType type, void *)
     }
 }
 
-void poll()
+// The pad as HID has it now. Called by the input sampler alone while it
+// runs (hidScanInput isn't for two threads), else by poll().
+game::Pad read_pad()
 {
-    if (!apt_service())
-        return;
     hidScanInput();
     const u32 k = hidKeysHeld();
     game::Pad pad;
@@ -1849,6 +2009,51 @@ void poll()
         pad.touch_x = t.px;
         pad.touch_y = t.py;
     }
+    return pad;
+}
+
+// Issue #118: the pad read every 4 ms on the second core, each reading into
+// g_pad_history, so that a press shorter than a frame reaches the game (its
+// message pump reads input once a frame). Without a second core, poll()
+// reads the pad itself, as before; the history then never replays.
+Thread g_input_thread = nullptr;
+volatile bool g_input_stop = false;
+uint32_t g_input_replays = 0;
+
+void input_main(void *)
+{
+    while (!g_input_stop) {
+        g_pad_history.push(read_pad(), osGetTime());   // the host's clock: the game's is the game thread's
+        svcSleepThread(4000000);
+    }
+}
+
+void start_input_sampler()
+{
+    if (g_input_thread || g_render_core < 0)   // a core of its own only: PadHistory's lock spins
+        return;
+    s32 prio = 0x30;
+    svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+    g_input_stop = false;
+    g_input_thread = threadCreate(input_main, nullptr, 4 * 1024, prio - 3, g_render_core, false);
+    status("input: %s", g_input_thread ? "the pad read every 4 ms on its own thread" : "read at the message pump");
+}
+
+void stop_input_sampler()
+{
+    if (!g_input_thread)
+        return;
+    g_input_stop = true;
+    threadJoin(g_input_thread, U64_MAX);
+    threadFree(g_input_thread);
+    g_input_thread = nullptr;
+}
+
+// One reading of the pad, applied as poll() applied its one reading before
+// issue #118; `now` is when it was read, `last` whether it is the pump's
+// latest.
+void apply_pad(game::Pad pad, uint64_t now, bool last)
+{
     const game::GameState gs = game::read_game_state();
     // Autoplay drives the pad until the player touches anything.
     if (g_autoplay_on) {
@@ -1856,9 +2061,9 @@ void poll()
             std::abs(pad.cstick_x) > 40 || std::abs(pad.cstick_y) > 40) {
             g_autoplay_on = false;
             rt::logf("autoplay stopped: physical input");
-        } else if (g_autoplay.active()) {
+        } else if (last && g_autoplay.active()) {   // the script steps once a pump
             bool shot = false;
-            pad = g_autoplay.step(rt::now_ms(), g_controls, shot, gs);
+            pad = g_autoplay.step(now, g_controls, shot, gs);
             g_shot_request |= shot;
             // A profiler run from the script: started or stopped at the next
             // heartbeat, as by its button.
@@ -1882,7 +2087,7 @@ void poll()
     prev_held = pad.held;
     const bool touch_down = pad.touching && !prev_touch;
     prev_touch = pad.touching;
-    g_osk.tick(rt::now_ms());
+    g_osk.tick(now);
     if (g_osk.is_open()) {
         // The keyboard has the touch screen and its buttons; the game gets
         // an idle pad, which also releases anything that was held.
@@ -1898,12 +2103,12 @@ void poll()
         else
             g_wait_release = false;
     }
-    g_ss.update(pad, gs, g_controls.cursor_x(), g_controls.cursor_y(), rt::now_ms());
+    g_ss.update(pad, gs, g_controls.cursor_x(), g_controls.cursor_y(), now);
     if (g_ss.take_settings_changed())
         save_settings();
     g_controls.set_context(gs.in_game, gs.panel_open, gs.ui, gs.in_game && game::holding_item());
     g_lock_in_game.store(gs.in_game, std::memory_order_relaxed);
-    g_controls.update(pad, rt::now_ms());
+    g_controls.update(pad, now);
     if (g_controls.take_zoom_toggle())
         g_zoom = !g_zoom;
     g_ss.request(g_controls.take_bottom_request());   // Select + D-pad
@@ -1911,6 +2116,27 @@ void poll()
         g_osk.open();
     if (g_controls.take_screenshot_request())   // L+R+Select
         g_shot_request = true;
+}
+
+void poll()
+{
+    if (!apt_service())
+        return;
+    if (!g_input_thread)
+        g_pad_history.push(read_pad(), osGetTime());
+    static std::vector<game::PadSample> samples;
+    const size_t replayed = g_pad_history.take(samples);
+    // The readings' times on the game's clock: the latest at now, as when
+    // the pump read the pad itself, the earlier ones as much before it.
+    const uint64_t now = rt::now_ms(), latest = samples.empty() ? 0 : samples.back().ms;
+    for (game::PadSample &s : samples)
+        s.ms = now - std::min<uint64_t>(now, latest - s.ms);
+    if (replayed && ++g_input_replays <= 10)
+        rt::logf("input: a press shorter than a pump replayed (%u changes since the last)%s", (unsigned)replayed,
+                 g_input_replays == 10 ? "; the next ones not logged" : "");
+    g_controls.begin_pump();
+    for (size_t i = 0; i < samples.size(); i++)
+        apply_pad(samples[i].pad, samples[i].ms, i + 1 == samples.size());
     if (__atomic_load_n(&g_shot_done, __ATOMIC_ACQUIRE)) {
         __atomic_store_n(&g_shot_done, false, __ATOMIC_RELAXED);
         status("%s", g_shot_msg.c_str());
@@ -2179,6 +2405,8 @@ void profiler_switch(uint32_t want)
         file_trace_stop();
     if (stop & game::kProfFrames)
         frame_trace_file_stop();
+    if (stop & game::kProfSound)
+        d2rt::dsound::set_diag(false);
     g_prof_on &= ~stop;
     uint32_t refused = 0;
     if ((start & game::kProfSprites) && !game::sprite_trace_start(kTracePath))
@@ -2195,6 +2423,8 @@ void profiler_switch(uint32_t want)
         refused |= game::kProfFrames;
     if (start & game::kProfSdBench)
         sd_benchmark(g_bench_path);   // once, as the run starts
+    if (start & game::kProfSound)   // issue #117: the "sondiag" line each 10 s window, from the next one
+        d2rt::dsound::set_diag(true);
     if (refused)
         status("profiler run: could not start %s", game::profile_names(refused).c_str());
     g_prof_refused |= refused;
@@ -2246,6 +2476,11 @@ void hitch_heartbeat(const game::SpriteCacheWindow &w)
                   (unsigned)hw.ready_ms, (unsigned)hw.host_ms, (unsigned)hw.heartbeat_ms, (unsigned)hw.skipped,
                   (unsigned)hw.famine);
     logline_held(line);
+    {   // the profiler run's sound clipping row (issue #117): ds_emul's mix and limiter counters for the window
+        char son[640];
+        if (d2rt::dsound::diag_line(son, sizeof son) > 0)
+            logline_held((std::string("[rt] ") + son + (d2rt::dsound::limiter_on() ? " (limiter on)" : " (limiter off)")).c_str());
+    }
     // The screen (swap_screens): how long the frames stayed on it.
     Glass g;
     LightLock_Lock(&g_glass_lock);
@@ -2274,6 +2509,11 @@ void hitch_heartbeat(const game::SpriteCacheWindow &w)
     logline_held(line);
     // The native sprite decoder (issue #83): the window's groups by who decoded them.
     static game::DccStats dcc_mark;
+    for (const std::string &l : game::aot_lines()) {   // the AOT spike's bench (issue #113)
+        char aot[360];
+        std::snprintf(aot, sizeof aot, "[rt] %s", l.c_str());
+        logline_held(aot);
+    }
     const game::DccStats d = game::dcc_stats();
     std::snprintf(line, sizeof line,
                   "[rt] dcc: %s; groups native %u (on the frame thread %u, the worker full %u), on the worker %u, "
@@ -2288,6 +2528,18 @@ void hitch_heartbeat(const game::SpriteCacheWindow &w)
     for (const std::string &l : game::frame_reads_lines())
         logline_held(l.c_str());
     for (const std::string &l : game::tiles_ahead_lines())
+        logline_held(l.c_str());
+    for (const std::string &l : game::sprites_ahead_lines())
+        logline_held(l.c_str());
+    for (const std::string &l : game::dcc_frame_lines())
+        logline_held(l.c_str());
+    for (const std::string &l : game::monster_pace_lines())
+        logline_held(l.c_str());
+    for (const std::string &l : game::player_modes_lines())
+        logline_held(l.c_str());
+    for (const std::string &l : game::sprite_headers_lines())
+        logline_held(l.c_str());
+    for (const std::string &l : game::sound_defer_lines())
         logline_held(l.c_str());
     // The JIT pool full (issue #90): chunks refused, so the JIT evicts.
     static uint32_t refused_seen = 0;
@@ -2324,8 +2576,56 @@ extern "C" __attribute__((noreturn)) void __wrap_abort(void)
 // keeps the rest: the jump tables not in linear memory, the JIT's metadata
 // and the runtime (JIT code is in its pool). The largest layout that the
 // heap and the linear memory set aside for jump tables allow.
+#ifdef D2RT_CPU_AOT
+// The AOT build with its code off the hot list compiled for size (issue
+// #153) has 6 MiB more than the 95 MiB heap window can take: the heap is at
+// the window, and the rest (3.3 MiB) is linear memory, which Box86's jump
+// tables aren't there to use. True when it is so.
+static bool aot_linear_spare() { return g_heap_setup.jmptbl_linear >= (3u << 20); }
+// Linear memory first, the heap when it has none: for what the AOT build
+// keeps out of the heap (reserve_arena).
+static void *linear_first(size_t n)
+{
+    if (void *p = linearMemAlign(n, 8))
+        return p;
+    return memalign(8, n);
+}
+static void linear_first_free(void *p)
+{
+    const u32 a = (u32)p;
+    if (a >= __ctru_linear_heap && a - __ctru_linear_heap < __ctru_linear_heap_size)
+        linearFree(p);
+    else
+        free(p);
+}
+#endif
 static const rt::Layout *reserve_arena()
 {
+#ifdef D2RT_CPU_AOT
+    // A build with CpuAot (issue #138): no jump tables, no JIT records and no
+    // alignment the backend asks for, so the arena is the heap less what the
+    // host itself uses, whatever the heap's size (the compiled code is in the
+    // executable, and the heap is the smaller for it: 93 MiB in Azahar).
+    // kAotHostHeap: the host used 8.3 MiB at most outside the arena in
+    // Azahar's town-walk (the cinematics; 7.3 in town), and Box86's builds
+    // run with 4 MiB of room. The map is kCtrGameLayoutN3's with the pool's
+    // end moved.
+    constexpr u32 kAotHostHeap = 12u << 20;
+    // With linear memory to spare (aot_linear_spare), the threads' host
+    // stacks are there (128 KiB each), out of the heap.
+    if (aot_linear_spare())
+        d2rt::cpu_aot_set_stack_alloc(linear_first, linear_first_free);
+    static rt::Layout aot = rt::kCtrGameLayoutN3;
+    const u32 span = __ctru_heap_size > kAotHostHeap ? (__ctru_heap_size - kAotHostHeap) & ~0xFFFFFu : 0;
+    if (span >= rt::kCtrGameLayout.span && (g_arena = memalign(0x1000, span))) {
+        aot.name = "ctr-game-aot";
+        aot.span = span;
+        aot.va_size = span - aot.va_base;
+        g_arena_block = g_arena;
+        g_arena_size = span;
+        return &aot;
+    }
+#endif
     const bool full = __ctru_heap_size >= (95u << 20);
     // The larger arena only with 3 MiB of jump tables in linear memory. The
     // console set 1,792 KiB aside, so it has always run ctr-game-n3-heap;
@@ -2424,6 +2724,7 @@ int main()
         gfxExit();
         return 0;
     }
+    note_archives(game_dir);
     if (exe.empty() && !read_file(game_dir + "/Game.exe", exe)) {
         status("Game.exe not found in %s.", kGameDir);
         status("Copy Game.exe (1.14d) and the .mpq files there.");
@@ -2506,6 +2807,11 @@ int main()
         // left: the cache goes down to its minimum, once per new take. What
         // stays in the spare after it does not hold the cache there.
         const uint64_t t0 = rt::now_us();
+        static const uint64_t first = t0;
+        if (g_stop_test_s && t0 - first >= (uint64_t)g_stop_test_s * 1000000u) {
+            g_stop_test_s = 0;
+            d2rt::cpu_aot_stop_test();
+        }
         const rt::MemoryReport m = rt::memory_report();
         static uint32_t spare_takes_seen = 0;
         const bool spare_taken = m.spare_takes != spare_takes_seen;
@@ -2607,9 +2913,53 @@ int main()
         if (g_storm_direct)
             game::install_storm_direct_reads(c);
         game::install_frame_reads(c);
+        game::install_sound_defer(c, g_sound_defer);
+        game::install_monster_pace(c, g_monster_pace);
+        game::install_sprite_headers(c, kSpriteHeaders, g_archives_sig, g_sprite_headers);
+        game::install_player_modes(c, g_player_modes);
+        game::set_sprites_ahead(g_sprites_ahead);
+        if (g_sprite_keep_kib) {
+            void *keep = memalign(64, g_sprite_keep_kib << 10);
+            rt::set_sprite_keep(keep, g_sprite_keep_kib << 10);
+            status("sprite store: %s", keep ? (std::to_string(g_sprite_keep_kib) + " KiB of the heap").c_str() : "no memory for it, off");
+        } else
+            status("sprite store: off");
+#ifdef D2RT_CPU_AOT
+        {
+            // The AOT build's store: 1.5 MiB of the linear memory to spare,
+            // where the console's log had the 1 MiB one full all session
+            // with 0.4-1.5 MiB of the nearest rooms' tiles not loaded and
+            // the frame thread waiting 4 s of 380 on tiles (3DS-D2-1H).
+            // Without the room, 1 MiB of the heap. The read cache has 2 MiB
+            // of that memory after it (set_read_cache), and 1 MiB stays
+            // free, as the Box86 build has.
+            const u32 want = aot_linear_spare() ? 1536u << 10 : 0;
+            void *store = want && linearSpaceFree() >= want + (3u << 20) ? linearMemAlign(want, 64) : nullptr;
+            const u32 size = store ? want : 1u << 20;
+            if (!store)
+                store = memalign(64, size);
+            rt::set_prefetch_arena(store, store ? size : 0);
+            status("tile store: %u KiB, %s", (unsigned)(store ? size >> 10 : 0), store && size == want ? "linear" : "heap");
+            void *slab = store && size == want && linearSpaceFree() >= (3u << 20) ? linearMemAlign(2u << 20, 64) : nullptr;
+            rt::set_read_cache(slab ? 32 : 8, slab, slab ? 2u << 20 : 0);
+            status("read cache: %s", slab ? "32 blocks a file, 2048 KiB of them linear" : "8 blocks a file");
+        }
+#else
         rt::set_prefetch_arena(g_prefetch_arena, sizeof g_prefetch_arena);
-        if (g_storm_rate_kib)
-            game::set_storm_read_rate(c, g_storm_rate_kib << 10);
+#endif
+        game::set_storm_read_rate(c, g_storm_rate_kib << 10);
+        {
+            std::string detail;
+            if (report::environment(detail) != "azahar")
+                status("sd model: off (never on outside an emulator)");
+            else if (!g_sd_model[0])
+                status("sd model: off (sdmodel=0), the emulator's own reads");
+            else {
+                rt::set_sd_model(g_sd_model[0], g_sd_model[1], g_sd_model[2]);
+                status("sd model: a read %u us and %u us a KiB, within %u%% (an emulator's run)", (unsigned)g_sd_model[0],
+                       (unsigned)g_sd_model[1], (unsigned)g_sd_model[2]);
+            }
+        }
         game::install_fatal_exit(c);
         game::install_pool_release(c);
         game::set_pool_block_size(c, game::kCtrPoolBlock);
@@ -2665,7 +3015,12 @@ int main()
     start_writer_thread();
     game::sprite_trace_set_wrap([](FILE *f, char *buf, size_t n) { return app::writer_wrap(f, buf, n, "sprites.trc"); });
     aptHook(&g_apt_cookie, apt_hook, nullptr);
+    start_input_sampler();
+#ifdef AOT_SAMPLE_ON
+    start_aot_sampler();
+#endif
     rt::RunResult r = rt::run_exe(std::move(exe), opt);
+    stop_input_sampler();
     join_io_thread();
     join_floor_thread();
     if (g_prof_on)
@@ -2682,10 +3037,19 @@ int main()
         status("Diablo II ran out of memory (%u requests refused, see game.log).", rt::stats().alloc_failures);
     else if (game::fatal_exit_caller())
         status("Diablo II stopped on an internal error at %08lx.", (unsigned long)game::fatal_exit_caller());
+    // A stop of the build without Box86 (issue #139): what it can't run.
+    const char *const stopped = d2rt::cpu_aot_stop_text();
+    static char stopped_why[240];
+    if (stopped) {
+        status("FATAL: the compiled code stopped:");
+        status("%s", stopped);
+        std::snprintf(stopped_why, sizeof stopped_why, "the compiled code stopped: %s", stopped);
+    }
     // A report (issue #26), now that the game's memory is free: for an
     // error, or because the player asked for one on the INFO tab.
     const char *why = !r.loaded                    ? "the game did not start"
                       : rt::stats().alloc_failures ? "ran out of memory"
+                      : stopped                    ? stopped_why
                       : game::fatal_exit_caller()  ? "stopped on an internal error"
                       : g_ss.report_requested()    ? "asked for by the player"
                       : g_prof_used                ? "a profiler run"

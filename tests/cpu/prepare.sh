@@ -3,7 +3,10 @@
 # a pristine copy of the submodule as a git work tree (commit and tag
 # "pristine"), then the variant's patch series, one commit per patch.
 #
-#   prepare.sh <tree> <patch dir> <submodule> <inputs id>
+#   prepare.sh <tree> <patch dir> <submodule> <inputs id> [<export command>]
+#
+# Used for the Box86 backend (tests/cpu/Makefile) and for d2d
+# (tests/d2d/Makefile). Only the *.patch files in <patch dir> are the series.
 #
 # The stamp <tree>/.prepared holds the inputs id (the submodule's commit and
 # a hash of the patch series) and the tree's HEAD once prepared. The tree is
@@ -17,7 +20,7 @@
 # it: uncommitted changes, or commits since it was prepared that are not the
 # patch series. Commits that are the series (just exported) only renew the stamp.
 set -euo pipefail
-tree=$1 patches=$2 submodule=$3 id=$4
+tree=$1 patches=$2 submodule=$3 id=$4 export_cmd=${5:-make -C tests/cpu export VARIANT=...}
 GIT=(git -c safe.directory='*' -c user.name=3ds-d2 -c user.email=3ds-d2@localhost -c commit.gpgsign=false)
 
 die() { echo "prepare.sh: $*" >&2; exit 1; }
@@ -36,19 +39,20 @@ if [ -d "$tree/.git" ]; then
     head=$("${GIT[@]}" -C "$tree" rev-parse HEAD)
     [ -z "$("${GIT[@]}" -C "$tree" status --porcelain --untracked-files=no)" ] ||
         die "$tree has uncommitted changes and its patch series changed. Commit them and run" \
-            "'make -C tests/cpu export VARIANT=...', or discard them; then build again."
+            "'$export_cmd', or discard them; then build again."
     if [ "$head" != "$old_head" ]; then
         # Commits since it was prepared: the series itself (just exported), or work not in it.
         exported=$(mktemp -d)
         "${GIT[@]}" -C "$tree" format-patch -q --no-signature --zero-commit -N -o "$exported" pristine..HEAD
-        if diff -rq "$exported" "$patches" >/dev/null 2>&1; then
+        if diff <(cd "$exported" && sha256sum -- *.patch 2>/dev/null) \
+                <(cd "$patches" && sha256sum -- *.patch 2>/dev/null) >/dev/null; then
             rm -rf "$exported"
             echo "$id $head" > "$tree/.prepared"
             exit 0
         fi
         rm -rf "$exported"
         die "$tree has commits that are not the patch series in $patches: work not exported" \
-            "('make -C tests/cpu export VARIANT=...'), or a tree prepared for another branch." \
+            "('$export_cmd'), or a tree prepared for another branch." \
             "Export what you need, then delete $tree and build again."
     fi
 fi

@@ -26,8 +26,10 @@
 #
 # Azahar is the project's own portable copy (scripts/fetch-azahar.sh, fetched on
 # first use into build/azahar/<version>/, its SD card in user/sdmc next to the
-# binary), unless --system-azahar picks an installed one instead. AZAHAR=<azahar
-# binary> and AZAHAR_SDMC=<emulated SD folder> override both.
+# binary, on macOS next to Azahar.app), unless --system-azahar picks an
+# installed one instead. AZAHAR=<azahar binary> and AZAHAR_SDMC=<emulated SD
+# folder> override both. On macOS the game is started through `open` on the
+# app bundle: run directly, the binary first shows a dialog saying so.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 die() { echo "run-game-azahar.sh: $*" >&2; exit 1; }
@@ -53,7 +55,11 @@ case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) windows=1 ;; esac
 unix_path() { if [ "$windows" = 1 ]; then cygpath -u "$1"; else printf '%s\n' "$1"; fi; }
 
 find_azahar() {
-    [ -n "${AZAHAR:-}" ] && { unix_path "$AZAHAR"; return; }
+    if [ -n "${AZAHAR:-}" ]; then   # made absolute: the portable copy is told by its path
+        local a; a="$(unix_path "$AZAHAR")"
+        case "$a" in /*) ;; *) a="$PWD/$a" ;; esac
+        echo "$a"; return
+    fi
     [ "$system" = 1 ] || { "$ROOT/scripts/fetch-azahar.sh"; return; }
     local c
     for c in /Applications/Azahar.app/Contents/MacOS/azahar "$HOME/Applications/Azahar.app/Contents/MacOS/azahar"; do
@@ -69,12 +75,30 @@ find_azahar() {
     command -v azahar 2>/dev/null || command -v azahar.exe 2>/dev/null || command -v azahar-qt 2>/dev/null || true
 }
 
-# The emulated SD card: a portable install's user/ folder next to the binary
-# first, then the platform's data folder.
+# A portable install's user/ folder: next to the binary, on macOS next to
+# Azahar.app (where Azahar looks for it).
+portable_user() {
+    case "$1" in
+    */Azahar.app/Contents/MacOS/*) echo "${1%/Azahar.app/Contents/MacOS/*}/user" ;;
+    *) echo "$(dirname "$1")/user" ;;
+    esac
+}
+
+# Starts Azahar on <file>, and returns when it closes. On macOS through `open`
+# on the app bundle (-W waits for it, -n a new instance).
+run_azahar() {
+    case "$AZ" in
+    */Azahar.app/Contents/MacOS/*) exec open -W -n "${AZ%/Contents/MacOS/*}" --args "$1" ;;
+    *) exec "$AZ" "$1" ;;
+    esac
+}
+
+# The emulated SD card: a portable install's user/ folder first, then the
+# platform's data folder.
 find_sdmc() {
     [ -n "${AZAHAR_SDMC:-}" ] && { unix_path "$AZAHAR_SDMC"; return; }
     local c
-    for c in "$(dirname "$1")/user/sdmc" "$HOME/Library/Application Support/Azahar/sdmc" \
+    for c in "$(portable_user "$1")/sdmc" "$HOME/Library/Application Support/Azahar/sdmc" \
              "${XDG_DATA_HOME:-$HOME/.local/share}/azahar-emu/sdmc" "${XDG_DATA_HOME:-$HOME/.local/share}/azahar/sdmc"; do
         [ -d "$c" ] && { echo "$c"; return; }
     done
@@ -86,7 +110,7 @@ find_sdmc() {
 
 AZ="$(find_azahar)"
 [ -n "$AZ" ] || die "Azahar not found: install it, or set AZAHAR to its binary"
-case "$AZ" in "$ROOT"/build/azahar/*) mkdir -p "$(dirname "$AZ")/user/sdmc" ;; esac   # the portable copy's SD card
+case "$AZ" in "$ROOT"/build/azahar/*) mkdir -p "$(portable_user "$AZ")/sdmc" ;; esac   # the portable copy's SD card
 SDMC="$(find_sdmc "$AZ")"
 [ -n "$SDMC" ] || die "no emulated SD card found: start Azahar once, or set AZAHAR_SDMC"
 SD="$SDMC/3ds/3ds-d2"
@@ -138,12 +162,16 @@ if [ "$use_3dsx" = 1 ]; then
     app="$ROOT/build/cpu/ctr/3ds-d2-game.3dsx"
     [ -f "$app" ] || die "no $app (scripts/docker.sh game-3dsx)"
     [ "$windows" = 1 ] && app="$(cygpath -w "$app")"
-    exec "$AZ" "$app"
+    run_azahar "$app"
 fi
 
 # The CIA: built with the game's art (its icon, banner and tune) from the
 # game folder, installed (azahar -i, which stays open after: stopped once the
-# title's content is in place), then its content started.
+# title's content is in place), then its content started. The install is
+# told by Azahar's own line, or by the title's content folder changing (each
+# install writes a TMD under the next number; the .app keeps its name when
+# the CIA is the same). Without either, it stops: the .app left there is the
+# earlier install's, and starting it would run the old build.
 if [ "$build" = 1 ]; then
     art="${install:-$ROOT/dist/game}"
     [ -f "$art/Game.exe" ] || die "no game folder for the CIA's art: --install <dir>, or dist/game"
@@ -151,31 +179,48 @@ if [ "$build" = 1 ]; then
 fi
 [ -n "$cia" ] || cia="$(ls -t "$ROOT"/dist/cia/*.cia 2>/dev/null | head -1)"
 [ -f "$cia" ] || die "no CIA (scripts/docker.sh package-cia dist/game)"
-content="$SDMC/Nintendo 3DS/00000000000000000000000000000000/00000000000000000000000000000000/title/00040000/0d2d3d00/content"
-before="$(ls "$content"/*.app 2>/dev/null || true)"
-stamp="$(mktemp)"
+case "$cia" in /*) ;; *) cia="$PWD/$cia" ;; esac   # Azahar takes a relative path from its own folder ("File not found")
+case "$(basename "$cia")" in 3ds-d2-x86-*) title=0d2d3e00 ;; *) title=0d2d3d00 ;; esac   # a title a backend (issue #116)
+content="$SDMC/Nintendo 3DS/00000000000000000000000000000000/00000000000000000000000000000000/title/00040000/$title/content"
+before="$(ls "$content" 2>/dev/null || true)"
+ilog="$(mktemp)"
 echo "installing $(basename "$cia")"
 c="$cia"; [ "$windows" = 1 ] && c="$(cygpath -w "$cia")"
-"$AZ" -i "$c" >/dev/null 2>&1 &
+"$AZ" -i "$c" >"$ilog" 2>&1 &
 pid=$!
-app=""
+result=""
 for _ in $(seq 1 240); do   # up to 2 minutes
-    for a in "$content"/*.app; do
-        [ -f "$a" ] || continue
-        if ! printf '%s
-' "$before" | grep -qxF "$a" || [ "$a" -nt "$stamp" ]; then app="$a"; fi
-    done
-    [ -n "$app" ] && break
-    kill -0 "$pid" 2>/dev/null || break
+    if grep -q "Installed CIA successfully" "$ilog"; then result=ok; break; fi
+    if grep -qE "Failed to install|Could not install CIA|installation aborted|aborting install|Blocked unauthorized" "$ilog"; then
+        result=failed; break
+    fi
+    [ "$(ls "$content" 2>/dev/null || true)" != "$before" ] && { result=changed; break; }
+    kill -0 "$pid" 2>/dev/null || { result=exited; break; }
     sleep 0.5
 done
 sleep 1   # the content written out
 kill "$pid" 2>/dev/null || true
 [ "$windows" = 1 ] && taskkill //F //PID "$(cat /proc/$pid/winpid 2>/dev/null || echo 0)" >/dev/null 2>&1 || true
 wait "$pid" 2>/dev/null || true
-rm -f "$stamp"
-[ -n "$app" ] || app="$(ls -t "$content"/*.app 2>/dev/null | head -1)"
+# Azahar's line can come before the folder shows the new files, and a
+# changed folder before the line: either way the folder must have changed.
+[ "$result" = ok ] || [ "$result" = changed ] && [ "$(ls "$content" 2>/dev/null || true)" = "$before" ] && result=unchanged
+if [ "$result" != ok ] && [ "$result" != changed ]; then
+    case "$result" in
+    failed)    why="Azahar said the install failed" ;;
+    exited)    why="azahar -i exited without installing it" ;;
+    unchanged) why="Azahar said it installed, but the title's content folder did not change" ;;
+    *)         why="nothing installed in 2 minutes" ;;
+    esac
+    echo "--- azahar -i:" >&2; tail -20 "$ilog" >&2
+    others="$(pgrep -lx 'azahar|azahar-qt|azahar.exe' 2>/dev/null || true)"
+    [ -n "$others" ] && printf '%s\n%s\n' "--- Azahar already running (close it and try again):" "$others" >&2
+    rm -f "$ilog"
+    die "$(basename "$cia") was not installed ($why)"
+fi
+rm -f "$ilog"
+app="$(ls -t "$content"/*.app 2>/dev/null | head -1)"
 [ -n "$app" ] || die "the CIA did not install (no $content/*.app)"
 echo "installed: $app"
 [ "$windows" = 1 ] && app="$(cygpath -w "$app")"
-exec "$AZ" "$app"
+run_azahar "$app"

@@ -14,7 +14,8 @@ namespace {
 
 bool g_renote = false;   // note_game_state_again
 
-constexpr uint32_t kCheckVa = 0x0045B440;     // push ebp
+constexpr uint32_t kCheckVa = 0x0045B450;     // mov dword [0x7a5204], ... at 45b44e: its operand
+constexpr uint32_t kCheckWant = 0x007A5204;
 constexpr uint32_t kPlayerUnitVa = 0x007A6A70;
 constexpr uint32_t kUiTableVa = 0x007A27C0;
 constexpr uint32_t kFocusVa = 0x007D55C8;
@@ -34,8 +35,8 @@ GameState read_game_state()
 {
     GameState s;
     s.video = cinematic_playing();
-    uint8_t check = 0;
-    if (!rt::guest_read(kCheckVa, &check, 1) || check != 0x55)
+    uint32_t check = 0;
+    if (!rt::guest_read(kCheckVa, &check, 4) || check != kCheckWant)
         return s;   // not the 1.14d layout: report nothing, the controls stay in cursor mode
     s.known = true;
     uint32_t player = 0;

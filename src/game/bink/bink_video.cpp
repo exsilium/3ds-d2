@@ -683,7 +683,14 @@ bool VideoDecoder::decode_plane(BitReader &br, int p, bool chroma)
                 case kIntraBlock:
                     std::memset(coeffs, 0, sizeof coeffs);
                     coeffs[0] = s16(kIntraDc);
-                    dequantize(coeffs, kIntraQuant[read_dct(br, coeffs, coef_pos, coef_count)], coef_pos, coef_count);
+                    {
+                        // read_dct fills coef_pos and sets coef_count, which dequantize then
+                        // uses. C++ leaves the order of a call's arguments unspecified, so
+                        // within one call dequantize could get coef_count from before
+                        // read_dct ran (x86 GCC does): read it first, then dequantize.
+                        const int quant_level = read_dct(br, coeffs, coef_pos, coef_count);
+                        dequantize(coeffs, kIntraQuant[quant_level], coef_pos, coef_count);
+                    }
                     idct_put(small, 8, coeffs);
                     break;
                 case kFillBlock:
@@ -754,7 +761,11 @@ bool VideoDecoder::decode_plane(BitReader &br, int p, bool chroma)
             case kIntraBlock:
                 std::memset(coeffs, 0, sizeof coeffs);
                 coeffs[0] = s16(kIntraDc);
-                dequantize(coeffs, kIntraQuant[read_dct(br, coeffs, coef_pos, coef_count)], coef_pos, coef_count);
+                {
+                    // read_dct first, then dequantize: see the scaled-block case above.
+                    const int quant_level = read_dct(br, coeffs, coef_pos, coef_count);
+                    dequantize(coeffs, kIntraQuant[quant_level], coef_pos, coef_count);
+                }
                 idct_put(dst, stride, coeffs);
                 break;
             case kFillBlock:
@@ -767,7 +778,11 @@ bool VideoDecoder::decode_plane(BitReader &br, int p, bool chroma)
                 copy8(dst, src, stride);
                 std::memset(coeffs, 0, sizeof coeffs);
                 coeffs[0] = s16(kInterDc);
-                dequantize(coeffs, kInterQuant[read_dct(br, coeffs, coef_pos, coef_count)], coef_pos, coef_count);
+                {
+                    // read_dct first, then dequantize: see the scaled-block case above.
+                    const int quant_level = read_dct(br, coeffs, coef_pos, coef_count);
+                    dequantize(coeffs, kInterQuant[quant_level], coef_pos, coef_count);
+                }
                 idct_add(dst, stride, coeffs);
                 break;
             }

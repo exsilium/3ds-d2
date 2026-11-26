@@ -1,0 +1,14 @@
+[package]
+name = "recompile"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Game.exe's functions to C for the AOT build (issue #144; the port of recompile.py)"
+license = "BSD-2-Clause"
+publish = false
+
+[dependencies]
+capstone-sys = { version = "=0.18.0", default-features = false, features = ["full", "arch_x86"] }
+
+[profile.release]
+debug = 1

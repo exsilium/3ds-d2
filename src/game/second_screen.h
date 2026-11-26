@@ -136,13 +136,21 @@ public:
     // run on or not, and the platform applies it at once.
     static constexpr int kProfBtnX = 4, kProfBtnW = 156;
     static constexpr int kProfRows = kProfileOptionCount + 1;
-    static constexpr int kProfRowY = kBarH + 20, kProfRowH = 30;   // six rows above the buttons
+    // A row: its box and label, the note under it (y+3 to y+23). 26 pixels
+    // each, so that seven rows end above the buttons (issue #117).
+    static constexpr int kProfRowY = kBarH + 20, kProfRowH = 26;
+    static_assert(kProfRowY + kProfRows * kProfRowH <= kMapBtnY,
+                  "the checklist's rows run into the buttons under them");
     // INFO's own page has three buttons: the profiler run, the port's
     // OPTIONS (port_options.h: how the engine runs, a box each, applied at
     // once, a run on or not) and the report. On the checklist and the
     // OPTIONS page, the right-hand one goes back to INFO.
     static constexpr int kInfoBtnW = 104, kInfoBtnX0 = 2, kInfoBtnX1 = 108, kInfoBtnX2 = 214;
-    static constexpr int kOptRowY = kBarH + 20, kOptRowH = 30;
+    // A row: its box and label, the note under it (y+3 to y+23). 26 pixels
+    // each, so that seven rows end above the buttons (issue #117).
+    static constexpr int kOptRowY = kBarH + 20, kOptRowH = 26;
+    static_assert(kOptRowY + kPortOptionCount * kOptRowH <= kMapBtnY,
+                  "the OPTIONS page's rows run into the buttons under them");
     bool profiling() const { return profiling_; }
     uint32_t profile_choice() const { return profile_; }
     void set_profile_choice(uint32_t bits);
@@ -232,6 +240,8 @@ private:
     enum class Grip : uint8_t { None, Bar, Pad, Key, Point, MapButton };
     Grip grip_ = Grip::None;
     int key_ = -1;                    // KEYS: the button held
+    static constexpr int kKeyOptions = 99;   // INFO's OPTIONS button: under the OPTIONS rows' 100, over the checklist's
+    static_assert(5 + kProfileOptionCount < kKeyOptions, "a checklist row's key would be the OPTIONS button's");
     int tx0_ = 0, ty0_ = 0, moved_ = 0;
     uint64_t t0_ = 0, moved_at_ = 0;
     bool long_fired_ = false, scrolled_ = false;

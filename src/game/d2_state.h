@@ -9,8 +9,10 @@
 //   0x007D55C8  D2Win's focused control (0: none); a control's first dword
 //               is its type, 1 = edit box. The text itself (control+0x5C) is
 //               never read: on Battle.net it can be a password.
-//   0x0045B440  a function entry starting with push ebp (0x55): a cheap check
+//   0x0045B450  0x007A5204, the operand of the mov at 45b44e: a cheap check
 //               that this really is the 1.14d layout before trusting the rest
+//               (not a function's first bytes: the natives and the compiled
+//               code's hooks write a jump there, issue #115)
 #ifndef D2_GAME_D2_STATE_H
 #define D2_GAME_D2_STATE_H
 

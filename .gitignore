@@ -10,3 +10,5 @@ Game.exe
 .DS_Store
 /containers/d2vita-ref/patches-armv6/
 __pycache__/
+# scripts/docker.sh test aot-compare: an older recompile.py, beside this one while it runs
+/tools/aot/.recompile-*.py

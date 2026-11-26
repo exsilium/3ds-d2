@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 3ds-d2 <3ds-d2@localhost>
+Date: Sun, 15 Nov 2026 15:40:18 +0200
+Subject: [PATCH] ds_emul: set_limiter()/limiter_on() and set_diag()/diag_on(),
+ the output limiter and the diagnostic counters switched at run time
+
+---
+ src/runtime/ds_emul.cpp |  4 ++++
+ src/runtime/ds_emul.h   | 10 ++++++++++
+ 2 files changed, 14 insertions(+)
+
+diff --git a/src/runtime/ds_emul.cpp b/src/runtime/ds_emul.cpp
+index 219abc9..8e6bec0 100644
+--- a/src/runtime/ds_emul.cpp
++++ b/src/runtime/ds_emul.cpp
+@@ -1294,6 +1294,10 @@ void shutdown() {
+ }
+ 
+ unsigned long long famine_count() { return c_famine.load(std::memory_order_relaxed); }
++void set_limiter(bool on) { __atomic_store_n(&g_limit, on ? 1 : 0, __ATOMIC_RELAXED); }
++bool limiter_on() { return __atomic_load_n(&g_limit, __ATOMIC_RELAXED) != 0; }
++void set_diag(bool on) { __atomic_store_n(&g_diag, on, __ATOMIC_RELAXED); }
++bool diag_on() { return __atomic_load_n(&g_diag, __ATOMIC_RELAXED); }
+ 
+ int stat_line(char* out, unsigned n) {
+     if (!g_on || !out || !n) return 0;
+diff --git a/src/runtime/ds_emul.h b/src/runtime/ds_emul.h
+index c73f52d..fc7eceb 100644
+--- a/src/runtime/ds_emul.h
++++ b/src/runtime/ds_emul.h
+@@ -112,6 +112,16 @@ int diag_line(char* out, unsigned n);
+ // stat_line keeps. Lock-free, any thread.
+ unsigned long long famine_count();
+ 
++// The output limiter (D2_SONLIMIT above) switched at run time, from any
++// thread: the mixer reads it once per grain. Turned back on, it starts from
++// the gain it last had and releases to unity as usual.
++void set_limiter(bool on);
++bool limiter_on();
++// D2_SONDIAG's counters (diag_line) switched at run time, likewise. The first
++// window after switching them on is a partial one.
++void set_diag(bool on);
++bool diag_on();
++
+ // Sink-only self-test (D2_SONTEST=1): pushes a 440 Hz sine into a WAV sink,
+ // then reads the file back and verifies it. Isolates "the sink works" from
+ // "DirectSound emulation works". Returns 0 on PASS.

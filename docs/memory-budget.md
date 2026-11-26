@@ -490,6 +490,33 @@ On the Linux lane (`fight.txt`, `ctr-n3`, virtual clock, `M4_NATIVE=late`, the a
 
 The cache count drops because a DCC group's file bytes are no longer counted. The sprites decoded before the install (67 of 251 in the trace) still hold the pool system's blocks. Of the 184 decoded after it, `tools/sprite_trace.py --game` finds all 184 counted at the class the allocator predicts. This is a short fight with the cache half full and no evictions. The console session in #24 measures what partly used slabs cost once the cache churns, along with the governor's limit, the pool's free space and the cells decoded.
 
+### A group over 256 KiB with no block: the cache lets go of another (issue #153, 3DS-D2-1F)
+
+A console session on the AOT build `d54100a56e2f-aot30364a` ended after 3,382 s with `heap full: want 390 KiB`. The guest pool had 5,381 KiB free, but in 53 pieces of 320 KiB at the most; the 2 MiB zone for blocks over 256 KiB held five (320, 320, 448, 320, 320 KiB). The group fell through to the pool system and from there to the guest heap, whose 2 MiB spare was 1,990 KiB in use. The cache was letting sprites go all the while, but small ones, whose units leave no piece of that size.
+
+`big_room` in `src/game/d2_memory.cpp` now runs before that fall-through:
+
+- **What it knows.** `SpriteFramesHeld` (0x5ff72d, the cache entry in edi) records the entry of each group whose unit is over 256 KiB; `SpriteFramesFree` forgets it.
+- **What it does.** It walks the cache's two lists (0x89db60: `+0x14` the used entries, `+0x1c` those not drawn since they came in), takes the recorded entries longest unused first, and has the game let each go with its own 0x5ff4a0 until the request has a block. No game code is replaced.
+- **What it leaves.** An entry in use (`+0xc` bit 1), and any entry used within a second of the cache's newest use: a draw up the stack may hold frames it has just fetched. If nothing is left to let go of, the request goes on to the pool system as before.
+- **The log.** `sprite frames: <n> KiB had no block; <g> sprites with blocks of their own let go of (<r> used in the last second, <s> in use or gone, <f> refused), and it has one|still has none`, and the heartbeat's sprite frames line ends `, <n> let go of for the room of <m>` once any were.
+
+No session here reaches the state the console was in, so the path is tested forced: `bigroomtest=1` in settings.txt (`D2_BIG_ROOM_TEST=1` on the lane) lowers the size to 32 KiB and has every such group let go of another first, as if it had found no block.
+
+| forced run | sprites let go of | end |
+| --- | ---: | --- |
+| lane, `fight.txt` | 7 | 3,255 frames, as without |
+| lane, Act II east | 9 | the script's end |
+| lane, town walk | 20 | the script's end |
+| Azahar, AOT CIA, Cold Plains 200 s | 347 | the script's end |
+| Azahar, x86 CIA, Cold Plains 200 s | 340 | the script's end |
+
+Caveats:
+
+- A first version let go in any order, and the lane's fight ended in the loader's check of a freed handle (0x40a9e0, `fatal exit(-1)` from 0x40aa06) after 1,205 of them. The order by last use and the second's grace came after that, and no run since has failed; whether the grace is the cure or only makes it rare isn't shown.
+- Without the switch the path wasn't taken in any run: both lanes and the tests are as before.
+- Not run on a console. The session that failed isn't reproduced.
+
 ### Going East: the HOME Menu or the kernel goes down (issue #24, 2026-11-01)
 
 Three times in four runs on build `2d5e1c8c7799`, travelling East from the Rogue Encampment stopped the console just as the Act II cinematic opened. It happened after 1 to 17 minutes of play, with or without HOME use or the profiler. Each run's log ends with `cinematic: 640x292, 4604 frames at 24/1 fps, sound on`, and no video frame reached the screen. Luma3DS saved a dump each time, and none was of the app's own code. (The reports are all in Sentry issue 3DS-D2-K, one event each: below by the first 8 characters of the event ID.)
@@ -624,7 +651,7 @@ This is the split of the New 3DS's 124 MiB application region in play. The figur
 
 | Symbol | Size | What it is |
 | --- | --- | --- |
-| `dyn86_ctr_jitpool` | 16 MiB | The translated code's pool (`src/app/ctr_game.cpp`) |
+| `dyn86_ctr_jitpool` | 16 MiB in that build; 14 MiB since issue #89 (below) | The translated code's pool (`src/app/ctr_game.cpp`) |
 | `static_insts` | 896 KiB | Box86's scratch while translating a block |
 | `weight.5` | 512 KiB | A function-static table in the backend; not identified yet |
 | `g_hp_addr`, `g_hp_count` | 256 KiB each | Probably the profiler's hot-path tables; not checked |

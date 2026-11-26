@@ -609,6 +609,8 @@ std::string event_json(const Event &e)
         tags.push_back({"dump_pc", hex32(e.dump.pc)});
     o += ",\"tags\":" + json_object(tags);
     o += ",\"contexts\":{\"device\":" + json_object(e.device);
+    if (!e.os_name.empty())
+        o += ",\"os\":{\"type\":\"os\",\"name\":" + json_string(e.os_name) + "}";
     // The build the session went wrong on, as the runtime: Sentry's events
     // table shows it in its Runtime column ("3ds-d2 <build>").
     if (!e.dist.empty())

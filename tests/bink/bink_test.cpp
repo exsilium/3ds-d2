@@ -2,12 +2,13 @@
 // FFmpeg writes for the same file, so the two can be compared byte for byte
 // (tests/bink/compare.sh):
 //
-//   bink_test <file.bik> [-v <out.yuv>] [-a <out.s16>] [-n <frames>]
+//   bink_test <file.bik> [-v <out.yuv>] [-a <out.s16>] [-n <frames>] [-x 1]
 //
 // -v: every frame as raw yuv420p, cropped to the picture size
 //     (ffmpeg -i f.bik -f rawvideo -pix_fmt yuv420p).
 // -a: the first audio track as interleaved 16-bit samples
 //     (ffmpeg -i f.bik -map 0:a:0 -f s16le).
+// -x 1: audio only, the video is not decoded (tests/bink/audio_compare.sh).
 // Always prints the header and the decode time per frame (video, audio:
 // average and worst), which on the qemu ARM11 lane is the CPU-bound measure.
 #include "game/bink/bink_audio.h"
@@ -34,11 +35,12 @@ double now_ms()
 int main(int argc, char **argv)
 {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: %s <file.bik> [-v out.yuv] [-a out.s16] [-n frames]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <file.bik> [-v out.yuv] [-a out.s16] [-n frames] [-x 1]\n", argv[0]);
         return 2;
     }
     const char *yuv_path = nullptr, *pcm_path = nullptr;
     uint32_t limit = 0;
+    bool skip_video = false;
     for (int i = 2; i + 1 < argc; i += 2) {
         if (!std::strcmp(argv[i], "-v"))
             yuv_path = argv[i + 1];
@@ -46,6 +48,8 @@ int main(int argc, char **argv)
             pcm_path = argv[i + 1];
         else if (!std::strcmp(argv[i], "-n"))
             limit = (uint32_t)std::strtoul(argv[i + 1], nullptr, 0);
+        else if (!std::strcmp(argv[i], "-x"))
+            skip_video = std::strtoul(argv[i + 1], nullptr, 0) != 0;
     }
     bink::File file;
     if (!file.open(argv[1], 0)) {
@@ -86,6 +90,8 @@ int main(int argc, char **argv)
             if (pcm)
                 std::fwrite(samples.data(), sizeof(int16_t), samples.size(), pcm);
         }
+        if (skip_video)
+            continue;
         const double t0 = now_ms();
         if (!video.decode(p.video, p.video_size) && failures++ < 10)
             std::fprintf(stderr, "frame %u: video data damaged\n", i);

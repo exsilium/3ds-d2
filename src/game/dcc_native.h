@@ -13,6 +13,8 @@
 #define D2_GAME_DCC_NATIVE_H
 
 #include <cstdint>
+#include <string>
+#include <vector>
 
 namespace d2rt { struct Cpu; }
 
@@ -40,6 +42,9 @@ struct DccStats {
     uint32_t on_frame = 0, worker_busy = 0;         // decoded in place: on the frame thread, the worker full
 };
 DccStats dcc_stats();
+// The window's groups decoded on the frame thread, by the callers of the
+// sprite fetch (the heartbeat's line; none when there were none).
+std::vector<std::string> dcc_frame_lines();
 
 }  // namespace game
 

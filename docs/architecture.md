@@ -1,4 +1,60 @@
-# Architecture — M2 audit
+# Architecture
+
+## How it works today
+
+The game is the user's own Diablo II 1.14d `Game.exe`. It runs unmodified, inside a Win32 runtime, on a New 3DS. `scripts/docker.sh package-cia <game-dir>` builds two apps from it, which differ only in how the game's x86 code becomes ARM code. Both can be installed at once:
+
+| CIA | Title | How the x86 code runs |
+| --- | --- | --- |
+| `3ds-d2-aot-…` | **3ds-d2** (`000400000D2D3D00`, the ID of every release up to v0.4.0) | Compiled ahead of time on the user's machine. No Box86, no JIT. |
+| `3ds-d2-x86-…` | **3ds-d2 x86** (`000400000D2D3E00`) | Translated at run time by the Box86 port. |
+
+| Layer | What it is | Where |
+| --- | --- | --- |
+| AOT (the `aot` CIA) | `tools/aot/recompile` (Rust) runs inside `package-cia`. It writes each function of the user's Game.exe out as C, about 14,500 of them, and devkitARM's gcc compiles them into the CIA. `CpuAot`, the backend behind WinVita's `Cpu` interface, runs that code: each guest thread on a fiber of its own, imports and calls through a pointer as callouts to the shims. Code that ran in profiles is built `-O2`, the rest `-Os`. Code that isn't compiled stops the run in order, with a report. Game.exe must be the one the build was compiled from. Box86 checks the compiled code (`scripts/docker.sh test aot`). | `tools/aot/`, `src/runtime/` (`CpuAot`), [aot.md](aot.md) |
+| Translation (the `x86` CIA) | Box86's dynarec, ported to the ARM11 (ARMv6K), translates the game's x86 code at run time. It sits inside WinVita's runtime (the `third_party/winx86` submodule, MIT) with this project's patch series. | `tests/cpu/patches/armv6/`; the work tree [build-and-run.md](build-and-run.md#the-backends-work-tree) |
+| Win32 runtime | The PE loader, the import bridge, and shims for kernel32 and the files, user32, advapi32, gdi32, winmm, the network, Bink and Smacker (`src/runtime/rt_shims_*.cpp`), with WinVita's DirectSound (`ds_emul`). The game draws in its software (GDI) mode and hands each 8-bit frame over through `StretchBlt`/`BitBlt`. The game's threads run one at a time under WinVita's cooperative scheduler, on either backend. | `src/runtime/`, and WinVita's |
+| Natives | About 50 sites where C++ replaces the game's hottest routines and loops (drawing, lighting, decoding, the sprite cache, stats, collision, movement, path search). Each is checked against the game's own code and listed in one table (`native_sites_table.h`) that both backends read. Box86 hooks them into the image; the AOT build binds them to their functions' addresses. | `src/game/`, [natives.md](natives.md) |
+| Intrinsics | Uncontended locks and the clock, served in line without the runtime's lock: from translated code (backend patches) or from compiled code's callouts (`CpuAot`) | backend patches, `src/runtime/` |
+| The app | Start-up, the game files (romfs or SD), the screens, sound (ndsp), cinematics (Bink, DCT soundtracks included), the controls, the bottom screen's tabs, problem reports, the profiler | `src/app/`, `src/game/` |
+
+**The cores (New 3DS):**
+- **Core 0:** the game's threads, translated code and natives.
+- **Core 2,** or core 1 at a 30% time share when core 2 isn't available:
+  - the render thread: copies the game's frame, scales it, and presents it at 50 Hz;
+  - the floor queue's worker (floor tiles drawn beside the game's thread);
+  - the I/O worker (file reads, DCC decoding off the read thread, tiles read ahead);
+  - the sound thread;
+  - the SD writer for logs and traces;
+  - a stall watcher.
+
+**Memory:** about 124 MiB in all, in New 3DS extended mode. The guest arena holds the game's heap and VirtualAlloc space, with the sprite cache in it.
+- **x86 build:** a 75 MiB arena. The translation layer takes about 31 MiB (code pool, jump tables, block records).
+- **AOT build:** an 83 MiB arena. The compiled code is about 19 MiB of the executable. The linear memory that Box86's jump tables used holds the read cache's blocks (2 MiB), the tile store (1.5 MiB) and the threads' host stacks.
+
+[memory-budget.md](memory-budget.md) and [aot.md](aot.md) have the details and their history.
+
+**Measuring:**
+- every build counts hitches and memory on a 10 s heartbeat;
+- a profiler run adds frame timing, the guest code profile, the sprite and file-read traces, and an SD card benchmark;
+- reports go to Sentry ([build-and-run.md](build-and-run.md#reading-console-reports-in-sentry)).
+
+The m4 lane runs the real Game.exe under qemu with scripted play, for exact block counts and per-call checks ([hardware-test.md](hardware-test.md)). The AOT lanes run the same scripts on the compiled code. With Box86 beside it, each compiled function is checked against Box86's run of the same call, and must show 0 differ. Without Box86, on `CpuAot` alone, the run must reach the scripts' frames and state lines.
+
+**d2decomped** (`third_party/d2d`, GPL-3.0) is used by tests and tools only; no d2d code is linked into either CIA. Its function list is the AOT recompiler's target, read from the submodule at build time; the compiled code's table keeps d2d's names. Its reference implementations and emulator-made cases test the natives ([aot.md](aot.md#distribution) has the licensing decisions).
+
+### Where it is heading
+
+- **The AOT build on the console (#139, #153):** measure the memory it frees on hardware, and spend it on sprites and preloading. Most AOT changes so far ran in the lanes and in Azahar only.
+- **Natives bound at compile time (#138):** natives called from compiled code without the Bridge's shim and the copy of the registers.
+- **The top screen in wide mode, 800×240 (#170),** for the AOT build.
+- **GPU rendering through a Glide path, and an 800×480 render size (#120),** under study.
+
+The rest of this document is the M2 audit from before the port was written. It is kept for its reasoning; parts of it no longer describe the code.
+
+---
+
+## M2 audit (2026-10-16)
 
 Status: M2 audit complete (2026-10-16). **Decision (2026-10-16): the main route is the ARMv6K port of the Box86 backend inside WinVita. DOSBox dynrec is reference material only.** Memory feasibility (§2) is measured before the port starts. Sources were read at the commits in [third_party/deps.lock](../third_party/deps.lock). Every claim cites a file in those trees. Nothing here has been measured on the 3DS.
 
@@ -390,7 +446,7 @@ The logo has no background. The lettering is opaque. The flames, which the game 
 
 The flipbook shows 3 of the 30 frames (0, 10 and 20) at 15 fps, as 256×128 cells of two RGBA4 atlases. The current frame's plane is in place and the others wait far above the view. A frame stays in place until the next one has arrived.
 
-Under the logo, a still plane carries "EXPANSION SET / Lord of Destruction" and "v1.14d". The two lines are cut out of the LoD main menu's background (`gameselectscreenEXP.dc6` in d2exp.mpq). The cut-out is keyed on brightness or on warmth (red minus blue), whichever is higher, so the gold lettering keeps its darker strokes while the grey scene drops out. The two lines get a dark halo so they read on a light background. The version is set in the main menu's font (`font24.DC6`), in the lines' gold made a little lighter and with a lighter halo, so it reads as a caption. The visible pixels of the whole banner are centred between the HOME menu's top bar and its bottom hints. The CGFX is 251 KB, under the HOME menu's 512 KiB limit.
+Under the logo, a still plane carries "EXPANSION SET / Lord of Destruction" and a version line that names the CIA's backend, "v1.14D-AOT" or "v1.14D-X86" (`D2_BANNER_VERSION`; `subtitle-preview.png` beside the banner shows the plane). The two lines are cut out of the LoD main menu's background (`gameselectscreenEXP.dc6` in d2exp.mpq). The cut-out is keyed on brightness or on warmth (red minus blue), whichever is higher, so the gold lettering keeps its darker strokes while the grey scene drops out. The two lines get a dark halo so they read on a light background. The version is set in the main menu's font (`font24.DC6`), in the lines' gold made a little lighter and with a lighter halo, so it reads as a caption. The visible pixels of the whole banner are centred between the HOME menu's top bar and its bottom hints. The CGFX is 251 KB, under the HOME menu's 512 KiB limit.
 
 Two hardware limits were found by bisecting on a New 3DS. Every failure froze the HOME menu as the title was selected:
 - One material and texture per frame (15 of each) froze it. The same 15 planes sharing 2 atlas materials work when not animated.

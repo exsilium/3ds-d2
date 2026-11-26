@@ -13,13 +13,15 @@
 // stream and guest memory (no staging buffer), file handles are a fixed-size
 // table, and directory listings are read once.
 //
-// Read-only files from the game install (the MPQs) bypass stdio. The game
+// Existing files opened to read (the MPQs, and a save's files) bypass stdio. The game
 // reads them in small sector-sized pieces with a seek before most of them,
 // and stdio dropped its small buffer at every fseek: on the console each
 // call became an SD access, at 400-750 KiB/s. Such a file is an unbuffered
 // descriptor under a per-handle block cache (ReadCache), and its position is
 // kept here, so SetFilePointer never reaches the file system. Files the
-// guest may write keep stdio, so no cache can go stale against a write.
+// guest creates or truncates keep stdio; one opened to read and write is
+// cached until its first write (to_stdio), so no cache is older than a write
+// through its own handle.
 #include "runtime/rt_host.h"
 #include "runtime/rt_layout.h"
 
@@ -347,7 +349,9 @@ FileStats g_file_stats;
 // before each read of an MPQ file) is read ahead again once it has gone.
 // The files are the read-only game files a ReadCache was opened on, by
 // name; the worker reads them through descriptors of its own.
-constexpr uint32_t kPfRanges = 512, kPfFiles = 32;
+// (The AOT build's is 3.5 MiB of linear memory: 2,048 ranges, where 512 held
+// the 1 MiB.)
+constexpr uint32_t kPfRanges = 2048, kPfFiles = 32;
 uint8_t *g_pf_arena = nullptr;
 uint32_t g_pf_arena_size = 0, g_pf_head = 0;   // the ring's next write (the worker's)
 struct PfFile {
@@ -460,6 +464,114 @@ void pf_commit(int id, uint64_t pos, uint32_t at, uint32_t len)
         }
 }
 
+// The sprites' store (issue #153, set_sprite_keep): the bytes read from the
+// card inside a region keep_region named (a sprite file's extent in its
+// archive), kept for the next read of the same bytes. The game's sprite
+// cache holds decoded frames and lets them go in a crowd; the draw then
+// fetches the direction again, and on the console that was the card again
+// (one file 41 times in a fight: 3DS-D2-1J, event 7f538e2f), since a read of
+// a block or more passes the read cache by. A ring, like the prefetch's: a
+// new range replaces the oldest where it lands.
+constexpr uint32_t kKeepRanges = 384, kKeepRegions = 128;
+uint8_t *g_keep_arena = nullptr;
+uint32_t g_keep_size = 0, g_keep_head = 0, g_keep_region_next = 0;
+struct KeepRegion {
+    int id = -1;
+    uint64_t pos = 0;
+    uint32_t len = 0;
+};
+KeepRegion g_keep_regions[kKeepRegions];
+PfRange g_keep[kKeepRanges];
+std::atomic_flag g_keep_lock = ATOMIC_FLAG_INIT;
+std::atomic<uint32_t> g_keep_hits{0}, g_keep_hit_bytes{0}, g_keep_puts{0}, g_keep_put_bytes{0}, g_keep_held{0};
+struct KeepGuard {
+    KeepGuard()
+    {
+        while (g_keep_lock.test_and_set(std::memory_order_acquire)) {
+        }
+    }
+    ~KeepGuard() { g_keep_lock.clear(std::memory_order_release); }
+};
+
+bool keep_serve(int id, uint64_t pos, uint8_t *dst, uint32_t n)
+{
+    if (id < 0 || !g_keep_held.load(std::memory_order_relaxed))
+        return false;
+    KeepGuard g;
+    for (const PfRange &r : g_keep)
+        if (r.id == id && r.len && pos >= r.pos && pos + n <= r.pos + r.len) {
+            std::memcpy(dst, g_keep_arena + r.at + (pos - r.pos), n);
+            g_keep_hits++;
+            g_keep_hit_bytes += n;
+            return true;
+        }
+    return false;
+}
+
+// Whether [pos, pos+n) is all inside a named region.
+bool keep_wanted(int id, uint64_t pos, uint32_t n)
+{
+    if (id < 0 || !g_keep_arena)
+        return false;
+    KeepGuard g;
+    for (const KeepRegion &r : g_keep_regions)
+        if (r.id == id && pos >= r.pos && pos + n <= r.pos + r.len)
+            return true;
+    return false;
+}
+
+void keep_put(int id, uint64_t pos, const uint8_t *src, uint32_t n)
+{
+    if (!n || n > g_keep_size / 4)
+        return;
+    KeepGuard g;
+    if (g_keep_head + n > g_keep_size)
+        g_keep_head = 0;
+    const uint32_t at = g_keep_head;
+    PfRange *slot = nullptr;
+    for (PfRange &r : g_keep) {
+        if (r.len && r.at < at + n && at < r.at + r.len) {
+            g_keep_held -= r.len;
+            r.len = 0;
+            r.id = -1;
+        }
+        if (!r.len && !slot)
+            slot = &r;
+    }
+    if (!slot)
+        return;
+    std::memcpy(g_keep_arena + at, src, n);
+    slot->id = id;
+    slot->pos = pos;
+    slot->at = at;
+    slot->len = n;
+    g_keep_head = at + n;
+    g_keep_held += n;
+    g_keep_puts++;
+    g_keep_put_bytes += n;
+}
+
+// The card's read time, modelled (issue #166, set_sd_model): a read that
+// began at t0 waits here until the model's time for its size has passed.
+std::atomic<uint32_t> g_sd_fixed_us{0}, g_sd_kib_us{0}, g_sd_spread{0};
+std::atomic<uint32_t> g_sd_seed{0x2545F491};
+void sd_model_wait(uint64_t t0, uint32_t n)
+{
+    const uint32_t fixed = g_sd_fixed_us.load(std::memory_order_relaxed);
+    if (!fixed)
+        return;
+    uint64_t want = fixed + (uint64_t)g_sd_kib_us.load(std::memory_order_relaxed) * n / 1024;
+    if (const uint32_t spread = g_sd_spread.load(std::memory_order_relaxed)) {
+        // Evenly within +-spread per cent.
+        const uint32_t r = g_sd_seed.load(std::memory_order_relaxed) * 1664525u + 1013904223u;
+        g_sd_seed.store(r, std::memory_order_relaxed);
+        want = want * (100 - spread + (r >> 8) % (2 * spread + 1)) / 100;
+    }
+    const uint64_t took = wx86_now_us() - t0;
+    if (took < want)
+        ::usleep((useconds_t)(want - took));
+}
+
 bool pf_disk(int id, uint64_t pos, void *dst, uint32_t n, uint32_t &got)
 {
     got = 0;
@@ -477,6 +589,7 @@ bool pf_disk(int id, uint64_t pos, void *dst, uint32_t n, uint32_t &got)
             break;
         got += (uint32_t)r;
     }
+    sd_model_wait(t0, got);
     g_file_stats.prefetch_reads++;
     g_file_stats.prefetch_bytes += got;
     g_file_stats.prefetch_us += wx86_now_us() - t0;
@@ -513,18 +626,74 @@ bool run_background()
 // than 8 KiB blocks without read-ahead; larger blocks or more read-ahead
 // read too much the game never uses. Memory is tight (4 MiB of blocks ran
 // the host heap out in Blood Moor), so blocks are allocated on first use
-// and capped in total (kCap): past it, a file reuses its own blocks.
+// and capped in total (set_read_cache): past it, a file reuses its own blocks.
+//
+// set_read_cache (the AOT build: issue #153): 32 blocks a file, and 2 MiB of
+// blocks more in a slab the platform gives (the console's linear memory,
+// which that build has to spare; the heap's 1 MiB stays what it was: a film's
+// frames need the rest). A replay of two Azahar traces (an act's load and
+// arrival, Cold Plains) costs 18-19% less SD time with 32 blocks and 3 MiB
+// than with 8 and 1 MiB (24 and 2 MiB: 14-16%; 64 and 4 MiB: 25-28%): an MPQ
+// is one file here, read by many of the game's at once.
+constexpr uint32_t kRcBlock = 16 * 1024;
+uint32_t g_rc_blocks = 8;
+uint64_t g_rc_cap = 1u << 20;      // of heap blocks; a file with none still gets one
+std::atomic<uint32_t> g_rc_heap_bytes{0};   // a file closes on the game's thread while the worker fills another
+uint8_t *g_rc_slab = nullptr;
+uint32_t g_rc_slab_size = 0, g_rc_slab_next = 0;
+std::vector<uint8_t *> g_rc_slab_free;
+std::atomic_flag g_rc_lock = ATOMIC_FLAG_INIT;   // the slab's list: a file closes on the game's thread while the worker fills another
+
+// A block: from the slab while it has one, else the heap under its cap
+// (force: past it too). Null: reuse one.
+uint8_t *rc_alloc(bool force)
+{
+    uint8_t *p = nullptr;
+    while (g_rc_lock.test_and_set(std::memory_order_acquire)) {
+    }
+    if (!g_rc_slab_free.empty()) {
+        p = g_rc_slab_free.back();
+        g_rc_slab_free.pop_back();
+    } else if (g_rc_slab && g_rc_slab_next + kRcBlock <= g_rc_slab_size) {
+        p = g_rc_slab + g_rc_slab_next;
+        g_rc_slab_next += kRcBlock;
+    }
+    g_rc_lock.clear(std::memory_order_release);
+    if (p || (!force && g_rc_heap_bytes.load(std::memory_order_relaxed) + kRcBlock > g_rc_cap))
+        return p;
+    p = new (std::nothrow) uint8_t[kRcBlock];
+    if (p)
+        g_rc_heap_bytes += kRcBlock;
+    return p;
+}
+struct RcFree {
+    void operator()(uint8_t *p) const
+    {
+        if (g_rc_slab && p >= g_rc_slab && p < g_rc_slab + g_rc_slab_size) {
+            while (g_rc_lock.test_and_set(std::memory_order_acquire)) {
+            }
+            g_rc_slab_free.push_back(p);
+            g_rc_lock.clear(std::memory_order_release);
+        } else if (p) {
+            delete[] p;
+            g_rc_heap_bytes -= kRcBlock;
+        }
+    }
+};
+
 class ReadCache {
 public:
-    static constexpr uint32_t kBlock = 16 * 1024, kBlocks = 8;
-    static constexpr uint64_t kCap = 1u << 20;
+    static constexpr uint32_t kBlock = kRcBlock, kBlocksMax = 32;
 
-    ReadCache(int fd, uint64_t size, int pf = -1) : fd_(fd), size_(size), pf_(pf) {}
+    ReadCache(int fd, uint64_t size, int pf = -1)
+        : fd_(fd), size_(size), pf_(pf), count_(std::min(g_rc_blocks, kBlocksMax))
+    {
+    }
     void set_fd(int fd) { fd_ = fd; }   // the file reopened (resume_files)
     ~ReadCache()
     {
-        for (const Block &b : blocks_)
-            if (b.data)
+        for (uint32_t k = 0; k < count_; k++)
+            if (blocks_[k].data)
                 g_file_stats.cache_bytes -= kBlock;
     }
 
@@ -544,7 +713,8 @@ public:
             return true;
         if (n > size_ - pos)
             n = (uint32_t)(size_ - pos);
-        if (pf_serve(pf_, pos, dst, n)) {   // read ahead on the worker (issue #89)
+        if (pf_serve(pf_, pos, dst, n) ||    // read ahead on the worker (issue #89)
+            keep_serve(pf_, pos, dst, n)) {  // a sprite's, read before (issue #153)
             got = n;
             return true;
         }
@@ -579,9 +749,15 @@ public:
             n = (uint32_t)(size_ - pos);
         if (pf_serve(pf_, pos, dst, n))   // read ahead on the worker (issue #89)
             return n;
+        if (keep_serve(pf_, pos, dst, n))   // a sprite's, read before (issue #153)
+            return n;
+        const bool keep = keep_wanted(pf_, pos, n);
         if (n >= kBlock) {
             g_file_stats.direct++;
-            return disk_read(pos, dst, n);
+            const uint32_t r = disk_read(pos, dst, n);
+            if (keep && r == n)
+                keep_put(pf_, pos, dst, n);
+            return r;
         }
         uint32_t done = 0;
         while (done < n) {
@@ -596,6 +772,8 @@ public:
             std::memcpy(dst + done, b->data.get() + off, take);
             done += take;
         }
+        if (keep && done == n)
+            keep_put(pf_, pos, dst, n);
         return done;
     }
 
@@ -603,7 +781,7 @@ private:
     struct Block {
         uint64_t base = ~0ull;
         uint32_t len = 0, used = 0;
-        std::unique_ptr<uint8_t[]> data;
+        std::unique_ptr<uint8_t[], RcFree> data;
     };
 
     struct Guard {
@@ -618,9 +796,9 @@ private:
 
     Block *find(uint64_t base)
     {
-        for (Block &b : blocks_)
-            if (b.base == base && b.data)
-                return &b;
+        for (uint32_t k = 0; k < count_; k++)
+            if (blocks_[k].base == base && blocks_[k].data)
+                return &blocks_[k];
         return nullptr;
     }
 
@@ -631,7 +809,8 @@ private:
     Block *victim(const Block *keep)
     {
         Block *any = nullptr, *with_memory = nullptr;
-        for (Block &b : blocks_) {
+        for (uint32_t k = 0; k < count_; k++) {
+            Block &b = blocks_[k];
             if (&b == keep)
                 continue;
             if (!any || b.used < any->used)
@@ -639,12 +818,10 @@ private:
             if (b.data && (!with_memory || b.used < with_memory->used))
                 with_memory = &b;
         }
-        if (any && !any->data && with_memory && g_file_stats.cache_bytes + kBlock > kCap)
-            any = with_memory;   // at the cap: reuse a block instead of allocating
         if (any && !any->data) {
-            any->data.reset(new (std::nothrow) uint8_t[kBlock]);
+            any->data.reset(rc_alloc(!with_memory));
             if (!any->data)
-                return with_memory;
+                return with_memory;   // at the cap (or no memory): reuse a block instead
             g_file_stats.cache_bytes += kBlock;
         }
         return any;
@@ -711,6 +888,7 @@ private:
                     break;
                 done += (uint32_t)got;
             }
+        sd_model_wait(t0, done);
         g_file_stats.disk_reads++;
         g_file_stats.disk_bytes += done;
         g_file_stats.disk_us += wx86_now_us() - t0;
@@ -722,7 +900,8 @@ private:
     int pf_;   // the prefetch store's id for this file, -1 none
     uint32_t clock_ = 0;
     uint64_t last_fill_ = ~0ull - kBlock;   // the last block filled: a miss right after it reads ahead
-    Block blocks_[kBlocks];
+    const uint32_t count_;   // of blocks_, the ones in use (set_read_cache when the file was opened)
+    Block blocks_[kBlocksMax];
     std::atomic_flag lock_ = ATOMIC_FLAG_INIT;
 };
 
@@ -740,6 +919,7 @@ struct RtFile : Waitable {
     bool suspended = false;
     long fp_pos = 0;
     uint32_t traced = 0;             // the file trace (set_file_trace) that named it
+    uint32_t plain_reads = 0;        // ReadFile calls through stdio, logged at its close when many
     RtFile() { g_files.push_back(this); }
     ~RtFile() override
     {
@@ -748,6 +928,8 @@ struct RtFile : Waitable {
         while (cache && cache->inflight.load(std::memory_order_acquire) > 0)
             if (options().sleep_ms)
                 options().sleep_ms(1);
+        if (plain_reads >= 64)   // each may be an SD access (see the top)
+            logf("files: %s (\"%s\") closed after %u reads through stdio", host.c_str(), mode, (unsigned)plain_reads);
         if (fp)
             std::fclose(fp);
         if (fd >= 0)
@@ -928,6 +1110,50 @@ bool prefetch_raw(int id, uint64_t pos, void *dst, uint32_t n)
 {
     uint32_t got;
     return pf_disk(id, pos, dst, n, got) && got == n;
+}
+
+void set_sd_model(uint32_t fixed_us, uint32_t kib_us, uint32_t spread_pct)
+{
+    g_sd_kib_us = kib_us;
+    g_sd_spread = spread_pct < 100 ? spread_pct : 99;
+    g_sd_fixed_us = fixed_us;
+}
+
+void set_read_cache(uint32_t blocks, void *slab, uint32_t slab_size)
+{
+    g_rc_blocks = std::max<uint32_t>(2, std::min(blocks, ReadCache::kBlocksMax));
+    g_rc_slab = static_cast<uint8_t *>(slab);
+    g_rc_slab_size = slab ? slab_size : 0;
+    g_rc_slab_free.reserve(g_rc_slab_size / kRcBlock);   // no allocation when a block comes back
+}
+
+void set_sprite_keep(void *arena, uint32_t size)
+{
+    g_keep_arena = static_cast<uint8_t *>(arena);
+    g_keep_size = arena ? size : 0;
+}
+
+void keep_region(int id, uint64_t pos, uint32_t len)
+{
+    if (id < 0 || !len || !g_keep_arena)
+        return;
+    KeepGuard g;
+    for (const KeepRegion &r : g_keep_regions)
+        if (r.id == id && r.pos == pos && r.len == len)
+            return;
+    g_keep_regions[g_keep_region_next++ % kKeepRegions] = KeepRegion{id, pos, len};
+}
+
+KeepStats keep_stats()
+{
+    KeepStats k;
+    k.hits = g_keep_hits.exchange(0);
+    k.hit_bytes = g_keep_hit_bytes.exchange(0);
+    k.puts = g_keep_puts.exchange(0);
+    k.put_bytes = g_keep_put_bytes.exchange(0);
+    k.held = g_keep_held.load();
+    k.size = g_keep_size;
+    return k;
 }
 
 void set_prefetch_arena(void *arena, uint32_t size)
@@ -1396,6 +1622,31 @@ bool ini_write(const std::string &file, const std::string &app, const std::strin
     return std::fclose(f) == 0;
 }
 
+// A file opened to read and write starts under the read cache (create_file).
+// Its first write, or a change of its size, puts it on stdio at the position
+// it has: the cache goes, so nothing cached is older than a write. False:
+// it couldn't be opened to write.
+bool to_stdio(RtFile *f)
+{
+    if (!f->cache)
+        return true;
+    if (std::strcmp(f->mode, "r+b") != 0)
+        return false;   // opened to read alone
+    while (f->cache->inflight.load(std::memory_order_acquire) > 0)
+        if (options().sleep_ms)
+            options().sleep_ms(1);
+    FILE *fp = std::fopen(f->host.c_str(), "r+b");
+    if (!fp)
+        return false;
+    std::fseek(fp, (long)f->pos, SEEK_SET);
+    f->cache.reset();
+    if (f->fd >= 0)
+        ::close(f->fd);
+    f->fd = -1;
+    f->fp = fp;
+    return true;
+}
+
 // ---- file creation ------------------------------------------------------------------
 
 uint32_t create_file(Cpu &c, const std::string &guest, uint32_t access, uint32_t disp)
@@ -1440,14 +1691,21 @@ uint32_t create_file(Cpu &c, const std::string &guest, uint32_t access, uint32_t
     f->mode = mode;
     if (mode[0] == 'w' || write)
         touched(host);   // created, truncated or about to be written
-    // Read-only and in the game install: the cached path (see the top).
+    // An existing file opened to read: the cached path (see the top). A file
+    // of the write root too, and one opened to read and write (a save's map
+    // file, "r+b"): the game reads those about a hundred bytes a call, each
+    // call an SD access through stdio (an act change by waypoint: 30,000
+    // reads of 145 opens, 24 s in ReadFile on the console, 3DS-D2-1H). The
+    // cache is this handle's and ends with it or at its first write
+    // (to_stdio); only the game install's files are read ahead.
     const std::string &data = data_root();
-    if (std::strcmp(mode, "rb") == 0 && split_roots() && host.compare(0, data.size(), data) == 0) {
+    if ((std::strcmp(mode, "rb") == 0 || std::strcmp(mode, "r+b") == 0) && split_roots()) {
+        const bool install = host.compare(0, data.size(), data) == 0;
         f->fd = ::open(host.c_str(), O_RDONLY);
         struct stat fst;
         if (f->fd >= 0 && ::fstat(f->fd, &fst) == 0) {
             f->size = (uint64_t)fst.st_size;
-            f->cache.reset(new ReadCache(f->fd, f->size, pf_register(host)));
+            f->cache.reset(new ReadCache(f->fd, f->size, install ? pf_register(host) : -1));
         } else if (f->fd >= 0) {
             ::close(f->fd);
             f->fd = -1;
@@ -1691,9 +1949,13 @@ void install_files(Bridge &br)
             got = cached_read(c, *f, buf, n);
             g_file_stats.stall_us += g_file_stats.disk_us - disk_us;   // synchronous: the disk time is the stall
         } else {
+            const uint64_t t0 = wx86_now_us();
             if (ov)
                 std::fseek(f->fp, (long)c.read_u32(ov + 8), SEEK_SET);
             got = (uint32_t)stream_read(c, f->fp, buf, n);
+            g_file_stats.plain++;
+            f->plain_reads++;
+            g_file_stats.plain_us += wx86_now_us() - t0;
         }
         stats().bytes_read += got;
         if (pread)
@@ -1722,7 +1984,7 @@ void install_files(Bridge &br)
         }
         RtFile *f = file_of(h);
         if (!f) { set_last_error(c, ERROR_INVALID_HANDLE); return 0; }
-        if (f->cache) { set_last_error(c, ERROR_ACCESS_DENIED); return 0; }   // opened for reading only
+        if (!to_stdio(f)) { set_last_error(c, ERROR_ACCESS_DENIED); return 0; }   // opened for reading only
         touched(f->host);   // its size and time change
         if (ov)
             std::fseek(f->fp, (long)c.read_u32(ov + 8), SEEK_SET);
@@ -1785,7 +2047,7 @@ void install_files(Bridge &br)
     K("SetEndOfFile", 1, [](Cpu &c) -> uint32_t {
         RtFile *f = file_of(c.arg(0));
         if (!f) { set_last_error(c, ERROR_INVALID_HANDLE); return 0; }
-        if (f->cache) { set_last_error(c, ERROR_ACCESS_DENIED); return 0; }
+        if (!to_stdio(f)) { set_last_error(c, ERROR_ACCESS_DENIED); return 0; }
         std::fflush(f->fp);
         touched(f->host);
         return ::ftruncate(fileno(f->fp), std::ftell(f->fp)) == 0;

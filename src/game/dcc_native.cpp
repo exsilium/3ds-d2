@@ -2,6 +2,7 @@
 #include "game/dcc_native.h"
 
 #include "game/dcc_decode.h"
+#include "game/native_sites.h"
 #include "runtime/cpu.h"
 #include "runtime/rt_host.h"
 
@@ -46,6 +47,14 @@ DccScratch *g_scratch_game = nullptr, *g_scratch_worker = nullptr;
 DccStats g_stats;
 std::atomic<uint64_t> g_worker_us{0};
 std::atomic<uint32_t> g_worker_refused{0};
+
+// The window's decodes on the frame thread, by who asked.
+struct FrameChain {
+    std::string text;
+    uint32_t groups;
+    uint64_t us;
+};
+std::vector<FrameChain> g_chains;
 
 // The check's expected bytes, from the native at kLoop to the callback.
 uint32_t g_check_out = 0;
@@ -142,29 +151,36 @@ uint32_t loop_native(d2rt::Cpu &c)
         }
         g_stats.worker_busy++;
     }
+    FrameChain *chain = nullptr;
     if (frame) {
         g_stats.on_frame++;
-        // Who decodes on the frame thread: each different EBP chain, once
-        // (20 at the most).
-        static std::vector<std::string> chains;
-        if (chains.size() < 20) {
-            char chain[160];
-            int n = 0;
-            uint32_t fp = c.read_u32(ebp);
-            for (int k = 0; k < 8 && fp && n < (int)sizeof chain - 10; k++) {
-                n += std::snprintf(chain + n, sizeof chain - n, " %06x", (unsigned)c.read_u32(fp + 4));
-                fp = c.read_u32(fp);
-            }
-            chain[n] = 0;
-            if (std::find(chains.begin(), chains.end(), std::string(chain)) == chains.end()) {
-                chains.emplace_back(chain);
-                rt::logf("dcc: decoded on the frame thread from%s", chain);
-            }
+        // Who decodes on the frame thread: the callers above the sprite
+        // fetch (0x6001f0), by their return addresses up the EBP chain.
+        char text[160];
+        int n = 0;
+        uint32_t fp = c.read_u32(ebp);
+        for (int k = 0; k < 8 && fp && n < (int)sizeof text - 10; k++) {
+            const uint32_t ret = c.read_u32(fp + 4);
+            if (k >= 3)   // the first three are the fetch's own (0x5ff760, 0x5ffe90, 0x6001f0)
+                n += std::snprintf(text + n, sizeof text - n, " %06x", (unsigned)ret);
+            fp = c.read_u32(fp);
+        }
+        text[n] = 0;
+        for (FrameChain &f : g_chains)
+            if (f.text == text)
+                chain = &f;
+        if (!chain && g_chains.size() < 64) {
+            g_chains.push_back(FrameChain{text, 0, 0});
+            chain = &g_chains.back();
         }
     }
     const uint64_t t0 = rt::now_us();
     const uint32_t r = decode(a, *g_scratch_game);
     g_stats.native_us += rt::now_us() - t0;
+    if (chain) {
+        chain->groups++;
+        chain->us += rt::now_us() - t0;
+    }
     if (r == end) {
         g_stats.native++;
     } else {
@@ -211,16 +227,10 @@ bool install_dcc_native(d2rt::Cpu &c, DccMode mode)
     const uint32_t native = rt::native_entry("DccDecode", 0, loop_native);
     if (!native)
         return false;
-    // call native; cmp eax, [ebp-0x340]; nops to 0x60c11f.
-    uint8_t p[sizeof kLoopOrig];
-    std::memset(p, 0x90, sizeof p);
-    p[0] = 0xe8;
-    put_rel32(p + 1, kLoop + 5, native);
-    const uint8_t cmp[6] = {0x3b, 0x85, 0xc0, 0xfc, 0xff, 0xff};
-    std::memcpy(p + 5, cmp, sizeof cmp);
+    // call native; cmp eax, [ebp-0x340]; nops to 0x60c11f (native_sites_table.h).
     static_assert(kLoop + sizeof kLoopOrig == kLoopNext, "the patch ends where the game's code goes on");
-    c.write(kLoop, p, sizeof p);
-    c.invalidate_code(kLoop, sizeof p);
+    if (!apply_sites(c, "dcc", {{"DccDecode", native}}))
+        return false;
     if (mode == DccMode::Check) {
         uint8_t a[sizeof kAfterOrig];
         if (c.read(kAfter, a, sizeof a) && std::memcmp(a, kAfterOrig, sizeof a) == 0) {
@@ -247,6 +257,29 @@ void set_dcc_mode(DccMode mode)
 }
 
 DccMode dcc_mode() { return (DccMode)g_mode.load(std::memory_order_relaxed); }
+
+std::vector<std::string> dcc_frame_lines()
+{
+    std::vector<std::string> out;
+    std::sort(g_chains.begin(), g_chains.end(), [](const FrameChain &a, const FrameChain &b) { return a.us > b.us; });
+    char line[400];
+    int n = 0;
+    uint32_t groups = 0;
+    uint64_t us = 0;
+    for (const FrameChain &f : g_chains) {
+        groups += f.groups;
+        us += f.us;
+    }
+    if (!groups)
+        return out;
+    n = std::snprintf(line, sizeof line, "[rt] dcc on the frame thread: %u groups in %u ms;", groups, (unsigned)(us / 1000));
+    for (size_t i = 0; i < g_chains.size() && i < 5 && n < (int)sizeof line - 80; i++)
+        n += std::snprintf(line + n, sizeof line - n, "%s %ux %u ms from%s", i ? ";" : "", g_chains[i].groups,
+                           (unsigned)(g_chains[i].us / 1000), g_chains[i].text.c_str());
+    out.emplace_back(line);
+    g_chains.clear();
+    return out;
+}
 
 DccStats dcc_stats()
 {

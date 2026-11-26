@@ -1,5 +1,7 @@
 // See frame_reads.h.
 #include "game/frame_reads.h"
+#include "game/native_sites.h"
+#include "game/sprites_ahead.h"
 #include "game/tiles_ahead.h"
 
 #include "runtime/cpu.h"
@@ -9,6 +11,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <unordered_map>
 
 namespace game {
@@ -27,10 +30,7 @@ namespace {
 //   41aae3  ...                (eax is loaded again before it is read)
 // becomes a call to the native, which clears *read itself, and the frame:
 //   call native; push ebp; mov ebp, esp; sub esp, 0x2c; nops to 0x41aae3
-constexpr uint32_t kAt = 0x0041aad0, kNext = 0x0041aae3;
-constexpr uint8_t kOrig[] = {0x55, 0x8b, 0xec, 0x8b, 0x45, 0x14, 0x83, 0xec, 0x2c, 0x85,
-                             0xc0, 0x74, 0x06, 0xc7, 0x00, 0x00, 0x00, 0x00, 0x00};
-static_assert(kAt + sizeof kOrig == kNext, "the patch ends where the game's code goes on");
+constexpr uint32_t kAt = 0x0041aad0;
 
 // rt::frame_thread_us's kinds the game thread waits for a read in.
 constexpr size_t kCritsec = 4, kEvent = 5, kFileio = 6, kMulti = 7;
@@ -48,6 +48,18 @@ struct Use {
 std::unordered_map<std::string, Use> g_files;   // the window's, by name
 std::string g_last;                              // the game thread's last read, its wait not yet charged
 uint64_t g_last_kind[4] = {};
+// The same by who read (issue #153): the read's caller and four frames up
+// its EBP chain, by the file's class.
+struct Chain {
+    uint32_t ra[5] = {};
+    bool operator<(const Chain &o) const { return std::memcmp(ra, o.ra, sizeof ra) < 0; }
+};
+std::map<Chain, Use> g_chains[kClasses];
+Chain g_last_chain;
+int g_last_chain_of = -1;
+// The reads sprites_ahead answered 1 (a file's first) and 2 (a later one).
+Use g_ahead[3];
+int g_last_ahead = 0;
 
 // The wait since the last read's entry, to that read, by kind.
 void charge()
@@ -57,10 +69,16 @@ void charge()
     const uint64_t now[4] = {t[kCritsec], t[kEvent], t[kFileio], t[kMulti]};
     if (!g_last.empty()) {
         Use &u = g_files[g_last];
+        Use *by = g_last_chain_of >= 0 ? &g_chains[g_last_chain_of][g_last_chain] : nullptr;
         for (int k = 0; k < 4; k++)
             if (now[k] > g_last_kind[k]) {
                 u.kind_us[k] += now[k] - g_last_kind[k];
                 u.wait_us += now[k] - g_last_kind[k];
+                if (by) {
+                    by->kind_us[k] += now[k] - g_last_kind[k];
+                    by->wait_us += now[k] - g_last_kind[k];
+                }
+                g_ahead[g_last_ahead].wait_us += now[k] - g_last_kind[k];
             }
     }
     for (int k = 0; k < 4; k++)
@@ -126,6 +144,32 @@ uint32_t on_read(d2rt::Cpu &c)
     Use &u = g_files[g_last];
     u.reads++;
     u.bytes += bytes;
+    const Class cls = class_of(g_last);
+    // A missile's, an overlay's or an object's sprite (issue #153), which
+    // the draw loads a direction at a time: the rest of the file read ahead.
+    if ((cls == kMissiles || cls == kOverlays || cls == kObjects) && file && len > 4 &&
+        (name[len - 1] | 0x20) == 'c' && (name[len - 2] | 0x20) == 'c' && (name[len - 3] | 0x20) == 'd')
+        g_last_ahead = sprites_ahead_read(c, name, file);
+    else
+        g_last_ahead = 0;
+    // Any sprite's file: what the card gives of it is kept (issue #153).
+    if (file && len > 4 && (name[len - 1] | 0x20) == 'c' && (name[len - 2] | 0x20) == 'c' && (name[len - 3] | 0x20) == 'd')
+        sprites_keep_read(c, file);
+    g_ahead[g_last_ahead].reads++;
+    g_last_chain_of = cls;
+    {
+        Chain ch;
+        ch.ra[0] = c.read_u32(esp + 4);
+        uint32_t ebp = c.reg(d2rt::R_EBP);
+        for (int i = 1; i < 5 && ebp && c.hostptr(ebp, 8); i++) {
+            ch.ra[i] = c.read_u32(ebp + 4);
+            ebp = c.read_u32(ebp);
+        }
+        g_last_chain = ch;
+        Use &by = g_chains[g_last_chain_of][ch];
+        by.reads++;
+        by.bytes += bytes;
+    }
     return 0;
 }
 
@@ -133,21 +177,11 @@ uint32_t on_read(d2rt::Cpu &c)
 
 bool install_frame_reads(d2rt::Cpu &c)
 {
-    uint8_t have[sizeof kOrig];
-    if (!c.read(kAt, have, sizeof have) || std::memcmp(have, kOrig, sizeof have) != 0)
-        return false;
     const uint32_t native = rt::native_entry("FrameRead", 0, on_read);
-    if (!native)
+    // native_sites_table.h's frame_reads row, which the AOT recompiler reads
+    // too (issue #138).
+    if (!native || !apply_sites(c, "frame_reads", {{"FrameRead", native}}))
         return false;
-    uint8_t p[sizeof kOrig];
-    std::memset(p, 0x90, sizeof p);
-    p[0] = 0xe8;
-    const uint32_t rel = native - (kAt + 5);
-    std::memcpy(p + 1, &rel, 4);
-    const uint8_t frame[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x2c};
-    std::memcpy(p + 5, frame, sizeof frame);
-    c.write(kAt, p, sizeof p);
-    c.invalidate_code(kAt, sizeof p);
     rt::logf("frame reads: the game thread's reads named at %08x", kAt);
     return true;
 }
@@ -174,7 +208,7 @@ std::vector<std::string> frame_reads_lines()
     }
     if (!all.reads && all.wait_us < 1000)
         return out;
-    char line[512];
+    char line[640];
     int n = std::snprintf(line, sizeof line, "[rt] frame reads: %u reads of %u files, %u KiB, waited %u ms;",
                           all.reads, (unsigned)files.size(), (unsigned)(all.bytes >> 10), (unsigned)(all.wait_us / 1000));
     for (int k = 0; k < kClasses && n < (int)sizeof line - 48; k++)
@@ -202,6 +236,35 @@ std::vector<std::string> frame_reads_lines()
                                files[i].second.reads, (unsigned)(files[i].second.wait_us / 1000));
         out.emplace_back(line);
     }
+    // A class's callers, where it waited 20 ms or more in the window.
+    for (int w = 0; w < kClasses; w++) {
+        std::vector<std::pair<Chain, Use>> v(g_chains[w].begin(), g_chains[w].end());
+        g_chains[w].clear();
+        if (v.empty() || by[w].wait_us < 20000)
+            continue;
+        std::sort(v.begin(), v.end(), [](const auto &a, const auto &b) {
+            return a.second.wait_us != b.second.wait_us ? a.second.wait_us > b.second.wait_us : a.second.reads > b.second.reads;
+        });
+        n = std::snprintf(line, sizeof line, "[rt] frame reads, %s by caller:", kClassNames[w]);
+        for (size_t i = 0; i < v.size() && i < 4 && n < (int)sizeof line - 120; i++) {
+            const Use &u = v[i].second;
+            n += std::snprintf(line + n, sizeof line - n, "%s %ux %u KiB %u ms (lock %u, read thread %u, file %u) from", i ? ";" : "",
+                               u.reads, (unsigned)(u.bytes >> 10), (unsigned)(u.wait_us / 1000), (unsigned)(u.kind_us[0] / 1000),
+                               (unsigned)(u.kind_us[1] / 1000), (unsigned)(u.kind_us[2] / 1000));
+            for (int k = 0; k < 5; k++)
+                n += std::snprintf(line + n, sizeof line - n, " %x", v[i].first.ra[k]);
+        }
+        out.emplace_back(line);
+    }
+    if (g_ahead[1].reads || g_ahead[2].reads) {
+        std::snprintf(line, sizeof line,
+                      "[rt] frame reads, sprites ahead: a file's first read %ux %u ms, its later reads %ux %u ms",
+                      g_ahead[1].reads, (unsigned)(g_ahead[1].wait_us / 1000), g_ahead[2].reads,
+                      (unsigned)(g_ahead[2].wait_us / 1000));
+        out.emplace_back(line);
+    }
+    for (Use &u : g_ahead)
+        u = Use{};
     g_files.clear();
     if (!g_last.empty())
         g_files[g_last];   // its wait still to come
